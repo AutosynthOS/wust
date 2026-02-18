@@ -5,6 +5,7 @@ pub enum Value {
     I64(i64),
     F32(f32),
     F64(f64),
+    V128(u128),
     /// Function reference: Some(func_idx) or None (ref.null func).
     FuncRef(Option<u32>),
 }
@@ -44,6 +45,7 @@ impl Value {
             wasmparser::ValType::I64 => Value::I64(0),
             wasmparser::ValType::F32 => Value::F32(0.0),
             wasmparser::ValType::F64 => Value::F64(0.0),
+            wasmparser::ValType::V128 => Value::V128(0),
             wasmparser::ValType::Ref(r) if r.heap_type() == wasmparser::HeapType::FUNC => {
                 Value::FuncRef(None)
             }
@@ -61,6 +63,7 @@ impl Value {
             Value::F64(v) => v.to_bits(),
             Value::FuncRef(Some(idx)) => idx as u64,
             Value::FuncRef(None) => u64::MAX,
+            Value::V128(v) => panic!("tried to pack V128 value into u64: {:?}", v),
         }
     }
 }

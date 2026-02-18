@@ -1,38 +1,8 @@
-use crate::runtime::module::{ElemItem, Instruction, Module};
+use crate::runtime::instruction::Instruction;
+use crate::runtime::module::{ElemItem, Module};
 use crate::runtime::value::Value;
 
 const PAGE_SIZE: usize = 65536; // 64KB WASM pages
-
-/// Evaluate a const expression (possibly multi-instruction) to an i32 offset.
-fn eval_const_expr_i32(instrs: &[Instruction], globals: &[Value]) -> Option<i32> {
-    let mut stack: Vec<i32> = Vec::new();
-    for instr in instrs {
-        match instr {
-            Instruction::I32Const(v) => stack.push(*v),
-            Instruction::GlobalGet(idx) => match globals.get(*idx as usize) {
-                Some(&Value::I32(v)) => stack.push(v),
-                _ => return None,
-            },
-            Instruction::I32Add => {
-                let b = stack.pop()?;
-                let a = stack.pop()?;
-                stack.push(a.wrapping_add(b));
-            }
-            Instruction::I32Sub => {
-                let b = stack.pop()?;
-                let a = stack.pop()?;
-                stack.push(a.wrapping_sub(b));
-            }
-            Instruction::I32Mul => {
-                let b = stack.pop()?;
-                let a = stack.pop()?;
-                stack.push(a.wrapping_mul(b));
-            }
-            _ => return None,
-        }
-    }
-    stack.pop()
-}
 
 /// Evaluate a const expression to a Value, supporting all WASM types and extended const ops.
 fn eval_const_expr(instrs: &[Instruction], globals: &[Value]) -> Option<Value> {
@@ -126,9 +96,13 @@ pub struct Store {
     pub host_funcs: Vec<HostFunc>,
     /// Element segment data for table.init (None = dropped).
     pub elem_segments: Vec<Option<Vec<Option<u32>>>>,
+    /// Data segment data for memory.init (None = dropped).
+    pub data_segments: Vec<Option<Vec<u8>>>,
     /// External funcref callbacks (for cross-module function references).
     /// Indexed by (func_idx - EXTERN_FUNC_BASE).
     pub extern_funcs: Vec<HostFunc>,
+    /// Table definitions (min/max sizes) for grow/size operations.
+    pub table_defs: Vec<(u64, Option<u64>)>,
 }
 
 impl Store {
@@ -160,25 +134,8 @@ impl Store {
             memory_max = mem.max.map(|m| m as u32);
         }
 
-        // Init data segments
-        for seg in &module.data_segments {
-            let offset = match &seg.offset {
-                Instruction::I32Const(v) => *v as u32 as usize,
-                Instruction::GlobalGet(idx) => match imported_globals.get(*idx as usize) {
-                    Some(&Value::I32(v)) => v as u32 as usize,
-                    _ => return Err("unsupported data segment offset".into()),
-                },
-                _ => return Err("unsupported data segment offset expr".into()),
-            };
-            let end = offset.checked_add(seg.data.len())
-                .ok_or("out of bounds memory access")?;
-            if end > memory.len() {
-                return Err("out of bounds memory access".into());
-            }
-            memory[offset..end].copy_from_slice(&seg.data);
-        }
-
         // Init globals: imported globals first, then module-defined globals
+        // (must be done before data segments since offsets may reference globals)
         let mut globals = imported_globals;
         for g in &module.globals {
             let val = eval_const_expr(&g.init, &globals)
@@ -186,27 +143,56 @@ impl Store {
             globals.push(val);
         }
 
-        // Init tables
-        let mut tables: Vec<Vec<Option<u32>>> = module
-            .tables
-            .iter()
-            .map(|t| vec![None; t.min as usize])
-            .collect();
-
-        // Apply element segments
-        for elem in &module.elements {
-            let offset = match eval_const_expr_i32(&elem.offset, &globals) {
-                Some(v) => v as u32 as usize,
-                None => continue,
-            };
-            if let Some(table) = tables.get_mut(elem.table_idx as usize) {
-                let end = offset.checked_add(elem.items.len())
-                    .ok_or("out of bounds table access")?;
-                if end > table.len() {
-                    return Err("out of bounds table access".into());
+        // Init active data segments (copy data into memory)
+        for seg in &module.data_segments {
+            if seg.active {
+                let offset = eval_const_expr(&seg.offset, &globals)
+                    .and_then(|v| match v {
+                        Value::I32(v) => Some(v as u32 as usize),
+                        _ => None,
+                    })
+                    .ok_or("unsupported data segment offset expr")?;
+                let end = offset.checked_add(seg.data.len())
+                    .ok_or("out of bounds memory access")?;
+                if end > memory.len() {
+                    return Err("out of bounds memory access".into());
                 }
-                for (i, item) in elem.items.iter().enumerate() {
-                    table[offset + i] = resolve_elem_item(item, &globals);
+                memory[offset..end].copy_from_slice(&seg.data);
+            }
+        }
+
+        // Init tables (with optional init expressions)
+        let mut tables: Vec<Vec<Option<u32>>> = Vec::new();
+        for t in &module.tables {
+            let init_val = match &t.init {
+                Some(instrs) => {
+                    match eval_const_expr(instrs, &globals) {
+                        Some(Value::FuncRef(func_ref)) => func_ref,
+                        Some(Value::I32(v)) => Some(v as u32),
+                        _ => None,
+                    }
+                }
+                None => None,
+            };
+            tables.push(vec![init_val; t.min as usize]);
+        }
+
+        // Apply active element segments to tables
+        for elem in &module.elements {
+            if elem.active {
+                let offset = match eval_const_expr(&elem.offset, &globals) {
+                    Some(Value::I32(v)) => v as u32 as usize,
+                    _ => continue,
+                };
+                if let Some(table) = tables.get_mut(elem.table_idx as usize) {
+                    let end = offset.checked_add(elem.items.len())
+                        .ok_or("out of bounds table access")?;
+                    if end > table.len() {
+                        return Err("out of bounds table access".into());
+                    }
+                    for (i, item) in elem.items.iter().enumerate() {
+                        table[offset + i] = resolve_elem_item(item, &globals);
+                    }
                 }
             }
         }
@@ -217,16 +203,32 @@ impl Store {
             let funcs: Vec<Option<u32>> = elem.items.iter()
                 .map(|item| resolve_elem_item(item, &globals))
                 .collect();
-            // Active segments (those with an offset) are implicitly dropped
-            let is_active = !elem.offset.is_empty();
-            if is_active {
-                elem_segments.push(None); // dropped
+            if elem.active {
+                elem_segments.push(None); // active segments are dropped after init
             } else {
                 elem_segments.push(Some(funcs));
             }
         }
 
-        Ok(Store { memory, memory_max, globals, tables, host_funcs, elem_segments, extern_funcs: Vec::new() })
+        // Build data_segments: active segments are dropped after init.
+        let mut data_segments: Vec<Option<Vec<u8>>> = Vec::new();
+        for seg in &module.data_segments {
+            if seg.active {
+                data_segments.push(None); // active segments are dropped after init
+            } else {
+                data_segments.push(Some(seg.data.clone()));
+            }
+        }
+
+        // Store table definitions for grow/size
+        let table_defs: Vec<(u64, Option<u64>)> = module.tables.iter()
+            .map(|t| (t.min, t.max))
+            .collect();
+
+        Ok(Store {
+            memory, memory_max, globals, tables, host_funcs,
+            elem_segments, data_segments, extern_funcs: Vec::new(), table_defs,
+        })
     }
 
     pub fn memory_load<const N: usize>(&self, addr: u64) -> Result<[u8; N], &'static str> {

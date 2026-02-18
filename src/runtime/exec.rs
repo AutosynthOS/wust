@@ -1,5 +1,5 @@
-use crate::runtime::module::{Module, Op};
-use crate::runtime::module::*;
+use crate::runtime::module::Module;
+use crate::runtime::instruction::*;
 use crate::runtime::store::{Store, EXTERN_FUNC_BASE};
 use crate::runtime::value::Value;
 
@@ -220,53 +220,32 @@ impl Float for f64 {
     fn float_signum(self) -> Self { self.signum() }
 }
 
-// --- Stack helper macros for u64-based stack ---
-// pop_i32: pop u64, interpret low 32 bits as i32
-// pop_i64: pop u64, interpret as i64
-// pop_f32: pop u64, interpret low 32 bits as f32
-// pop_f64: pop u64, interpret as f64
+// --- Stack helper functions for u64-based stack ---
+// WASM validation guarantees stack is non-empty at every pop site.
 
-/// Unsafe unchecked pop: WASM validation guarantees stack is non-empty.
-macro_rules! pop_i32 {
-    ($stack:expr) => { unsafe {
-        let new_len = $stack.len() - 1;
-        let v = *$stack.get_unchecked(new_len);
-        $stack.set_len(new_len);
-        v as i32
-    }}
+#[inline(always)]
+fn pop_raw(stack: &mut Vec<u64>) -> u64 {
+    stack.pop().unwrap()
 }
-macro_rules! pop_i64 {
-    ($stack:expr) => { unsafe {
-        let new_len = $stack.len() - 1;
-        let v = *$stack.get_unchecked(new_len);
-        $stack.set_len(new_len);
-        v as i64
-    }}
+
+#[inline(always)]
+fn pop_i32(stack: &mut Vec<u64>) -> i32 {
+    stack.pop().unwrap() as i32
 }
-macro_rules! pop_f32 {
-    ($stack:expr) => { unsafe {
-        let new_len = $stack.len() - 1;
-        let v = *$stack.get_unchecked(new_len);
-        $stack.set_len(new_len);
-        f32::from_bits(v as u32)
-    }}
+
+#[inline(always)]
+fn pop_i64(stack: &mut Vec<u64>) -> i64 {
+    stack.pop().unwrap() as i64
 }
-macro_rules! pop_f64 {
-    ($stack:expr) => { unsafe {
-        let new_len = $stack.len() - 1;
-        let v = *$stack.get_unchecked(new_len);
-        $stack.set_len(new_len);
-        f64::from_bits(v)
-    }}
+
+#[inline(always)]
+fn pop_f32(stack: &mut Vec<u64>) -> f32 {
+    f32::from_bits(stack.pop().unwrap() as u32)
 }
-/// Unsafe raw pop (returns u64 directly).
-macro_rules! pop_raw {
-    ($stack:expr) => { unsafe {
-        let new_len = $stack.len() - 1;
-        let v = *$stack.get_unchecked(new_len);
-        $stack.set_len(new_len);
-        v
-    }}
+
+#[inline(always)]
+fn pop_f64(stack: &mut Vec<u64>) -> f64 {
+    f64::from_bits(stack.pop().unwrap())
 }
 macro_rules! push_i32 {
     ($stack:expr, $v:expr) => { $stack.push($v as u32 as u64) }
@@ -283,7 +262,7 @@ macro_rules! push_f64 {
 
 macro_rules! mem_load {
     ($stack:expr, $store:expr, $offset:expr, $N:literal, $conv:expr) => {{
-        let base = pop_i32!($stack) as u32 as u64;
+        let base = pop_i32(&mut $stack) as u32 as u64;
         let bytes = $store
             .memory_load::<$N>(base + $offset)
             .map_err(|e| ExecError::Trap(e.into()))?;
@@ -292,9 +271,9 @@ macro_rules! mem_load {
 }
 
 macro_rules! mem_store {
-    ($stack:expr, $store:expr, $offset:expr, $pop_macro:ident, $conv:expr) => {{
-        let val = $pop_macro!($stack);
-        let base = pop_i32!($stack) as u32 as u64;
+    ($stack:expr, $store:expr, $offset:expr, $pop_fn:ident, $conv:expr) => {{
+        let val = $pop_fn(&mut $stack);
+        let base = pop_i32(&mut $stack) as u32 as u64;
         $store
             .memory_store(base + $offset, &$conv(val))
             .map_err(|e| ExecError::Trap(e.into()))?;
@@ -303,99 +282,99 @@ macro_rules! mem_store {
 
 macro_rules! binop_i32 {
     ($stack:expr, $op:expr) => {{
-        let b = pop_i32!($stack);
-        let a = pop_i32!($stack);
+        let b = pop_i32(&mut $stack);
+        let a = pop_i32(&mut $stack);
         push_i32!($stack, $op(a, b));
     }};
 }
 
 macro_rules! binop_i64 {
     ($stack:expr, $op:expr) => {{
-        let b = pop_i64!($stack);
-        let a = pop_i64!($stack);
+        let b = pop_i64(&mut $stack);
+        let a = pop_i64(&mut $stack);
         push_i64!($stack, $op(a, b));
     }};
 }
 
 macro_rules! binop_f32 {
     ($stack:expr, $op:expr) => {{
-        let b = pop_f32!($stack);
-        let a = pop_f32!($stack);
+        let b = pop_f32(&mut $stack);
+        let a = pop_f32(&mut $stack);
         push_f32!($stack, $op(a, b));
     }};
 }
 
 macro_rules! binop_f64 {
     ($stack:expr, $op:expr) => {{
-        let b = pop_f64!($stack);
-        let a = pop_f64!($stack);
+        let b = pop_f64(&mut $stack);
+        let a = pop_f64(&mut $stack);
         push_f64!($stack, $op(a, b));
     }};
 }
 
 macro_rules! unop_i32 {
     ($stack:expr, $op:expr) => {{
-        let a = pop_i32!($stack);
+        let a = pop_i32(&mut $stack);
         push_i32!($stack, $op(a));
     }};
 }
 
 macro_rules! unop_i64 {
     ($stack:expr, $op:expr) => {{
-        let a = pop_i64!($stack);
+        let a = pop_i64(&mut $stack);
         push_i64!($stack, $op(a));
     }};
 }
 
 macro_rules! unop_f32 {
     ($stack:expr, $op:expr) => {{
-        let a = pop_f32!($stack);
+        let a = pop_f32(&mut $stack);
         push_f32!($stack, $op(a));
     }};
 }
 
 macro_rules! unop_f64 {
     ($stack:expr, $op:expr) => {{
-        let a = pop_f64!($stack);
+        let a = pop_f64(&mut $stack);
         push_f64!($stack, $op(a));
     }};
 }
 
 macro_rules! cmpop_i32 {
     ($stack:expr, $op:expr) => {{
-        let b = pop_i32!($stack);
-        let a = pop_i32!($stack);
+        let b = pop_i32(&mut $stack);
+        let a = pop_i32(&mut $stack);
         push_i32!($stack, if $op(a, b) { 1i32 } else { 0i32 });
     }};
 }
 
 macro_rules! cmpop_i64 {
     ($stack:expr, $op:expr) => {{
-        let b = pop_i64!($stack);
-        let a = pop_i64!($stack);
+        let b = pop_i64(&mut $stack);
+        let a = pop_i64(&mut $stack);
         push_i32!($stack, if $op(a, b) { 1i32 } else { 0i32 });
     }};
 }
 
 macro_rules! cmpop_f32 {
     ($stack:expr, $op:expr) => {{
-        let b = pop_f32!($stack);
-        let a = pop_f32!($stack);
+        let b = pop_f32(&mut $stack);
+        let a = pop_f32(&mut $stack);
         push_i32!($stack, if $op(a, b) { 1i32 } else { 0i32 });
     }};
 }
 
 macro_rules! cmpop_f64 {
     ($stack:expr, $op:expr) => {{
-        let b = pop_f64!($stack);
-        let a = pop_f64!($stack);
+        let b = pop_f64(&mut $stack);
+        let a = pop_f64(&mut $stack);
         push_i32!($stack, if $op(a, b) { 1i32 } else { 0i32 });
     }};
 }
 
 macro_rules! trunc_op {
-    ($stack:expr, $pop_macro:ident, $push_macro:ident, $int_ty:ty, $max_bound:expr, $min_bound:expr) => {{
-        let a = $pop_macro!($stack);
+    ($stack:expr, $pop_fn:ident, $push_macro:ident, $int_ty:ty, $max_bound:expr, $min_bound:expr) => {{
+        let a = $pop_fn(&mut $stack);
         if a.is_nan() {
             return Err(ExecError::Trap("invalid conversion to integer".into()));
         }
@@ -411,8 +390,8 @@ macro_rules! trunc_op {
 }
 
 macro_rules! trunc_op_u {
-    ($stack:expr, $pop_macro:ident, $push_macro:ident, $uint_ty:ty, $int_ty:ty, $max_bound:expr) => {{
-        let a = $pop_macro!($stack);
+    ($stack:expr, $pop_fn:ident, $push_macro:ident, $uint_ty:ty, $int_ty:ty, $max_bound:expr) => {{
+        let a = $pop_fn(&mut $stack);
         if a.is_nan() {
             return Err(ExecError::Trap("invalid conversion to integer".into()));
         }
@@ -427,16 +406,90 @@ macro_rules! trunc_op_u {
     }};
 }
 
+/// Convert a raw u64 on the stack to a Value based on its ValType.
+#[inline(always)]
+fn bits_to_value(bits: u64, ty: wasmparser::ValType) -> Value {
+    match ty {
+        wasmparser::ValType::I32 => Value::I32(bits as i32),
+        wasmparser::ValType::I64 => Value::I64(bits as i64),
+        wasmparser::ValType::F32 => Value::F32(f32::from_bits(bits as u32)),
+        wasmparser::ValType::F64 => Value::F64(f64::from_bits(bits)),
+        wasmparser::ValType::Ref(_) => {
+            if bits == u64::MAX { Value::FuncRef(None) }
+            else { Value::FuncRef(Some(bits as u32)) }
+        }
+        _ => Value::I32(0),
+    }
+}
+
+/// Pop N args from the stack, convert to Values based on param types.
+fn pop_args_as_values(stack: &mut Vec<u64>, param_types: &[wasmparser::ValType]) -> Vec<Value> {
+    let param_count = param_types.len();
+    let args: Vec<Value> = param_types.iter().enumerate().map(|(i, &ty)| {
+        bits_to_value(stack[stack.len() - param_count + i], ty)
+    }).collect();
+    stack.truncate(stack.len() - param_count);
+    args
+}
+
+/// Call a host function: pop args, invoke, push results.
+fn call_host_fn(
+    stack: &mut Vec<u64>,
+    host_fn: &dyn Fn(&[Value]) -> Vec<Value>,
+    param_types: &[wasmparser::ValType],
+) {
+    let args = pop_args_as_values(stack, param_types);
+    let results = host_fn(&args);
+    for r in results {
+        stack.push(r.to_bits());
+    }
+}
+
+/// Set up a local (non-import) call: extend stack with zero locals, push label, swap frame.
+fn setup_local_call<'a>(
+    frame: &mut Frame<'a>,
+    call_stack: &mut Vec<Frame<'a>>,
+    stack: &mut Vec<u64>,
+    labels: &mut Vec<Label>,
+    callee: &'a crate::runtime::module::Func,
+    callee_type: &wasmparser::FuncType,
+) -> Result<(), ExecError> {
+    let param_count = callee_type.params().len();
+    let new_arity = callee_type.results().len();
+    let locals_start = stack.len() - param_count;
+    let extra_locals = callee.locals.len() - param_count;
+    for _ in 0..extra_locals {
+        stack.push(0u64);
+    }
+    let stack_height = stack.len();
+    let labels_start = labels.len();
+    labels.push(Label {
+        target: callee.body.len().saturating_sub(1),
+        stack_height,
+        arity: new_arity,
+        is_loop: false,
+    });
+    let new_f = Frame {
+        pc: 0,
+        locals_start,
+        stack_height,
+        labels_start,
+        arity: new_arity,
+        body: &callee.body,
+        br_tables: &callee.br_tables,
+    };
+    if call_stack.len() >= MAX_CALL_DEPTH {
+        return Err(ExecError::Trap("call stack exhausted".into()));
+    }
+    let old_frame = std::mem::replace(frame, new_f);
+    call_stack.push(old_frame);
+    Ok(())
+}
+
 /// Convert raw u64 stack values to Value types for the public API, using the function's result types.
 fn raw_to_values(raw: &[u64], types: &[wasmparser::ValType]) -> Vec<Value> {
     raw.iter().zip(types.iter()).map(|(&bits, &ty)| {
-        match ty {
-            wasmparser::ValType::I32 => Value::I32(bits as i32),
-            wasmparser::ValType::I64 => Value::I64(bits as i64),
-            wasmparser::ValType::F32 => Value::F32(f32::from_bits(bits as u32)),
-            wasmparser::ValType::F64 => Value::F64(f64::from_bits(bits)),
-            _ => todo!("unsupported type: {:?}", ty),
-        }
+        bits_to_value(bits, ty)
     }).collect()
 }
 
@@ -476,7 +529,7 @@ pub fn call(
             continue;
         }
 
-        let op = unsafe { *frame.body.get_unchecked(frame.pc) };
+        let op = frame.body[frame.pc];
         frame.pc += 1;
 
         match op.code {
@@ -507,7 +560,7 @@ pub fn call(
             }
             OP_IF => {
                 // No else branch: imm = (end_pc << 32) | arity
-                let cond = pop_i32!(stack);
+                let cond = pop_i32(&mut stack);
                 let end_pc = op.imm_hi() as usize;
                 let arity = op.imm_lo() as usize;
                 labels.push(Label {
@@ -523,7 +576,7 @@ pub fn call(
             }
             OP_IF_ELSE => {
                 // imm = (arity << 56) | (end_pc << 28) | else_pc
-                let cond = pop_i32!(stack);
+                let cond = pop_i32(&mut stack);
                 let arity = (op.imm >> 56) as usize;
                 let end_pc = ((op.imm >> 28) & 0x0FFF_FFFF) as usize;
                 let else_pc = (op.imm & 0x0FFF_FFFF) as usize;
@@ -538,7 +591,7 @@ pub fn call(
                 }
             }
             OP_ELSE => {
-                let label = unsafe { labels.last().unwrap_unchecked() };
+                let label = labels.last().unwrap();
                 frame.pc = label.target + 1;
                 labels.pop();
             }
@@ -551,14 +604,14 @@ pub fn call(
                 do_br(&mut frame, &mut stack, &mut labels, op.imm_u32(), &mut steps)?;
             }
             OP_BR_IF => {
-                let cond = pop_i32!(stack);
+                let cond = pop_i32(&mut stack);
                 if cond != 0 {
                     do_br(&mut frame, &mut stack, &mut labels, op.imm_u32(), &mut steps)?;
                 }
             }
             OP_BR_TABLE => {
                 let (ref targets, default) = frame.br_tables[op.imm as usize];
-                let idx = pop_i32!(stack) as usize;
+                let idx = pop_i32(&mut stack) as usize;
                 let depth = if idx < targets.len() { targets[idx] } else { default };
                 do_br(&mut frame, &mut stack, &mut labels, depth, &mut steps)?;
             }
@@ -579,63 +632,19 @@ pub fn call(
                 if module.is_import(idx) {
                     let type_idx = module.func_types[idx as usize];
                     let callee_type = &module.types[type_idx as usize];
-                    let param_count = callee_type.params().len();
-                    let val_args: Vec<Value> = callee_type.params().iter().enumerate().map(|(i, &ty)| {
-                        let bits = stack[stack.len() - param_count + i];
-                        match ty {
-                            wasmparser::ValType::I32 => Value::I32(bits as i32),
-                            wasmparser::ValType::I64 => Value::I64(bits as i64),
-                            wasmparser::ValType::F32 => Value::F32(f32::from_bits(bits as u32)),
-                            wasmparser::ValType::F64 => Value::F64(f64::from_bits(bits)),
-                            _ => Value::I32(0),
-                        }
-                    }).collect();
-                    stack.truncate(stack.len() - param_count);
-                    if let Some(host_fn) = store.host_funcs.get(idx as usize) {
-                        let results = host_fn(&val_args);
-                        for r in results {
-                            stack.push(r.to_bits());
-                        }
-                    } else {
-                        return Err(ExecError::Trap(format!("unresolved import function {idx}")));
-                    }
+                    let host_fn = store.host_funcs.get(idx as usize)
+                        .ok_or_else(|| ExecError::Trap(format!("unresolved import function {idx}")))?;
+                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params());
                 } else {
                     let callee = module.get_func(idx).unwrap();
-                    let param_count = module.types[callee.type_idx as usize].params().len();
-                    let new_arity = module.types[callee.type_idx as usize].results().len();
-                    let locals_start = stack.len() - param_count;
-                    let extra_locals = callee.locals.len() - param_count;
-                    for _ in 0..extra_locals {
-                        stack.push(0u64);
-                    }
-                    let stack_height = stack.len();
-                    let labels_start = labels.len();
-                    labels.push(Label {
-                        target: callee.body.len().saturating_sub(1),
-                        stack_height,
-                        arity: new_arity,
-                        is_loop: false,
-                    });
-                    let new_f = Frame {
-                        pc: 0,
-                        locals_start,
-                        stack_height,
-                        labels_start,
-                        arity: new_arity,
-                        body: &callee.body,
-                        br_tables: &callee.br_tables,
-                    };
-                    if call_stack.len() >= MAX_CALL_DEPTH {
-                        return Err(ExecError::Trap("call stack exhausted".into()));
-                    }
-                    let old_frame = std::mem::replace(&mut frame, new_f);
-                    call_stack.push(old_frame);
+                    let callee_type = &module.types[callee.type_idx as usize];
+                    setup_local_call(&mut frame, &mut call_stack, &mut stack, &mut labels, callee, callee_type)?;
                 }
             }
             OP_CALL_INDIRECT => {
                 let ci_type_idx = op.imm_hi();
                 let ci_table_idx = op.imm_lo();
-                let elem_idx = pop_i32!(stack) as u32;
+                let elem_idx = pop_i32(&mut stack) as u32;
                 let table = store.tables.get(ci_table_idx as usize)
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
                 let func_idx = table.get(elem_idx as usize)
@@ -643,97 +652,35 @@ pub fn call(
                     .ok_or_else(|| ExecError::Trap("uninitialized element".into()))?;
 
                 if func_idx >= EXTERN_FUNC_BASE {
-                    // External function reference (cross-module funcref)
                     let extern_idx = (func_idx - EXTERN_FUNC_BASE) as usize;
                     let expected_type = &module.types[ci_type_idx as usize];
-                    let param_count = expected_type.params().len();
-                    let val_args: Vec<Value> = expected_type.params().iter().enumerate().map(|(i, &ty)| {
-                        let bits = stack[stack.len() - param_count + i];
-                        match ty {
-                            wasmparser::ValType::I32 => Value::I32(bits as i32),
-                            wasmparser::ValType::I64 => Value::I64(bits as i64),
-                            wasmparser::ValType::F32 => Value::F32(f32::from_bits(bits as u32)),
-                            wasmparser::ValType::F64 => Value::F64(f64::from_bits(bits)),
-                            _ => Value::I32(0),
-                        }
-                    }).collect();
-                    stack.truncate(stack.len() - param_count);
-                    if let Some(extern_fn) = store.extern_funcs.get(extern_idx) {
-                        let results = extern_fn(&val_args);
-                        for r in results {
-                            stack.push(r.to_bits());
-                        }
-                    } else {
-                        return Err(ExecError::Trap(format!("unresolved extern function {func_idx}")));
-                    }
+                    let extern_fn = store.extern_funcs.get(extern_idx)
+                        .ok_or_else(|| ExecError::Trap(format!("unresolved extern function {func_idx}")))?;
+                    call_host_fn(&mut stack, extern_fn.as_ref(), expected_type.params());
                 } else if module.is_import(func_idx) {
                     let callee_type_idx = module.func_types[func_idx as usize];
                     if module.types[callee_type_idx as usize] != module.types[ci_type_idx as usize] {
                         return Err(ExecError::Trap("indirect call type mismatch".into()));
                     }
                     let callee_type = &module.types[callee_type_idx as usize];
-                    let param_count = callee_type.params().len();
-                    let val_args: Vec<Value> = callee_type.params().iter().enumerate().map(|(i, &ty)| {
-                        let bits = stack[stack.len() - param_count + i];
-                        match ty {
-                            wasmparser::ValType::I32 => Value::I32(bits as i32),
-                            wasmparser::ValType::I64 => Value::I64(bits as i64),
-                            wasmparser::ValType::F32 => Value::F32(f32::from_bits(bits as u32)),
-                            wasmparser::ValType::F64 => Value::F64(f64::from_bits(bits)),
-                            _ => Value::I32(0),
-                        }
-                    }).collect();
-                    stack.truncate(stack.len() - param_count);
-                    if let Some(host_fn) = store.host_funcs.get(func_idx as usize) {
-                        let results = host_fn(&val_args);
-                        for r in results {
-                            stack.push(r.to_bits());
-                        }
-                    } else {
-                        return Err(ExecError::Trap(format!("unresolved import function {func_idx}")));
-                    }
+                    let host_fn = store.host_funcs.get(func_idx as usize)
+                        .ok_or_else(|| ExecError::Trap(format!("unresolved import function {func_idx}")))?;
+                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params());
                 } else {
                     let callee = module.get_func(func_idx).unwrap();
                     if module.types[callee.type_idx as usize] != module.types[ci_type_idx as usize] {
                         return Err(ExecError::Trap("indirect call type mismatch".into()));
                     }
-                    let param_count = module.types[callee.type_idx as usize].params().len();
-                    let new_arity = module.types[callee.type_idx as usize].results().len();
-                    let locals_start = stack.len() - param_count;
-                    let extra_locals = callee.locals.len() - param_count;
-                    for _ in 0..extra_locals {
-                        stack.push(0u64);
-                    }
-                    let stack_height = stack.len();
-                    let labels_start = labels.len();
-                    labels.push(Label {
-                        target: callee.body.len().saturating_sub(1),
-                        stack_height,
-                        arity: new_arity,
-                        is_loop: false,
-                    });
-                    let new_f = Frame {
-                        pc: 0,
-                        locals_start,
-                        stack_height,
-                        labels_start,
-                        arity: new_arity,
-                        body: &callee.body,
-                        br_tables: &callee.br_tables,
-                    };
-                    if call_stack.len() >= MAX_CALL_DEPTH {
-                        return Err(ExecError::Trap("call stack exhausted".into()));
-                    }
-                    let old_frame = std::mem::replace(&mut frame, new_f);
-                    call_stack.push(old_frame);
+                    let callee_type = &module.types[callee.type_idx as usize];
+                    setup_local_call(&mut frame, &mut call_stack, &mut stack, &mut labels, callee, callee_type)?;
                 }
             }
 
-            OP_DROP => { pop_raw!(stack); }
+            OP_DROP => { pop_raw(&mut stack); }
             OP_SELECT => {
-                let cond = pop_i32!(stack);
-                let b = pop_raw!(stack);
-                let a = pop_raw!(stack);
+                let cond = pop_i32(&mut stack);
+                let b = pop_raw(&mut stack);
+                let a = pop_raw(&mut stack);
                 stack.push(if cond != 0 { a } else { b });
             }
 
@@ -741,34 +688,34 @@ pub fn call(
             OP_LOCAL_GET_I32_CONST => {
                 let idx = op.imm_hi() as usize;
                 let val = op.imm_lo();
-                stack.push(unsafe { *stack.get_unchecked(frame.locals_start + idx) });
+                stack.push(stack[frame.locals_start + idx]);
                 stack.push(val as u64);
             }
             OP_LOCAL_GET_LOCAL_GET => {
                 let a = op.imm_hi() as usize;
                 let b = op.imm_lo() as usize;
-                let va = unsafe { *stack.get_unchecked(frame.locals_start + a) };
-                let vb = unsafe { *stack.get_unchecked(frame.locals_start + b) };
+                let va = stack[frame.locals_start + a];
+                let vb = stack[frame.locals_start + b];
                 stack.push(va);
                 stack.push(vb);
             }
 
             // --- Locals / Globals ---
             OP_LOCAL_GET => {
-                let v = unsafe { *stack.get_unchecked(frame.locals_start + op.imm as usize) };
+                let v = stack[frame.locals_start + op.imm as usize];
                 stack.push(v);
             }
             OP_LOCAL_SET => {
-                let v = pop_raw!(stack);
-                unsafe { *stack.get_unchecked_mut(frame.locals_start + op.imm as usize) = v };
+                let v = pop_raw(&mut stack);
+                stack[frame.locals_start + op.imm as usize] = v;
             }
             OP_LOCAL_TEE => {
-                let v = unsafe { *stack.get_unchecked(stack.len() - 1) };
-                unsafe { *stack.get_unchecked_mut(frame.locals_start + op.imm as usize) = v };
+                let v = *stack.last().unwrap();
+                stack[frame.locals_start + op.imm as usize] = v;
             }
             OP_GLOBAL_GET => stack.push(store.globals[op.imm as usize].to_bits()),
             OP_GLOBAL_SET => {
-                let bits = pop_raw!(stack);
+                let bits = pop_raw(&mut stack);
                 store.globals[op.imm as usize] = match store.globals[op.imm as usize] {
                     Value::I32(_) => Value::I32(bits as i32),
                     Value::I64(_) => Value::I64(bits as i64),
@@ -778,6 +725,7 @@ pub fn call(
                         if bits == u64::MAX { Value::FuncRef(None) }
                         else { Value::FuncRef(Some(bits as u32)) }
                     }
+                    Value::V128(_) => return Err(ExecError::Trap("v128 globals not supported".into())),
                 };
             }
 
@@ -810,7 +758,7 @@ pub fn call(
 
             OP_MEMORY_SIZE => push_i32!(stack, store.memory_size()),
             OP_MEMORY_GROW => {
-                let pages = pop_i32!(stack);
+                let pages = pop_i32(&mut stack);
                 push_i32!(stack, store.memory_grow(pages as u32));
             }
 
@@ -841,27 +789,27 @@ pub fn call(
             OP_I32_SUB => binop_i32!(stack, |a: i32, b: i32| a.wrapping_sub(b)),
             OP_I32_MUL => binop_i32!(stack, |a: i32, b: i32| a.wrapping_mul(b)),
             OP_I32_DIV_S => {
-                let b = pop_i32!(stack);
-                let a = pop_i32!(stack);
+                let b = pop_i32(&mut stack);
+                let a = pop_i32(&mut stack);
                 if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
                 if a == i32::MIN && b == -1 { return Err(ExecError::Trap("integer overflow".into())); }
                 push_i32!(stack, a.wrapping_div(b));
             }
             OP_I32_DIV_U => {
-                let b = pop_i32!(stack) as u32;
-                let a = pop_i32!(stack) as u32;
+                let b = pop_i32(&mut stack) as u32;
+                let a = pop_i32(&mut stack) as u32;
                 if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
                 push_i32!(stack, (a / b) as i32);
             }
             OP_I32_REM_S => {
-                let b = pop_i32!(stack);
-                let a = pop_i32!(stack);
+                let b = pop_i32(&mut stack);
+                let a = pop_i32(&mut stack);
                 if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
                 push_i32!(stack, if a == i32::MIN && b == -1 { 0 } else { a.wrapping_rem(b) });
             }
             OP_I32_REM_U => {
-                let b = pop_i32!(stack) as u32;
-                let a = pop_i32!(stack) as u32;
+                let b = pop_i32(&mut stack) as u32;
+                let a = pop_i32(&mut stack) as u32;
                 if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
                 push_i32!(stack, (a % b) as i32);
             }
@@ -871,8 +819,8 @@ pub fn call(
             OP_I32_SHL => binop_i32!(stack, |a: i32, b: i32| a.wrapping_shl(b as u32)),
             OP_I32_SHR_S => binop_i32!(stack, |a: i32, b: i32| a.wrapping_shr(b as u32)),
             OP_I32_SHR_U => {
-                let b = pop_i32!(stack) as u32;
-                let a = pop_i32!(stack) as u32;
+                let b = pop_i32(&mut stack) as u32;
+                let a = pop_i32(&mut stack) as u32;
                 push_i32!(stack, a.wrapping_shr(b) as i32);
             }
             OP_I32_ROTL => binop_i32!(stack, |a: i32, b: i32| a.rotate_left(b as u32)),
@@ -880,7 +828,7 @@ pub fn call(
 
             // --- i64 comparison ---
             OP_I64_EQZ => {
-                let a = pop_i64!(stack);
+                let a = pop_i64(&mut stack);
                 push_i32!(stack, if a == 0 { 1i32 } else { 0i32 });
             }
             OP_I64_EQ => cmpop_i64!(stack, |a: i64, b: i64| a == b),
@@ -902,27 +850,27 @@ pub fn call(
             OP_I64_SUB => binop_i64!(stack, |a: i64, b: i64| a.wrapping_sub(b)),
             OP_I64_MUL => binop_i64!(stack, |a: i64, b: i64| a.wrapping_mul(b)),
             OP_I64_DIV_S => {
-                let b = pop_i64!(stack);
-                let a = pop_i64!(stack);
+                let b = pop_i64(&mut stack);
+                let a = pop_i64(&mut stack);
                 if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
                 if a == i64::MIN && b == -1 { return Err(ExecError::Trap("integer overflow".into())); }
                 push_i64!(stack, a.wrapping_div(b));
             }
             OP_I64_DIV_U => {
-                let b = pop_i64!(stack) as u64;
-                let a = pop_i64!(stack) as u64;
+                let b = pop_i64(&mut stack) as u64;
+                let a = pop_i64(&mut stack) as u64;
                 if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
                 push_i64!(stack, (a / b) as i64);
             }
             OP_I64_REM_S => {
-                let b = pop_i64!(stack);
-                let a = pop_i64!(stack);
+                let b = pop_i64(&mut stack);
+                let a = pop_i64(&mut stack);
                 if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
                 push_i64!(stack, if a == i64::MIN && b == -1 { 0 } else { a.wrapping_rem(b) });
             }
             OP_I64_REM_U => {
-                let b = pop_i64!(stack) as u64;
-                let a = pop_i64!(stack) as u64;
+                let b = pop_i64(&mut stack) as u64;
+                let a = pop_i64(&mut stack) as u64;
                 if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
                 push_i64!(stack, (a % b) as i64);
             }
@@ -932,8 +880,8 @@ pub fn call(
             OP_I64_SHL => binop_i64!(stack, |a: i64, b: i64| a.wrapping_shl(b as u32)),
             OP_I64_SHR_S => binop_i64!(stack, |a: i64, b: i64| a.wrapping_shr(b as u32)),
             OP_I64_SHR_U => {
-                let b = pop_i64!(stack) as u64;
-                let a = pop_i64!(stack) as u64;
+                let b = pop_i64(&mut stack) as u64;
+                let a = pop_i64(&mut stack) as u64;
                 push_i64!(stack, a.wrapping_shr(b as u32) as i64);
             }
             OP_I64_ROTL => binop_i64!(stack, |a: i64, b: i64| a.rotate_left(b as u32)),
@@ -941,15 +889,15 @@ pub fn call(
 
             // --- Conversions ---
             OP_I32_WRAP_I64 => {
-                let a = pop_i64!(stack);
+                let a = pop_i64(&mut stack);
                 push_i32!(stack, a as i32);
             }
             OP_I64_EXTEND_I32_S => {
-                let a = pop_i32!(stack);
+                let a = pop_i32(&mut stack);
                 push_i64!(stack, a as i64);
             }
             OP_I64_EXTEND_I32_U => {
-                let a = pop_i32!(stack);
+                let a = pop_i32(&mut stack);
                 push_i64!(stack, (a as u32) as i64);
             }
 
@@ -962,19 +910,19 @@ pub fn call(
 
             // Reinterpret
             OP_I32_REINTERPRET_F32 => {
-                let a = pop_f32!(stack);
+                let a = pop_f32(&mut stack);
                 push_i32!(stack, a.to_bits() as i32);
             }
             OP_I64_REINTERPRET_F64 => {
-                let a = pop_f64!(stack);
+                let a = pop_f64(&mut stack);
                 push_i64!(stack, a.to_bits() as i64);
             }
             OP_F32_REINTERPRET_I32 => {
-                let a = pop_i32!(stack);
+                let a = pop_i32(&mut stack);
                 push_f32!(stack, f32::from_bits(a as u32));
             }
             OP_F64_REINTERPRET_I64 => {
-                let a = pop_i64!(stack);
+                let a = pop_i64(&mut stack);
                 push_f64!(stack, f64::from_bits(a as u64));
             }
 
@@ -1038,73 +986,73 @@ pub fn call(
 
             // --- Saturating truncation ---
             OP_I32_TRUNC_SAT_F32_S => {
-                let a = pop_f32!(stack);
+                let a = pop_f32(&mut stack);
                 push_i32!(stack, if a.is_nan() { 0i32 }
                     else if a >= 2147483648.0_f32 { i32::MAX }
                     else if a < -2147483648.0_f32 { i32::MIN }
                     else { a as i32 });
             }
             OP_I32_TRUNC_SAT_F32_U => {
-                let a = pop_f32!(stack);
+                let a = pop_f32(&mut stack);
                 push_i32!(stack, if a.is_nan() || a <= -1.0 { 0u32 as i32 }
                     else if a >= 4294967296.0_f32 { u32::MAX as i32 }
                     else { a as u32 as i32 });
             }
             OP_I32_TRUNC_SAT_F64_S => {
-                let a = pop_f64!(stack);
+                let a = pop_f64(&mut stack);
                 push_i32!(stack, if a.is_nan() { 0i32 }
                     else if a >= 2147483648.0_f64 { i32::MAX }
                     else if a <= -2147483649.0_f64 { i32::MIN }
                     else { a as i32 });
             }
             OP_I32_TRUNC_SAT_F64_U => {
-                let a = pop_f64!(stack);
+                let a = pop_f64(&mut stack);
                 push_i32!(stack, if a.is_nan() || a <= -1.0 { 0u32 as i32 }
                     else if a >= 4294967296.0_f64 { u32::MAX as i32 }
                     else { a as u32 as i32 });
             }
             OP_I64_TRUNC_SAT_F32_S => {
-                let a = pop_f32!(stack);
+                let a = pop_f32(&mut stack);
                 push_i64!(stack, if a.is_nan() { 0i64 }
                     else if a >= 9223372036854775808.0_f32 { i64::MAX }
                     else if a < -9223372036854775808.0_f32 { i64::MIN }
                     else { a as i64 });
             }
             OP_I64_TRUNC_SAT_F32_U => {
-                let a = pop_f32!(stack);
+                let a = pop_f32(&mut stack);
                 push_i64!(stack, if a.is_nan() || a <= -1.0 { 0u64 as i64 }
                     else if a >= 18446744073709551616.0_f32 { u64::MAX as i64 }
                     else { a as u64 as i64 });
             }
             OP_I64_TRUNC_SAT_F64_S => {
-                let a = pop_f64!(stack);
+                let a = pop_f64(&mut stack);
                 push_i64!(stack, if a.is_nan() { 0i64 }
                     else if a >= 9223372036854775808.0_f64 { i64::MAX }
                     else if a < -9223372036854775808.0_f64 { i64::MIN }
                     else { a as i64 });
             }
             OP_I64_TRUNC_SAT_F64_U => {
-                let a = pop_f64!(stack);
+                let a = pop_f64(&mut stack);
                 push_i64!(stack, if a.is_nan() || a <= -1.0 { 0u64 as i64 }
                     else if a >= 18446744073709551616.0_f64 { u64::MAX as i64 }
                     else { a as u64 as i64 });
             }
 
-            OP_F32_CONVERT_I32_S => { let a = pop_i32!(stack); push_f32!(stack, a as f32); }
-            OP_F32_CONVERT_I32_U => { let a = pop_i32!(stack); push_f32!(stack, (a as u32) as f32); }
-            OP_F32_CONVERT_I64_S => { let a = pop_i64!(stack); push_f32!(stack, a as f32); }
-            OP_F32_CONVERT_I64_U => { let a = pop_i64!(stack); push_f32!(stack, (a as u64) as f32); }
-            OP_F32_DEMOTE_F64 => { let a = pop_f64!(stack); push_f32!(stack, a as f32); }
-            OP_F64_CONVERT_I32_S => { let a = pop_i32!(stack); push_f64!(stack, a as f64); }
-            OP_F64_CONVERT_I32_U => { let a = pop_i32!(stack); push_f64!(stack, (a as u32) as f64); }
-            OP_F64_CONVERT_I64_S => { let a = pop_i64!(stack); push_f64!(stack, a as f64); }
-            OP_F64_CONVERT_I64_U => { let a = pop_i64!(stack); push_f64!(stack, (a as u64) as f64); }
-            OP_F64_PROMOTE_F32 => { let a = pop_f32!(stack); push_f64!(stack, a as f64); }
+            OP_F32_CONVERT_I32_S => { let a = pop_i32(&mut stack); push_f32!(stack, a as f32); }
+            OP_F32_CONVERT_I32_U => { let a = pop_i32(&mut stack); push_f32!(stack, (a as u32) as f32); }
+            OP_F32_CONVERT_I64_S => { let a = pop_i64(&mut stack); push_f32!(stack, a as f32); }
+            OP_F32_CONVERT_I64_U => { let a = pop_i64(&mut stack); push_f32!(stack, (a as u64) as f32); }
+            OP_F32_DEMOTE_F64 => { let a = pop_f64(&mut stack); push_f32!(stack, a as f32); }
+            OP_F64_CONVERT_I32_S => { let a = pop_i32(&mut stack); push_f64!(stack, a as f64); }
+            OP_F64_CONVERT_I32_U => { let a = pop_i32(&mut stack); push_f64!(stack, (a as u32) as f64); }
+            OP_F64_CONVERT_I64_S => { let a = pop_i64(&mut stack); push_f64!(stack, a as f64); }
+            OP_F64_CONVERT_I64_U => { let a = pop_i64(&mut stack); push_f64!(stack, (a as u64) as f64); }
+            OP_F64_PROMOTE_F32 => { let a = pop_f32(&mut stack); push_f64!(stack, a as f64); }
 
             OP_TABLE_INIT => {
-                let n = pop_i32!(stack) as u32;
-                let s = pop_i32!(stack) as u32;
-                let d = pop_i32!(stack) as u32;
+                let n = pop_i32(&mut stack) as u32;
+                let s = pop_i32(&mut stack) as u32;
+                let d = pop_i32(&mut stack) as u32;
                 let elem_idx = op.imm_hi() as usize;
                 let table_idx = op.imm_lo() as usize;
                 let seg = store.elem_segments.get(elem_idx)
@@ -1138,9 +1086,182 @@ pub fn call(
                 }
             }
 
+            OP_REF_FUNC => {
+                let func_idx = op.imm_u32();
+                // Push funcref as u64 (matching Value::FuncRef(Some(idx)).to_bits())
+                stack.push(func_idx as u64);
+            }
+            OP_REF_NULL => {
+                // Push null funcref (u64::MAX matches Value::FuncRef(None).to_bits())
+                stack.push(u64::MAX);
+            }
+            OP_REF_IS_NULL => {
+                let val = pop_raw(&mut stack);
+                // A null funcref is encoded as u64::MAX
+                push_i32!(stack, if val == u64::MAX { 1i32 } else { 0i32 });
+            }
+
+            OP_MEMORY_INIT => {
+                let n = pop_i32(&mut stack) as u32;
+                let s = pop_i32(&mut stack) as u32;
+                let d = pop_i32(&mut stack) as u32;
+                let seg_idx = op.imm as usize;
+                let seg = store.data_segments.get(seg_idx)
+                    .ok_or_else(|| ExecError::Trap("unknown data segment".into()))?;
+                match seg {
+                    None => {
+                        if n > 0 || s > 0 {
+                            return Err(ExecError::Trap("out of bounds memory access".into()));
+                        }
+                    }
+                    Some(data) => {
+                        if s as u64 + n as u64 > data.len() as u64 {
+                            return Err(ExecError::Trap("out of bounds memory access".into()));
+                        }
+                        if d as u64 + n as u64 > store.memory.len() as u64 {
+                            return Err(ExecError::Trap("out of bounds memory access".into()));
+                        }
+                        let src = &data[s as usize..(s + n) as usize];
+                        let src_copy = src.to_vec();
+                        store.memory[d as usize..(d + n) as usize]
+                            .copy_from_slice(&src_copy);
+                    }
+                }
+            }
+            OP_DATA_DROP => {
+                let seg_idx = op.imm as usize;
+                if seg_idx < store.data_segments.len() {
+                    store.data_segments[seg_idx] = None;
+                }
+            }
+            OP_MEMORY_COPY => {
+                let n = pop_i32(&mut stack) as u32;
+                let s = pop_i32(&mut stack) as u32;
+                let d = pop_i32(&mut stack) as u32;
+                if s as u64 + n as u64 > store.memory.len() as u64
+                    || d as u64 + n as u64 > store.memory.len() as u64
+                {
+                    return Err(ExecError::Trap("out of bounds memory access".into()));
+                }
+                // memmove semantics: handle overlapping regions
+                store.memory.copy_within(s as usize..(s + n) as usize, d as usize);
+            }
+            OP_MEMORY_FILL => {
+                let n = pop_i32(&mut stack) as u32;
+                let val = pop_i32(&mut stack) as u8;
+                let d = pop_i32(&mut stack) as u32;
+                if d as u64 + n as u64 > store.memory.len() as u64 {
+                    return Err(ExecError::Trap("out of bounds memory access".into()));
+                }
+                store.memory[d as usize..(d + n) as usize].fill(val);
+            }
+
+            OP_TABLE_GET => {
+                let idx = pop_i32(&mut stack) as u32;
+                let table_idx = op.imm as usize;
+                let table = store.tables.get(table_idx)
+                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                if idx as usize >= table.len() {
+                    return Err(ExecError::Trap("out of bounds table access".into()));
+                }
+                match table[idx as usize] {
+                    Some(func_idx) => stack.push(func_idx as u64),
+                    None => stack.push(u64::MAX), // null funcref
+                }
+            }
+            OP_TABLE_SET => {
+                let val = pop_raw(&mut stack);
+                let idx = pop_i32(&mut stack) as u32;
+                let table_idx = op.imm as usize;
+                let table = store.tables.get_mut(table_idx)
+                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                if idx as usize >= table.len() {
+                    return Err(ExecError::Trap("out of bounds table access".into()));
+                }
+                table[idx as usize] = if val == u64::MAX { None } else { Some(val as u32) };
+            }
+            OP_TABLE_SIZE => {
+                let table_idx = op.imm as usize;
+                let table = store.tables.get(table_idx)
+                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                push_i32!(stack, table.len() as i32);
+            }
+            OP_TABLE_GROW => {
+                let n = pop_i32(&mut stack) as u32;
+                let init_val = pop_raw(&mut stack);
+                let table_idx = op.imm as usize;
+                let table = store.tables.get_mut(table_idx)
+                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                let old_size = table.len() as u32;
+                let new_size = old_size as u64 + n as u64;
+                // Check max limit
+                let max = store.table_defs.get(table_idx)
+                    .and_then(|(_, max)| *max);
+                if let Some(max) = max {
+                    if new_size > max {
+                        push_i32!(stack, -1i32);
+                        continue;
+                    }
+                }
+                if new_size > u32::MAX as u64 {
+                    push_i32!(stack, -1i32);
+                    continue;
+                }
+                let fill = if init_val == u64::MAX { None } else { Some(init_val as u32) };
+                table.resize(new_size as usize, fill);
+                push_i32!(stack, old_size as i32);
+            }
+            OP_TABLE_COPY => {
+                let n = pop_i32(&mut stack) as u32;
+                let s = pop_i32(&mut stack) as u32;
+                let d = pop_i32(&mut stack) as u32;
+                let dst_table = op.imm_hi() as usize;
+                let src_table = op.imm_lo() as usize;
+                // Bounds check both tables
+                let src_len = store.tables.get(src_table)
+                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?.len();
+                let dst_len = store.tables.get(dst_table)
+                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?.len();
+                if s as u64 + n as u64 > src_len as u64
+                    || d as u64 + n as u64 > dst_len as u64
+                {
+                    return Err(ExecError::Trap("out of bounds table access".into()));
+                }
+                if n > 0 {
+                    if src_table == dst_table {
+                        // Same table: use copy_within for memmove semantics
+                        let table = &mut store.tables[src_table];
+                        table.copy_within(s as usize..(s + n) as usize, d as usize);
+                    } else {
+                        // Different tables: copy element by element
+                        let mut tmp = Vec::with_capacity(n as usize);
+                        for i in 0..n as usize {
+                            tmp.push(store.tables[src_table][s as usize + i]);
+                        }
+                        for (i, val) in tmp.into_iter().enumerate() {
+                            store.tables[dst_table][d as usize + i] = val;
+                        }
+                    }
+                }
+            }
+            OP_TABLE_FILL => {
+                let n = pop_i32(&mut stack) as u32;
+                let val = pop_raw(&mut stack);
+                let i = pop_i32(&mut stack) as u32;
+                let table_idx = op.imm as usize;
+                let table = store.tables.get_mut(table_idx)
+                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                if i as u64 + n as u64 > table.len() as u64 {
+                    return Err(ExecError::Trap("out of bounds table access".into()));
+                }
+                let fill = if val == u64::MAX { None } else { Some(val as u32) };
+                for j in 0..n as usize {
+                    table[i as usize + j] = fill;
+                }
+            }
+
             _ => {
-                debug_assert!(false, "unimplemented opcode: {}", op.code);
-                unsafe { std::hint::unreachable_unchecked() }
+                return Err(ExecError::Trap(format!("unimplemented opcode: {}", op.code)));
             }
         }
     }
@@ -1163,7 +1284,7 @@ fn stack_unwind(stack: &mut Vec<u64>, height: usize, arity: usize) {
 
 fn do_br(frame: &mut Frame, stack: &mut Vec<u64>, labels: &mut Vec<Label>, depth: u32, steps: &mut u64) -> Result<(), ExecError> {
     let label_idx = labels.len() - 1 - depth as usize;
-    let label = unsafe { labels.get_unchecked(label_idx) };
+    let label = &labels[label_idx];
 
     let arity = label.arity;
     let sh = label.stack_height;

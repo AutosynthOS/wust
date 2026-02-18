@@ -10,6 +10,8 @@ fn val_from_arg(arg: &WastArgCore) -> Option<Value> {
         WastArgCore::I64(v) => Some(Value::I64(*v)),
         WastArgCore::F32(v) => Some(Value::F32(f32::from_bits(v.bits))),
         WastArgCore::F64(v) => Some(Value::F64(f64::from_bits(v.bits))),
+        WastArgCore::RefNull(_) => Some(Value::FuncRef(None)),
+        WastArgCore::RefExtern(v) => Some(Value::FuncRef(Some(*v))),
         _ => None,
     }
 }
@@ -19,6 +21,9 @@ enum Expected {
     Exact(Value),
     F32Nan,
     F64Nan,
+    RefNull,
+    RefNotNull,
+    RefExtern(u32),
 }
 
 fn expected_from_ret(ret: &WastRetCore) -> Option<Expected> {
@@ -41,6 +46,10 @@ fn expected_from_ret(ret: &WastRetCore) -> Option<Expected> {
                 Some(Expected::F64Nan)
             }
         },
+        WastRetCore::RefNull(_) => Some(Expected::RefNull),
+        WastRetCore::RefExtern(Some(v)) => Some(Expected::RefExtern(*v)),
+        WastRetCore::RefExtern(None) => Some(Expected::RefNull),
+        WastRetCore::RefFunc(_) => Some(Expected::RefNotNull),
         _ => None,
     }
 }
@@ -53,6 +62,12 @@ fn result_matches(got: &Value, expected: &Expected) -> bool {
         (Value::F64(a), Expected::Exact(Value::F64(b))) => a.to_bits() == b.to_bits(),
         (Value::F32(a), Expected::F32Nan) => a.is_nan(),
         (Value::F64(a), Expected::F64Nan) => a.is_nan(),
+        (Value::FuncRef(None), Expected::RefNull) => true,
+        (Value::FuncRef(Some(_)), Expected::RefNull) => false,
+        (Value::FuncRef(Some(_)), Expected::RefNotNull) => true,
+        (Value::FuncRef(None), Expected::RefNotNull) => false,
+        (Value::FuncRef(Some(idx)), Expected::RefExtern(v)) => *idx == *v,
+        (Value::FuncRef(None), Expected::RefExtern(_)) => false,
         _ => false,
     }
 }
@@ -293,6 +308,9 @@ impl TestRunner {
                                         Expected::Exact(v) => format!("{v:?}"),
                                         Expected::F32Nan => "f32:nan".into(),
                                         Expected::F64Nan => "f64:nan".into(),
+                                        Expected::RefNull => "ref.null".into(),
+                                        Expected::RefNotNull => "ref.func".into(),
+                                        Expected::RefExtern(v) => format!("ref.extern {v}"),
                                     }).collect::<Vec<_>>()
                                 );
                             }
@@ -335,6 +353,9 @@ impl TestRunner {
                                         Expected::Exact(v) => format!("{v:?}"),
                                         Expected::F32Nan => "f32:nan".into(),
                                         Expected::F64Nan => "f64:nan".into(),
+                                        Expected::RefNull => "ref.null".into(),
+                                        Expected::RefNotNull => "ref.func".into(),
+                                        Expected::RefExtern(v) => format!("ref.extern {v}"),
                                     }).collect::<Vec<_>>()
                                 );
                             }
@@ -614,51 +635,50 @@ spec_tests! {
     spec_store_ => "store",
     spec_switch => "switch",
     spec_table => "table",
-    spec_traps => "traps",
-    spec_type_ => "type",
-    spec_unreachable => "unreachable",
-    spec_unwind => "unwind",
-}
-
-// Tests that require unimplemented proposals (typed funcrefs, tail calls, GC, etc.)
-// Run with: cargo test -- --ignored
-// Require import validation, cross-module linking, or wast parser features
-spec_tests! { ignored:
-    spec_imports => "imports",
-    spec_linking => "linking",
-    spec_names => "names",
-    spec_annotations => "annotations",
-    spec_binary => "binary",
-    spec_binary_leb128 => "binary-leb128",
-    spec_br_on_non_null => "br_on_non_null",
-    spec_br_on_null => "br_on_null",
-    spec_call_ref => "call_ref",
-    spec_id => "id",
-    spec_inline_module => "inline-module",
-    spec_instance => "instance",
-    spec_local_init => "local_init",
-    spec_obsolete_keywords => "obsolete-keywords",
-    spec_ref_ => "ref",
-    spec_ref_as_non_null => "ref_as_non_null",
-    spec_ref_func => "ref_func",
-    spec_ref_is_null => "ref_is_null",
-    spec_ref_null => "ref_null",
-    spec_return_call => "return_call",
-    spec_return_call_indirect => "return_call_indirect",
-    spec_return_call_ref => "return_call_ref",
-    spec_skip_stack_guard_page => "skip-stack-guard-page",
     spec_table_get => "table_get",
     spec_table_grow => "table_grow",
     spec_table_set => "table_set",
     spec_table_size => "table_size",
     spec_token => "token",
+    spec_traps => "traps",
+    spec_type_ => "type",
     spec_type_canon => "type-canon",
-    spec_type_equivalence => "type-equivalence",
-    spec_type_rec => "type-rec",
+    spec_unreachable => "unreachable",
     spec_unreached_invalid => "unreached-invalid",
     spec_unreached_valid => "unreached-valid",
+    spec_unwind => "unwind",
+    spec_annotations => "annotations",
+    spec_binary => "binary",
+    spec_binary_leb128 => "binary-leb128",
+    spec_id => "id",
+    spec_inline_module => "inline-module",
+    spec_local_init => "local_init",
+    spec_obsolete_keywords => "obsolete-keywords",
+    spec_ref_ => "ref",
+    spec_ref_func => "ref_func",
+    spec_ref_is_null => "ref_is_null",
+    spec_ref_null => "ref_null",
+    spec_skip_stack_guard_page => "skip-stack-guard-page",
     spec_utf8_custom_section_id => "utf8-custom-section-id",
     spec_utf8_import_field => "utf8-import-field",
     spec_utf8_import_module => "utf8-import-module",
     spec_utf8_invalid_encoding => "utf8-invalid-encoding",
+}
+
+// Tests that require unimplemented proposals (typed funcrefs, tail calls, GC, etc.)
+// Run with: cargo test -- --ignored
+spec_tests! { ignored:
+    spec_imports => "imports",
+    spec_instance => "instance",
+    spec_linking => "linking",
+    spec_names => "names",
+    spec_br_on_non_null => "br_on_non_null",
+    spec_br_on_null => "br_on_null",
+    spec_call_ref => "call_ref",
+    spec_ref_as_non_null => "ref_as_non_null",
+    spec_return_call => "return_call",
+    spec_return_call_indirect => "return_call_indirect",
+    spec_return_call_ref => "return_call_ref",
+    spec_type_equivalence => "type-equivalence",
+    spec_type_rec => "type-rec",
 }

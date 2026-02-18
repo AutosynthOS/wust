@@ -1,4 +1,5 @@
 pub mod module;
+pub mod instruction;
 mod store;
 pub mod exec;
 mod value;
@@ -7,6 +8,7 @@ mod value;
 // pub mod jit;
 
 pub use module::{Module, ExportKind};
+pub use instruction::{Instruction, Op};
 pub use store::{Store, HostFunc, EXTERN_FUNC_BASE};
 pub use exec::ExecError;
 pub use value::Value;
