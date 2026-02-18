@@ -435,11 +435,12 @@ fn pop_args_as_values(stack: &mut Vec<u64>, param_types: &[wasmparser::ValType])
 /// Call a host function: pop args, invoke, push results.
 fn call_host_fn(
     stack: &mut Vec<u64>,
-    host_fn: &dyn Fn(&[Value]) -> Vec<Value>,
+    host_fn: &dyn Fn(&[Value], &[u8]) -> Vec<Value>,
     param_types: &[wasmparser::ValType],
+    memory: &[u8],
 ) {
     let args = pop_args_as_values(stack, param_types);
-    let results = host_fn(&args);
+    let results = host_fn(&args, memory);
     for r in results {
         stack.push(r.to_bits());
     }
@@ -502,7 +503,7 @@ pub fn call(
     // If the target is an imported host function, call it directly
     if module.is_import(func_idx) {
         return if let Some(host_fn) = store.host_funcs.get(func_idx as usize) {
-            Ok(host_fn(args))
+            Ok(host_fn(args, &store.memory))
         } else {
             Err(ExecError::Trap(format!("unresolved import function {func_idx}")))
         };
@@ -634,7 +635,7 @@ pub fn call(
                     let callee_type = &module.types[type_idx as usize];
                     let host_fn = store.host_funcs.get(idx as usize)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved import function {idx}")))?;
-                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params());
+                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params(), &store.memory);
                 } else {
                     let callee = module.get_func(idx).unwrap();
                     let callee_type = &module.types[callee.type_idx as usize];
@@ -656,7 +657,7 @@ pub fn call(
                     let expected_type = &module.types[ci_type_idx as usize];
                     let extern_fn = store.extern_funcs.get(extern_idx)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved extern function {func_idx}")))?;
-                    call_host_fn(&mut stack, extern_fn.as_ref(), expected_type.params());
+                    call_host_fn(&mut stack, extern_fn.as_ref(), expected_type.params(), &store.memory);
                 } else if module.is_import(func_idx) {
                     let callee_type_idx = module.func_types[func_idx as usize];
                     if module.types[callee_type_idx as usize] != module.types[ci_type_idx as usize] {
@@ -665,7 +666,7 @@ pub fn call(
                     let callee_type = &module.types[callee_type_idx as usize];
                     let host_fn = store.host_funcs.get(func_idx as usize)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved import function {func_idx}")))?;
-                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params());
+                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params(), &store.memory);
                 } else {
                     let callee = module.get_func(func_idx).unwrap();
                     if module.types[callee.type_idx as usize] != module.types[ci_type_idx as usize] {

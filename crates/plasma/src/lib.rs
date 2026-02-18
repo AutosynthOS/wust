@@ -1,5 +1,11 @@
-use boa_engine::{Context, Source, JsValue, js_string, JsArgs};
+#![no_std]
+extern crate alloc;
+
+use alloc::alloc::Layout;
 use boa_engine::native_function::NativeFunction;
+use boa_engine::{Context, JsArgs, JsValue, Source, js_string};
+use core::slice;
+use core::str;
 
 unsafe extern "C" {
     /// Host-provided logging function.
@@ -13,9 +19,8 @@ unsafe extern "C" {
 /// writing a JS source string for `eval` to read.
 #[unsafe(no_mangle)]
 pub extern "C" fn alloc(size: usize) -> *mut u8 {
-    let layout = std::alloc::Layout::from_size_align(size, 1)
-        .expect("invalid layout");
-    unsafe { std::alloc::alloc(layout) }
+    let layout = Layout::from_size_align(size, 1).expect("invalid layout");
+    unsafe { alloc::alloc::alloc(layout) }
 }
 
 /// Evaluates a UTF-8 JS source string located at `ptr` with length `len`.
@@ -23,8 +28,8 @@ pub extern "C" fn alloc(size: usize) -> *mut u8 {
 /// Returns `0` on success, `1` on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn eval(ptr: *const u8, len: usize) -> i32 {
-    let source = unsafe { std::slice::from_raw_parts(ptr, len) };
-    let source = match std::str::from_utf8(source) {
+    let source = unsafe { slice::from_raw_parts(ptr, len) };
+    let source = match str::from_utf8(source) {
         Ok(s) => s,
         Err(_) => return 1,
     };
@@ -58,6 +63,10 @@ fn register_console(context: &mut Context) {
         .build();
 
     context
-        .register_global_property(js_string!("console"), console, boa_engine::property::Attribute::all())
+        .register_global_property(
+            js_string!("console"),
+            console,
+            boa_engine::property::Attribute::all(),
+        )
         .expect("failed to register console");
 }

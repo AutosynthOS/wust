@@ -119,7 +119,7 @@ fn build_imports(
                     if let Some(func_idx) = reg.module.export_func(&import.name) {
                         let reg_module = reg.module.clone();
                         let reg_store = reg.store.clone();
-                        let host_fn: HostFunc = Box::new(move |args| {
+                        let host_fn: HostFunc = Box::new(move |args, _memory| {
                             let mut store = reg_store.lock().unwrap();
                             match wust::runtime::exec::call(&reg_module, &mut store, func_idx, args)
                             {
@@ -131,7 +131,7 @@ fn build_imports(
                         continue;
                     }
                 }
-                let nop: HostFunc = Box::new(|_args| Vec::new());
+                let nop: HostFunc = Box::new(|_args, _memory| Vec::new());
                 host_funcs.push(nop);
             }
             wust::runtime::module::ImportKind::Global { ty, .. } => {
@@ -195,7 +195,7 @@ fn try_instantiate(
     for (_global_idx, src_module, src_store, src_func_idx) in pending_funcrefs {
         let reg_module = src_module.clone();
         let reg_store = src_store.clone();
-        let wrapper: HostFunc = Box::new(move |args| {
+        let wrapper: HostFunc = Box::new(move |args, _memory| {
             let mut s = reg_store.lock().unwrap();
             match wust::runtime::exec::call(&reg_module, &mut s, src_func_idx, args) {
                 Ok(results) => results,

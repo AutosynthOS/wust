@@ -4,13 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-wasmparser = "0.229"
+wasmparser = "0.245"
 libc = "0.2"
 
 [dev-dependencies]
-wast = "229"
+wast = "245"
 wat = "1"
 wasmtime = "41"
 
 [[example]]
 name = "bench_fib"
+
+[[example]]
+name = "plasma_hello"

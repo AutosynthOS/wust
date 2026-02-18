@@ -152,8 +152,10 @@ impl Module {
             let payload = payload.map_err(|e| format!("parse error: {e}"))?;
             match payload {
                 Payload::ImportSection(reader) => {
-                    for import in reader {
-                        let import = import.map_err(|e| format!("import error: {e}"))?;
+                    for imports_group in reader {
+                        let imports_group = imports_group.map_err(|e| format!("import error: {e}"))?;
+                    for import in imports_group {
+                        let (_offset, import) = import.map_err(|e| format!("import error: {e}"))?;
                         let kind = match import.ty {
                             wasmparser::TypeRef::Func(idx) => {
                                 func_types.push(idx);
@@ -181,6 +183,7 @@ impl Module {
                             name: import.name.to_string(),
                             kind,
                         });
+                    }
                     }
                 }
                 Payload::TypeSection(reader) => {

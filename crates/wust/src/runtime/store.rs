@@ -79,7 +79,11 @@ fn resolve_elem_item(item: &ElemItem, globals: &[Value]) -> Option<u32> {
 }
 
 /// A host-provided function callable by imported WASM functions.
-pub type HostFunc = Box<dyn Fn(&[Value]) -> Vec<Value>>;
+///
+/// The second parameter is the module's linear memory, allowing
+/// host functions to read data written by WASM code (e.g. strings
+/// passed as pointer+length pairs).
+pub type HostFunc = Box<dyn Fn(&[Value], &[u8]) -> Vec<Value>>;
 
 /// Function indices >= this are external funcref callbacks stored in Store.extern_funcs.
 pub const EXTERN_FUNC_BASE: u32 = 0x7FFF_0000;

@@ -4,6 +4,3 @@ members = [
     "crates/wust",
     "crates/plasma",
 ]
-
-[profile.release]
-debug = true
