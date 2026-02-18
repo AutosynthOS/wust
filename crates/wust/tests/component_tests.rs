@@ -82,7 +82,7 @@ impl ComponentTestRunner {
         instance.invoke_component(func_name, &component_args)
     }
 
-    fn run_wast(&mut self, path: &Path) -> (usize, usize, usize) {
+    fn run_wast(&mut self, path: &Path) -> (usize, usize) {
         let source = std::fs::read_to_string(path).unwrap();
         // Strip ;; RUN: ... lines that aren't part of the wast spec
         let source: String = source
@@ -95,13 +95,12 @@ impl ComponentTestRunner {
             Ok(w) => w,
             Err(e) => {
                 eprintln!("  PARSE ERROR: {e}");
-                return (0, 1, 0);
+                return (0, 1);
             }
         };
 
         let mut passed = 0usize;
         let mut failed = 0usize;
-        let mut skipped = 0usize;
 
         for directive in wast.directives {
             match directive {
@@ -121,8 +120,8 @@ impl ComponentTestRunner {
                                     passed += 1;
                                 }
                                 Err(e) => {
-                                    skipped += 1;
-                                    eprintln!("  SKIP component instantiation: {e}");
+                                    failed += 1;
+                                    eprintln!("  FAIL component instantiation: {e}");
                                 }
                             }
                         }
@@ -168,12 +167,13 @@ impl ComponentTestRunner {
                                 passed += 1;
                             }
                             Err(e) => {
-                                skipped += 1;
-                                eprintln!("  SKIP instance instantiation: {e}");
+                                failed += 1;
+                                eprintln!("  FAIL instance instantiation: {e}");
                             }
                         },
                         None => {
-                            skipped += 1;
+                            failed += 1;
+                            eprintln!("  FAIL instance: definition not found");
                         }
                     }
                 }
@@ -189,7 +189,8 @@ impl ComponentTestRunner {
                             passed += 1;
                         }
                         None => {
-                            skipped += 1;
+                            failed += 1;
+                            eprintln!("  FAIL register: no instance available");
                         }
                     }
                 }
@@ -206,7 +207,8 @@ impl ComponentTestRunner {
                         None => self.current_instance.is_some(),
                     };
                     if !has_instance {
-                        skipped += 1;
+                        failed += 1;
+                        eprintln!("  FAIL assert_return {}(): no instance available", invoke.name);
                         continue;
                     }
                     let args = extract_component_args(&invoke);
@@ -256,7 +258,8 @@ impl ComponentTestRunner {
                     exec: wast::WastExecute::Get { .. },
                     ..
                 } => {
-                    skipped += 1;
+                    failed += 1;
+                    eprintln!("  FAIL assert_return(get): not implemented");
                 }
 
                 // assert_trap with invoke
@@ -271,7 +274,8 @@ impl ComponentTestRunner {
                         None => self.current_instance.is_some(),
                     };
                     if !has_instance {
-                        skipped += 1;
+                        failed += 1;
+                        eprintln!("  FAIL assert_trap {}(): no instance available", invoke.name);
                         continue;
                     }
                     let args = extract_component_args(&invoke);
@@ -381,17 +385,20 @@ impl ComponentTestRunner {
 
                 // assert_exhaustion
                 wast::WastDirective::AssertExhaustion { .. } => {
-                    skipped += 1;
+                    failed += 1;
+                    eprintln!("  FAIL assert_exhaustion: not implemented");
                 }
 
                 // assert_exception
                 wast::WastDirective::AssertException { .. } => {
-                    skipped += 1;
+                    failed += 1;
+                    eprintln!("  FAIL assert_exception: not implemented");
                 }
 
                 // assert_suspension
                 wast::WastDirective::AssertSuspension { .. } => {
-                    skipped += 1;
+                    failed += 1;
+                    eprintln!("  FAIL assert_suspension: not implemented");
                 }
 
                 // bare invoke
@@ -402,21 +409,29 @@ impl ComponentTestRunner {
                         None => self.current_instance.is_some(),
                     };
                     if !has_instance {
-                        skipped += 1;
+                        failed += 1;
+                        eprintln!("  FAIL invoke {}(): no instance available", invoke.name);
                         continue;
                     }
                     let args = extract_component_args(&invoke);
-                    let _ = self.invoke_component(invoke.name, &args, module_name);
+                    match self.invoke_component(invoke.name, &args, module_name) {
+                        Ok(_) => passed += 1,
+                        Err(e) => {
+                            failed += 1;
+                            eprintln!("  FAIL invoke {}(): {e}", invoke.name);
+                        }
+                    }
                 }
 
-                // thread, wait, etc.
+                // Unhandled directive type
                 _ => {
-                    skipped += 1;
+                    failed += 1;
+                    eprintln!("  FAIL: unhandled directive type");
                 }
             }
         }
 
-        (passed, failed, skipped)
+        (passed, failed)
     }
 }
 
@@ -524,13 +539,9 @@ fn run_component_test(name: &str, subdir: &str) {
     }
 
     let mut runner = ComponentTestRunner::new();
-    let (passed, failed, skipped) = runner.run_wast(&path);
+    let (passed, failed) = runner.run_wast(&path);
 
-    println!("{name}: {passed} passed, {failed} failed, {skipped} skipped");
-
-    if skipped > 0 {
-        println!("  ({skipped} directives skipped — not yet implemented)");
-    }
+    println!("{name}: {passed} passed, {failed} failed");
 
     assert_eq!(failed, 0, "{name}: {failed} assertions failed");
 }
