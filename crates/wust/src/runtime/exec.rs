@@ -73,9 +73,12 @@ fn new_frame<'a>(
     args: &[Value],
     stack: &mut Vec<u64>,
     labels: &mut Vec<Label>,
-) -> Frame<'a> {
-    let func = module.get_func(func_idx).expect("new_frame called on import");
-    let arity = module.types[func.type_idx as usize].results().len();
+) -> Result<Frame<'a>, ExecError> {
+    let func = module.get_func(func_idx)
+        .ok_or_else(|| ExecError::NotFound(format!("function {func_idx} not found (import or invalid index)")))?;
+    let func_type = module.types.get(func.type_idx as usize)
+        .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", func.type_idx)))?;
+    let arity = func_type.results().len();
     let locals_start = push_locals(stack, func, args);
     let stack_height = stack.len();
     let labels_start = labels.len();
@@ -85,7 +88,7 @@ fn new_frame<'a>(
         arity,
         is_loop: false,
     });
-    Frame {
+    Ok(Frame {
         pc: 0,
         locals_start,
         stack_height,
@@ -93,7 +96,7 @@ fn new_frame<'a>(
         arity,
         body: &func.body,
         br_tables: &func.br_tables,
-    }
+    })
 }
 
 
@@ -406,6 +409,21 @@ macro_rules! trunc_op_u {
     }};
 }
 
+/// Convert raw bits to a Value matching the type of an existing global.
+fn coerce_bits_to_global(bits: u64, existing: &Value) -> Result<Value, ExecError> {
+    match existing {
+        Value::I32(_) => Ok(Value::I32(bits as i32)),
+        Value::I64(_) => Ok(Value::I64(bits as i64)),
+        Value::F32(_) => Ok(Value::F32(f32::from_bits(bits as u32))),
+        Value::F64(_) => Ok(Value::F64(f64::from_bits(bits))),
+        Value::FuncRef(_) => {
+            if bits == u64::MAX { Ok(Value::FuncRef(None)) }
+            else { Ok(Value::FuncRef(Some(bits as u32))) }
+        }
+        Value::V128(_) => Err(ExecError::Trap("v128 globals not supported".into())),
+    }
+}
+
 /// Convert a raw u64 on the stack to a Value based on its ValType.
 #[inline(always)]
 fn bits_to_value(bits: u64, ty: wasmparser::ValType) -> Value {
@@ -487,6 +505,130 @@ fn setup_local_call<'a>(
     Ok(())
 }
 
+/// Copy elements from an element segment into a table, with bounds checking.
+fn execute_table_init(
+    store: &mut Store,
+    elem_idx: usize,
+    table_idx: usize,
+    dst: u32,
+    src: u32,
+    count: u32,
+) -> Result<(), ExecError> {
+    let seg = store.elem_segments.get(elem_idx)
+        .ok_or_else(|| ExecError::Trap("unknown elem segment".into()))?;
+    match seg {
+        None => {
+            if count > 0 {
+                return Err(ExecError::Trap("out of bounds table access".into()));
+            }
+        }
+        Some(elems) => {
+            if src as usize + count as usize > elems.len() {
+                return Err(ExecError::Trap("out of bounds table access".into()));
+            }
+            let table = store.tables.get_mut(table_idx)
+                .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+            if dst as usize + count as usize > table.len() {
+                return Err(ExecError::Trap("out of bounds table access".into()));
+            }
+            for i in 0..count as usize {
+                table[dst as usize + i] = elems[src as usize + i];
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Copy bytes from a data segment into memory, with bounds checking.
+fn execute_memory_init(
+    store: &mut Store,
+    seg_idx: usize,
+    dst: u32,
+    src: u32,
+    count: u32,
+) -> Result<(), ExecError> {
+    let seg = store.data_segments.get(seg_idx)
+        .ok_or_else(|| ExecError::Trap("unknown data segment".into()))?;
+    match seg {
+        None => {
+            if count > 0 || src > 0 {
+                return Err(ExecError::Trap("out of bounds memory access".into()));
+            }
+        }
+        Some(data) => {
+            if src as u64 + count as u64 > data.len() as u64 {
+                return Err(ExecError::Trap("out of bounds memory access".into()));
+            }
+            if dst as u64 + count as u64 > store.memory.len() as u64 {
+                return Err(ExecError::Trap("out of bounds memory access".into()));
+            }
+            let src_copy = data[src as usize..(src + count) as usize].to_vec();
+            store.memory[dst as usize..(dst + count) as usize]
+                .copy_from_slice(&src_copy);
+        }
+    }
+    Ok(())
+}
+
+/// Copy elements between tables (or within the same table), with bounds checking.
+fn execute_table_copy(
+    store: &mut Store,
+    dst_table: usize,
+    src_table: usize,
+    dst: u32,
+    src: u32,
+    count: u32,
+) -> Result<(), ExecError> {
+    let src_len = store.tables.get(src_table)
+        .ok_or_else(|| ExecError::Trap("undefined table".into()))?.len();
+    let dst_len = store.tables.get(dst_table)
+        .ok_or_else(|| ExecError::Trap("undefined table".into()))?.len();
+    if src as u64 + count as u64 > src_len as u64
+        || dst as u64 + count as u64 > dst_len as u64
+    {
+        return Err(ExecError::Trap("out of bounds table access".into()));
+    }
+    if count > 0 {
+        if src_table == dst_table {
+            let table = &mut store.tables[src_table];
+            table.copy_within(src as usize..(src + count) as usize, dst as usize);
+        } else {
+            let tmp: Vec<_> = (0..count as usize)
+                .map(|i| store.tables[src_table][src as usize + i])
+                .collect();
+            for (i, val) in tmp.into_iter().enumerate() {
+                store.tables[dst_table][dst as usize + i] = val;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Look up a function index from a table element, returning an error if out of bounds or null.
+fn resolve_table_element(store: &Store, table_idx: u32, elem_idx: u32) -> Result<u32, ExecError> {
+    let table = store.tables.get(table_idx as usize)
+        .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+    let entry = table.get(elem_idx as usize)
+        .ok_or_else(|| ExecError::Trap("undefined element".into()))?;
+    entry.ok_or_else(|| ExecError::Trap("uninitialized element".into()))
+}
+
+/// Validate that a callee's type matches the expected indirect call type.
+fn check_indirect_type(
+    module: &Module,
+    func_idx: u32,
+    expected: &wasmparser::FuncType,
+) -> Result<(), ExecError> {
+    let callee_type_idx = *module.func_types.get(func_idx as usize)
+        .ok_or_else(|| ExecError::Trap(format!("func type index {} out of bounds", func_idx)))?;
+    let callee_type = module.types.get(callee_type_idx as usize)
+        .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", callee_type_idx)))?;
+    if *callee_type != *expected {
+        return Err(ExecError::Trap("indirect call type mismatch".into()));
+    }
+    Ok(())
+}
+
 /// Convert raw u64 stack values to Value types for the public API, using the function's result types.
 fn raw_to_values(raw: &[u64], types: &[wasmparser::ValType]) -> Vec<Value> {
     raw.iter().zip(types.iter()).map(|(&bits, &ty)| {
@@ -514,10 +656,12 @@ pub fn call(
     let mut labels: Vec<Label> = Vec::with_capacity(64);
     let top_func = module.get_func(func_idx)
         .ok_or_else(|| ExecError::NotFound(format!("function {func_idx} not found")))?;
-    let mut frame = new_frame(module, func_idx, args, &mut stack, &mut labels);
+    let mut frame = new_frame(module, func_idx, args, &mut stack, &mut labels)?;
 
     // Get result types for the top-level function to convert raw results back
-    let result_types: Vec<wasmparser::ValType> = module.types[top_func.type_idx as usize].results().to_vec();
+    let top_func_type = module.types.get(top_func.type_idx as usize)
+        .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", top_func.type_idx)))?;
+    let result_types: Vec<wasmparser::ValType> = top_func_type.results().to_vec();
 
     let mut steps = 0u64;
     loop {
@@ -631,48 +775,46 @@ pub fn call(
                     return Err(ExecError::Trap("execution limit".into()));
                 }
                 if module.is_import(idx) {
-                    let type_idx = module.func_types[idx as usize];
-                    let callee_type = &module.types[type_idx as usize];
+                    let type_idx = *module.func_types.get(idx as usize)
+                        .ok_or_else(|| ExecError::Trap(format!("func type index {} out of bounds", idx)))?;
+                    let callee_type = module.types.get(type_idx as usize)
+                        .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", type_idx)))?;
                     let host_fn = store.host_funcs.get(idx as usize)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved import function {idx}")))?;
                     call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params(), &store.memory);
                 } else {
-                    let callee = module.get_func(idx).unwrap();
-                    let callee_type = &module.types[callee.type_idx as usize];
+                    let callee = module.get_func(idx)
+                        .ok_or_else(|| ExecError::Trap(format!("function {idx} not found")))?;
+                    let callee_type = module.types.get(callee.type_idx as usize)
+                        .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", callee.type_idx)))?;
                     setup_local_call(&mut frame, &mut call_stack, &mut stack, &mut labels, callee, callee_type)?;
                 }
             }
             OP_CALL_INDIRECT => {
                 let ci_type_idx = op.imm_hi();
-                let ci_table_idx = op.imm_lo();
                 let elem_idx = pop_i32(&mut stack) as u32;
-                let table = store.tables.get(ci_table_idx as usize)
-                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
-                let func_idx = table.get(elem_idx as usize)
-                    .ok_or_else(|| ExecError::Trap("undefined element".into()))?
-                    .ok_or_else(|| ExecError::Trap("uninitialized element".into()))?;
+                let func_idx = resolve_table_element(store, op.imm_lo(), elem_idx)?;
+                let ci_type = module.types.get(ci_type_idx as usize)
+                    .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", ci_type_idx)))?;
 
                 if func_idx >= EXTERN_FUNC_BASE {
                     let extern_idx = (func_idx - EXTERN_FUNC_BASE) as usize;
-                    let expected_type = &module.types[ci_type_idx as usize];
                     let extern_fn = store.extern_funcs.get(extern_idx)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved extern function {func_idx}")))?;
-                    call_host_fn(&mut stack, extern_fn.as_ref(), expected_type.params(), &store.memory);
+                    call_host_fn(&mut stack, extern_fn.as_ref(), ci_type.params(), &store.memory);
                 } else if module.is_import(func_idx) {
-                    let callee_type_idx = module.func_types[func_idx as usize];
-                    if module.types[callee_type_idx as usize] != module.types[ci_type_idx as usize] {
-                        return Err(ExecError::Trap("indirect call type mismatch".into()));
-                    }
-                    let callee_type = &module.types[callee_type_idx as usize];
+                    check_indirect_type(module, func_idx, ci_type)?;
                     let host_fn = store.host_funcs.get(func_idx as usize)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved import function {func_idx}")))?;
-                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params(), &store.memory);
+                    call_host_fn(&mut stack, host_fn.as_ref(), ci_type.params(), &store.memory);
                 } else {
-                    let callee = module.get_func(func_idx).unwrap();
-                    if module.types[callee.type_idx as usize] != module.types[ci_type_idx as usize] {
+                    let callee = module.get_func(func_idx)
+                        .ok_or_else(|| ExecError::Trap(format!("function {func_idx} not found")))?;
+                    let callee_type = module.types.get(callee.type_idx as usize)
+                        .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", callee.type_idx)))?;
+                    if *callee_type != *ci_type {
                         return Err(ExecError::Trap("indirect call type mismatch".into()));
                     }
-                    let callee_type = &module.types[callee.type_idx as usize];
                     setup_local_call(&mut frame, &mut call_stack, &mut stack, &mut labels, callee, callee_type)?;
                 }
             }
@@ -714,20 +856,17 @@ pub fn call(
                 let v = *stack.last().unwrap();
                 stack[frame.locals_start + op.imm as usize] = v;
             }
-            OP_GLOBAL_GET => stack.push(store.globals[op.imm as usize].to_bits()),
+            OP_GLOBAL_GET => {
+                let g = store.globals.get(op.imm as usize)
+                    .ok_or_else(|| ExecError::Trap(format!("global index {} out of bounds", op.imm)))?;
+                stack.push(g.to_bits());
+            }
             OP_GLOBAL_SET => {
                 let bits = pop_raw(&mut stack);
-                store.globals[op.imm as usize] = match store.globals[op.imm as usize] {
-                    Value::I32(_) => Value::I32(bits as i32),
-                    Value::I64(_) => Value::I64(bits as i64),
-                    Value::F32(_) => Value::F32(f32::from_bits(bits as u32)),
-                    Value::F64(_) => Value::F64(f64::from_bits(bits)),
-                    Value::FuncRef(_) => {
-                        if bits == u64::MAX { Value::FuncRef(None) }
-                        else { Value::FuncRef(Some(bits as u32)) }
-                    }
-                    Value::V128(_) => return Err(ExecError::Trap("v128 globals not supported".into())),
-                };
+                let idx = op.imm as usize;
+                let g = store.globals.get(idx)
+                    .ok_or_else(|| ExecError::Trap(format!("global index {} out of bounds", idx)))?;
+                store.globals[idx] = coerce_bits_to_global(bits, g)?;
             }
 
             // --- Memory loads ---
@@ -1054,31 +1193,7 @@ pub fn call(
                 let n = pop_i32(&mut stack) as u32;
                 let s = pop_i32(&mut stack) as u32;
                 let d = pop_i32(&mut stack) as u32;
-                let elem_idx = op.imm_hi() as usize;
-                let table_idx = op.imm_lo() as usize;
-                let seg = store.elem_segments.get(elem_idx)
-                    .ok_or_else(|| ExecError::Trap("unknown elem segment".into()))?;
-                match seg {
-                    None => {
-                        // Dropped segment: any non-zero access traps
-                        if n > 0 {
-                            return Err(ExecError::Trap("out of bounds table access".into()));
-                        }
-                    }
-                    Some(elems) => {
-                        if s as usize + n as usize > elems.len() {
-                            return Err(ExecError::Trap("out of bounds table access".into()));
-                        }
-                        let table = store.tables.get_mut(table_idx)
-                            .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
-                        if d as usize + n as usize > table.len() {
-                            return Err(ExecError::Trap("out of bounds table access".into()));
-                        }
-                        for i in 0..n as usize {
-                            table[d as usize + i] = elems[s as usize + i];
-                        }
-                    }
-                }
+                execute_table_init(store, op.imm_hi() as usize, op.imm_lo() as usize, d, s, n)?;
             }
             OP_ELEM_DROP => {
                 let elem_idx = op.imm as usize;
@@ -1106,28 +1221,7 @@ pub fn call(
                 let n = pop_i32(&mut stack) as u32;
                 let s = pop_i32(&mut stack) as u32;
                 let d = pop_i32(&mut stack) as u32;
-                let seg_idx = op.imm as usize;
-                let seg = store.data_segments.get(seg_idx)
-                    .ok_or_else(|| ExecError::Trap("unknown data segment".into()))?;
-                match seg {
-                    None => {
-                        if n > 0 || s > 0 {
-                            return Err(ExecError::Trap("out of bounds memory access".into()));
-                        }
-                    }
-                    Some(data) => {
-                        if s as u64 + n as u64 > data.len() as u64 {
-                            return Err(ExecError::Trap("out of bounds memory access".into()));
-                        }
-                        if d as u64 + n as u64 > store.memory.len() as u64 {
-                            return Err(ExecError::Trap("out of bounds memory access".into()));
-                        }
-                        let src = &data[s as usize..(s + n) as usize];
-                        let src_copy = src.to_vec();
-                        store.memory[d as usize..(d + n) as usize]
-                            .copy_from_slice(&src_copy);
-                    }
-                }
+                execute_memory_init(store, op.imm as usize, d, s, n)?;
             }
             OP_DATA_DROP => {
                 let seg_idx = op.imm as usize;
@@ -1216,34 +1310,7 @@ pub fn call(
                 let n = pop_i32(&mut stack) as u32;
                 let s = pop_i32(&mut stack) as u32;
                 let d = pop_i32(&mut stack) as u32;
-                let dst_table = op.imm_hi() as usize;
-                let src_table = op.imm_lo() as usize;
-                // Bounds check both tables
-                let src_len = store.tables.get(src_table)
-                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?.len();
-                let dst_len = store.tables.get(dst_table)
-                    .ok_or_else(|| ExecError::Trap("undefined table".into()))?.len();
-                if s as u64 + n as u64 > src_len as u64
-                    || d as u64 + n as u64 > dst_len as u64
-                {
-                    return Err(ExecError::Trap("out of bounds table access".into()));
-                }
-                if n > 0 {
-                    if src_table == dst_table {
-                        // Same table: use copy_within for memmove semantics
-                        let table = &mut store.tables[src_table];
-                        table.copy_within(s as usize..(s + n) as usize, d as usize);
-                    } else {
-                        // Different tables: copy element by element
-                        let mut tmp = Vec::with_capacity(n as usize);
-                        for i in 0..n as usize {
-                            tmp.push(store.tables[src_table][s as usize + i]);
-                        }
-                        for (i, val) in tmp.into_iter().enumerate() {
-                            store.tables[dst_table][d as usize + i] = val;
-                        }
-                    }
-                }
+                execute_table_copy(store, op.imm_hi() as usize, op.imm_lo() as usize, d, s, n)?;
             }
             OP_TABLE_FILL => {
                 let n = pop_i32(&mut stack) as u32;

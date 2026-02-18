@@ -39,17 +39,17 @@ impl Value {
         }
     }
 
-    pub fn default_for(ty: wasmparser::ValType) -> Self {
+    pub fn default_for(ty: wasmparser::ValType) -> Result<Self, String> {
         match ty {
-            wasmparser::ValType::I32 => Value::I32(0),
-            wasmparser::ValType::I64 => Value::I64(0),
-            wasmparser::ValType::F32 => Value::F32(0.0),
-            wasmparser::ValType::F64 => Value::F64(0.0),
-            wasmparser::ValType::V128 => Value::V128(0),
+            wasmparser::ValType::I32 => Ok(Value::I32(0)),
+            wasmparser::ValType::I64 => Ok(Value::I64(0)),
+            wasmparser::ValType::F32 => Ok(Value::F32(0.0)),
+            wasmparser::ValType::F64 => Ok(Value::F64(0.0)),
+            wasmparser::ValType::V128 => Ok(Value::V128(0)),
             wasmparser::ValType::Ref(r) if r.heap_type() == wasmparser::HeapType::FUNC => {
-                Value::FuncRef(None)
+                Ok(Value::FuncRef(None))
             }
-            _ => todo!("unsupported type: {:?}", ty),
+            _ => Err(format!("unsupported value type: {:?}", ty)),
         }
     }
 

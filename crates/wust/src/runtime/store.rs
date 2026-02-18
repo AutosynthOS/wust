@@ -19,33 +19,33 @@ fn eval_const_expr(instrs: &[Instruction], globals: &[Value]) -> Option<Value> {
                 stack.push(*globals.get(*idx as usize)?);
             }
             Instruction::I32Add => {
-                let b = stack.pop()?.unwrap_i32();
-                let a = stack.pop()?.unwrap_i32();
+                let Value::I32(b) = stack.pop()? else { return None };
+                let Value::I32(a) = stack.pop()? else { return None };
                 stack.push(Value::I32(a.wrapping_add(b)));
             }
             Instruction::I32Sub => {
-                let b = stack.pop()?.unwrap_i32();
-                let a = stack.pop()?.unwrap_i32();
+                let Value::I32(b) = stack.pop()? else { return None };
+                let Value::I32(a) = stack.pop()? else { return None };
                 stack.push(Value::I32(a.wrapping_sub(b)));
             }
             Instruction::I32Mul => {
-                let b = stack.pop()?.unwrap_i32();
-                let a = stack.pop()?.unwrap_i32();
+                let Value::I32(b) = stack.pop()? else { return None };
+                let Value::I32(a) = stack.pop()? else { return None };
                 stack.push(Value::I32(a.wrapping_mul(b)));
             }
             Instruction::I64Add => {
-                let b = stack.pop()?.unwrap_i64();
-                let a = stack.pop()?.unwrap_i64();
+                let Value::I64(b) = stack.pop()? else { return None };
+                let Value::I64(a) = stack.pop()? else { return None };
                 stack.push(Value::I64(a.wrapping_add(b)));
             }
             Instruction::I64Sub => {
-                let b = stack.pop()?.unwrap_i64();
-                let a = stack.pop()?.unwrap_i64();
+                let Value::I64(b) = stack.pop()? else { return None };
+                let Value::I64(a) = stack.pop()? else { return None };
                 stack.push(Value::I64(a.wrapping_sub(b)));
             }
             Instruction::I64Mul => {
-                let b = stack.pop()?.unwrap_i64();
-                let a = stack.pop()?.unwrap_i64();
+                let Value::I64(b) = stack.pop()? else { return None };
+                let Value::I64(a) = stack.pop()? else { return None };
                 stack.push(Value::I64(a.wrapping_mul(b)));
             }
             _ => return None,
@@ -107,15 +107,6 @@ pub struct Store {
     pub extern_funcs: Vec<HostFunc>,
     /// Table definitions (min/max sizes) for grow/size operations.
     pub table_defs: Vec<(u64, Option<u64>)>,
-}
-
-impl Store {
-    /// Register an external function callback and return its funcref index.
-    pub fn add_extern_func(&mut self, func: HostFunc) -> u32 {
-        let idx = EXTERN_FUNC_BASE + self.extern_funcs.len() as u32;
-        self.extern_funcs.push(func);
-        idx
-    }
 }
 
 impl Store {
@@ -274,5 +265,12 @@ impl Store {
 
     pub fn memory_size(&self) -> i32 {
         (self.memory.len() / PAGE_SIZE) as i32
+    }
+
+    /// Register an external function callback and return its funcref index.
+    pub fn add_extern_func(&mut self, func: HostFunc) -> u32 {
+        let idx = EXTERN_FUNC_BASE + self.extern_funcs.len() as u32;
+        self.extern_funcs.push(func);
+        idx
     }
 }

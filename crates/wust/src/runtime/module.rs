@@ -120,309 +120,216 @@ pub enum ElemItem {
     Expr(Vec<Instruction>),
 }
 
-impl Module {
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        // Validate the module before parsing
-        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::default())
-            .validate_all(bytes)
-            .map_err(|e| format!("validation error: {e}"))?;
+/// Accumulates parsed sections while walking through WASM payloads.
+struct ModuleBuilder {
+    types: Vec<FuncType>,
+    memories: Vec<MemoryType>,
+    globals: Vec<GlobalDef>,
+    exports: Vec<Export>,
+    data_segments: Vec<DataSegment>,
+    func_types: Vec<u32>,
+    tables: Vec<TableDef>,
+    elements: Vec<ElemSegment>,
+    start: Option<u32>,
+    imports: Vec<Import>,
+    num_func_imports: u32,
+    num_global_imports: u32,
+    num_memory_imports: u32,
+    num_table_imports: u32,
+    func_bodies: Vec<(Vec<ValType>, Vec<Instruction>)>,
+    code_idx: u32,
+}
 
-        let parser = Parser::new(0);
-        let mut types = Vec::new();
-        let mut funcs = Vec::new();
-        let mut memories = Vec::new();
-        let mut globals = Vec::new();
-        let mut exports = Vec::new();
-        let mut data_segments = Vec::new();
-        let mut func_types = Vec::new();
-        let mut tables = Vec::new();
-        let mut elements = Vec::new();
-        let mut start = None;
-        let mut code_idx = 0u32;
-        let mut imports = Vec::new();
-        let mut num_func_imports = 0u32;
-        let mut num_global_imports = 0u32;
-        let mut num_memory_imports = 0u32;
-        let mut num_table_imports = 0u32;
-
-        // Collect function bodies separately, then zip with types
-        let mut func_bodies: Vec<(Vec<ValType>, Vec<Instruction>)> = Vec::new();
-
-        for payload in parser.parse_all(bytes) {
-            let payload = payload.map_err(|e| format!("parse error: {e}"))?;
-            match payload {
-                Payload::ImportSection(reader) => {
-                    for imports_group in reader {
-                        let imports_group = imports_group.map_err(|e| format!("import error: {e}"))?;
-                    for import in imports_group {
-                        let (_offset, import) = import.map_err(|e| format!("import error: {e}"))?;
-                        let kind = match import.ty {
-                            wasmparser::TypeRef::Func(idx) => {
-                                func_types.push(idx);
-                                num_func_imports += 1;
-                                ImportKind::Func(idx)
-                            }
-                            wasmparser::TypeRef::Global(ty) => {
-                                num_global_imports += 1;
-                                ImportKind::Global { ty: ty.content_type, mutable: ty.mutable }
-                            }
-                            wasmparser::TypeRef::Memory(ty) => {
-                                memories.push(MemoryType { min: ty.initial, max: ty.maximum });
-                                num_memory_imports += 1;
-                                ImportKind::Memory(MemoryType { min: ty.initial, max: ty.maximum })
-                            }
-                            wasmparser::TypeRef::Table(ty) => {
-                                tables.push(TableDef { min: ty.initial, max: ty.maximum, init: None });
-                                num_table_imports += 1;
-                                ImportKind::Table(TableDef { min: ty.initial, max: ty.maximum, init: None })
-                            }
-                            _ => continue,
-                        };
-                        imports.push(Import {
-                            module: import.module.to_string(),
-                            name: import.name.to_string(),
-                            kind,
-                        });
-                    }
-                    }
-                }
-                Payload::TypeSection(reader) => {
-                    for ty in reader.into_iter_err_on_gc_types() {
-                        let ty = ty.map_err(|e| format!("type error: {e}"))?;
-                        types.push(ty.clone());
-                    }
-                }
-                Payload::FunctionSection(reader) => {
-                    for type_idx in reader {
-                        let type_idx = type_idx.map_err(|e| format!("func error: {e}"))?;
-                        func_types.push(type_idx);
-                    }
-                }
-                Payload::MemorySection(reader) => {
-                    for mem in reader {
-                        let mem = mem.map_err(|e| format!("memory error: {e}"))?;
-                        memories.push(MemoryType {
-                            min: mem.initial,
-                            max: mem.maximum,
-                        });
-                    }
-                }
-                Payload::GlobalSection(reader) => {
-                    for global in reader {
-                        let global = global.map_err(|e| format!("global error: {e}"))?;
-                        let init = decode_const_expr_multi(&global.init_expr)?;
-                        globals.push(GlobalDef {
-                            ty: global.ty.content_type,
-                            mutable: global.ty.mutable,
-                            init,
-                        });
-                    }
-                }
-                Payload::TableSection(reader) => {
-                    for table in reader {
-                        let table = table.map_err(|e| format!("table error: {e}"))?;
-                        let init = match table.init {
-                            wasmparser::TableInit::RefNull => None,
-                            wasmparser::TableInit::Expr(expr) => {
-                                Some(decode_const_expr_multi(&expr)?)
-                            }
-                        };
-                        tables.push(TableDef {
-                            min: table.ty.initial,
-                            max: table.ty.maximum,
-                            init,
-                        });
-                    }
-                }
-                Payload::ElementSection(reader) => {
-                    for elem in reader {
-                        let elem = elem.map_err(|e| format!("element error: {e}"))?;
-                        let items = parse_elem_items(&elem.items)?;
-                        match elem.kind {
-                            wasmparser::ElementKind::Active {
-                                table_index,
-                                offset_expr,
-                            } => {
-                                let table_idx = table_index.unwrap_or(0);
-                                let offset = decode_const_expr_multi(&offset_expr)?;
-                                elements.push(ElemSegment {
-                                    table_idx,
-                                    offset,
-                                    items,
-                                    active: true,
-                                });
-                            }
-                            wasmparser::ElementKind::Passive => {
-                                elements.push(ElemSegment {
-                                    table_idx: 0,
-                                    offset: Vec::new(),
-                                    items,
-                                    active: false,
-                                });
-                            }
-                            wasmparser::ElementKind::Declared => {
-                                // Declared segments are dropped at instantiation
-                                // but still occupy an index in the element section.
-                                elements.push(ElemSegment {
-                                    table_idx: 0,
-                                    offset: Vec::new(),
-                                    items,
-                                    active: true, // treated as active so it gets dropped
-                                });
-                            }
-                        }
-                    }
-                }
-                Payload::StartSection { func, .. } => {
-                    start = Some(func);
-                }
-                Payload::ExportSection(reader) => {
-                    for export in reader {
-                        let export = export.map_err(|e| format!("export error: {e}"))?;
-                        let kind = match export.kind {
-                            wasmparser::ExternalKind::Func => ExportKind::Func,
-                            wasmparser::ExternalKind::Memory => ExportKind::Memory,
-                            wasmparser::ExternalKind::Global => ExportKind::Global,
-                            wasmparser::ExternalKind::Table => ExportKind::Table,
-                            _ => continue,
-                        };
-                        exports.push(Export {
-                            name: export.name.to_string(),
-                            kind,
-                            index: export.index,
-                        });
-                    }
-                }
-                Payload::DataSection(reader) => {
-                    for data in reader {
-                        let data = data.map_err(|e| format!("data error: {e}"))?;
-                        match data.kind {
-                            wasmparser::DataKind::Active {
-                                memory_index: 0,
-                                offset_expr,
-                            } => {
-                                let offset = decode_const_expr_multi(&offset_expr)?;
-                                data_segments.push(DataSegment {
-                                    offset,
-                                    data: data.data.to_vec(),
-                                    active: true,
-                                });
-                            }
-                            wasmparser::DataKind::Passive => {
-                                data_segments.push(DataSegment {
-                                    offset: Vec::new(),
-                                    data: data.data.to_vec(),
-                                    active: false,
-                                });
-                            }
-                            _ => {
-                                // Active with memory_index != 0 — store but skip init
-                                data_segments.push(DataSegment {
-                                    offset: Vec::new(),
-                                    data: data.data.to_vec(),
-                                    active: false,
-                                });
-                            }
-                        }
-                    }
-                }
-                Payload::CodeSectionEntry(body) => {
-                    let mut locals = Vec::new();
-                    // First: the params from the function type
-                    let type_idx = func_types[num_func_imports as usize + code_idx as usize];
-                    let func_type = &types[type_idx as usize];
-                    for &param_ty in func_type.params() {
-                        locals.push(param_ty);
-                    }
-                    // Then: the declared locals
-                    let local_reader = body.get_locals_reader()
-                        .map_err(|e| format!("locals error: {e}"))?;
-                    for local in local_reader {
-                        let (count, ty) = local.map_err(|e| format!("local error: {e}"))?;
-                        for _ in 0..count {
-                            locals.push(ty);
-                        }
-                    }
-
-                    let ops_reader = body.get_operators_reader()
-                        .map_err(|e| format!("ops error: {e}"))?;
-                    let mut instructions = Vec::new();
-                    for op in ops_reader {
-                        let op = op.map_err(|e| format!("op error: {e}"))?;
-                        if let Some(instr) = decode_op(&op) {
-                            instructions.push(instr);
-                        }
-                    }
-
-                    resolve_block_targets(&mut instructions);
-                    func_bodies.push((locals, instructions));
-                    code_idx += 1;
-                }
-                _ => {}
-            }
+impl ModuleBuilder {
+    fn new() -> Self {
+        Self {
+            types: Vec::new(),
+            memories: Vec::new(),
+            globals: Vec::new(),
+            exports: Vec::new(),
+            data_segments: Vec::new(),
+            func_types: Vec::new(),
+            tables: Vec::new(),
+            elements: Vec::new(),
+            start: None,
+            imports: Vec::new(),
+            num_func_imports: 0,
+            num_global_imports: 0,
+            num_memory_imports: 0,
+            num_table_imports: 0,
+            func_bodies: Vec::new(),
+            code_idx: 0,
         }
-
-        // Build Func entries — imported funcs occupy indices 0..num_func_imports,
-        // code bodies correspond to func_types[num_func_imports..]
-        for (i, (locals, mut instr_body)) in func_bodies.into_iter().enumerate() {
-            let type_idx = func_types[num_func_imports as usize + i];
-            Self::peephole_optimize(&mut instr_body);
-            let (body, br_tables) = compile_body(&instr_body, &types);
-            funcs.push(Func {
-                type_idx,
-                locals,
-                body,
-                br_tables,
-            });
-        }
-
-        Ok(Module {
-            types,
-            funcs,
-            memories,
-            globals,
-            exports,
-            data_segments,
-            tables,
-            elements,
-            start,
-            func_types,
-            num_func_imports,
-            num_global_imports,
-            num_memory_imports,
-            num_table_imports,
-            imports,
-        })
     }
 
-    /// Peephole optimization pass: fuse common instruction sequences into superinstructions.
-    /// Replaces consumed instructions with Nop to preserve body length and all PC offsets.
-    fn peephole_optimize(body: &mut [Instruction]) {
-        let len = body.len();
-        let mut i = 0;
-        while i + 1 < len {
-            match (&body[i], &body[i + 1]) {
-                // LocalGet + I32Const → LocalGetI32Const
-                (Instruction::LocalGet(idx), Instruction::I32Const(val)) => {
-                    let idx = *idx;
-                    let val = *val;
-                    body[i] = Instruction::LocalGetI32Const(idx, val);
-                    body[i + 1] = Instruction::Nop;
-                    i += 2;
-                }
-                // LocalGet + LocalGet → LocalGetLocalGet
-                (Instruction::LocalGet(a), Instruction::LocalGet(b)) => {
-                    let a = *a;
-                    let b = *b;
-                    body[i] = Instruction::LocalGetLocalGet(a, b);
-                    body[i + 1] = Instruction::Nop;
-                    i += 2;
-                }
-                _ => {
-                    i += 1;
-                }
+    /// Parse a single import entry and update the relevant index spaces.
+    fn parse_single_import(&mut self, import: wasmparser::Import<'_>) -> Result<(), String> {
+        let kind = match import.ty {
+            wasmparser::TypeRef::Func(idx) => {
+                self.func_types.push(idx);
+                self.num_func_imports += 1;
+                ImportKind::Func(idx)
+            }
+            wasmparser::TypeRef::Global(ty) => {
+                self.num_global_imports += 1;
+                ImportKind::Global { ty: ty.content_type, mutable: ty.mutable }
+            }
+            wasmparser::TypeRef::Memory(ty) => {
+                self.memories.push(MemoryType { min: ty.initial, max: ty.maximum });
+                self.num_memory_imports += 1;
+                ImportKind::Memory(MemoryType { min: ty.initial, max: ty.maximum })
+            }
+            wasmparser::TypeRef::Table(ty) => {
+                self.tables.push(TableDef { min: ty.initial, max: ty.maximum, init: None });
+                self.num_table_imports += 1;
+                ImportKind::Table(TableDef { min: ty.initial, max: ty.maximum, init: None })
+            }
+            _ => return Ok(()),
+        };
+        self.imports.push(Import {
+            module: import.module.to_string(),
+            name: import.name.to_string(),
+            kind,
+        });
+        Ok(())
+    }
+
+    /// Parse a single element and push it onto `self.elements`.
+    fn parse_element(&mut self, elem: wasmparser::Element<'_>) -> Result<(), String> {
+        let items = parse_elem_items(&elem.items)?;
+        match elem.kind {
+            wasmparser::ElementKind::Active { table_index, offset_expr } => {
+                let offset = decode_const_expr_multi(&offset_expr)?;
+                self.elements.push(ElemSegment {
+                    table_idx: table_index.unwrap_or(0),
+                    offset,
+                    items,
+                    active: true,
+                });
+            }
+            wasmparser::ElementKind::Passive => {
+                self.elements.push(ElemSegment {
+                    table_idx: 0,
+                    offset: Vec::new(),
+                    items,
+                    active: false,
+                });
+            }
+            wasmparser::ElementKind::Declared => {
+                // Declared segments are dropped at instantiation
+                // but still occupy an index in the element section.
+                self.elements.push(ElemSegment {
+                    table_idx: 0,
+                    offset: Vec::new(),
+                    items,
+                    active: true, // treated as active so it gets dropped
+                });
             }
         }
+        Ok(())
+    }
+
+    /// Parse a single data segment entry.
+    fn parse_data_segment(&mut self, data: wasmparser::Data<'_>) -> Result<(), String> {
+        match data.kind {
+            wasmparser::DataKind::Active { memory_index: 0, offset_expr } => {
+                let offset = decode_const_expr_multi(&offset_expr)?;
+                self.data_segments.push(DataSegment {
+                    offset,
+                    data: data.data.to_vec(),
+                    active: true,
+                });
+            }
+            wasmparser::DataKind::Passive => {
+                self.data_segments.push(DataSegment {
+                    offset: Vec::new(),
+                    data: data.data.to_vec(),
+                    active: false,
+                });
+            }
+            _ => {
+                // Active with memory_index != 0 — store but skip init
+                self.data_segments.push(DataSegment {
+                    offset: Vec::new(),
+                    data: data.data.to_vec(),
+                    active: false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a single code section entry into locals + instructions.
+    fn parse_code_entry(&mut self, body: wasmparser::FunctionBody<'_>) -> Result<(), String> {
+        let locals = self.collect_locals(&body)?;
+        let instructions = decode_function_body(&body)?;
+        self.func_bodies.push((locals, instructions));
+        self.code_idx += 1;
+        Ok(())
+    }
+
+    /// Collect parameter types and declared locals for a function body.
+    fn collect_locals(&self, body: &wasmparser::FunctionBody<'_>) -> Result<Vec<ValType>, String> {
+        let type_idx = self.func_types[self.num_func_imports as usize + self.code_idx as usize];
+        let func_type = &self.types[type_idx as usize];
+        let mut locals: Vec<ValType> = func_type.params().to_vec();
+
+        let local_reader = body.get_locals_reader()
+            .map_err(|e| format!("locals error: {e}"))?;
+        for local in local_reader {
+            let (count, ty) = local.map_err(|e| format!("local error: {e}"))?;
+            for _ in 0..count {
+                locals.push(ty);
+            }
+        }
+        Ok(locals)
+    }
+
+    /// Compile function bodies into optimized Func entries.
+    fn build_funcs(&self) -> Vec<Func> {
+        self.func_bodies.iter().enumerate().map(|(i, (locals, instr_body))| {
+            let type_idx = self.func_types[self.num_func_imports as usize + i];
+            let mut body = instr_body.clone();
+            peephole_optimize(&mut body);
+            let (compiled, br_tables) = compile_body(&body, &self.types);
+            Func { type_idx, locals: locals.clone(), body: compiled, br_tables }
+        }).collect()
+    }
+
+    /// Consume the builder and produce the final Module.
+    fn build(self) -> Module {
+        let funcs = self.build_funcs();
+        Module {
+            types: self.types,
+            funcs,
+            memories: self.memories,
+            globals: self.globals,
+            exports: self.exports,
+            data_segments: self.data_segments,
+            tables: self.tables,
+            elements: self.elements,
+            start: self.start,
+            func_types: self.func_types,
+            num_func_imports: self.num_func_imports,
+            num_global_imports: self.num_global_imports,
+            num_memory_imports: self.num_memory_imports,
+            num_table_imports: self.num_table_imports,
+            imports: self.imports,
+        }
+    }
+}
+
+impl Module {
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        validate_module(bytes)?;
+        let mut builder = ModuleBuilder::new();
+
+        for payload in Parser::new(0).parse_all(bytes) {
+            let payload = payload.map_err(|e| format!("parse error: {e}"))?;
+            dispatch_payload(&mut builder, payload)?;
+        }
+
+        Ok(builder.build())
     }
 
     /// Get a local function by global index (accounting for imports).
@@ -448,6 +355,156 @@ impl Module {
             }
             None
         })
+    }
+}
+
+/// Validate a WASM module's bytes before parsing.
+fn validate_module(bytes: &[u8]) -> Result<(), String> {
+    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::default())
+        .validate_all(bytes)
+        .map_err(|e| format!("validation error: {e}"))?;
+    Ok(())
+}
+
+/// Route a single parsed payload to the appropriate builder method.
+fn dispatch_payload(builder: &mut ModuleBuilder, payload: Payload<'_>) -> Result<(), String> {
+    match payload {
+        Payload::ImportSection(reader) => {
+            for imports_group in reader {
+                let imports_group = imports_group.map_err(|e| format!("import error: {e}"))?;
+                for import in imports_group {
+                    let (_offset, import) = import.map_err(|e| format!("import error: {e}"))?;
+                    builder.parse_single_import(import)?;
+                }
+            }
+        }
+        Payload::TypeSection(reader) => {
+            for ty in reader.into_iter_err_on_gc_types() {
+                let ty = ty.map_err(|e| format!("type error: {e}"))?;
+                builder.types.push(ty.clone());
+            }
+        }
+        Payload::FunctionSection(reader) => {
+            for type_idx in reader {
+                let type_idx = type_idx.map_err(|e| format!("func error: {e}"))?;
+                builder.func_types.push(type_idx);
+            }
+        }
+        Payload::MemorySection(reader) => {
+            for mem in reader {
+                let mem = mem.map_err(|e| format!("memory error: {e}"))?;
+                builder.memories.push(MemoryType { min: mem.initial, max: mem.maximum });
+            }
+        }
+        Payload::GlobalSection(reader) => {
+            for global in reader {
+                let global = global.map_err(|e| format!("global error: {e}"))?;
+                let init = decode_const_expr_multi(&global.init_expr)?;
+                builder.globals.push(GlobalDef {
+                    ty: global.ty.content_type,
+                    mutable: global.ty.mutable,
+                    init,
+                });
+            }
+        }
+        Payload::TableSection(reader) => {
+            for table in reader {
+                let table = table.map_err(|e| format!("table error: {e}"))?;
+                let init = match table.init {
+                    wasmparser::TableInit::RefNull => None,
+                    wasmparser::TableInit::Expr(expr) => {
+                        Some(decode_const_expr_multi(&expr)?)
+                    }
+                };
+                builder.tables.push(TableDef {
+                    min: table.ty.initial,
+                    max: table.ty.maximum,
+                    init,
+                });
+            }
+        }
+        Payload::ElementSection(reader) => {
+            for elem in reader {
+                let elem = elem.map_err(|e| format!("element error: {e}"))?;
+                builder.parse_element(elem)?;
+            }
+        }
+        Payload::StartSection { func, .. } => {
+            builder.start = Some(func);
+        }
+        Payload::ExportSection(reader) => {
+            for export in reader {
+                let export = export.map_err(|e| format!("export error: {e}"))?;
+                let kind = match export.kind {
+                    wasmparser::ExternalKind::Func => ExportKind::Func,
+                    wasmparser::ExternalKind::Memory => ExportKind::Memory,
+                    wasmparser::ExternalKind::Global => ExportKind::Global,
+                    wasmparser::ExternalKind::Table => ExportKind::Table,
+                    _ => continue,
+                };
+                builder.exports.push(Export {
+                    name: export.name.to_string(),
+                    kind,
+                    index: export.index,
+                });
+            }
+        }
+        Payload::DataSection(reader) => {
+            for data in reader {
+                let data = data.map_err(|e| format!("data error: {e}"))?;
+                builder.parse_data_segment(data)?;
+            }
+        }
+        Payload::CodeSectionEntry(body) => {
+            builder.parse_code_entry(body)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Decode operators from a function body into a list of instructions.
+fn decode_function_body(body: &wasmparser::FunctionBody<'_>) -> Result<Vec<Instruction>, String> {
+    let ops_reader = body.get_operators_reader()
+        .map_err(|e| format!("ops error: {e}"))?;
+    let mut instructions = Vec::new();
+    for op in ops_reader {
+        let op = op.map_err(|e| format!("op error: {e}"))?;
+        if let Some(instr) = decode_op(&op) {
+            instructions.push(instr);
+        }
+    }
+    resolve_block_targets(&mut instructions);
+    Ok(instructions)
+}
+
+/// Peephole optimization pass: fuse common instruction sequences into superinstructions.
+/// Replaces consumed instructions with Nop to preserve body length and all PC offsets.
+fn peephole_optimize(body: &mut [Instruction]) {
+    let len = body.len();
+    let mut i = 0;
+    while i + 1 < len {
+        match (&body[i], &body[i + 1]) {
+            // LocalGet + I32Const → LocalGetI32Const
+            (Instruction::LocalGet(idx), Instruction::I32Const(val)) => {
+                let idx = *idx;
+                let val = *val;
+                body[i] = Instruction::LocalGetI32Const(idx, val);
+                body[i + 1] = Instruction::Nop;
+                i += 2;
+            }
+            // LocalGet + LocalGet → LocalGetLocalGet
+            (Instruction::LocalGet(a), Instruction::LocalGet(b)) => {
+                let a = *a;
+                let b = *b;
+                body[i] = Instruction::LocalGetLocalGet(a, b);
+                body[i + 1] = Instruction::Nop;
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
+        }
     }
 }
 
