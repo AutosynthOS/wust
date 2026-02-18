@@ -1,0 +1,19 @@
+package plasma:runtime@0.1.0;
+
+/// The plasma JS runtime component.
+///
+/// Uses raw pointer ABI (u32 pointers into linear memory) rather than
+/// component-model strings. The host is responsible for writing UTF-8
+/// bytes into memory via `alloc` before calling `eval`.
+world plasma {
+    /// Log a UTF-8 string from linear memory. The host reads `len`
+    /// bytes starting at `ptr`.
+    import host-log: func(ptr: u32, len: u32);
+
+    /// Allocate `size` bytes in linear memory and return a pointer.
+    export alloc: func(size: u32) -> u32;
+
+    /// Evaluate a UTF-8 JS source string at `ptr` with length `len`.
+    /// Returns 0 on success, 1 on error.
+    export eval: func(ptr: u32, len: u32) -> s32;
+}

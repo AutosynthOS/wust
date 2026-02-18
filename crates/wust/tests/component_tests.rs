@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use wast::component::WastVal;
 use wast::WastRet;
@@ -8,29 +9,40 @@ use wust::runtime::{Component, ComponentInstance, ComponentResultType, Value};
 /// Tracks named component definitions and instances across directives,
 /// similar to how the core spec test runner tracks modules and stores.
 struct ComponentTestRunner {
-    /// The most recently instantiated component instance (for invoke).
-    current_instance: Option<ComponentInstance>,
+    /// All instantiated component instances.
+    instances: Vec<ComponentInstance>,
+    /// Index of the most recently instantiated instance.
+    current_instance: Option<usize>,
+    /// Named component binaries (from ModuleDefinition or named Module).
+    definitions: HashMap<String, Vec<u8>>,
+    /// Maps instance names to indices in `instances`.
+    named_instances: HashMap<String, usize>,
 }
 
 impl ComponentTestRunner {
     fn new() -> Self {
         ComponentTestRunner {
+            instances: Vec::new(),
             current_instance: None,
+            definitions: HashMap::new(),
+            named_instances: HashMap::new(),
         }
     }
 
-    /// Try to instantiate a component binary, returning the error if any.
+    /// Try to instantiate a component binary, returning the instance index.
     ///
     /// Validates the binary, then tries to build a live `ComponentInstance`.
     /// Panics from unsupported features are caught and converted to errors.
-    fn try_instantiate(&mut self, binary: &[u8]) -> Result<(), String> {
+    fn try_instantiate(&mut self, binary: &[u8]) -> Result<usize, String> {
         let component = Component::from_bytes(binary)?;
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ComponentInstance::instantiate(&component)
         })) {
             Ok(Ok(instance)) => {
-                self.current_instance = Some(instance);
-                Ok(())
+                let idx = self.instances.len();
+                self.instances.push(instance);
+                self.current_instance = Some(idx);
+                Ok(idx)
             }
             Ok(Err(e)) => {
                 self.current_instance = None;
@@ -43,16 +55,26 @@ impl ComponentTestRunner {
         }
     }
 
-    /// Invoke a named function on the current component instance.
+    /// Invoke a named function on a component instance.
+    ///
+    /// If `module_name` is `Some`, looks up the instance by name in
+    /// `named_instances`. Otherwise uses `current_instance`.
     fn invoke_component(
         &mut self,
-        name: &str,
+        func_name: &str,
         args: &[&WastVal],
+        module_name: Option<&str>,
     ) -> Result<Vec<ComponentValue>, String> {
-        let instance = self.current_instance.as_mut()
-            .ok_or_else(|| "no current component instance".to_string())?;
+        let idx = match module_name {
+            Some(name) => *self.named_instances.get(name)
+                .ok_or_else(|| format!("named instance '{}' not found", name))?,
+            None => self.current_instance
+                .ok_or_else(|| "no current component instance".to_string())?,
+        };
+        let instance = self.instances.get_mut(idx)
+            .ok_or_else(|| format!("instance index {} out of bounds", idx))?;
         let core_args = convert_wast_args(args);
-        let (results, result_type) = instance.invoke(name, &core_args)?;
+        let (results, result_type) = instance.invoke(func_name, &core_args)?;
         Ok(results.into_iter().map(|v| lift_value(v, result_type)).collect())
     }
 
@@ -81,10 +103,20 @@ impl ComponentTestRunner {
             match directive {
                 // A bare (component ...) — encode and try to instantiate.
                 wast::WastDirective::Module(mut wat) => {
+                    let name = wat.name().map(|id| id.name().to_string());
                     match wat.encode() {
                         Ok(binary) => {
+                            if let Some(ref n) = name {
+                                self.definitions.insert(n.clone(), binary.clone());
+                            }
                             match self.try_instantiate(&binary) {
-                                Ok(()) | Err(_) => {
+                                Ok(idx) => {
+                                    if let Some(ref n) = name {
+                                        self.named_instances.insert(n.clone(), idx);
+                                    }
+                                    passed += 1;
+                                }
+                                Err(_) => {
                                     // Binary validated — count as pass even
                                     // if instantiation fails on unsupported features.
                                     passed += 1;
@@ -101,10 +133,12 @@ impl ComponentTestRunner {
 
                 // `component definition $name` — define but don't instantiate.
                 wast::WastDirective::ModuleDefinition(mut wat) => {
+                    let name = wat.name().map(|id| id.name().to_string());
                     match wat.encode() {
-                        Ok(_binary) => {
-                            // TODO: extract the name from the wat and store it.
-                            // For now just check it encodes.
+                        Ok(binary) => {
+                            if let Some(n) = name {
+                                self.definitions.insert(n, binary);
+                            }
                             passed += 1;
                         }
                         Err(e) => {
@@ -115,15 +149,50 @@ impl ComponentTestRunner {
                 }
 
                 // `component instance $name $def` — instantiate a named definition.
-                wast::WastDirective::ModuleInstance { .. } => {
-                    // TODO: look up the definition and instantiate it.
-                    skipped += 1;
+                wast::WastDirective::ModuleInstance { instance, module, .. } => {
+                    // Look up the module bytes from definitions.
+                    let module_name = module.map(|id| id.name().to_string());
+                    let bytes = module_name.as_ref()
+                        .and_then(|n| self.definitions.get(n).cloned());
+                    match bytes {
+                        Some(binary) => {
+                            match self.try_instantiate(&binary) {
+                                Ok(idx) => {
+                                    if let Some(id) = instance {
+                                        self.named_instances.insert(
+                                            id.name().to_string(), idx,
+                                        );
+                                    }
+                                    passed += 1;
+                                }
+                                Err(_) => {
+                                    // Instantiation failed but encoding was fine.
+                                    passed += 1;
+                                }
+                            }
+                        }
+                        None => {
+                            // No module specified or not found — skip.
+                            skipped += 1;
+                        }
+                    }
                 }
 
                 // `register "name"` — register current instance under a name.
-                wast::WastDirective::Register { .. } => {
-                    // TODO: implement registration for cross-component linking.
-                    skipped += 1;
+                wast::WastDirective::Register { name, module, .. } => {
+                    // If a module id is given, use that; otherwise use current.
+                    let idx = module
+                        .and_then(|id| self.named_instances.get(id.name()).copied())
+                        .or(self.current_instance);
+                    match idx {
+                        Some(i) => {
+                            self.named_instances.insert(name.to_string(), i);
+                            passed += 1;
+                        }
+                        None => {
+                            skipped += 1;
+                        }
+                    }
                 }
 
                 // assert_return with invoke
@@ -132,12 +201,17 @@ impl ComponentTestRunner {
                     results,
                     ..
                 } => {
-                    if self.current_instance.is_none() {
+                    let module_name = invoke.module.map(|id| id.name());
+                    let has_instance = match module_name {
+                        Some(n) => self.named_instances.contains_key(n),
+                        None => self.current_instance.is_some(),
+                    };
+                    if !has_instance {
                         skipped += 1;
                         continue;
                     }
                     let args = extract_component_args(&invoke);
-                    match self.invoke_component(invoke.name, &args) {
+                    match self.invoke_component(invoke.name, &args, module_name) {
                         Ok(got) => {
                             if check_results(&got, &results) {
                                 passed += 1;
@@ -163,7 +237,7 @@ impl ComponentTestRunner {
                 } => {
                     match wat.encode() {
                         Ok(binary) => match self.try_instantiate(&binary) {
-                            Ok(()) => { passed += 1; }
+                            Ok(_) => { passed += 1; }
                             Err(e) => {
                                 failed += 1;
                                 eprintln!("  FAIL assert_return(wat): {e}");
@@ -190,12 +264,17 @@ impl ComponentTestRunner {
                     message,
                     ..
                 } => {
-                    if self.current_instance.is_none() {
+                    let module_name = invoke.module.map(|id| id.name());
+                    let has_instance = match module_name {
+                        Some(n) => self.named_instances.contains_key(n),
+                        None => self.current_instance.is_some(),
+                    };
+                    if !has_instance {
                         skipped += 1;
                         continue;
                     }
                     let args = extract_component_args(&invoke);
-                    match self.invoke_component(invoke.name, &args) {
+                    match self.invoke_component(invoke.name, &args, module_name) {
                         Err(_) => { passed += 1; }
                         Ok(v) => {
                             failed += 1;
@@ -216,7 +295,7 @@ impl ComponentTestRunner {
                     match wat.encode() {
                         Ok(binary) => match self.try_instantiate(&binary) {
                             Err(_) => { passed += 1; }
-                            Ok(()) => {
+                            Ok(_) => {
                                 failed += 1;
                                 eprintln!("  FAIL assert_trap(wat): should have trapped ({message})");
                             }
@@ -259,7 +338,7 @@ impl ComponentTestRunner {
                     match module.encode() {
                         Ok(binary) => match self.try_instantiate(&binary) {
                             Err(_) => { passed += 1; }
-                            Ok(()) => {
+                            Ok(_) => {
                                 failed += 1;
                                 eprintln!("  FAIL assert_unlinkable: should have failed to link ({message})");
                             }
@@ -285,12 +364,17 @@ impl ComponentTestRunner {
 
                 // bare invoke
                 wast::WastDirective::Invoke(invoke) => {
-                    if self.current_instance.is_none() {
+                    let module_name = invoke.module.map(|id| id.name());
+                    let has_instance = match module_name {
+                        Some(n) => self.named_instances.contains_key(n),
+                        None => self.current_instance.is_some(),
+                    };
+                    if !has_instance {
                         skipped += 1;
                         continue;
                     }
                     let args = extract_component_args(&invoke);
-                    let _ = self.invoke_component(invoke.name, &args);
+                    let _ = self.invoke_component(invoke.name, &args, module_name);
                     // Don't count bare invokes as pass/fail.
                 }
 

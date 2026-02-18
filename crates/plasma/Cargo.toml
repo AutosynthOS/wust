@@ -9,4 +9,4 @@ crate-type = ["cdylib"]
 [dependencies]
 boa_engine = { git = "https://github.com/AlbertMarashi/boa", branch = "albert/combined-fixes", default-features = false }
 boa_parser = { git = "https://github.com/AlbertMarashi/boa", branch = "albert/combined-fixes" }
-getrandom = { version = "0.3.4", default-features = false, features = ["wasm_js"] }
+getrandom = { version = "0.3.4", default-features = false }

@@ -1,4 +1,4 @@
-use wasmparser::{FuncType, ValType};
+use wasmparser::{Operator, ValType};
 
 /// Our own instruction enum — decoded from wasmparser's Operator once at parse
 /// time so we don't re-parse during execution.
@@ -248,538 +248,6 @@ pub enum BlockType {
     FuncType(u32),
 }
 
-/// Flat instruction for execution — 16 bytes, cache-friendly.
-/// Replaces the ~40-byte Instruction enum for the hot interpreter loop.
-#[derive(Clone, Copy)]
-pub struct Op {
-    pub code: u16,
-    pub imm: u64,
-}
-
-const _: () = assert!(std::mem::size_of::<Op>() == 16);
-
-impl std::fmt::Debug for Op {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Op({}, 0x{:x})", self.code, self.imm)
-    }
-}
-
-impl Op {
-    #[inline(always)]
-    pub fn new(code: u16, imm: u64) -> Self { Op { code, imm } }
-    #[inline(always)]
-    pub fn unit(code: u16) -> Self { Op { code, imm: 0 } }
-    /// Pack two u32 values into the imm field.
-    #[inline(always)]
-    pub fn pair(code: u16, hi: u32, lo: u32) -> Self {
-        Op { code, imm: (hi as u64) << 32 | lo as u64 }
-    }
-    #[inline(always)]
-    pub fn imm_u32(&self) -> u32 { self.imm as u32 }
-    #[inline(always)]
-    pub fn imm_i32(&self) -> i32 { self.imm as i32 }
-    #[inline(always)]
-    pub fn imm_u64(&self) -> u64 { self.imm }
-    #[inline(always)]
-    pub fn imm_i64(&self) -> i64 { self.imm as i64 }
-    #[inline(always)]
-    pub fn imm_f32(&self) -> f32 { f32::from_bits(self.imm as u32) }
-    #[inline(always)]
-    pub fn imm_f64(&self) -> f64 { f64::from_bits(self.imm) }
-    #[inline(always)]
-    pub fn imm_hi(&self) -> u32 { (self.imm >> 32) as u32 }
-    #[inline(always)]
-    pub fn imm_lo(&self) -> u32 { self.imm as u32 }
-}
-
-// Opcode constants — grouped to match Instruction enum order
-// Control
-pub const OP_UNREACHABLE: u16 = 0;
-pub const OP_NOP: u16 = 1;
-pub const OP_BLOCK: u16 = 2;           // imm = (end_pc << 32) | arity
-pub const OP_LOOP: u16 = 3;            // imm = loop_arity
-pub const OP_IF: u16 = 4;              // imm = (end_pc << 32) | arity (no else)
-pub const OP_IF_ELSE: u16 = 5;         // imm = (arity << 56) | (end_pc << 28) | else_pc
-pub const OP_ELSE: u16 = 6;
-pub const OP_END: u16 = 7;
-pub const OP_BR: u16 = 8;              // imm = depth
-pub const OP_BR_IF: u16 = 9;           // imm = depth
-pub const OP_BR_TABLE: u16 = 10;       // imm = index into br_tables
-pub const OP_RETURN: u16 = 11;
-pub const OP_CALL: u16 = 12;           // imm = func_idx
-pub const OP_CALL_INDIRECT: u16 = 13;  // imm = (type_idx << 32) | table_idx
-pub const OP_DROP: u16 = 14;
-pub const OP_SELECT: u16 = 15;
-// Locals / Globals
-pub const OP_LOCAL_GET: u16 = 16;      // imm = idx
-pub const OP_LOCAL_SET: u16 = 17;
-pub const OP_LOCAL_TEE: u16 = 18;
-pub const OP_GLOBAL_GET: u16 = 19;
-pub const OP_GLOBAL_SET: u16 = 20;
-// Memory loads
-pub const OP_I32_LOAD: u16 = 21;       // imm = offset
-pub const OP_I64_LOAD: u16 = 22;
-pub const OP_F32_LOAD: u16 = 23;
-pub const OP_F64_LOAD: u16 = 24;
-pub const OP_I32_LOAD8_S: u16 = 25;
-pub const OP_I32_LOAD8_U: u16 = 26;
-pub const OP_I32_LOAD16_S: u16 = 27;
-pub const OP_I32_LOAD16_U: u16 = 28;
-pub const OP_I64_LOAD8_S: u16 = 29;
-pub const OP_I64_LOAD8_U: u16 = 30;
-pub const OP_I64_LOAD16_S: u16 = 31;
-pub const OP_I64_LOAD16_U: u16 = 32;
-pub const OP_I64_LOAD32_S: u16 = 33;
-pub const OP_I64_LOAD32_U: u16 = 34;
-// Memory stores
-pub const OP_I32_STORE: u16 = 35;
-pub const OP_I64_STORE: u16 = 36;
-pub const OP_F32_STORE: u16 = 37;
-pub const OP_F64_STORE: u16 = 38;
-pub const OP_I32_STORE8: u16 = 39;
-pub const OP_I32_STORE16: u16 = 40;
-pub const OP_I64_STORE8: u16 = 41;
-pub const OP_I64_STORE16: u16 = 42;
-pub const OP_I64_STORE32: u16 = 43;
-pub const OP_MEMORY_SIZE: u16 = 44;
-pub const OP_MEMORY_GROW: u16 = 45;
-// Constants
-pub const OP_I32_CONST: u16 = 46;      // imm = val as u32 as u64
-pub const OP_I64_CONST: u16 = 47;      // imm = val as u64
-pub const OP_F32_CONST: u16 = 48;      // imm = val.to_bits() as u64
-pub const OP_F64_CONST: u16 = 49;      // imm = val.to_bits()
-// Superinstructions
-pub const OP_LOCAL_GET_I32_CONST: u16 = 50; // imm = (idx << 32) | (val as u32)
-pub const OP_LOCAL_GET_LOCAL_GET: u16 = 51; // imm = (a << 32) | b
-// i32 comparison
-pub const OP_I32_EQZ: u16 = 52;
-pub const OP_I32_EQ: u16 = 53;
-pub const OP_I32_NE: u16 = 54;
-pub const OP_I32_LT_S: u16 = 55;
-pub const OP_I32_LT_U: u16 = 56;
-pub const OP_I32_GT_S: u16 = 57;
-pub const OP_I32_GT_U: u16 = 58;
-pub const OP_I32_LE_S: u16 = 59;
-pub const OP_I32_LE_U: u16 = 60;
-pub const OP_I32_GE_S: u16 = 61;
-pub const OP_I32_GE_U: u16 = 62;
-// i32 arithmetic
-pub const OP_I32_CLZ: u16 = 63;
-pub const OP_I32_CTZ: u16 = 64;
-pub const OP_I32_POPCNT: u16 = 65;
-pub const OP_I32_ADD: u16 = 66;
-pub const OP_I32_SUB: u16 = 67;
-pub const OP_I32_MUL: u16 = 68;
-pub const OP_I32_DIV_S: u16 = 69;
-pub const OP_I32_DIV_U: u16 = 70;
-pub const OP_I32_REM_S: u16 = 71;
-pub const OP_I32_REM_U: u16 = 72;
-pub const OP_I32_AND: u16 = 73;
-pub const OP_I32_OR: u16 = 74;
-pub const OP_I32_XOR: u16 = 75;
-pub const OP_I32_SHL: u16 = 76;
-pub const OP_I32_SHR_S: u16 = 77;
-pub const OP_I32_SHR_U: u16 = 78;
-pub const OP_I32_ROTL: u16 = 79;
-pub const OP_I32_ROTR: u16 = 80;
-// i64 comparison
-pub const OP_I64_EQZ: u16 = 81;
-pub const OP_I64_EQ: u16 = 82;
-pub const OP_I64_NE: u16 = 83;
-pub const OP_I64_LT_S: u16 = 84;
-pub const OP_I64_LT_U: u16 = 85;
-pub const OP_I64_GT_S: u16 = 86;
-pub const OP_I64_GT_U: u16 = 87;
-pub const OP_I64_LE_S: u16 = 88;
-pub const OP_I64_LE_U: u16 = 89;
-pub const OP_I64_GE_S: u16 = 90;
-pub const OP_I64_GE_U: u16 = 91;
-// i64 arithmetic
-pub const OP_I64_CLZ: u16 = 92;
-pub const OP_I64_CTZ: u16 = 93;
-pub const OP_I64_POPCNT: u16 = 94;
-pub const OP_I64_ADD: u16 = 95;
-pub const OP_I64_SUB: u16 = 96;
-pub const OP_I64_MUL: u16 = 97;
-pub const OP_I64_DIV_S: u16 = 98;
-pub const OP_I64_DIV_U: u16 = 99;
-pub const OP_I64_REM_S: u16 = 100;
-pub const OP_I64_REM_U: u16 = 101;
-pub const OP_I64_AND: u16 = 102;
-pub const OP_I64_OR: u16 = 103;
-pub const OP_I64_XOR: u16 = 104;
-pub const OP_I64_SHL: u16 = 105;
-pub const OP_I64_SHR_S: u16 = 106;
-pub const OP_I64_SHR_U: u16 = 107;
-pub const OP_I64_ROTL: u16 = 108;
-pub const OP_I64_ROTR: u16 = 109;
-// Conversions
-pub const OP_I32_WRAP_I64: u16 = 110;
-pub const OP_I64_EXTEND_I32_S: u16 = 111;
-pub const OP_I64_EXTEND_I32_U: u16 = 112;
-// f32 comparison
-pub const OP_F32_EQ: u16 = 113;
-pub const OP_F32_NE: u16 = 114;
-pub const OP_F32_LT: u16 = 115;
-pub const OP_F32_GT: u16 = 116;
-pub const OP_F32_LE: u16 = 117;
-pub const OP_F32_GE: u16 = 118;
-// f64 comparison
-pub const OP_F64_EQ: u16 = 119;
-pub const OP_F64_NE: u16 = 120;
-pub const OP_F64_LT: u16 = 121;
-pub const OP_F64_GT: u16 = 122;
-pub const OP_F64_LE: u16 = 123;
-pub const OP_F64_GE: u16 = 124;
-// f32 arithmetic
-pub const OP_F32_ABS: u16 = 125;
-pub const OP_F32_NEG: u16 = 126;
-pub const OP_F32_CEIL: u16 = 127;
-pub const OP_F32_FLOOR: u16 = 128;
-pub const OP_F32_TRUNC: u16 = 129;
-pub const OP_F32_NEAREST: u16 = 130;
-pub const OP_F32_SQRT: u16 = 131;
-pub const OP_F32_ADD: u16 = 132;
-pub const OP_F32_SUB: u16 = 133;
-pub const OP_F32_MUL: u16 = 134;
-pub const OP_F32_DIV: u16 = 135;
-pub const OP_F32_MIN: u16 = 136;
-pub const OP_F32_MAX: u16 = 137;
-pub const OP_F32_COPYSIGN: u16 = 138;
-// f64 arithmetic
-pub const OP_F64_ABS: u16 = 139;
-pub const OP_F64_NEG: u16 = 140;
-pub const OP_F64_CEIL: u16 = 141;
-pub const OP_F64_FLOOR: u16 = 142;
-pub const OP_F64_TRUNC: u16 = 143;
-pub const OP_F64_NEAREST: u16 = 144;
-pub const OP_F64_SQRT: u16 = 145;
-pub const OP_F64_ADD: u16 = 146;
-pub const OP_F64_SUB: u16 = 147;
-pub const OP_F64_MUL: u16 = 148;
-pub const OP_F64_DIV: u16 = 149;
-pub const OP_F64_MIN: u16 = 150;
-pub const OP_F64_MAX: u16 = 151;
-pub const OP_F64_COPYSIGN: u16 = 152;
-// Float-int conversions
-pub const OP_I32_TRUNC_F32_S: u16 = 153;
-pub const OP_I32_TRUNC_F32_U: u16 = 154;
-pub const OP_I32_TRUNC_F64_S: u16 = 155;
-pub const OP_I32_TRUNC_F64_U: u16 = 156;
-pub const OP_I64_TRUNC_F32_S: u16 = 157;
-pub const OP_I64_TRUNC_F32_U: u16 = 158;
-pub const OP_I64_TRUNC_F64_S: u16 = 159;
-pub const OP_I64_TRUNC_F64_U: u16 = 160;
-pub const OP_F32_CONVERT_I32_S: u16 = 161;
-pub const OP_F32_CONVERT_I32_U: u16 = 162;
-pub const OP_F32_CONVERT_I64_S: u16 = 163;
-pub const OP_F32_CONVERT_I64_U: u16 = 164;
-pub const OP_F32_DEMOTE_F64: u16 = 165;
-pub const OP_F64_CONVERT_I32_S: u16 = 166;
-pub const OP_F64_CONVERT_I32_U: u16 = 167;
-pub const OP_F64_CONVERT_I64_S: u16 = 168;
-pub const OP_F64_CONVERT_I64_U: u16 = 169;
-pub const OP_F64_PROMOTE_F32: u16 = 170;
-// Reinterpret
-pub const OP_I32_REINTERPRET_F32: u16 = 171;
-pub const OP_I64_REINTERPRET_F64: u16 = 172;
-pub const OP_F32_REINTERPRET_I32: u16 = 173;
-pub const OP_F64_REINTERPRET_I64: u16 = 174;
-// Sign extension
-pub const OP_I32_EXTEND8_S: u16 = 175;
-pub const OP_I32_EXTEND16_S: u16 = 176;
-pub const OP_I64_EXTEND8_S: u16 = 177;
-pub const OP_I64_EXTEND16_S: u16 = 178;
-pub const OP_I64_EXTEND32_S: u16 = 179;
-// Saturating truncation
-pub const OP_I32_TRUNC_SAT_F32_S: u16 = 180;
-pub const OP_I32_TRUNC_SAT_F32_U: u16 = 181;
-pub const OP_I32_TRUNC_SAT_F64_S: u16 = 182;
-pub const OP_I32_TRUNC_SAT_F64_U: u16 = 183;
-pub const OP_I64_TRUNC_SAT_F32_S: u16 = 184;
-pub const OP_I64_TRUNC_SAT_F32_U: u16 = 185;
-pub const OP_I64_TRUNC_SAT_F64_S: u16 = 186;
-pub const OP_I64_TRUNC_SAT_F64_U: u16 = 187;
-// Reference types / bulk memory
-pub const OP_REF_FUNC: u16 = 188;        // imm = func_idx
-pub const OP_REF_NULL: u16 = 189;
-pub const OP_TABLE_INIT: u16 = 190;      // imm = (elem_idx << 32) | table_idx
-pub const OP_ELEM_DROP: u16 = 191;       // imm = elem_idx
-pub const OP_REF_IS_NULL: u16 = 192;
-pub const OP_MEMORY_INIT: u16 = 193;     // imm = data_segment_idx
-pub const OP_DATA_DROP: u16 = 194;       // imm = data_segment_idx
-pub const OP_MEMORY_COPY: u16 = 195;
-pub const OP_MEMORY_FILL: u16 = 196;
-pub const OP_TABLE_GET: u16 = 197;       // imm = table_idx
-pub const OP_TABLE_SET: u16 = 198;       // imm = table_idx
-pub const OP_TABLE_GROW: u16 = 199;      // imm = table_idx
-pub const OP_TABLE_SIZE: u16 = 200;      // imm = table_idx
-pub const OP_TABLE_COPY: u16 = 201;      // imm = (dst_table << 32) | src_table
-pub const OP_TABLE_FILL: u16 = 202;      // imm = table_idx
-
-/// Compile a Vec<Instruction> into flat Ops, pre-computing block arities.
-/// Returns (ops, br_tables) where br_tables stores BrTable target data out-of-line.
-pub fn compile_body(instrs: &[Instruction], types: &[FuncType]) -> (Vec<Op>, Vec<(Vec<u32>, u32)>) {
-    let mut ops = Vec::with_capacity(instrs.len());
-    let mut br_tables = Vec::new();
-    for instr in instrs {
-        let op = match instr {
-            Instruction::Unreachable => Op::unit(OP_UNREACHABLE),
-            Instruction::Nop => Op::unit(OP_NOP),
-            Instruction::Block { ty, end_pc } => {
-                let arity = match ty {
-                    BlockType::Empty => 0u32,
-                    BlockType::Val(_) => 1,
-                    BlockType::FuncType(idx) => types[*idx as usize].results().len() as u32,
-                };
-                Op::pair(OP_BLOCK, *end_pc as u32, arity)
-            }
-            Instruction::Loop { ty } => {
-                let arity = match ty {
-                    BlockType::Empty | BlockType::Val(_) => 0u32,
-                    BlockType::FuncType(idx) => types[*idx as usize].params().len() as u32,
-                };
-                Op::new(OP_LOOP, arity as u64)
-            }
-            Instruction::If { ty, end_pc, else_pc } => {
-                let arity = match ty {
-                    BlockType::Empty => 0u32,
-                    BlockType::Val(_) => 1,
-                    BlockType::FuncType(idx) => types[*idx as usize].results().len() as u32,
-                };
-                match else_pc {
-                    None => Op::pair(OP_IF, *end_pc as u32, arity),
-                    Some(ep) => {
-                        // Pack: (arity << 56) | (end_pc << 28) | else_pc
-                        let imm = (arity as u64) << 56
-                            | (*end_pc as u64) << 28
-                            | *ep as u64;
-                        Op::new(OP_IF_ELSE, imm)
-                    }
-                }
-            }
-            Instruction::Else => Op::unit(OP_ELSE),
-            Instruction::End => Op::unit(OP_END),
-            Instruction::Br(d) => Op::new(OP_BR, *d as u64),
-            Instruction::BrIf(d) => Op::new(OP_BR_IF, *d as u64),
-            Instruction::BrTable { targets, default } => {
-                let idx = br_tables.len();
-                br_tables.push((targets.clone(), *default));
-                Op::new(OP_BR_TABLE, idx as u64)
-            }
-            Instruction::Return => Op::unit(OP_RETURN),
-            Instruction::Call(idx) => Op::new(OP_CALL, *idx as u64),
-            Instruction::CallIndirect { type_idx, table_idx } => {
-                Op::pair(OP_CALL_INDIRECT, *type_idx as u32, *table_idx as u32)
-            }
-            Instruction::Drop => Op::unit(OP_DROP),
-            Instruction::Select => Op::unit(OP_SELECT),
-            Instruction::LocalGet(idx) => Op::new(OP_LOCAL_GET, *idx as u64),
-            Instruction::LocalSet(idx) => Op::new(OP_LOCAL_SET, *idx as u64),
-            Instruction::LocalTee(idx) => Op::new(OP_LOCAL_TEE, *idx as u64),
-            Instruction::GlobalGet(idx) => Op::new(OP_GLOBAL_GET, *idx as u64),
-            Instruction::GlobalSet(idx) => Op::new(OP_GLOBAL_SET, *idx as u64),
-            // Memory loads
-            Instruction::I32Load(o) => Op::new(OP_I32_LOAD, *o),
-            Instruction::I64Load(o) => Op::new(OP_I64_LOAD, *o),
-            Instruction::F32Load(o) => Op::new(OP_F32_LOAD, *o),
-            Instruction::F64Load(o) => Op::new(OP_F64_LOAD, *o),
-            Instruction::I32Load8S(o) => Op::new(OP_I32_LOAD8_S, *o),
-            Instruction::I32Load8U(o) => Op::new(OP_I32_LOAD8_U, *o),
-            Instruction::I32Load16S(o) => Op::new(OP_I32_LOAD16_S, *o),
-            Instruction::I32Load16U(o) => Op::new(OP_I32_LOAD16_U, *o),
-            Instruction::I64Load8S(o) => Op::new(OP_I64_LOAD8_S, *o),
-            Instruction::I64Load8U(o) => Op::new(OP_I64_LOAD8_U, *o),
-            Instruction::I64Load16S(o) => Op::new(OP_I64_LOAD16_S, *o),
-            Instruction::I64Load16U(o) => Op::new(OP_I64_LOAD16_U, *o),
-            Instruction::I64Load32S(o) => Op::new(OP_I64_LOAD32_S, *o),
-            Instruction::I64Load32U(o) => Op::new(OP_I64_LOAD32_U, *o),
-            // Memory stores
-            Instruction::I32Store(o) => Op::new(OP_I32_STORE, *o),
-            Instruction::I64Store(o) => Op::new(OP_I64_STORE, *o),
-            Instruction::F32Store(o) => Op::new(OP_F32_STORE, *o),
-            Instruction::F64Store(o) => Op::new(OP_F64_STORE, *o),
-            Instruction::I32Store8(o) => Op::new(OP_I32_STORE8, *o),
-            Instruction::I32Store16(o) => Op::new(OP_I32_STORE16, *o),
-            Instruction::I64Store8(o) => Op::new(OP_I64_STORE8, *o),
-            Instruction::I64Store16(o) => Op::new(OP_I64_STORE16, *o),
-            Instruction::I64Store32(o) => Op::new(OP_I64_STORE32, *o),
-            Instruction::MemorySize => Op::unit(OP_MEMORY_SIZE),
-            Instruction::MemoryGrow => Op::unit(OP_MEMORY_GROW),
-            // Constants
-            Instruction::I32Const(v) => Op::new(OP_I32_CONST, *v as u32 as u64),
-            Instruction::I64Const(v) => Op::new(OP_I64_CONST, *v as u64),
-            Instruction::F32Const(v) => Op::new(OP_F32_CONST, v.to_bits() as u64),
-            Instruction::F64Const(v) => Op::new(OP_F64_CONST, v.to_bits()),
-            // Superinstructions
-            Instruction::LocalGetI32Const(idx, val) => {
-                Op::pair(OP_LOCAL_GET_I32_CONST, *idx, *val as u32)
-            }
-            Instruction::LocalGetLocalGet(a, b) => {
-                Op::pair(OP_LOCAL_GET_LOCAL_GET, *a, *b)
-            }
-            // All unit ops
-            Instruction::I32Eqz => Op::unit(OP_I32_EQZ),
-            Instruction::I32Eq => Op::unit(OP_I32_EQ),
-            Instruction::I32Ne => Op::unit(OP_I32_NE),
-            Instruction::I32LtS => Op::unit(OP_I32_LT_S),
-            Instruction::I32LtU => Op::unit(OP_I32_LT_U),
-            Instruction::I32GtS => Op::unit(OP_I32_GT_S),
-            Instruction::I32GtU => Op::unit(OP_I32_GT_U),
-            Instruction::I32LeS => Op::unit(OP_I32_LE_S),
-            Instruction::I32LeU => Op::unit(OP_I32_LE_U),
-            Instruction::I32GeS => Op::unit(OP_I32_GE_S),
-            Instruction::I32GeU => Op::unit(OP_I32_GE_U),
-            Instruction::I32Clz => Op::unit(OP_I32_CLZ),
-            Instruction::I32Ctz => Op::unit(OP_I32_CTZ),
-            Instruction::I32Popcnt => Op::unit(OP_I32_POPCNT),
-            Instruction::I32Add => Op::unit(OP_I32_ADD),
-            Instruction::I32Sub => Op::unit(OP_I32_SUB),
-            Instruction::I32Mul => Op::unit(OP_I32_MUL),
-            Instruction::I32DivS => Op::unit(OP_I32_DIV_S),
-            Instruction::I32DivU => Op::unit(OP_I32_DIV_U),
-            Instruction::I32RemS => Op::unit(OP_I32_REM_S),
-            Instruction::I32RemU => Op::unit(OP_I32_REM_U),
-            Instruction::I32And => Op::unit(OP_I32_AND),
-            Instruction::I32Or => Op::unit(OP_I32_OR),
-            Instruction::I32Xor => Op::unit(OP_I32_XOR),
-            Instruction::I32Shl => Op::unit(OP_I32_SHL),
-            Instruction::I32ShrS => Op::unit(OP_I32_SHR_S),
-            Instruction::I32ShrU => Op::unit(OP_I32_SHR_U),
-            Instruction::I32Rotl => Op::unit(OP_I32_ROTL),
-            Instruction::I32Rotr => Op::unit(OP_I32_ROTR),
-            Instruction::I64Eqz => Op::unit(OP_I64_EQZ),
-            Instruction::I64Eq => Op::unit(OP_I64_EQ),
-            Instruction::I64Ne => Op::unit(OP_I64_NE),
-            Instruction::I64LtS => Op::unit(OP_I64_LT_S),
-            Instruction::I64LtU => Op::unit(OP_I64_LT_U),
-            Instruction::I64GtS => Op::unit(OP_I64_GT_S),
-            Instruction::I64GtU => Op::unit(OP_I64_GT_U),
-            Instruction::I64LeS => Op::unit(OP_I64_LE_S),
-            Instruction::I64LeU => Op::unit(OP_I64_LE_U),
-            Instruction::I64GeS => Op::unit(OP_I64_GE_S),
-            Instruction::I64GeU => Op::unit(OP_I64_GE_U),
-            Instruction::I64Clz => Op::unit(OP_I64_CLZ),
-            Instruction::I64Ctz => Op::unit(OP_I64_CTZ),
-            Instruction::I64Popcnt => Op::unit(OP_I64_POPCNT),
-            Instruction::I64Add => Op::unit(OP_I64_ADD),
-            Instruction::I64Sub => Op::unit(OP_I64_SUB),
-            Instruction::I64Mul => Op::unit(OP_I64_MUL),
-            Instruction::I64DivS => Op::unit(OP_I64_DIV_S),
-            Instruction::I64DivU => Op::unit(OP_I64_DIV_U),
-            Instruction::I64RemS => Op::unit(OP_I64_REM_S),
-            Instruction::I64RemU => Op::unit(OP_I64_REM_U),
-            Instruction::I64And => Op::unit(OP_I64_AND),
-            Instruction::I64Or => Op::unit(OP_I64_OR),
-            Instruction::I64Xor => Op::unit(OP_I64_XOR),
-            Instruction::I64Shl => Op::unit(OP_I64_SHL),
-            Instruction::I64ShrS => Op::unit(OP_I64_SHR_S),
-            Instruction::I64ShrU => Op::unit(OP_I64_SHR_U),
-            Instruction::I64Rotl => Op::unit(OP_I64_ROTL),
-            Instruction::I64Rotr => Op::unit(OP_I64_ROTR),
-            Instruction::I32WrapI64 => Op::unit(OP_I32_WRAP_I64),
-            Instruction::I64ExtendI32S => Op::unit(OP_I64_EXTEND_I32_S),
-            Instruction::I64ExtendI32U => Op::unit(OP_I64_EXTEND_I32_U),
-            Instruction::F32Eq => Op::unit(OP_F32_EQ),
-            Instruction::F32Ne => Op::unit(OP_F32_NE),
-            Instruction::F32Lt => Op::unit(OP_F32_LT),
-            Instruction::F32Gt => Op::unit(OP_F32_GT),
-            Instruction::F32Le => Op::unit(OP_F32_LE),
-            Instruction::F32Ge => Op::unit(OP_F32_GE),
-            Instruction::F64Eq => Op::unit(OP_F64_EQ),
-            Instruction::F64Ne => Op::unit(OP_F64_NE),
-            Instruction::F64Lt => Op::unit(OP_F64_LT),
-            Instruction::F64Gt => Op::unit(OP_F64_GT),
-            Instruction::F64Le => Op::unit(OP_F64_LE),
-            Instruction::F64Ge => Op::unit(OP_F64_GE),
-            Instruction::F32Abs => Op::unit(OP_F32_ABS),
-            Instruction::F32Neg => Op::unit(OP_F32_NEG),
-            Instruction::F32Ceil => Op::unit(OP_F32_CEIL),
-            Instruction::F32Floor => Op::unit(OP_F32_FLOOR),
-            Instruction::F32Trunc => Op::unit(OP_F32_TRUNC),
-            Instruction::F32Nearest => Op::unit(OP_F32_NEAREST),
-            Instruction::F32Sqrt => Op::unit(OP_F32_SQRT),
-            Instruction::F32Add => Op::unit(OP_F32_ADD),
-            Instruction::F32Sub => Op::unit(OP_F32_SUB),
-            Instruction::F32Mul => Op::unit(OP_F32_MUL),
-            Instruction::F32Div => Op::unit(OP_F32_DIV),
-            Instruction::F32Min => Op::unit(OP_F32_MIN),
-            Instruction::F32Max => Op::unit(OP_F32_MAX),
-            Instruction::F32Copysign => Op::unit(OP_F32_COPYSIGN),
-            Instruction::F64Abs => Op::unit(OP_F64_ABS),
-            Instruction::F64Neg => Op::unit(OP_F64_NEG),
-            Instruction::F64Ceil => Op::unit(OP_F64_CEIL),
-            Instruction::F64Floor => Op::unit(OP_F64_FLOOR),
-            Instruction::F64Trunc => Op::unit(OP_F64_TRUNC),
-            Instruction::F64Nearest => Op::unit(OP_F64_NEAREST),
-            Instruction::F64Sqrt => Op::unit(OP_F64_SQRT),
-            Instruction::F64Add => Op::unit(OP_F64_ADD),
-            Instruction::F64Sub => Op::unit(OP_F64_SUB),
-            Instruction::F64Mul => Op::unit(OP_F64_MUL),
-            Instruction::F64Div => Op::unit(OP_F64_DIV),
-            Instruction::F64Min => Op::unit(OP_F64_MIN),
-            Instruction::F64Max => Op::unit(OP_F64_MAX),
-            Instruction::F64Copysign => Op::unit(OP_F64_COPYSIGN),
-            Instruction::I32TruncF32S => Op::unit(OP_I32_TRUNC_F32_S),
-            Instruction::I32TruncF32U => Op::unit(OP_I32_TRUNC_F32_U),
-            Instruction::I32TruncF64S => Op::unit(OP_I32_TRUNC_F64_S),
-            Instruction::I32TruncF64U => Op::unit(OP_I32_TRUNC_F64_U),
-            Instruction::I64TruncF32S => Op::unit(OP_I64_TRUNC_F32_S),
-            Instruction::I64TruncF32U => Op::unit(OP_I64_TRUNC_F32_U),
-            Instruction::I64TruncF64S => Op::unit(OP_I64_TRUNC_F64_S),
-            Instruction::I64TruncF64U => Op::unit(OP_I64_TRUNC_F64_U),
-            Instruction::F32ConvertI32S => Op::unit(OP_F32_CONVERT_I32_S),
-            Instruction::F32ConvertI32U => Op::unit(OP_F32_CONVERT_I32_U),
-            Instruction::F32ConvertI64S => Op::unit(OP_F32_CONVERT_I64_S),
-            Instruction::F32ConvertI64U => Op::unit(OP_F32_CONVERT_I64_U),
-            Instruction::F32DemoteF64 => Op::unit(OP_F32_DEMOTE_F64),
-            Instruction::F64ConvertI32S => Op::unit(OP_F64_CONVERT_I32_S),
-            Instruction::F64ConvertI32U => Op::unit(OP_F64_CONVERT_I32_U),
-            Instruction::F64ConvertI64S => Op::unit(OP_F64_CONVERT_I64_S),
-            Instruction::F64ConvertI64U => Op::unit(OP_F64_CONVERT_I64_U),
-            Instruction::F64PromoteF32 => Op::unit(OP_F64_PROMOTE_F32),
-            Instruction::I32ReinterpretF32 => Op::unit(OP_I32_REINTERPRET_F32),
-            Instruction::I64ReinterpretF64 => Op::unit(OP_I64_REINTERPRET_F64),
-            Instruction::F32ReinterpretI32 => Op::unit(OP_F32_REINTERPRET_I32),
-            Instruction::F64ReinterpretI64 => Op::unit(OP_F64_REINTERPRET_I64),
-            Instruction::I32Extend8S => Op::unit(OP_I32_EXTEND8_S),
-            Instruction::I32Extend16S => Op::unit(OP_I32_EXTEND16_S),
-            Instruction::I64Extend8S => Op::unit(OP_I64_EXTEND8_S),
-            Instruction::I64Extend16S => Op::unit(OP_I64_EXTEND16_S),
-            Instruction::I64Extend32S => Op::unit(OP_I64_EXTEND32_S),
-            Instruction::I32TruncSatF32S => Op::unit(OP_I32_TRUNC_SAT_F32_S),
-            Instruction::I32TruncSatF32U => Op::unit(OP_I32_TRUNC_SAT_F32_U),
-            Instruction::I32TruncSatF64S => Op::unit(OP_I32_TRUNC_SAT_F64_S),
-            Instruction::I32TruncSatF64U => Op::unit(OP_I32_TRUNC_SAT_F64_U),
-            Instruction::I64TruncSatF32S => Op::unit(OP_I64_TRUNC_SAT_F32_S),
-            Instruction::I64TruncSatF32U => Op::unit(OP_I64_TRUNC_SAT_F32_U),
-            Instruction::I64TruncSatF64S => Op::unit(OP_I64_TRUNC_SAT_F64_S),
-            Instruction::I64TruncSatF64U => Op::unit(OP_I64_TRUNC_SAT_F64_U),
-            Instruction::RefFunc(idx) => Op::new(OP_REF_FUNC, *idx as u64),
-            Instruction::RefNull => Op::unit(OP_REF_NULL),
-            Instruction::RefIsNull => Op::unit(OP_REF_IS_NULL),
-            Instruction::TableInit { elem_idx, table_idx } => {
-                Op::pair(OP_TABLE_INIT, *elem_idx, *table_idx)
-            }
-            Instruction::ElemDrop(idx) => Op::new(OP_ELEM_DROP, *idx as u64),
-            Instruction::MemoryInit(idx) => Op::new(OP_MEMORY_INIT, *idx as u64),
-            Instruction::DataDrop(idx) => Op::new(OP_DATA_DROP, *idx as u64),
-            Instruction::MemoryCopy => Op::unit(OP_MEMORY_COPY),
-            Instruction::MemoryFill => Op::unit(OP_MEMORY_FILL),
-            Instruction::TableGet(idx) => Op::new(OP_TABLE_GET, *idx as u64),
-            Instruction::TableSet(idx) => Op::new(OP_TABLE_SET, *idx as u64),
-            Instruction::TableGrow(idx) => Op::new(OP_TABLE_GROW, *idx as u64),
-            Instruction::TableSize(idx) => Op::new(OP_TABLE_SIZE, *idx as u64),
-            Instruction::TableCopy { dst_table, src_table } => {
-                Op::pair(OP_TABLE_COPY, *dst_table, *src_table)
-            }
-            Instruction::TableFill(idx) => Op::new(OP_TABLE_FILL, *idx as u64),
-        };
-        ops.push(op);
-    }
-    (ops, br_tables)
-}
-
 /// Fill in end_pc/else_pc for Block and If instructions.
 pub fn resolve_block_targets(body: &mut [Instruction]) {
     // Stack of (block_start_pc, is_if)
@@ -823,6 +291,272 @@ pub fn resolve_block_targets(body: &mut [Instruction]) {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+pub(crate) fn decode_block_type(bt: wasmparser::BlockType) -> BlockType {
+    match bt {
+        wasmparser::BlockType::Empty => BlockType::Empty,
+        wasmparser::BlockType::Type(ty) => BlockType::Val(ty),
+        wasmparser::BlockType::FuncType(idx) => BlockType::FuncType(idx),
+    }
+}
+
+pub(crate) fn decode_op(op: &Operator) -> Option<Instruction> {
+    Some(match *op {
+        Operator::Unreachable => Instruction::Unreachable,
+        Operator::Nop => Instruction::Nop,
+        Operator::Block { blockty } => Instruction::Block { ty: decode_block_type(blockty), end_pc: 0 },
+        Operator::Loop { blockty } => Instruction::Loop { ty: decode_block_type(blockty) },
+        Operator::If { blockty } => Instruction::If { ty: decode_block_type(blockty), end_pc: 0, else_pc: None },
+        Operator::Else => Instruction::Else,
+        Operator::End => Instruction::End,
+        Operator::Br { relative_depth } => Instruction::Br(relative_depth),
+        Operator::BrIf { relative_depth } => Instruction::BrIf(relative_depth),
+        Operator::BrTable { ref targets } => Instruction::BrTable {
+            targets: targets.targets().collect::<Result<Vec<_>, _>>().ok()?,
+            default: targets.default(),
+        },
+        Operator::Return => Instruction::Return,
+        Operator::Call { function_index } => Instruction::Call(function_index),
+        Operator::CallIndirect { type_index, table_index } => Instruction::CallIndirect {
+            type_idx: type_index,
+            table_idx: table_index,
+        },
+        Operator::Drop => Instruction::Drop,
+        Operator::Select => Instruction::Select,
+        Operator::TypedSelect { .. } => Instruction::Select,
+
+        Operator::LocalGet { local_index } => Instruction::LocalGet(local_index),
+        Operator::LocalSet { local_index } => Instruction::LocalSet(local_index),
+        Operator::LocalTee { local_index } => Instruction::LocalTee(local_index),
+        Operator::GlobalGet { global_index } => Instruction::GlobalGet(global_index),
+        Operator::GlobalSet { global_index } => Instruction::GlobalSet(global_index),
+
+        Operator::I32Load { memarg } => Instruction::I32Load(memarg.offset),
+        Operator::I64Load { memarg } => Instruction::I64Load(memarg.offset),
+        Operator::F32Load { memarg } => Instruction::F32Load(memarg.offset),
+        Operator::F64Load { memarg } => Instruction::F64Load(memarg.offset),
+        Operator::I32Load8S { memarg } => Instruction::I32Load8S(memarg.offset),
+        Operator::I32Load8U { memarg } => Instruction::I32Load8U(memarg.offset),
+        Operator::I32Load16S { memarg } => Instruction::I32Load16S(memarg.offset),
+        Operator::I32Load16U { memarg } => Instruction::I32Load16U(memarg.offset),
+        Operator::I64Load8S { memarg } => Instruction::I64Load8S(memarg.offset),
+        Operator::I64Load8U { memarg } => Instruction::I64Load8U(memarg.offset),
+        Operator::I64Load16S { memarg } => Instruction::I64Load16S(memarg.offset),
+        Operator::I64Load16U { memarg } => Instruction::I64Load16U(memarg.offset),
+        Operator::I64Load32S { memarg } => Instruction::I64Load32S(memarg.offset),
+        Operator::I64Load32U { memarg } => Instruction::I64Load32U(memarg.offset),
+        Operator::I32Store { memarg } => Instruction::I32Store(memarg.offset),
+        Operator::I64Store { memarg } => Instruction::I64Store(memarg.offset),
+        Operator::F32Store { memarg } => Instruction::F32Store(memarg.offset),
+        Operator::F64Store { memarg } => Instruction::F64Store(memarg.offset),
+        Operator::I32Store8 { memarg } => Instruction::I32Store8(memarg.offset),
+        Operator::I32Store16 { memarg } => Instruction::I32Store16(memarg.offset),
+        Operator::I64Store8 { memarg } => Instruction::I64Store8(memarg.offset),
+        Operator::I64Store16 { memarg } => Instruction::I64Store16(memarg.offset),
+        Operator::I64Store32 { memarg } => Instruction::I64Store32(memarg.offset),
+        Operator::MemorySize { .. } => Instruction::MemorySize,
+        Operator::MemoryGrow { .. } => Instruction::MemoryGrow,
+
+        Operator::I32Const { value } => Instruction::I32Const(value),
+        Operator::I64Const { value } => Instruction::I64Const(value),
+        Operator::F32Const { value } => Instruction::F32Const(f32::from_bits(value.bits())),
+        Operator::F64Const { value } => Instruction::F64Const(f64::from_bits(value.bits())),
+
+        Operator::I32Eqz => Instruction::I32Eqz,
+        Operator::I32Eq => Instruction::I32Eq,
+        Operator::I32Ne => Instruction::I32Ne,
+        Operator::I32LtS => Instruction::I32LtS,
+        Operator::I32LtU => Instruction::I32LtU,
+        Operator::I32GtS => Instruction::I32GtS,
+        Operator::I32GtU => Instruction::I32GtU,
+        Operator::I32LeS => Instruction::I32LeS,
+        Operator::I32LeU => Instruction::I32LeU,
+        Operator::I32GeS => Instruction::I32GeS,
+        Operator::I32GeU => Instruction::I32GeU,
+        Operator::I32Clz => Instruction::I32Clz,
+        Operator::I32Ctz => Instruction::I32Ctz,
+        Operator::I32Popcnt => Instruction::I32Popcnt,
+        Operator::I32Add => Instruction::I32Add,
+        Operator::I32Sub => Instruction::I32Sub,
+        Operator::I32Mul => Instruction::I32Mul,
+        Operator::I32DivS => Instruction::I32DivS,
+        Operator::I32DivU => Instruction::I32DivU,
+        Operator::I32RemS => Instruction::I32RemS,
+        Operator::I32RemU => Instruction::I32RemU,
+        Operator::I32And => Instruction::I32And,
+        Operator::I32Or => Instruction::I32Or,
+        Operator::I32Xor => Instruction::I32Xor,
+        Operator::I32Shl => Instruction::I32Shl,
+        Operator::I32ShrS => Instruction::I32ShrS,
+        Operator::I32ShrU => Instruction::I32ShrU,
+        Operator::I32Rotl => Instruction::I32Rotl,
+        Operator::I32Rotr => Instruction::I32Rotr,
+
+        Operator::I64Eqz => Instruction::I64Eqz,
+        Operator::I64Eq => Instruction::I64Eq,
+        Operator::I64Ne => Instruction::I64Ne,
+        Operator::I64LtS => Instruction::I64LtS,
+        Operator::I64LtU => Instruction::I64LtU,
+        Operator::I64GtS => Instruction::I64GtS,
+        Operator::I64GtU => Instruction::I64GtU,
+        Operator::I64LeS => Instruction::I64LeS,
+        Operator::I64LeU => Instruction::I64LeU,
+        Operator::I64GeS => Instruction::I64GeS,
+        Operator::I64GeU => Instruction::I64GeU,
+        Operator::I64Clz => Instruction::I64Clz,
+        Operator::I64Ctz => Instruction::I64Ctz,
+        Operator::I64Popcnt => Instruction::I64Popcnt,
+        Operator::I64Add => Instruction::I64Add,
+        Operator::I64Sub => Instruction::I64Sub,
+        Operator::I64Mul => Instruction::I64Mul,
+        Operator::I64DivS => Instruction::I64DivS,
+        Operator::I64DivU => Instruction::I64DivU,
+        Operator::I64RemS => Instruction::I64RemS,
+        Operator::I64RemU => Instruction::I64RemU,
+        Operator::I64And => Instruction::I64And,
+        Operator::I64Or => Instruction::I64Or,
+        Operator::I64Xor => Instruction::I64Xor,
+        Operator::I64Shl => Instruction::I64Shl,
+        Operator::I64ShrS => Instruction::I64ShrS,
+        Operator::I64ShrU => Instruction::I64ShrU,
+        Operator::I64Rotl => Instruction::I64Rotl,
+        Operator::I64Rotr => Instruction::I64Rotr,
+
+        Operator::I32WrapI64 => Instruction::I32WrapI64,
+        Operator::I64ExtendI32S => Instruction::I64ExtendI32S,
+        Operator::I64ExtendI32U => Instruction::I64ExtendI32U,
+
+        Operator::F32Eq => Instruction::F32Eq,
+        Operator::F32Ne => Instruction::F32Ne,
+        Operator::F32Lt => Instruction::F32Lt,
+        Operator::F32Gt => Instruction::F32Gt,
+        Operator::F32Le => Instruction::F32Le,
+        Operator::F32Ge => Instruction::F32Ge,
+        Operator::F64Eq => Instruction::F64Eq,
+        Operator::F64Ne => Instruction::F64Ne,
+        Operator::F64Lt => Instruction::F64Lt,
+        Operator::F64Gt => Instruction::F64Gt,
+        Operator::F64Le => Instruction::F64Le,
+        Operator::F64Ge => Instruction::F64Ge,
+        Operator::F32Abs => Instruction::F32Abs,
+        Operator::F32Neg => Instruction::F32Neg,
+        Operator::F32Ceil => Instruction::F32Ceil,
+        Operator::F32Floor => Instruction::F32Floor,
+        Operator::F32Trunc => Instruction::F32Trunc,
+        Operator::F32Nearest => Instruction::F32Nearest,
+        Operator::F32Sqrt => Instruction::F32Sqrt,
+        Operator::F32Add => Instruction::F32Add,
+        Operator::F32Sub => Instruction::F32Sub,
+        Operator::F32Mul => Instruction::F32Mul,
+        Operator::F32Div => Instruction::F32Div,
+        Operator::F32Min => Instruction::F32Min,
+        Operator::F32Max => Instruction::F32Max,
+        Operator::F32Copysign => Instruction::F32Copysign,
+        Operator::F64Abs => Instruction::F64Abs,
+        Operator::F64Neg => Instruction::F64Neg,
+        Operator::F64Ceil => Instruction::F64Ceil,
+        Operator::F64Floor => Instruction::F64Floor,
+        Operator::F64Trunc => Instruction::F64Trunc,
+        Operator::F64Nearest => Instruction::F64Nearest,
+        Operator::F64Sqrt => Instruction::F64Sqrt,
+        Operator::F64Add => Instruction::F64Add,
+        Operator::F64Sub => Instruction::F64Sub,
+        Operator::F64Mul => Instruction::F64Mul,
+        Operator::F64Div => Instruction::F64Div,
+        Operator::F64Min => Instruction::F64Min,
+        Operator::F64Max => Instruction::F64Max,
+        Operator::F64Copysign => Instruction::F64Copysign,
+
+        Operator::I32TruncF32S => Instruction::I32TruncF32S,
+        Operator::I32TruncF32U => Instruction::I32TruncF32U,
+        Operator::I32TruncF64S => Instruction::I32TruncF64S,
+        Operator::I32TruncF64U => Instruction::I32TruncF64U,
+        Operator::I64TruncF32S => Instruction::I64TruncF32S,
+        Operator::I64TruncF32U => Instruction::I64TruncF32U,
+        Operator::I64TruncF64S => Instruction::I64TruncF64S,
+        Operator::I64TruncF64U => Instruction::I64TruncF64U,
+        Operator::F32ConvertI32S => Instruction::F32ConvertI32S,
+        Operator::F32ConvertI32U => Instruction::F32ConvertI32U,
+        Operator::F32ConvertI64S => Instruction::F32ConvertI64S,
+        Operator::F32ConvertI64U => Instruction::F32ConvertI64U,
+        Operator::F32DemoteF64 => Instruction::F32DemoteF64,
+        Operator::F64ConvertI32S => Instruction::F64ConvertI32S,
+        Operator::F64ConvertI32U => Instruction::F64ConvertI32U,
+        Operator::F64ConvertI64S => Instruction::F64ConvertI64S,
+        Operator::F64ConvertI64U => Instruction::F64ConvertI64U,
+        Operator::F64PromoteF32 => Instruction::F64PromoteF32,
+        Operator::I32ReinterpretF32 => Instruction::I32ReinterpretF32,
+        Operator::I64ReinterpretF64 => Instruction::I64ReinterpretF64,
+        Operator::F32ReinterpretI32 => Instruction::F32ReinterpretI32,
+        Operator::F64ReinterpretI64 => Instruction::F64ReinterpretI64,
+
+        Operator::I32Extend8S => Instruction::I32Extend8S,
+        Operator::I32Extend16S => Instruction::I32Extend16S,
+        Operator::I64Extend8S => Instruction::I64Extend8S,
+        Operator::I64Extend16S => Instruction::I64Extend16S,
+        Operator::I64Extend32S => Instruction::I64Extend32S,
+
+        Operator::I32TruncSatF32S => Instruction::I32TruncSatF32S,
+        Operator::I32TruncSatF32U => Instruction::I32TruncSatF32U,
+        Operator::I32TruncSatF64S => Instruction::I32TruncSatF64S,
+        Operator::I32TruncSatF64U => Instruction::I32TruncSatF64U,
+        Operator::I64TruncSatF32S => Instruction::I64TruncSatF32S,
+        Operator::I64TruncSatF32U => Instruction::I64TruncSatF32U,
+        Operator::I64TruncSatF64S => Instruction::I64TruncSatF64S,
+        Operator::I64TruncSatF64U => Instruction::I64TruncSatF64U,
+
+        Operator::RefFunc { function_index } => Instruction::RefFunc(function_index),
+        Operator::RefNull { .. } => Instruction::RefNull,
+
+        Operator::RefIsNull => Instruction::RefIsNull,
+
+        Operator::TableInit { elem_index, table } => Instruction::TableInit { elem_idx: elem_index, table_idx: table },
+        Operator::ElemDrop { elem_index } => Instruction::ElemDrop(elem_index),
+        Operator::MemoryInit { data_index, mem: 0 } => Instruction::MemoryInit(data_index),
+        Operator::DataDrop { data_index } => Instruction::DataDrop(data_index),
+        Operator::MemoryCopy { dst_mem: 0, src_mem: 0 } => Instruction::MemoryCopy,
+        Operator::MemoryFill { mem: 0 } => Instruction::MemoryFill,
+
+        Operator::TableGet { table } => Instruction::TableGet(table),
+        Operator::TableSet { table } => Instruction::TableSet(table),
+        Operator::TableGrow { table } => Instruction::TableGrow(table),
+        Operator::TableSize { table } => Instruction::TableSize(table),
+        Operator::TableCopy { dst_table, src_table } => Instruction::TableCopy { dst_table, src_table },
+        Operator::TableFill { table } => Instruction::TableFill(table),
+
+        _ => return None,
+    })
+}
+
+/// Peephole optimization pass: fuse common instruction sequences into superinstructions.
+/// Replaces consumed instructions with Nop to preserve body length and all PC offsets.
+pub(crate) fn peephole_optimize(body: &mut [Instruction]) {
+    let len = body.len();
+    let mut i = 0;
+    while i + 1 < len {
+        match (&body[i], &body[i + 1]) {
+            // LocalGet + I32Const -> LocalGetI32Const
+            (Instruction::LocalGet(idx), Instruction::I32Const(val)) => {
+                let idx = *idx;
+                let val = *val;
+                body[i] = Instruction::LocalGetI32Const(idx, val);
+                body[i + 1] = Instruction::Nop;
+                i += 2;
+            }
+            // LocalGet + LocalGet -> LocalGetLocalGet
+            (Instruction::LocalGet(a), Instruction::LocalGet(b)) => {
+                let a = *a;
+                let b = *b;
+                body[i] = Instruction::LocalGetLocalGet(a, b);
+                body[i + 1] = Instruction::Nop;
+                i += 2;
+            }
+            _ => {
+                i += 1;
+            }
         }
     }
 }

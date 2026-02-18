@@ -1,6 +1,22 @@
 #![no_std]
 extern crate alloc;
 
+/// Dummy getrandom backend for `wasm32-unknown-unknown`.
+///
+/// Boa's dependency chain pulls in `getrandom`, but we don't need
+/// cryptographic randomness in the embedded JS runtime. This fills
+/// the buffer with zeros, which is sufficient for non-security uses.
+///
+/// Activated by building with `--cfg getrandom_backend="custom"`.
+#[unsafe(no_mangle)]
+unsafe extern "Rust" fn __getrandom_v03_custom(
+    dest: *mut u8,
+    len: usize,
+) -> Result<(), getrandom::Error> {
+    unsafe { core::ptr::write_bytes(dest, 0, len) };
+    Ok(())
+}
+
 use alloc::alloc::Layout;
 use boa_engine::native_function::NativeFunction;
 use boa_engine::{Context, JsArgs, JsValue, Source, js_string};

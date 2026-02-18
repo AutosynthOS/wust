@@ -1,5 +1,5 @@
 use crate::runtime::module::Module;
-use crate::runtime::instruction::*;
+use crate::runtime::opcode::*;
 use crate::runtime::store::{Store, EXTERN_FUNC_BASE};
 use crate::runtime::value::Value;
 
