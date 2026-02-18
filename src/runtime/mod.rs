@@ -6,7 +6,7 @@ mod value;
 // #[cfg(target_arch = "aarch64")]
 // pub mod jit;
 
-pub use module::Module;
-pub use store::{Store, HostFunc};
+pub use module::{Module, ExportKind};
+pub use store::{Store, HostFunc, EXTERN_FUNC_BASE};
 pub use exec::ExecError;
 pub use value::Value;

@@ -61,7 +61,7 @@ pub struct MemoryType {
 pub struct GlobalDef {
     pub ty: ValType,
     pub mutable: bool,
-    pub init: Instruction,
+    pub init: Vec<Instruction>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +95,18 @@ pub struct TableDef {
 pub struct ElemSegment {
     pub table_idx: u32,
     pub offset: Vec<Instruction>,
-    pub func_indices: Vec<u32>,
+    /// Each item is either a direct func index or an expression needing evaluation.
+    pub items: Vec<ElemItem>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ElemItem {
+    /// Direct function reference.
+    Func(u32),
+    /// Null reference.
+    Null,
+    /// Expression to evaluate at instantiation time (e.g. global.get for funcref).
+    Expr(Vec<Instruction>),
 }
 
 /// Our own instruction enum — decoded from wasmparser's Operator once at parse
@@ -304,6 +315,10 @@ pub enum Instruction {
     I64Extend8S,
     I64Extend16S,
     I64Extend32S,
+
+    // Reference types
+    RefFunc(u32),
+    RefNull,
 
     // Bulk memory operations
     TableInit { elem_idx: u32, table_idx: u32 },
@@ -580,8 +595,10 @@ pub const OP_I64_TRUNC_SAT_F32_U: u8 = 185;
 pub const OP_I64_TRUNC_SAT_F64_S: u8 = 186;
 pub const OP_I64_TRUNC_SAT_F64_U: u8 = 187;
 // Bulk memory operations
-pub const OP_TABLE_INIT: u8 = 188;      // imm = (elem_idx << 32) | table_idx
-pub const OP_ELEM_DROP: u8 = 189;       // imm = elem_idx
+pub const OP_REF_FUNC: u8 = 188;        // imm = func_idx
+pub const OP_REF_NULL: u8 = 189;
+pub const OP_TABLE_INIT: u8 = 190;      // imm = (elem_idx << 32) | table_idx
+pub const OP_ELEM_DROP: u8 = 191;       // imm = elem_idx
 
 /// Compile a Vec<Instruction> into flat Ops, pre-computing block arities.
 /// Returns (ops, br_tables) where br_tables stores BrTable target data out-of-line.
@@ -821,6 +838,8 @@ fn compile_body(instrs: &[Instruction], types: &[FuncType]) -> (Vec<Op>, Vec<(Ve
             Instruction::I64TruncSatF32U => Op::unit(OP_I64_TRUNC_SAT_F32_U),
             Instruction::I64TruncSatF64S => Op::unit(OP_I64_TRUNC_SAT_F64_S),
             Instruction::I64TruncSatF64U => Op::unit(OP_I64_TRUNC_SAT_F64_U),
+            Instruction::RefFunc(idx) => Op::new(OP_REF_FUNC, *idx as u64),
+            Instruction::RefNull => Op::unit(OP_REF_NULL),
             Instruction::TableInit { elem_idx, table_idx } => {
                 Op::pair(OP_TABLE_INIT, *elem_idx, *table_idx)
             }
@@ -833,6 +852,11 @@ fn compile_body(instrs: &[Instruction], types: &[FuncType]) -> (Vec<Op>, Vec<(Ve
 
 impl Module {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        // Validate the module before parsing
+        wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::default())
+            .validate_all(bytes)
+            .map_err(|e| format!("validation error: {e}"))?;
+
         let parser = Parser::new(0);
         let mut types = Vec::new();
         let mut funcs = Vec::new();
@@ -913,7 +937,7 @@ impl Module {
                 Payload::GlobalSection(reader) => {
                     for global in reader {
                         let global = global.map_err(|e| format!("global error: {e}"))?;
-                        let init = decode_const_expr(&global.init_expr)?;
+                        let init = decode_const_expr_multi(&global.init_expr)?;
                         globals.push(GlobalDef {
                             ty: global.ty.content_type,
                             mutable: global.ty.mutable,
@@ -940,38 +964,36 @@ impl Module {
                         {
                             let table_idx = table_index.unwrap_or(0);
                             let offset = decode_const_expr_multi(&offset_expr)?;
-                            let mut func_indices = Vec::new();
+                            let mut items = Vec::new();
                             match elem.items {
                                 wasmparser::ElementItems::Functions(reader) => {
                                     for idx in reader {
                                         let idx = idx.map_err(|e| format!("elem func error: {e}"))?;
-                                        func_indices.push(idx);
+                                        items.push(ElemItem::Func(idx));
                                     }
                                 }
                                 wasmparser::ElementItems::Expressions(_, reader) => {
                                     for expr in reader {
                                         let expr = expr.map_err(|e| format!("elem expr error: {e}"))?;
-                                        let mut expr_reader = expr.get_operators_reader();
-                                        let mut found = false;
-                                        while let Ok(op) = expr_reader.read() {
-                                            match op {
-                                                Operator::RefFunc { function_index } => {
-                                                    func_indices.push(function_index);
-                                                    found = true;
-                                                    break;
+                                        let instrs = decode_const_expr_multi(&expr)?;
+                                        // Try to resolve simple cases at parse time
+                                        if instrs.len() == 1 {
+                                            match &instrs[0] {
+                                                Instruction::RefFunc(idx) => {
+                                                    items.push(ElemItem::Func(*idx));
+                                                    continue;
                                                 }
-                                                Operator::I32Const { value } => {
-                                                    func_indices.push(value as u32);
-                                                    found = true;
-                                                    break;
+                                                Instruction::RefNull => {
+                                                    items.push(ElemItem::Null);
+                                                    continue;
                                                 }
-                                                Operator::End => break,
                                                 _ => {}
                                             }
                                         }
-                                        if !found {
-                                            // ref.null — push a sentinel; store will treat as None
-                                            func_indices.push(u32::MAX);
+                                        if instrs.is_empty() {
+                                            items.push(ElemItem::Null);
+                                        } else {
+                                            items.push(ElemItem::Expr(instrs));
                                         }
                                     }
                                 }
@@ -979,7 +1001,7 @@ impl Module {
                             elements.push(ElemSegment {
                                 table_idx,
                                 offset,
-                                func_indices,
+                                items,
                             });
                         }
                     }
@@ -1374,6 +1396,9 @@ fn decode_op(op: &Operator) -> Option<Instruction> {
         Operator::I64TruncSatF32U => Instruction::I64TruncSatF32U,
         Operator::I64TruncSatF64S => Instruction::I64TruncSatF64S,
         Operator::I64TruncSatF64U => Instruction::I64TruncSatF64U,
+
+        Operator::RefFunc { function_index } => Instruction::RefFunc(function_index),
+        Operator::RefNull { .. } => Instruction::RefNull,
 
         Operator::TableInit { elem_index, table } => Instruction::TableInit { elem_idx: elem_index, table_idx: table },
         Operator::ElemDrop { elem_index } => Instruction::ElemDrop(elem_index),

@@ -1,9 +1,10 @@
 use crate::runtime::module::{Module, Op};
 use crate::runtime::module::*;
-use crate::runtime::store::Store;
+use crate::runtime::store::{Store, EXTERN_FUNC_BASE};
 use crate::runtime::value::Value;
 
 const MAX_STEPS: u64 = 100_000_000;
+const MAX_CALL_DEPTH: usize = 10_000;
 
 #[derive(Debug)]
 pub enum ExecError {
@@ -624,6 +625,9 @@ pub fn call(
                         body: &callee.body,
                         br_tables: &callee.br_tables,
                     };
+                    if call_stack.len() >= MAX_CALL_DEPTH {
+                        return Err(ExecError::Trap("call stack exhausted".into()));
+                    }
                     let old_frame = std::mem::replace(&mut frame, new_f);
                     call_stack.push(old_frame);
                 }
@@ -638,7 +642,31 @@ pub fn call(
                     .ok_or_else(|| ExecError::Trap("undefined element".into()))?
                     .ok_or_else(|| ExecError::Trap("uninitialized element".into()))?;
 
-                if module.is_import(func_idx) {
+                if func_idx >= EXTERN_FUNC_BASE {
+                    // External function reference (cross-module funcref)
+                    let extern_idx = (func_idx - EXTERN_FUNC_BASE) as usize;
+                    let expected_type = &module.types[ci_type_idx as usize];
+                    let param_count = expected_type.params().len();
+                    let val_args: Vec<Value> = expected_type.params().iter().enumerate().map(|(i, &ty)| {
+                        let bits = stack[stack.len() - param_count + i];
+                        match ty {
+                            wasmparser::ValType::I32 => Value::I32(bits as i32),
+                            wasmparser::ValType::I64 => Value::I64(bits as i64),
+                            wasmparser::ValType::F32 => Value::F32(f32::from_bits(bits as u32)),
+                            wasmparser::ValType::F64 => Value::F64(f64::from_bits(bits)),
+                            _ => Value::I32(0),
+                        }
+                    }).collect();
+                    stack.truncate(stack.len() - param_count);
+                    if let Some(extern_fn) = store.extern_funcs.get(extern_idx) {
+                        let results = extern_fn(&val_args);
+                        for r in results {
+                            stack.push(r.to_bits());
+                        }
+                    } else {
+                        return Err(ExecError::Trap(format!("unresolved extern function {func_idx}")));
+                    }
+                } else if module.is_import(func_idx) {
                     let callee_type_idx = module.func_types[func_idx as usize];
                     if module.types[callee_type_idx as usize] != module.types[ci_type_idx as usize] {
                         return Err(ExecError::Trap("indirect call type mismatch".into()));
@@ -693,6 +721,9 @@ pub fn call(
                         body: &callee.body,
                         br_tables: &callee.br_tables,
                     };
+                    if call_stack.len() >= MAX_CALL_DEPTH {
+                        return Err(ExecError::Trap("call stack exhausted".into()));
+                    }
                     let old_frame = std::mem::replace(&mut frame, new_f);
                     call_stack.push(old_frame);
                 }
@@ -743,6 +774,10 @@ pub fn call(
                     Value::I64(_) => Value::I64(bits as i64),
                     Value::F32(_) => Value::F32(f32::from_bits(bits as u32)),
                     Value::F64(_) => Value::F64(f64::from_bits(bits)),
+                    Value::FuncRef(_) => {
+                        if bits == u64::MAX { Value::FuncRef(None) }
+                        else { Value::FuncRef(Some(bits as u32)) }
+                    }
                 };
             }
 

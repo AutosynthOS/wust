@@ -1,4 +1,4 @@
-use crate::runtime::module::{Instruction, Module};
+use crate::runtime::module::{ElemItem, Instruction, Module};
 use crate::runtime::value::Value;
 
 const PAGE_SIZE: usize = 65536; // 64KB WASM pages
@@ -34,8 +34,85 @@ fn eval_const_expr_i32(instrs: &[Instruction], globals: &[Value]) -> Option<i32>
     stack.pop()
 }
 
+/// Evaluate a const expression to a Value, supporting all WASM types and extended const ops.
+fn eval_const_expr(instrs: &[Instruction], globals: &[Value]) -> Option<Value> {
+    let mut stack: Vec<Value> = Vec::new();
+    for instr in instrs {
+        match instr {
+            Instruction::I32Const(v) => stack.push(Value::I32(*v)),
+            Instruction::I64Const(v) => stack.push(Value::I64(*v)),
+            Instruction::F32Const(v) => stack.push(Value::F32(*v)),
+            Instruction::F64Const(v) => stack.push(Value::F64(*v)),
+            Instruction::RefFunc(idx) => stack.push(Value::FuncRef(Some(*idx))),
+            Instruction::RefNull => stack.push(Value::FuncRef(None)),
+            Instruction::GlobalGet(idx) => {
+                stack.push(*globals.get(*idx as usize)?);
+            }
+            Instruction::I32Add => {
+                let b = stack.pop()?.unwrap_i32();
+                let a = stack.pop()?.unwrap_i32();
+                stack.push(Value::I32(a.wrapping_add(b)));
+            }
+            Instruction::I32Sub => {
+                let b = stack.pop()?.unwrap_i32();
+                let a = stack.pop()?.unwrap_i32();
+                stack.push(Value::I32(a.wrapping_sub(b)));
+            }
+            Instruction::I32Mul => {
+                let b = stack.pop()?.unwrap_i32();
+                let a = stack.pop()?.unwrap_i32();
+                stack.push(Value::I32(a.wrapping_mul(b)));
+            }
+            Instruction::I64Add => {
+                let b = stack.pop()?.unwrap_i64();
+                let a = stack.pop()?.unwrap_i64();
+                stack.push(Value::I64(a.wrapping_add(b)));
+            }
+            Instruction::I64Sub => {
+                let b = stack.pop()?.unwrap_i64();
+                let a = stack.pop()?.unwrap_i64();
+                stack.push(Value::I64(a.wrapping_sub(b)));
+            }
+            Instruction::I64Mul => {
+                let b = stack.pop()?.unwrap_i64();
+                let a = stack.pop()?.unwrap_i64();
+                stack.push(Value::I64(a.wrapping_mul(b)));
+            }
+            _ => return None,
+        }
+    }
+    stack.pop()
+}
+
+/// Resolve an element item to a function index, using globals for deferred expressions.
+fn resolve_elem_item(item: &ElemItem, globals: &[Value]) -> Option<u32> {
+    match item {
+        ElemItem::Func(idx) => Some(*idx),
+        ElemItem::Null => None,
+        ElemItem::Expr(instrs) => {
+            // Evaluate expression — could be global.get for a funcref
+            for instr in instrs {
+                match instr {
+                    Instruction::GlobalGet(idx) => match globals.get(*idx as usize) {
+                        Some(&Value::FuncRef(func_ref)) => return func_ref,
+                        Some(&Value::I32(v)) => return Some(v as u32),
+                        _ => return None,
+                    },
+                    Instruction::RefFunc(idx) => return Some(*idx),
+                    Instruction::RefNull => return None,
+                    _ => {}
+                }
+            }
+            None
+        }
+    }
+}
+
 /// A host-provided function callable by imported WASM functions.
 pub type HostFunc = Box<dyn Fn(&[Value]) -> Vec<Value>>;
+
+/// Function indices >= this are external funcref callbacks stored in Store.extern_funcs.
+pub const EXTERN_FUNC_BASE: u32 = 0x7FFF_0000;
 
 /// Runtime instance state for an instantiated module.
 pub struct Store {
@@ -49,6 +126,18 @@ pub struct Store {
     pub host_funcs: Vec<HostFunc>,
     /// Element segment data for table.init (None = dropped).
     pub elem_segments: Vec<Option<Vec<Option<u32>>>>,
+    /// External funcref callbacks (for cross-module function references).
+    /// Indexed by (func_idx - EXTERN_FUNC_BASE).
+    pub extern_funcs: Vec<HostFunc>,
+}
+
+impl Store {
+    /// Register an external function callback and return its funcref index.
+    pub fn add_extern_func(&mut self, func: HostFunc) -> u32 {
+        let idx = EXTERN_FUNC_BASE + self.extern_funcs.len() as u32;
+        self.extern_funcs.push(func);
+        idx
+    }
 }
 
 impl Store {
@@ -74,14 +163,15 @@ impl Store {
         // Init data segments
         for seg in &module.data_segments {
             let offset = match &seg.offset {
-                Instruction::I32Const(v) => *v as usize,
+                Instruction::I32Const(v) => *v as u32 as usize,
                 Instruction::GlobalGet(idx) => match imported_globals.get(*idx as usize) {
-                    Some(&Value::I32(v)) => v as usize,
+                    Some(&Value::I32(v)) => v as u32 as usize,
                     _ => return Err("unsupported data segment offset".into()),
                 },
                 _ => return Err("unsupported data segment offset expr".into()),
             };
-            let end = offset + seg.data.len();
+            let end = offset.checked_add(seg.data.len())
+                .ok_or("out of bounds memory access")?;
             if end > memory.len() {
                 return Err("out of bounds memory access".into());
             }
@@ -91,14 +181,8 @@ impl Store {
         // Init globals: imported globals first, then module-defined globals
         let mut globals = imported_globals;
         for g in &module.globals {
-            let val = match &g.init {
-                Instruction::I32Const(v) => Value::I32(*v),
-                Instruction::I64Const(v) => Value::I64(*v),
-                Instruction::F32Const(v) => Value::F32(*v),
-                Instruction::F64Const(v) => Value::F64(*v),
-                Instruction::GlobalGet(idx) => globals[*idx as usize],
-                _ => Value::I32(0), // skip unsupported init exprs
-            };
+            let val = eval_const_expr(&g.init, &globals)
+                .unwrap_or(Value::I32(0));
             globals.push(val);
         }
 
@@ -112,29 +196,27 @@ impl Store {
         // Apply element segments
         for elem in &module.elements {
             let offset = match eval_const_expr_i32(&elem.offset, &globals) {
-                Some(v) => v as usize,
+                Some(v) => v as u32 as usize,
                 None => continue,
             };
             if let Some(table) = tables.get_mut(elem.table_idx as usize) {
-                if offset + elem.func_indices.len() > table.len() {
+                let end = offset.checked_add(elem.items.len())
+                    .ok_or("out of bounds table access")?;
+                if end > table.len() {
                     return Err("out of bounds table access".into());
                 }
-                for (i, &func_idx) in elem.func_indices.iter().enumerate() {
-                    if func_idx == u32::MAX {
-                        table[offset + i] = None; // ref.null
-                    } else {
-                        table[offset + i] = Some(func_idx);
-                    }
+                for (i, item) in elem.items.iter().enumerate() {
+                    table[offset + i] = resolve_elem_item(item, &globals);
                 }
             }
         }
 
         // Build elem_segments: active segments are implicitly dropped after init.
         let mut elem_segments: Vec<Option<Vec<Option<u32>>>> = Vec::new();
-        for (i, elem) in module.elements.iter().enumerate() {
-            let funcs: Vec<Option<u32>> = elem.func_indices.iter().map(|&idx| {
-                if idx == u32::MAX { None } else { Some(idx) }
-            }).collect();
+        for elem in &module.elements {
+            let funcs: Vec<Option<u32>> = elem.items.iter()
+                .map(|item| resolve_elem_item(item, &globals))
+                .collect();
             // Active segments (those with an offset) are implicitly dropped
             let is_active = !elem.offset.is_empty();
             if is_active {
@@ -142,10 +224,9 @@ impl Store {
             } else {
                 elem_segments.push(Some(funcs));
             }
-            let _ = i; // suppress unused warning
         }
 
-        Ok(Store { memory, memory_max, globals, tables, host_funcs, elem_segments })
+        Ok(Store { memory, memory_max, globals, tables, host_funcs, elem_segments, extern_funcs: Vec::new() })
     }
 
     pub fn memory_load<const N: usize>(&self, addr: u64) -> Result<[u8; N], &'static str> {

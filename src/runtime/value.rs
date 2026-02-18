@@ -5,6 +5,8 @@ pub enum Value {
     I64(i64),
     F32(f32),
     F64(f64),
+    /// Function reference: Some(func_idx) or None (ref.null func).
+    FuncRef(Option<u32>),
 }
 
 impl Value {
@@ -42,6 +44,9 @@ impl Value {
             wasmparser::ValType::I64 => Value::I64(0),
             wasmparser::ValType::F32 => Value::F32(0.0),
             wasmparser::ValType::F64 => Value::F64(0.0),
+            wasmparser::ValType::Ref(r) if r.heap_type() == wasmparser::HeapType::FUNC => {
+                Value::FuncRef(None)
+            }
             _ => todo!("unsupported type: {:?}", ty),
         }
     }
@@ -54,6 +59,8 @@ impl Value {
             Value::I64(v) => v as u64,
             Value::F32(v) => v.to_bits() as u64,
             Value::F64(v) => v.to_bits(),
+            Value::FuncRef(Some(idx)) => idx as u64,
+            Value::FuncRef(None) => u64::MAX,
         }
     }
 }

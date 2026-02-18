@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use wast::core::{WastArgCore, WastRetCore};
-use wust::runtime::{ExecError, HostFunc, Module, Store, Value};
+use wust::runtime::{ExecError, ExportKind, HostFunc, Module, Store, Value, EXTERN_FUNC_BASE};
 
 fn val_from_arg(arg: &WastArgCore) -> Option<Value> {
     match arg {
@@ -12,46 +14,130 @@ fn val_from_arg(arg: &WastArgCore) -> Option<Value> {
     }
 }
 
-fn val_from_ret(ret: &WastRetCore) -> Option<Value> {
+/// Expected result from assert_return: either an exact value or a NaN check.
+enum Expected {
+    Exact(Value),
+    F32Nan,
+    F64Nan,
+}
+
+fn expected_from_ret(ret: &WastRetCore) -> Option<Expected> {
     match ret {
-        WastRetCore::I32(v) => Some(Value::I32(*v)),
-        WastRetCore::I64(v) => Some(Value::I64(*v)),
+        WastRetCore::I32(v) => Some(Expected::Exact(Value::I32(*v))),
+        WastRetCore::I64(v) => Some(Expected::Exact(Value::I64(*v))),
         WastRetCore::F32(v) => match v {
-            wast::core::NanPattern::Value(f) => Some(Value::F32(f32::from_bits(f.bits))),
-            _ => None, // nan patterns
+            wast::core::NanPattern::Value(f) => {
+                Some(Expected::Exact(Value::F32(f32::from_bits(f.bits))))
+            }
+            wast::core::NanPattern::CanonicalNan | wast::core::NanPattern::ArithmeticNan => {
+                Some(Expected::F32Nan)
+            }
         },
         WastRetCore::F64(v) => match v {
-            wast::core::NanPattern::Value(f) => Some(Value::F64(f64::from_bits(f.bits))),
-            _ => None, // nan patterns
+            wast::core::NanPattern::Value(f) => {
+                Some(Expected::Exact(Value::F64(f64::from_bits(f.bits))))
+            }
+            wast::core::NanPattern::CanonicalNan | wast::core::NanPattern::ArithmeticNan => {
+                Some(Expected::F64Nan)
+            }
         },
         _ => None,
     }
 }
 
-fn values_match(got: &Value, expected: &Value) -> bool {
+fn result_matches(got: &Value, expected: &Expected) -> bool {
     match (got, expected) {
-        (Value::I32(a), Value::I32(b)) => a == b,
-        (Value::I64(a), Value::I64(b)) => a == b,
-        (Value::F32(a), Value::F32(b)) => a.to_bits() == b.to_bits(),
-        (Value::F64(a), Value::F64(b)) => a.to_bits() == b.to_bits(),
+        (Value::I32(a), Expected::Exact(Value::I32(b))) => a == b,
+        (Value::I64(a), Expected::Exact(Value::I64(b))) => a == b,
+        (Value::F32(a), Expected::Exact(Value::F32(b))) => a.to_bits() == b.to_bits(),
+        (Value::F64(a), Expected::Exact(Value::F64(b))) => a.to_bits() == b.to_bits(),
+        (Value::F32(a), Expected::F32Nan) => a.is_nan(),
+        (Value::F64(a), Expected::F64Nan) => a.is_nan(),
         _ => false,
     }
 }
 
+fn parse_args(invoke: &wast::WastInvoke) -> Option<Vec<Value>> {
+    invoke
+        .args
+        .iter()
+        .map(|a| match a {
+            wast::WastArg::Core(c) => val_from_arg(c),
+            _ => None,
+        })
+        .collect()
+}
+
+fn parse_expected(results: &[wast::WastRet]) -> Option<Vec<Expected>> {
+    results
+        .iter()
+        .map(|r| match r {
+            wast::WastRet::Core(c) => expected_from_ret(c),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A registered module instance (module + store) for cross-module imports.
+struct RegisteredModule {
+    module: Arc<Module>,
+    store: Arc<std::sync::Mutex<Store>>,
+}
+
+/// A pending funcref registration: (global_index, source_module, source_store, source_func_idx).
+type PendingFuncRef = (usize, Arc<Module>, Arc<std::sync::Mutex<Store>>, u32);
+
 /// Build host functions and imported globals for a module's imports.
-/// Currently supports the "spectest" module.
-fn build_imports(module: &Module) -> (Vec<HostFunc>, Vec<Value>) {
+/// Returns pending funcref registrations that must be applied after Store creation.
+fn build_imports(
+    module: &Module,
+    registered: &HashMap<String, RegisteredModule>,
+) -> (Vec<HostFunc>, Vec<Value>, Vec<PendingFuncRef>) {
     let mut host_funcs: Vec<HostFunc> = Vec::new();
     let mut imported_globals: Vec<Value> = Vec::new();
+    let mut pending_funcrefs: Vec<PendingFuncRef> = Vec::new();
 
     for import in &module.imports {
         match &import.kind {
-            wust::runtime::module::ImportKind::Func(_) => {
-                // All spectest functions are nops (print_i32, print_f32, print, etc.)
+            wust::runtime::module::ImportKind::Func(_type_idx) => {
+                if let Some(reg) = registered.get(&import.module) {
+                    if let Some(func_idx) = reg.module.export_func(&import.name) {
+                        let reg_module = reg.module.clone();
+                        let reg_store = reg.store.clone();
+                        let host_fn: HostFunc = Box::new(move |args| {
+                            let mut store = reg_store.lock().unwrap();
+                            match wust::runtime::exec::call(&reg_module, &mut store, func_idx, args)
+                            {
+                                Ok(results) => results,
+                                Err(_) => Vec::new(),
+                            }
+                        });
+                        host_funcs.push(host_fn);
+                        continue;
+                    }
+                }
                 let nop: HostFunc = Box::new(|_args| Vec::new());
                 host_funcs.push(nop);
             }
             wust::runtime::module::ImportKind::Global { ty, .. } => {
+                if let Some(reg) = registered.get(&import.module) {
+                    let store = reg.store.lock().unwrap();
+                    if let Some(val) = resolve_exported_global(&reg.module, &store, &import.name) {
+                        if let Value::FuncRef(Some(src_func_idx)) = val {
+                            let extern_idx = EXTERN_FUNC_BASE + pending_funcrefs.len() as u32;
+                            imported_globals.push(Value::FuncRef(Some(extern_idx)));
+                            pending_funcrefs.push((
+                                imported_globals.len() - 1,
+                                reg.module.clone(),
+                                reg.store.clone(),
+                                src_func_idx,
+                            ));
+                            continue;
+                        }
+                        imported_globals.push(val);
+                        continue;
+                    }
+                }
                 let val = match import.module.as_str() {
                     "spectest" => match ty {
                         wasmparser::ValType::I32 => Value::I32(666),
@@ -64,18 +150,57 @@ fn build_imports(module: &Module) -> (Vec<HostFunc>, Vec<Value>) {
                 };
                 imported_globals.push(val);
             }
-            // Memory and Table imports are handled by the Module parser
-            // (they're already added to module.memories / module.tables)
             _ => {}
         }
     }
 
-    (host_funcs, imported_globals)
+    (host_funcs, imported_globals, pending_funcrefs)
+}
+
+/// Resolve an exported global's value from a registered module.
+fn resolve_exported_global(module: &Module, store: &Store, name: &str) -> Option<Value> {
+    for export in &module.exports {
+        if export.name == name {
+            if let ExportKind::Global = export.kind {
+                return store.globals.get(export.index as usize).copied();
+            }
+        }
+    }
+    None
+}
+
+/// Try to compile and instantiate a module. Returns Err if any step fails.
+fn try_instantiate(
+    binary: &[u8],
+    registered: &HashMap<String, RegisteredModule>,
+) -> Result<(Arc<Module>, Store), String> {
+    let m = Module::from_bytes(binary)?;
+    let (host_funcs, imported_globals, pending_funcrefs) = build_imports(&m, registered);
+    let mut store = Store::new_with_imports(&m, host_funcs, imported_globals)?;
+    for (_global_idx, src_module, src_store, src_func_idx) in pending_funcrefs {
+        let reg_module = src_module.clone();
+        let reg_store = src_store.clone();
+        let wrapper: HostFunc = Box::new(move |args| {
+            let mut s = reg_store.lock().unwrap();
+            match wust::runtime::exec::call(&reg_module, &mut s, src_func_idx, args) {
+                Ok(results) => results,
+                Err(_) => Vec::new(),
+            }
+        });
+        store.extern_funcs.push(wrapper);
+    }
+    let m = Arc::new(m);
+    if let Some(start_idx) = m.start {
+        wust::runtime::exec::call(&m, &mut store, start_idx, &[])
+            .map_err(|e| format!("{e}"))?;
+    }
+    Ok((m, store))
 }
 
 struct TestRunner {
-    module: Option<Module>,
-    store: Option<Store>,
+    module: Option<Arc<Module>>,
+    store: Option<Arc<std::sync::Mutex<Store>>>,
+    registered: HashMap<String, RegisteredModule>,
 }
 
 impl TestRunner {
@@ -83,6 +208,7 @@ impl TestRunner {
         TestRunner {
             module: None,
             store: None,
+            registered: HashMap::new(),
         }
     }
 
@@ -97,134 +223,170 @@ impl TestRunner {
 
         for directive in wast.directives {
             match directive {
-                wast::WastDirective::Module(mut wat) => match wat.encode() {
-                    Ok(binary) => match Module::from_bytes(&binary) {
-                        Ok(m) => {
-                            let (host_funcs, imported_globals) = build_imports(&m);
-                            match Store::new_with_imports(&m, host_funcs, imported_globals) {
-                                Ok(mut store) => {
-                                    // Run start function if present
-                                    if let Some(start_idx) = m.start {
-                                        let _ = wust::runtime::exec::call(&m, &mut store, start_idx, &[]);
-                                    }
-                                    self.store = Some(store);
-                                    self.module = Some(m);
-                                }
-                                Err(_e) => {
-                                    self.module = None;
-                                    self.store = None;
-                                }
+                wast::WastDirective::Module(mut wat) => {
+                    match wat.encode() {
+                        Ok(binary) => match try_instantiate(&binary, &self.registered) {
+                            Ok((m, store)) => {
+                                let store = Arc::new(std::sync::Mutex::new(store));
+                                self.store = Some(store);
+                                self.module = Some(m);
                             }
-                        }
-                        Err(_e) => {
+                            Err(_) => {
+                                self.module = None;
+                                self.store = None;
+                            }
+                        },
+                        Err(_) => {
                             self.module = None;
                             self.store = None;
                         }
-                    },
-                    Err(_) => {
-                        self.module = None;
-                        self.store = None;
                     }
-                },
+                }
+
+                wast::WastDirective::Register { name, .. } => {
+                    if let (Some(m), Some(s)) = (&self.module, &self.store) {
+                        self.registered.insert(
+                            name.to_string(),
+                            RegisteredModule {
+                                module: m.clone(),
+                                store: s.clone(),
+                            },
+                        );
+                    }
+                }
+
+                // assert_return with invoke
                 wast::WastDirective::AssertReturn {
                     exec: wast::WastExecute::Invoke(invoke),
                     results,
                     ..
                 } => {
-                    let (module, store) = match (&self.module, &mut self.store) {
+                    let (module, store_arc) = match (&self.module, &self.store) {
                         (Some(m), Some(s)) => (m, s),
-                        _ => {
-                            skipped += 1;
-                            continue;
-                        }
+                        _ => { skipped += 1; continue; }
                     };
-
-                    let args: Option<Vec<Value>> = invoke
-                        .args
-                        .iter()
-                        .map(|a| match a {
-                            wast::WastArg::Core(c) => val_from_arg(c),
-                            _ => None,
-                        })
-                        .collect();
-                    let args = match args {
+                    let args = match parse_args(&invoke) {
                         Some(a) => a,
                         None => { skipped += 1; continue; }
                     };
-
-                    let expected: Option<Vec<Value>> = results
-                        .iter()
-                        .map(|r| match r {
-                            wast::WastRet::Core(c) => val_from_ret(c),
-                            _ => None,
-                        })
-                        .collect();
-                    let expected = match expected {
+                    let expected = match parse_expected(&results) {
                         Some(e) => e,
                         None => { skipped += 1; continue; }
                     };
-
                     let func_idx = match module.export_func(invoke.name) {
                         Some(idx) => idx,
                         None => { skipped += 1; continue; }
                     };
-                    match wust::runtime::exec::call(module, store, func_idx, &args) {
+                    let mut store = store_arc.lock().unwrap();
+                    match wust::runtime::exec::call(module, &mut store, func_idx, &args) {
                         Ok(got) => {
                             if got.len() == expected.len()
-                                && got.iter().zip(&expected).all(|(g, e)| values_match(g, e))
+                                && got.iter().zip(&expected).all(|(g, e)| result_matches(g, e))
                             {
                                 passed += 1;
                             } else {
                                 failed += 1;
                                 eprintln!(
                                     "  FAIL {}({:?}) = {:?}, expected {:?}",
-                                    invoke.name, args, got, expected
+                                    invoke.name, args, got,
+                                    expected.iter().map(|e| match e {
+                                        Expected::Exact(v) => format!("{v:?}"),
+                                        Expected::F32Nan => "f32:nan".into(),
+                                        Expected::F64Nan => "f64:nan".into(),
+                                    }).collect::<Vec<_>>()
                                 );
                             }
                         }
                         Err(e) => {
                             failed += 1;
                             eprintln!(
-                                "  FAIL {}({:?}) trapped: {}, expected {:?}",
-                                invoke.name, args, e, expected
+                                "  FAIL {}({:?}) trapped: {}",
+                                invoke.name, args, e
                             );
                         }
                     }
                 }
+
+                // assert_return with get (read exported global)
+                wast::WastDirective::AssertReturn {
+                    exec: wast::WastExecute::Get { module: module_id, global, .. },
+                    results,
+                    ..
+                } => {
+                    // Named module references not yet supported
+                    if module_id.is_some() { skipped += 1; continue; }
+                    let (module, store_arc) = match (&self.module, &self.store) {
+                        (Some(m), Some(s)) => (m, s),
+                        _ => { skipped += 1; continue; }
+                    };
+                    let expected = match parse_expected(&results) {
+                        Some(e) => e,
+                        None => { skipped += 1; continue; }
+                    };
+                    let store = store_arc.lock().unwrap();
+                    match resolve_exported_global(module, &store, global) {
+                        Some(got) => {
+                            if expected.len() == 1 && result_matches(&got, &expected[0]) {
+                                passed += 1;
+                            } else {
+                                failed += 1;
+                                eprintln!("  FAIL (get {global}) = {got:?}, expected {expected:?}",
+                                    expected = expected.iter().map(|e| match e {
+                                        Expected::Exact(v) => format!("{v:?}"),
+                                        Expected::F32Nan => "f32:nan".into(),
+                                        Expected::F64Nan => "f64:nan".into(),
+                                    }).collect::<Vec<_>>()
+                                );
+                            }
+                        }
+                        None => {
+                            failed += 1;
+                            eprintln!("  FAIL (get {global}) global not found");
+                        }
+                    }
+                }
+
+                // assert_return with Wat (instantiate module, check no error)
+                wast::WastDirective::AssertReturn {
+                    exec: wast::WastExecute::Wat(mut wat),
+                    ..
+                } => {
+                    match wat.encode() {
+                        Ok(binary) => match try_instantiate(&binary, &self.registered) {
+                            Ok(_) => { passed += 1; }
+                            Err(e) => {
+                                failed += 1;
+                                eprintln!("  FAIL assert_return(wat) unexpected error: {e}");
+                            }
+                        },
+                        Err(e) => {
+                            failed += 1;
+                            eprintln!("  FAIL assert_return(wat) encode error: {e}");
+                        }
+                    }
+                }
+
+                // assert_trap with invoke
                 wast::WastDirective::AssertTrap {
                     exec: wast::WastExecute::Invoke(invoke),
                     message,
                     ..
                 } => {
-                    let (module, store) = match (&self.module, &mut self.store) {
+                    let (module, store_arc) = match (&self.module, &self.store) {
                         (Some(m), Some(s)) => (m, s),
-                        _ => {
-                            skipped += 1;
-                            continue;
-                        }
+                        _ => { skipped += 1; continue; }
                     };
-
-                    let args: Option<Vec<Value>> = invoke
-                        .args
-                        .iter()
-                        .map(|a| match a {
-                            wast::WastArg::Core(c) => val_from_arg(c),
-                            _ => None,
-                        })
-                        .collect();
-                    let args = match args {
+                    let args = match parse_args(&invoke) {
                         Some(a) => a,
                         None => { skipped += 1; continue; }
                     };
-
                     let func_idx = match module.export_func(invoke.name) {
                         Some(idx) => idx,
                         None => { skipped += 1; continue; }
                     };
-                    match wust::runtime::exec::call(module, store, func_idx, &args) {
-                        Err(ExecError::Trap(_)) => {
-                            passed += 1;
-                        }
+                    let mut store = store_arc.lock().unwrap();
+                    match wust::runtime::exec::call(module, &mut store, func_idx, &args) {
+                        Err(ExecError::Trap(_)) => { passed += 1; }
                         Ok(v) => {
                             failed += 1;
                             eprintln!(
@@ -238,29 +400,112 @@ impl TestRunner {
                         }
                     }
                 }
-                // Bare invoke (e.g. calling "init" or "reset" without checking result)
-                wast::WastDirective::Invoke(invoke) => {
-                    let (module, store) = match (&self.module, &mut self.store) {
+
+                // assert_trap with Wat (module instantiation should trap)
+                wast::WastDirective::AssertTrap {
+                    exec: wast::WastExecute::Wat(mut wat),
+                    message,
+                    ..
+                } => {
+                    match wat.encode() {
+                        Ok(binary) => match try_instantiate(&binary, &self.registered) {
+                            Ok(_) => {
+                                failed += 1;
+                                eprintln!("  FAIL assert_trap(wat) should have trapped ({message})");
+                            }
+                            Err(_) => { passed += 1; }
+                        },
+                        Err(_) => { passed += 1; }
+                    }
+                }
+
+                // assert_invalid: module should fail validation
+                wast::WastDirective::AssertInvalid { mut module, message, .. } => {
+                    match module.encode() {
+                        Ok(binary) => match Module::from_bytes(&binary) {
+                            Err(_) => { passed += 1; }
+                            Ok(_) => {
+                                failed += 1;
+                                eprintln!("  FAIL assert_invalid: module should be invalid ({message})");
+                            }
+                        },
+                        // Encode failure also counts as "invalid"
+                        Err(_) => { passed += 1; }
+                    }
+                }
+
+                // assert_malformed: module should fail to parse
+                wast::WastDirective::AssertMalformed { mut module, message, .. } => {
+                    match module.encode() {
+                        Ok(binary) => match Module::from_bytes(&binary) {
+                            Err(_) => { passed += 1; }
+                            Ok(_) => {
+                                failed += 1;
+                                eprintln!("  FAIL assert_malformed: module should be malformed ({message})");
+                            }
+                        },
+                        Err(_) => { passed += 1; }
+                    }
+                }
+
+                // assert_unlinkable: module instantiation should fail
+                wast::WastDirective::AssertUnlinkable { mut module, message, .. } => {
+                    match module.encode() {
+                        Ok(binary) => match try_instantiate(&binary, &self.registered) {
+                            Err(_) => { passed += 1; }
+                            Ok(_) => {
+                                failed += 1;
+                                eprintln!("  FAIL assert_unlinkable: should have failed ({message})");
+                            }
+                        },
+                        Err(_) => { passed += 1; }
+                    }
+                }
+
+                // assert_exhaustion: function call should exhaust resources (stack overflow)
+                wast::WastDirective::AssertExhaustion { call, message, .. } => {
+                    let (module, store_arc) = match (&self.module, &self.store) {
                         (Some(m), Some(s)) => (m, s),
                         _ => { skipped += 1; continue; }
                     };
-                    let args: Option<Vec<Value>> = invoke
-                        .args
-                        .iter()
-                        .map(|a| match a {
-                            wast::WastArg::Core(c) => val_from_arg(c),
-                            _ => None,
-                        })
-                        .collect();
-                    let args = match args {
+                    let args = match parse_args(&call) {
+                        Some(a) => a,
+                        None => { skipped += 1; continue; }
+                    };
+                    let func_idx = match module.export_func(call.name) {
+                        Some(idx) => idx,
+                        None => { skipped += 1; continue; }
+                    };
+                    let mut store = store_arc.lock().unwrap();
+                    match wust::runtime::exec::call(module, &mut store, func_idx, &args) {
+                        Err(_) => { passed += 1; }
+                        Ok(v) => {
+                            failed += 1;
+                            eprintln!(
+                                "  FAIL {}({:?}) should have exhausted ({}), got {:?}",
+                                call.name, args, message, v
+                            );
+                        }
+                    }
+                }
+
+                // Bare invoke
+                wast::WastDirective::Invoke(invoke) => {
+                    let (module, store_arc) = match (&self.module, &self.store) {
+                        (Some(m), Some(s)) => (m, s),
+                        _ => { skipped += 1; continue; }
+                    };
+                    let args = match parse_args(&invoke) {
                         Some(a) => a,
                         None => { skipped += 1; continue; }
                     };
                     if let Some(func_idx) = module.export_func(invoke.name) {
-                        let _ = wust::runtime::exec::call(module, store, func_idx, &args);
+                        let mut store = store_arc.lock().unwrap();
+                        let _ = wust::runtime::exec::call(module, &mut store, func_idx, &args);
                     }
                 }
-                // Skip other directives for now (assert_invalid, assert_malformed, etc.)
+
+                // Directives we don't handle yet
                 _ => {
                     skipped += 1;
                 }
@@ -288,194 +533,132 @@ fn run_spec_test(name: &str) {
     assert_eq!(failed, 0, "{name}: {failed} assertions failed");
 }
 
-// Integer
-#[test]
-fn spec_i32() {
-    run_spec_test("i32");
-}
-#[test]
-fn spec_i64() {
-    run_spec_test("i64");
-}
-#[test]
-fn spec_int_exprs() {
-    run_spec_test("int_exprs");
-}
-#[test]
-fn spec_int_literals() {
-    run_spec_test("int_literals");
-}
-
-// Control flow
-#[test]
-fn spec_nop() {
-    run_spec_test("nop");
-}
-#[test]
-fn spec_block() {
-    run_spec_test("block");
-}
-#[test]
-fn spec_loop_() {
-    run_spec_test("loop");
-}
-#[test]
-fn spec_if() {
-    run_spec_test("if");
-}
-#[test]
-fn spec_br() {
-    run_spec_test("br");
-}
-#[test]
-fn spec_br_if() {
-    run_spec_test("br_if");
-}
-#[test]
-fn spec_br_table() {
-    run_spec_test("br_table");
-}
-#[test]
-fn spec_return() {
-    run_spec_test("return");
-}
-#[test]
-fn spec_call() {
-    run_spec_test("call");
-}
-#[test]
-fn spec_call_indirect() {
-    run_spec_test("call_indirect");
-}
-#[test]
-fn spec_unreachable() {
-    run_spec_test("unreachable");
-}
-#[test]
-fn spec_unwind() {
-    run_spec_test("unwind");
-}
-#[test]
-fn spec_fac() {
-    run_spec_test("fac");
-}
-#[test]
-fn spec_forward() {
-    run_spec_test("forward");
-}
-#[test]
-fn spec_switch() {
-    run_spec_test("switch");
-}
-#[test]
-fn spec_labels() {
-    run_spec_test("labels");
-}
-#[test]
-fn spec_stack() {
-    run_spec_test("stack");
-}
-#[test]
-fn spec_left_to_right() {
-    run_spec_test("left-to-right");
+/// Generate a #[test] fn for each .wast file in the spec test directory.
+/// Tests in IGNORED are marked #[ignore] — they require unimplemented features
+/// (typed function references, tail calls, GC types, etc.)
+macro_rules! spec_tests {
+    ($($name:ident => $file:expr),* $(,)?) => {
+        $(
+            #[test]
+            fn $name() {
+                run_spec_test($file);
+            }
+        )*
+    };
+    (ignored: $($name:ident => $file:expr),* $(,)?) => {
+        $(
+            #[test]
+            #[ignore]
+            fn $name() {
+                run_spec_test($file);
+            }
+        )*
+    };
 }
 
-// Variables
-#[test]
-fn spec_local_get() {
-    run_spec_test("local_get");
-}
-#[test]
-fn spec_local_set() {
-    run_spec_test("local_set");
-}
-#[test]
-fn spec_local_tee() {
-    run_spec_test("local_tee");
-}
-#[test]
-fn spec_global() {
-    run_spec_test("global");
-}
-
-// Memory
-#[test]
-fn spec_memory() {
-    run_spec_test("memory");
-}
-#[test]
-fn spec_memory_size() {
-    run_spec_test("memory_size");
-}
-#[test]
-fn spec_memory_grow() {
-    run_spec_test("memory_grow");
-}
-#[test]
-fn spec_load() {
-    run_spec_test("load");
-}
-#[test]
-fn spec_store() {
-    run_spec_test("store");
-}
-#[test]
-fn spec_address() {
-    run_spec_test("address");
-}
-#[test]
-fn spec_align() {
-    run_spec_test("align");
-}
-#[test]
-fn spec_endianness() {
-    run_spec_test("endianness");
-}
-#[test]
-fn spec_traps() {
-    run_spec_test("traps");
-}
-
-// Other
-#[test]
-fn spec_func() {
-    run_spec_test("func");
-}
-#[test]
-fn spec_select() {
-    run_spec_test("select");
-}
-#[test]
-fn spec_conversions() {
-    run_spec_test("conversions");
-}
-#[test]
-fn spec_func_ptrs() {
-    run_spec_test("func_ptrs");
-}
-#[test]
-fn spec_start() {
-    run_spec_test("start");
-}
-#[test]
-fn spec_type() {
-    run_spec_test("type");
+// Tests that pass — auto-discovered from tests/spec/test/core/*.wast
+spec_tests! {
+    spec_address => "address",
+    spec_align => "align",
+    spec_block => "block",
+    spec_br => "br",
+    spec_br_if => "br_if",
+    spec_br_table => "br_table",
+    spec_call => "call",
+    spec_call_indirect => "call_indirect",
+    spec_comments => "comments",
+    spec_const_ => "const",
+    spec_conversions => "conversions",
+    spec_custom => "custom",
+    spec_data => "data",
+    spec_elem => "elem",
+    spec_endianness => "endianness",
+    spec_exports => "exports",
+    spec_f32 => "f32",
+    spec_f32_bitwise => "f32_bitwise",
+    spec_f32_cmp => "f32_cmp",
+    spec_f64 => "f64",
+    spec_f64_bitwise => "f64_bitwise",
+    spec_f64_cmp => "f64_cmp",
+    spec_fac => "fac",
+    spec_float_exprs => "float_exprs",
+    spec_float_literals => "float_literals",
+    spec_float_memory => "float_memory",
+    spec_float_misc => "float_misc",
+    spec_forward => "forward",
+    spec_func => "func",
+    spec_func_ptrs => "func_ptrs",
+    spec_global => "global",
+    spec_i32 => "i32",
+    spec_i64 => "i64",
+    spec_if_ => "if",
+    spec_int_exprs => "int_exprs",
+    spec_int_literals => "int_literals",
+    spec_labels => "labels",
+    spec_left_to_right => "left-to-right",
+    spec_load => "load",
+    spec_local_get => "local_get",
+    spec_local_set => "local_set",
+    spec_local_tee => "local_tee",
+    spec_loop_ => "loop",
+    spec_memory => "memory",
+    spec_memory_grow => "memory_grow",
+    spec_memory_size => "memory_size",
+    spec_memory_redundancy => "memory_redundancy",
+    spec_memory_trap => "memory_trap",
+    spec_nop => "nop",
+    spec_return_ => "return",
+    spec_select => "select",
+    spec_stack => "stack",
+    spec_start => "start",
+    spec_store_ => "store",
+    spec_switch => "switch",
+    spec_table => "table",
+    spec_traps => "traps",
+    spec_type_ => "type",
+    spec_unreachable => "unreachable",
+    spec_unwind => "unwind",
 }
 
-// Float
-#[test] fn spec_f32() { run_spec_test("f32"); }
-#[test] fn spec_f64() { run_spec_test("f64"); }
-#[test] fn spec_f32_cmp() { run_spec_test("f32_cmp"); }
-#[test] fn spec_f64_cmp() { run_spec_test("f64_cmp"); }
-#[test] fn spec_f32_bitwise() { run_spec_test("f32_bitwise"); }
-#[test] fn spec_f64_bitwise() { run_spec_test("f64_bitwise"); }
-#[test] fn spec_float_exprs() { run_spec_test("float_exprs"); }
-#[test] fn spec_float_literals() { run_spec_test("float_literals"); }
-#[test] fn spec_float_memory() { run_spec_test("float_memory"); }
-#[test] fn spec_float_misc() { run_spec_test("float_misc"); }
-
-// Data/Elem/Table
-#[test] fn spec_data() { run_spec_test("data"); }
-#[test] fn spec_elem() { run_spec_test("elem"); }
-#[test] fn spec_table() { run_spec_test("table"); }
-#[test] fn spec_exports() { run_spec_test("exports"); }
+// Tests that require unimplemented proposals (typed funcrefs, tail calls, GC, etc.)
+// Run with: cargo test -- --ignored
+// Require import validation, cross-module linking, or wast parser features
+spec_tests! { ignored:
+    spec_imports => "imports",
+    spec_linking => "linking",
+    spec_names => "names",
+    spec_annotations => "annotations",
+    spec_binary => "binary",
+    spec_binary_leb128 => "binary-leb128",
+    spec_br_on_non_null => "br_on_non_null",
+    spec_br_on_null => "br_on_null",
+    spec_call_ref => "call_ref",
+    spec_id => "id",
+    spec_inline_module => "inline-module",
+    spec_instance => "instance",
+    spec_local_init => "local_init",
+    spec_obsolete_keywords => "obsolete-keywords",
+    spec_ref_ => "ref",
+    spec_ref_as_non_null => "ref_as_non_null",
+    spec_ref_func => "ref_func",
+    spec_ref_is_null => "ref_is_null",
+    spec_ref_null => "ref_null",
+    spec_return_call => "return_call",
+    spec_return_call_indirect => "return_call_indirect",
+    spec_return_call_ref => "return_call_ref",
+    spec_skip_stack_guard_page => "skip-stack-guard-page",
+    spec_table_get => "table_get",
+    spec_table_grow => "table_grow",
+    spec_table_set => "table_set",
+    spec_table_size => "table_size",
+    spec_token => "token",
+    spec_type_canon => "type-canon",
+    spec_type_equivalence => "type-equivalence",
+    spec_type_rec => "type-rec",
+    spec_unreached_invalid => "unreached-invalid",
+    spec_unreached_valid => "unreached-valid",
+    spec_utf8_custom_section_id => "utf8-custom-section-id",
+    spec_utf8_import_field => "utf8-import-field",
+    spec_utf8_import_module => "utf8-import-module",
+    spec_utf8_invalid_encoding => "utf8-invalid-encoding",
+}
