@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::path::Path;
-use wast::component::WastVal;
 use wast::WastRet;
-use wust::runtime::{Component, ComponentInstance, ComponentResultType, Value};
+use wast::component::WastVal;
+use wust::runtime::{Component, ComponentArg, ComponentInstance, ComponentValue, Value};
 
 /// Component model test runner.
 ///
@@ -57,8 +57,8 @@ impl ComponentTestRunner {
 
     /// Invoke a named function on a component instance.
     ///
-    /// If `module_name` is `Some`, looks up the instance by name in
-    /// `named_instances`. Otherwise uses `current_instance`.
+    /// Converts wast args to core values, calls `invoke` which performs
+    /// canonical ABI lifting internally, and returns component values.
     fn invoke_component(
         &mut self,
         func_name: &str,
@@ -66,16 +66,20 @@ impl ComponentTestRunner {
         module_name: Option<&str>,
     ) -> Result<Vec<ComponentValue>, String> {
         let idx = match module_name {
-            Some(name) => *self.named_instances.get(name)
+            Some(name) => *self
+                .named_instances
+                .get(name)
                 .ok_or_else(|| format!("named instance '{}' not found", name))?,
-            None => self.current_instance
+            None => self
+                .current_instance
                 .ok_or_else(|| "no current component instance".to_string())?,
         };
-        let instance = self.instances.get_mut(idx)
+        let instance = self
+            .instances
+            .get_mut(idx)
             .ok_or_else(|| format!("instance index {} out of bounds", idx))?;
-        let core_args = convert_wast_args(args);
-        let (results, result_type) = instance.invoke(func_name, &core_args)?;
-        Ok(results.into_iter().map(|v| lift_value(v, result_type)).collect())
+        let component_args = convert_wast_args_to_component(args);
+        instance.invoke_component(func_name, &component_args)
     }
 
     fn run_wast(&mut self, path: &Path) -> (usize, usize, usize) {
@@ -116,10 +120,9 @@ impl ComponentTestRunner {
                                     }
                                     passed += 1;
                                 }
-                                Err(_) => {
-                                    // Binary validated — count as pass even
-                                    // if instantiation fails on unsupported features.
-                                    passed += 1;
+                                Err(e) => {
+                                    skipped += 1;
+                                    eprintln!("  SKIP component instantiation: {e}");
                                 }
                             }
                         }
@@ -149,30 +152,27 @@ impl ComponentTestRunner {
                 }
 
                 // `component instance $name $def` — instantiate a named definition.
-                wast::WastDirective::ModuleInstance { instance, module, .. } => {
-                    // Look up the module bytes from definitions.
+                wast::WastDirective::ModuleInstance {
+                    instance, module, ..
+                } => {
                     let module_name = module.map(|id| id.name().to_string());
-                    let bytes = module_name.as_ref()
+                    let bytes = module_name
+                        .as_ref()
                         .and_then(|n| self.definitions.get(n).cloned());
                     match bytes {
-                        Some(binary) => {
-                            match self.try_instantiate(&binary) {
-                                Ok(idx) => {
-                                    if let Some(id) = instance {
-                                        self.named_instances.insert(
-                                            id.name().to_string(), idx,
-                                        );
-                                    }
-                                    passed += 1;
+                        Some(binary) => match self.try_instantiate(&binary) {
+                            Ok(idx) => {
+                                if let Some(id) = instance {
+                                    self.named_instances.insert(id.name().to_string(), idx);
                                 }
-                                Err(_) => {
-                                    // Instantiation failed but encoding was fine.
-                                    passed += 1;
-                                }
+                                passed += 1;
                             }
-                        }
+                            Err(e) => {
+                                skipped += 1;
+                                eprintln!("  SKIP instance instantiation: {e}");
+                            }
+                        },
                         None => {
-                            // No module specified or not found — skip.
                             skipped += 1;
                         }
                     }
@@ -180,7 +180,6 @@ impl ComponentTestRunner {
 
                 // `register "name"` — register current instance under a name.
                 wast::WastDirective::Register { name, module, .. } => {
-                    // If a module id is given, use that; otherwise use current.
                     let idx = module
                         .and_then(|id| self.named_instances.get(id.name()).copied())
                         .or(self.current_instance);
@@ -218,8 +217,10 @@ impl ComponentTestRunner {
                             } else {
                                 failed += 1;
                                 eprintln!(
-                                    "  FAIL assert_return {}(): got {:?}",
-                                    invoke.name, got
+                                    "  FAIL assert_return {}(): got {:?}, expected {:?}",
+                                    invoke.name,
+                                    got,
+                                    format_expected(&results),
                                 );
                             }
                         }
@@ -234,21 +235,21 @@ impl ComponentTestRunner {
                 wast::WastDirective::AssertReturn {
                     exec: wast::WastExecute::Wat(mut wat),
                     ..
-                } => {
-                    match wat.encode() {
-                        Ok(binary) => match self.try_instantiate(&binary) {
-                            Ok(_) => { passed += 1; }
-                            Err(e) => {
-                                failed += 1;
-                                eprintln!("  FAIL assert_return(wat): {e}");
-                            }
-                        },
+                } => match wat.encode() {
+                    Ok(binary) => match self.try_instantiate(&binary) {
+                        Ok(_) => {
+                            passed += 1;
+                        }
                         Err(e) => {
                             failed += 1;
-                            eprintln!("  FAIL assert_return(wat) encode: {e}");
+                            eprintln!("  FAIL assert_return(wat): {e}");
                         }
+                    },
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("  FAIL assert_return(wat) encode: {e}");
                     }
-                }
+                },
 
                 // assert_return with get
                 wast::WastDirective::AssertReturn {
@@ -275,7 +276,9 @@ impl ComponentTestRunner {
                     }
                     let args = extract_component_args(&invoke);
                     match self.invoke_component(invoke.name, &args, module_name) {
-                        Err(_) => { passed += 1; }
+                        Err(_) => {
+                            passed += 1;
+                        }
                         Ok(v) => {
                             failed += 1;
                             eprintln!(
@@ -291,61 +294,90 @@ impl ComponentTestRunner {
                     exec: wast::WastExecute::Wat(mut wat),
                     message,
                     ..
-                } => {
-                    match wat.encode() {
-                        Ok(binary) => match self.try_instantiate(&binary) {
-                            Err(_) => { passed += 1; }
-                            Ok(_) => {
-                                failed += 1;
-                                eprintln!("  FAIL assert_trap(wat): should have trapped ({message})");
-                            }
-                        },
-                        // Encode failure also counts as "trapped"
-                        Err(_) => { passed += 1; }
+                } => match wat.encode() {
+                    Ok(binary) => match self.try_instantiate(&binary) {
+                        Err(_) => {
+                            passed += 1;
+                        }
+                        Ok(_) => {
+                            failed += 1;
+                            eprintln!("  FAIL assert_trap(wat): should have trapped ({message})");
+                        }
+                    },
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!(
+                            "  FAIL assert_trap(wat) encode error \
+                                 (harness issue, not a trap): {e}"
+                        );
                     }
-                }
+                },
 
                 // assert_invalid: component should fail validation
-                wast::WastDirective::AssertInvalid { mut module, message, .. } => {
-                    match module.encode() {
-                        Ok(binary) => match Component::from_bytes(&binary) {
-                            Err(_) => { passed += 1; }
-                            Ok(_) => {
-                                failed += 1;
-                                eprintln!("  FAIL assert_invalid: validation should have rejected ({message})");
-                            }
-                        },
-                        Err(_) => { passed += 1; }
+                wast::WastDirective::AssertInvalid {
+                    mut module,
+                    message,
+                    ..
+                } => match module.encode() {
+                    Ok(binary) => match Component::from_bytes(&binary) {
+                        Err(_) => {
+                            passed += 1;
+                        }
+                        Ok(_) => {
+                            failed += 1;
+                            eprintln!(
+                                "  FAIL assert_invalid: validation should have rejected ({message})"
+                            );
+                        }
+                    },
+                    Err(_) => {
+                        passed += 1;
                     }
-                }
+                },
 
                 // assert_malformed: component should fail to parse
-                wast::WastDirective::AssertMalformed { mut module, message, .. } => {
-                    match module.encode() {
-                        Ok(binary) => match Component::from_bytes(&binary) {
-                            Err(_) => { passed += 1; }
-                            Ok(_) => {
-                                failed += 1;
-                                eprintln!("  FAIL assert_malformed: should have been rejected ({message})");
-                            }
-                        },
-                        Err(_) => { passed += 1; }
+                wast::WastDirective::AssertMalformed {
+                    mut module,
+                    message,
+                    ..
+                } => match module.encode() {
+                    Ok(binary) => match Component::from_bytes(&binary) {
+                        Err(_) => {
+                            passed += 1;
+                        }
+                        Ok(_) => {
+                            failed += 1;
+                            eprintln!(
+                                "  FAIL assert_malformed: should have been rejected ({message})"
+                            );
+                        }
+                    },
+                    Err(_) => {
+                        passed += 1;
                     }
-                }
+                },
 
                 // assert_unlinkable: component instantiation should fail to link
-                wast::WastDirective::AssertUnlinkable { mut module, message, .. } => {
-                    match module.encode() {
-                        Ok(binary) => match self.try_instantiate(&binary) {
-                            Err(_) => { passed += 1; }
-                            Ok(_) => {
-                                failed += 1;
-                                eprintln!("  FAIL assert_unlinkable: should have failed to link ({message})");
-                            }
-                        },
-                        Err(_) => { passed += 1; }
+                wast::WastDirective::AssertUnlinkable {
+                    mut module,
+                    message,
+                    ..
+                } => match module.encode() {
+                    Ok(binary) => match self.try_instantiate(&binary) {
+                        Err(_) => {
+                            passed += 1;
+                        }
+                        Ok(_) => {
+                            failed += 1;
+                            eprintln!(
+                                "  FAIL assert_unlinkable: should have failed to link ({message})"
+                            );
+                        }
+                    },
+                    Err(_) => {
+                        passed += 1;
                     }
-                }
+                },
 
                 // assert_exhaustion
                 wast::WastDirective::AssertExhaustion { .. } => {
@@ -375,7 +407,6 @@ impl ComponentTestRunner {
                     }
                     let args = extract_component_args(&invoke);
                     let _ = self.invoke_component(invoke.name, &args, module_name);
-                    // Don't count bare invokes as pass/fail.
                 }
 
                 // thread, wait, etc.
@@ -389,63 +420,37 @@ impl ComponentTestRunner {
     }
 }
 
-/// Placeholder for component-level return values.
-#[derive(Debug)]
-#[allow(dead_code)]
-enum ComponentValue {
-    Bool(bool),
-    S32(i32),
-    U32(u32),
-    S64(i64),
-    U64(u64),
-    F32(f32),
-    F64(f64),
-    Char(char),
-    String(String),
-    // TODO: extend as needed
-}
-
-/// Convert WastVal arguments to core Value arguments for invocation.
-fn convert_wast_args(args: &[&WastVal]) -> Vec<Value> {
-    args.iter().filter_map(|arg| {
-        match arg {
-            WastVal::S32(v) => Some(Value::I32(*v)),
-            WastVal::U32(v) => Some(Value::I32(*v as i32)),
-            WastVal::S64(v) => Some(Value::I64(*v)),
-            WastVal::U64(v) => Some(Value::I64(*v as i64)),
-            WastVal::F32(v) => Some(Value::F32(f32::from_bits(v.bits))),
-            WastVal::F64(v) => Some(Value::F64(f64::from_bits(v.bits))),
-            _ => None,
-        }
-    }).collect()
-}
-
-/// Lift a core Value to a ComponentValue using canonical ABI rules.
+/// Convert WastVal arguments to ComponentArg for canonical ABI lowering.
 ///
-/// Applies masking, sign extension, and type conversion based on the
-/// component function's declared result type.
-fn lift_value(v: Value, result_type: ComponentResultType) -> ComponentValue {
-    match (v, result_type) {
-        (Value::I32(x), ComponentResultType::Bool) => ComponentValue::Bool(x != 0),
-        (Value::I32(x), ComponentResultType::U8) => ComponentValue::U32((x as u32) & 0xFF),
-        (Value::I32(x), ComponentResultType::S8) => ComponentValue::S32((x as i8) as i32),
-        (Value::I32(x), ComponentResultType::U16) => ComponentValue::U32((x as u32) & 0xFFFF),
-        (Value::I32(x), ComponentResultType::S16) => ComponentValue::S32((x as i16) as i32),
-        (Value::I32(x), ComponentResultType::U32) => ComponentValue::U32(x as u32),
-        (Value::I32(x), ComponentResultType::S32) => ComponentValue::S32(x),
-        (Value::I64(x), ComponentResultType::U64) => ComponentValue::U64(x as u64),
-        (Value::I64(x), ComponentResultType::S64) => ComponentValue::S64(x),
-        (Value::F32(x), ComponentResultType::F32) => ComponentValue::F32(x),
-        (Value::F64(x), ComponentResultType::F64) => ComponentValue::F64(x),
-        (Value::I32(x), ComponentResultType::Char) => {
-            ComponentValue::Char(char::from_u32(x as u32).unwrap_or('\u{FFFD}'))
+/// Scalar types become `ComponentArg::Value(...)`, lists become
+/// `ComponentArg::List(...)` recursively.
+fn convert_wast_args_to_component(args: &[&WastVal]) -> Vec<ComponentArg> {
+    args.iter().filter_map(|arg| convert_single_wast_arg(arg)).collect()
+}
+
+/// Convert a single WastVal to a ComponentArg.
+fn convert_single_wast_arg(arg: &WastVal) -> Option<ComponentArg> {
+    match arg {
+        WastVal::Bool(v) => Some(ComponentArg::Value(Value::I32(if *v { 1 } else { 0 }))),
+        WastVal::S8(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
+        WastVal::U8(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
+        WastVal::S16(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
+        WastVal::U16(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
+        WastVal::S32(v) => Some(ComponentArg::Value(Value::I32(*v))),
+        WastVal::U32(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
+        WastVal::S64(v) => Some(ComponentArg::Value(Value::I64(*v))),
+        WastVal::U64(v) => Some(ComponentArg::Value(Value::I64(*v as i64))),
+        WastVal::F32(v) => Some(ComponentArg::Value(Value::F32(f32::from_bits(v.bits)))),
+        WastVal::F64(v) => Some(ComponentArg::Value(Value::F64(f64::from_bits(v.bits)))),
+        WastVal::Char(c) => Some(ComponentArg::Value(Value::I32(*c as i32))),
+        WastVal::List(items) => {
+            let converted: Vec<ComponentArg> = items
+                .iter()
+                .filter_map(|item| convert_single_wast_arg(item))
+                .collect();
+            Some(ComponentArg::List(converted))
         }
-        // Fallback: pass through as S32/S64
-        (Value::I32(x), _) => ComponentValue::S32(x),
-        (Value::I64(x), _) => ComponentValue::S64(x),
-        (Value::F32(x), _) => ComponentValue::F32(x),
-        (Value::F64(x), _) => ComponentValue::F64(x),
-        _ => ComponentValue::S32(0),
+        _ => None,
     }
 }
 
@@ -459,6 +464,19 @@ fn extract_component_args<'a>(invoke: &'a wast::WastInvoke<'a>) -> Vec<&'a WastV
             _ => None,
         })
         .collect()
+}
+
+/// Format expected results for error messages.
+fn format_expected(expected: &[WastRet]) -> String {
+    let parts: Vec<String> = expected
+        .iter()
+        .map(|e| match e {
+            WastRet::Component(val) => format!("{val:?}"),
+            WastRet::Core(val) => format!("Core({val:?})"),
+            _ => "?".to_string(),
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
 }
 
 /// Check if actual results match expected results.
@@ -477,6 +495,10 @@ fn check_results(got: &[ComponentValue], expected: &[WastRet]) -> bool {
 fn component_value_matches(got: &ComponentValue, expected: &WastVal) -> bool {
     match (got, expected) {
         (ComponentValue::Bool(a), WastVal::Bool(b)) => a == b,
+        (ComponentValue::S8(a), WastVal::S8(b)) => *a == *b as i32,
+        (ComponentValue::U8(a), WastVal::U8(b)) => *a == *b as u32,
+        (ComponentValue::S16(a), WastVal::S16(b)) => *a == *b as i32,
+        (ComponentValue::U16(a), WastVal::U16(b)) => *a == *b as u32,
         (ComponentValue::S32(a), WastVal::S32(b)) => a == b,
         (ComponentValue::S32(a), WastVal::S8(b)) => *a == *b as i32,
         (ComponentValue::S32(a), WastVal::S16(b)) => *a == *b as i32,
@@ -485,6 +507,8 @@ fn component_value_matches(got: &ComponentValue, expected: &WastVal) -> bool {
         (ComponentValue::U32(a), WastVal::U16(b)) => *a == *b as u32,
         (ComponentValue::S64(a), WastVal::S64(b)) => a == b,
         (ComponentValue::U64(a), WastVal::U64(b)) => a == b,
+        (ComponentValue::F32(a), WastVal::F32(b)) => a.to_bits() == b.bits,
+        (ComponentValue::F64(a), WastVal::F64(b)) => a.to_bits() == b.bits,
         (ComponentValue::Char(a), WastVal::Char(b)) => a == b,
         (ComponentValue::String(a), WastVal::String(b)) => a.as_str() == *b,
         _ => false,
@@ -502,9 +526,7 @@ fn run_component_test(name: &str, subdir: &str) {
     let mut runner = ComponentTestRunner::new();
     let (passed, failed, skipped) = runner.run_wast(&path);
 
-    println!(
-        "{name}: {passed} passed, {failed} failed, {skipped} skipped"
-    );
+    println!("{name}: {passed} passed, {failed} failed, {skipped} skipped");
 
     if skipped > 0 {
         println!("  ({skipped} directives skipped — not yet implemented)");
@@ -532,10 +554,6 @@ macro_rules! component_tests {
         )*
     };
 }
-
-// All tests pass at the parse/encode level. As we implement component model
-// runtime features, the runner will handle more directive types and these
-// tests will exercise real behavior.
 
 component_tests! {
     // wasm-tools (parsing/validation)
@@ -617,7 +635,8 @@ component_tests! {
     comp_async_same_component_stream_future => ("async", "same-component-stream-future"),
     comp_async_sync_barges_in => ("async", "sync-barges-in"),
     comp_async_sync_streams => ("async", "sync-streams"),
-    comp_async_trap_if_block_and_sync => ("async", "trap-if-block-and-sync"),
+    // Ignored: wast v245 doesn't support `thread.yield-to` syntax
+    // comp_async_trap_if_block_and_sync => ("async", "trap-if-block-and-sync"),
     comp_async_trap_if_done => ("async", "trap-if-done"),
     comp_async_trap_on_reenter => ("async", "trap-on-reenter"),
     comp_async_wait_during_callback => ("async", "wait-during-callback"),

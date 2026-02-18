@@ -5,6 +5,7 @@ mod store;
 pub mod exec;
 mod value;
 pub mod component;
+mod canonical_abi;
 // JIT disabled — focusing on interpreter correctness first
 // #[cfg(target_arch = "aarch64")]
 // pub mod jit;
@@ -15,4 +16,4 @@ pub use opcode::Op;
 pub use store::{Store, HostFunc, EXTERN_FUNC_BASE};
 pub use exec::ExecError;
 pub use value::Value;
-pub use component::{Component, ComponentInstance, ComponentResultType};
+pub use component::{Component, ComponentArg, ComponentInstance, ComponentResultType, ComponentValue};

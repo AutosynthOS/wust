@@ -13,7 +13,7 @@
 //! Then run:
 //!   cargo run -p wust --example plasma_component --release
 
-use wust::runtime::{Component, ComponentInstance, Value};
+use wust::runtime::{Component, ComponentInstance, ComponentValue, Value};
 
 fn main() {
     let wasm_path = concat!(
@@ -40,13 +40,22 @@ fn main() {
     println!("\nAll component tests passed!");
 }
 
+/// Extract an i32 from a lifted component value.
+fn extract_i32(v: &ComponentValue) -> i32 {
+    match v {
+        ComponentValue::S32(x) => *x,
+        ComponentValue::U32(x) => *x as i32,
+        other => panic!("expected i32 component value, got {other:?}"),
+    }
+}
+
 /// Call the component's `alloc` export and verify it returns a non-zero pointer.
 fn test_alloc(instance: &mut ComponentInstance) {
     print!("test alloc ... ");
-    let (results, _) = instance
+    let results = instance
         .invoke("alloc", &[Value::I32(64)])
         .expect("alloc trapped");
-    let ptr = results[0].unwrap_i32();
+    let ptr = extract_i32(&results[0]);
     assert!(ptr > 0, "alloc returned null pointer");
     println!("ok (ptr = {ptr})");
 }
@@ -62,28 +71,24 @@ fn test_eval(instance: &mut ComponentInstance) {
     let js_source = "1 + 1";
 
     // Allocate space for the source string.
-    let (alloc_result, _) = instance
+    let alloc_result = instance
         .invoke("alloc", &[Value::I32(js_source.len() as i32)])
         .expect("alloc trapped");
-    let ptr = alloc_result[0].unwrap_i32() as usize;
+    let ptr = extract_i32(&alloc_result[0]) as usize;
 
-    // Write the JS source into component memory.
-    //
     // Component instances don't expose memory directly through the
-    // public API yet, so we rely on the core instance's memory.
-    // For now, we just call eval with the pointer and length and
-    // check the return code. The alloc call above reserved the
-    // space, but we need to actually write bytes into it.
+    // public API yet. We just call eval with pointer and length and
+    // check the return code.
     //
     // TODO: expose memory access on ComponentInstance so the host
     // can write bytes before calling eval.
     let _ = ptr;
 
     // For now, just verify eval doesn't panic with a zero-length input.
-    let (eval_result, _) = instance
+    let eval_result = instance
         .invoke("eval", &[Value::I32(0), Value::I32(0)])
         .expect("eval trapped");
-    let return_code = eval_result[0].unwrap_i32();
+    let return_code = extract_i32(&eval_result[0]);
     // Empty source evaluates to undefined, which is success (0).
     assert_eq!(return_code, 0, "eval returned error for empty source");
     println!("ok (return_code = {return_code})");

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::runtime::canonical_abi;
 use crate::runtime::exec;
 use crate::runtime::module::{ExportKind, ImportKind, Module};
 use crate::runtime::store::{HostFunc, Store};
@@ -90,8 +91,42 @@ impl_alias_export!(CoreGlobalDef);
 impl_alias_export!(CoreMemoryDef);
 impl_alias_export!(CoreTableDef);
 
+/// A lifted component-level value after canonical ABI processing.
+///
+/// Core wasm values (i32, i64, etc.) are lifted into their component-level
+/// types (bool, char, string, etc.) based on the function's declared type.
+#[derive(Debug, Clone)]
+pub enum ComponentValue {
+    Bool(bool),
+    S8(i32),
+    U8(u32),
+    S16(i32),
+    U16(u32),
+    S32(i32),
+    U32(u32),
+    S64(i64),
+    U64(u64),
+    F32(f32),
+    F64(f64),
+    Char(char),
+    String(String),
+}
+
+/// A component-level argument for canonical ABI lowering.
+///
+/// Wraps either a scalar value (lowered directly to a core `Value`) or a
+/// list of component values (lowered via realloc + memory write to a
+/// `(ptr, len)` pair of i32 core args).
+#[derive(Debug, Clone)]
+pub enum ComponentArg {
+    /// A scalar value passed directly as a core wasm value.
+    Value(Value),
+    /// A list of component values, lowered via canonical ABI.
+    List(Vec<ComponentArg>),
+}
+
 /// Simplified component value type for canonical ABI lifting.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentResultType {
     Bool,
     S8,
@@ -116,6 +151,10 @@ pub enum ComponentResultType {
 struct ComponentFuncDef {
     core_func_index: u32,
     type_index: u32,
+    /// Core memory index for canonical ABI operations (string lifting, etc.).
+    memory_index: Option<u32>,
+    /// Core func index of the realloc function for list/string lowering.
+    realloc_func_index: Option<u32>,
 }
 
 /// A component-level export.
@@ -148,6 +187,8 @@ pub struct Component {
     /// Component-level types. Only func types are stored; other type
     /// indices map to `None`.
     component_types: Vec<Option<ComponentFuncTypeDef>>,
+    /// Whether this component declares any component-level imports.
+    has_imports: bool,
 }
 
 /// A parsed component function type (params + result).
@@ -174,6 +215,7 @@ impl Component {
             component_funcs: Vec::new(),
             exports: Vec::new(),
             component_types: Vec::new(),
+            has_imports: false,
         };
 
         parse_component_sections(&mut component, bytes)?;
@@ -363,6 +405,9 @@ fn parse_component_sections(component: &mut Component, bytes: &[u8]) -> Result<(
             wasmparser::Payload::ComponentTypeSection(reader) => {
                 parse_type_section(component, reader)?;
             }
+            wasmparser::Payload::ComponentImportSection(_) => {
+                component.has_imports = true;
+            }
             _ => {}
         }
     }
@@ -482,11 +527,21 @@ fn parse_canonical_section(
             wasmparser::CanonicalFunction::Lift {
                 core_func_index,
                 type_index,
-                ..
+                options,
             } => {
+                let memory_index = options.iter().find_map(|opt| match opt {
+                    wasmparser::CanonicalOption::Memory(idx) => Some(*idx),
+                    _ => None,
+                });
+                let realloc_func_index = options.iter().find_map(|opt| match opt {
+                    wasmparser::CanonicalOption::Realloc(idx) => Some(*idx),
+                    _ => None,
+                });
                 component.component_funcs.push(ComponentFuncDef {
                     core_func_index,
                     type_index,
+                    memory_index,
+                    realloc_func_index,
                 });
             }
             _ => {}
@@ -570,7 +625,7 @@ fn convert_primitive_type(p: wasmparser::PrimitiveValType) -> ComponentResultTyp
 /// A resolved export from a core instance.
 #[derive(Clone)]
 #[allow(dead_code)]
-enum CoreExport {
+pub(crate) enum CoreExport {
     Func { instance: usize, index: u32 },
     Global { instance: usize, index: u32 },
     Memory { instance: usize, index: u32 },
@@ -590,7 +645,7 @@ fn make_core_export(kind: &ExportKind, instance: usize, index: u32) -> CoreExpor
 
 /// A live core instance — either a real instantiated module or a synthetic
 /// bag of exports.
-enum CoreInstance {
+pub(crate) enum CoreInstance {
     Instantiated {
         module: Module,
         store: Store,
@@ -629,6 +684,11 @@ struct ResolvedFunc {
     core_instance_index: usize,
     core_func_index: u32,
     result_type: ComponentResultType,
+    /// Resolved memory coordinates for canonical ABI string/list lifting.
+    /// The usize is the core instance index that owns the memory.
+    memory_instance: Option<usize>,
+    /// Core func index of the realloc function for list/string lowering.
+    realloc_func_index: Option<u32>,
 }
 
 /// A live component instance — analogous to `Store` for core modules.
@@ -653,6 +713,12 @@ impl ComponentInstance {
     ///    component export → component func (canon lift) → core func
     ///    (alias) → core instance export → actual func index.
     pub fn instantiate(component: &Component) -> Result<Self, String> {
+        if component.has_imports {
+            return Err(
+                "component has imports that are not satisfied".to_string(),
+            );
+        }
+
         let mut inst = ComponentInstance {
             core_instances: Vec::new(),
             exports: HashMap::new(),
@@ -673,13 +739,30 @@ impl ComponentInstance {
         Ok(inst)
     }
 
-    /// Invoke a named component function, returning core values and
-    /// the canonical result type for lifting.
+    /// Invoke a named component function with core wasm values.
+    ///
+    /// Convenience wrapper around `invoke_component` that wraps each
+    /// `Value` in `ComponentArg::Value`.
     pub fn invoke(
         &mut self,
         name: &str,
         args: &[Value],
-    ) -> Result<(Vec<Value>, ComponentResultType), String> {
+    ) -> Result<Vec<ComponentValue>, String> {
+        let component_args: Vec<ComponentArg> =
+            args.iter().map(|v| ComponentArg::Value(*v)).collect();
+        self.invoke_component(name, &component_args)
+    }
+
+    /// Invoke a named component function with component-level arguments.
+    ///
+    /// Performs canonical ABI lowering (list args → realloc + memory write),
+    /// calls the underlying core function, then lifts the raw results into
+    /// component-level values based on the canonical ABI result type.
+    pub fn invoke_component(
+        &mut self,
+        name: &str,
+        args: &[ComponentArg],
+    ) -> Result<Vec<ComponentValue>, String> {
         let resolved = self
             .exports
             .get(name)
@@ -687,20 +770,30 @@ impl ComponentInstance {
         let idx = resolved.core_instance_index;
         let func_idx = resolved.core_func_index;
         let result_type = resolved.result_type;
+        let memory_instance = resolved.memory_instance;
+        let realloc_func_index = resolved.realloc_func_index;
+
+        let core_args = canonical_abi::lower_component_args(
+            args,
+            realloc_func_index,
+            &mut self.core_instances,
+            idx,
+        )?;
+
         let instance = self
             .core_instances
             .get_mut(idx)
             .ok_or_else(|| format!("core instance {} out of bounds", idx))?;
-        match instance {
+        let values = match instance {
             CoreInstance::Instantiated { module, store } => {
-                let values =
-                    exec::call(module, store, func_idx, args).map_err(|e| format!("trap: {e}"))?;
-                Ok((values, result_type))
+                exec::call(module, store, func_idx, &core_args)
+                    .map_err(|e| format!("trap: {e}"))?
             }
             CoreInstance::Synthetic { .. } => {
-                Err("cannot invoke function on synthetic instance".into())
+                return Err("cannot invoke function on synthetic instance".into());
             }
-        }
+        };
+        canonical_abi::lift_results(&values, result_type, &self.core_instances, memory_instance)
     }
 
     /// Resolve a named export from a core instance to a full `CoreExport`.
@@ -1017,7 +1110,10 @@ fn resolve_single_export(
         })?;
 
     let result_type = lookup_result_type(component, comp_func.type_index);
-    let resolved = resolve_core_func_export(inst, core_func, result_type)?;
+    let resolved = resolve_core_func_export(
+        inst, component, core_func, result_type,
+        comp_func.memory_index, comp_func.realloc_func_index,
+    )?;
     inst.exports.insert(export_def.name.clone(), resolved);
     Ok(())
 }
@@ -1025,11 +1121,15 @@ fn resolve_single_export(
 /// Follow a core func alias to its live instance, returning a `ResolvedFunc`.
 fn resolve_core_func_export(
     inst: &ComponentInstance,
+    component: &Component,
     core_func: &CoreFuncDef,
     result_type: ComponentResultType,
+    memory_index: Option<u32>,
+    realloc_func_index: Option<u32>,
 ) -> Result<ResolvedFunc, String> {
     let instance_index = core_func.instance_index();
     let name = core_func.name();
+    let memory_instance = resolve_memory_instance(inst, component, memory_index)?;
     match inst.resolve_core_export(instance_index as usize, name) {
         Some(CoreExport::Func {
             instance: real_inst,
@@ -1038,8 +1138,37 @@ fn resolve_core_func_export(
             core_instance_index: real_inst,
             core_func_index: func_idx,
             result_type,
+            memory_instance,
+            realloc_func_index,
         }),
         _ => Err(format!("core export '{}' not found or not a func", name)),
+    }
+}
+
+/// Resolve a component-level core memory index to the core instance that
+/// owns the memory.
+///
+/// Returns `None` if `memory_index` is `None` (no memory option on canon lift).
+fn resolve_memory_instance(
+    inst: &ComponentInstance,
+    component: &Component,
+    memory_index: Option<u32>,
+) -> Result<Option<usize>, String> {
+    let Some(idx) = memory_index else {
+        return Ok(None);
+    };
+    let mem_def = component
+        .core_memories
+        .get(idx as usize)
+        .ok_or_else(|| format!("core memory index {} out of bounds", idx))?;
+    let core_inst_idx = mem_def.instance_index() as usize;
+    // Verify the instance exists and has a memory
+    match inst.core_instances.get(core_inst_idx) {
+        Some(CoreInstance::Instantiated { .. }) => Ok(Some(core_inst_idx)),
+        Some(CoreInstance::Synthetic { .. }) => {
+            Err("memory cannot be on a synthetic instance".into())
+        }
+        None => Err(format!("memory instance {} out of bounds", core_inst_idx)),
     }
 }
 
