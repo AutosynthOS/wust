@@ -1,19 +1,9 @@
-[package]
-name = "wust"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-wasmparser = "0.229"
-libc = "0.2"
-
-[dev-dependencies]
-wast = "229"
-wat = "1"
-wasmtime = "41"
+[workspace]
+resolver = "2"
+members = [
+    "crates/wust",
+    "crates/plasma",
+]
 
 [profile.release]
 debug = true
-
-[[example]]
-name = "bench_fib"
