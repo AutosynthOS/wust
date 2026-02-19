@@ -23,7 +23,6 @@ use crate::parse::types::*;
 
 /// A resolved export from a core instance.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(crate) enum CoreExport {
     Func {
         instance: usize,
@@ -168,7 +167,6 @@ pub(super) struct ResolvedFunc {
 
 /// An entry in the resource handle table.
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub(super) struct ResourceEntry {
     /// The i32 representation value stored when the resource was created.
     pub(super) rep: i32,
@@ -189,11 +187,6 @@ pub struct ComponentInstance {
     pub(super) exports: HashMap<String, ResolvedExport>,
     /// Child component instances created during instantiation.
     pub(super) child_instances: Vec<ComponentInstance>,
-    /// Named sub-instance exports, keyed by export name.
-    /// When a component exports an instance (e.g. `(export "nested" (instance ...))`),
-    /// this maps the export name to the child `ComponentInstance` so that
-    /// alias-instance-export resolution can extract the correct sub-instance.
-    pub(super) exported_instances: HashMap<String, ComponentInstance>,
     /// Whether this component instance is currently being instantiated.
     /// Used to prevent re-entrance via lowered functions during start.
     pub(super) instantiating: Rc<Cell<bool>>,
@@ -210,7 +203,6 @@ impl Default for ComponentInstance {
             core_instances: Vec::new(),
             exports: HashMap::new(),
             child_instances: Vec::new(),
-            exported_instances: HashMap::new(),
             instantiating: Rc::new(Cell::new(false)),
             resource_table: Rc::new(RefCell::new(vec![None])),
         }
@@ -238,10 +230,8 @@ impl ComponentInstance {
         types: &wasmparser::types::Types,
         features: wasmparser::WasmFeatures,
     ) -> Result<Self, String> {
-        let mut component = component.clone();
-        apply_self_aliases(&mut component);
-        let import_instances = default_import_instances(&component);
-        Self::instantiate_inner(component, import_instances, Rc::new(RefCell::new(vec![None])), types, features, 0)
+        let component = component.clone();
+        Self::instantiate_inner(component, Vec::new(), Rc::new(RefCell::new(vec![None])), types, features, 0)
     }
 
     /// Instantiate with positional imports (used by the Linker).
@@ -251,8 +241,7 @@ impl ComponentInstance {
         types: &wasmparser::types::Types,
         features: wasmparser::WasmFeatures,
     ) -> Result<Self, String> {
-        let mut component = component.clone();
-        apply_self_aliases(&mut component);
+        let component = component.clone();
         Self::instantiate_inner(component, import_instances, Rc::new(RefCell::new(vec![None])), types, features, 0)
     }
 
@@ -277,7 +266,6 @@ impl ComponentInstance {
             core_instances: Vec::new(),
             exports: HashMap::new(),
             child_instances: import_instances,
-            exported_instances: HashMap::new(),
             instantiating: instantiating.clone(),
             resource_table,
         };
@@ -304,8 +292,6 @@ impl ComponentInstance {
         }
 
         inst.exports = super::link::resolve_component_exports(&inst.core_instances, &component, types)?;
-        populate_from_exports_func_exports(&mut inst, &component, types);
-        populate_exported_instances(&mut inst, &component);
         instantiating.set(false);
         Ok(inst)
     }
@@ -317,12 +303,12 @@ impl ComponentInstance {
     /// trampolines. Also carries exported module/component bytes for alias
     /// resolution.
     pub fn export_view(&self) -> ComponentInstance {
-        clone_for_export(self)
+        self.clone()
     }
 
     /// Check whether this instance has an export with the given name.
     pub fn has_export(&self, name: &str) -> bool {
-        self.exports.contains_key(name) || self.exported_instances.contains_key(name)
+        self.exports.contains_key(name)
     }
 
     /// Create a minimal view with only core instances and exports.
@@ -418,139 +404,6 @@ impl ComponentInstance {
 // Import helpers
 // ---------------------------------------------------------------------------
 
-/// Build a default (empty) `ComponentInstance` for each instance import.
-///
-/// Used when instantiating a component without explicit imports — each
-/// instance import slot gets a placeholder so positional indexing works.
-fn default_import_instances(component: &ParsedComponent) -> Vec<ComponentInstance> {
-    component
-        .imports()
-        .iter()
-        .filter(|i| i.kind == ComponentImportKind::Instance)
-        .map(|_| ComponentInstance::default())
-        .collect()
-}
-
-// ---------------------------------------------------------------------------
-// Population helpers
-// ---------------------------------------------------------------------------
-
-/// Populate a FromExports component instance's exported sub-instances.
-fn populate_from_exports_instance(
-    child: &mut ComponentInstance,
-    exports: &[ComponentInstanceExport],
-    inst: &ComponentInstance,
-) {
-    for export in exports {
-        if export.kind == ComponentExternalKind::Instance {
-            let idx = export.index as usize;
-            if idx < inst.child_instances.len() {
-                let sub = clone_for_export(&inst.child_instances[idx]);
-                child.exported_instances.insert(export.name.clone(), sub);
-            }
-        }
-    }
-}
-
-/// Populate func exports on FromExports child component instances.
-///
-/// After component-level export resolution, iterates over each
-/// `FromExports` component instance definition and copies resolved
-/// func entries into the child's `exports` map.
-fn populate_from_exports_func_exports(inst: &mut ComponentInstance, component: &ParsedComponent, types: &wasmparser::types::Types) {
-    let import_count = component.instance_import_count as usize;
-    for (def_idx, def) in component.component_instances.iter().enumerate() {
-        let ComponentInstanceDef::FromExports(exports) = def else {
-            continue;
-        };
-        let child_idx = import_count + def_idx;
-        for export in exports {
-            if export.kind != ComponentExternalKind::Func {
-                continue;
-            }
-            let comp_func = component.component_funcs.get(export.index as usize);
-            let Some(comp_func) = comp_func else { continue };
-            let resolved = match comp_func {
-                ComponentFuncDef::Lift {
-                    core_func_index,
-                    type_index,
-                    memory_index,
-                    realloc_func_index,
-                } => {
-                    let core_func = component.core_funcs.get(*core_func_index as usize);
-                    let Some(core_func) = core_func else { continue };
-                    let param_types = super::link::lookup_param_types(*type_index, types);
-                    let result_type = super::link::lookup_result_type(*type_index, types);
-                    match super::link::resolve_core_func_to_resolved(
-                        &inst.core_instances,
-                        component,
-                        core_func,
-                        param_types,
-                        result_type,
-                        *memory_index,
-                        *realloc_func_index,
-                        types,
-                    ) {
-                        Ok(resolved) => ResolvedExport::Local(resolved),
-                        Err(_) => continue,
-                    }
-                }
-                ComponentFuncDef::AliasInstanceExport {
-                    instance_index,
-                    name,
-                } => {
-                    let src = *instance_index as usize;
-                    if child_idx < inst.child_instances.len()
-                        && src < inst.child_instances.len()
-                    {
-                        let copy = inst.child_instances[src].export_view();
-                        let new_idx = inst.child_instances[child_idx]
-                            .child_instances
-                            .len();
-                        inst.child_instances[child_idx]
-                            .child_instances
-                            .push(copy);
-                        ResolvedExport::Child {
-                            child_index: new_idx,
-                            export_name: name.clone(),
-                        }
-                    } else {
-                        ResolvedExport::Child {
-                            child_index: src,
-                            export_name: name.clone(),
-                        }
-                    }
-                }
-            };
-            if child_idx < inst.child_instances.len() {
-                inst.child_instances[child_idx]
-                    .exports
-                    .insert(export.name.clone(), resolved);
-            }
-        }
-        // Share the parent's core instances with the FromExports child so
-        // that ResolvedExport::Local entries can find their core store.
-        if child_idx < inst.child_instances.len()
-            && inst.child_instances[child_idx].core_instances.is_empty()
-        {
-            inst.child_instances[child_idx].core_instances = inst.core_instances.clone();
-        }
-    }
-}
-
-/// Populate exported sub-instances from component exports.
-fn populate_exported_instances(inst: &mut ComponentInstance, component: &ParsedComponent) {
-    for export in &component.exports {
-        if export.kind == ComponentExternalKind::Instance {
-            let idx = export.index as usize;
-            if idx < inst.child_instances.len() {
-                let child_clone = clone_for_export(&inst.child_instances[idx]);
-                inst.exported_instances
-                    .insert(export.name.clone(), child_clone);
-            }
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Child component instantiation
@@ -574,7 +427,6 @@ fn instantiate_child_components(
                     *component_index,
                     features,
                 )?;
-                apply_outer_aliases(&mut inner_component, component);
 
                 let child = instantiate_child(
                     inst,
@@ -587,149 +439,17 @@ fn instantiate_child_components(
                 )?;
                 inst.child_instances.push(child);
             }
-            ComponentInstanceDef::AliasInstanceExport {
-                instance_index,
-                name,
-            } => {
-                push_aliased_child_by_name(inst, *instance_index, name)?;
+            ComponentInstanceDef::AliasInstanceExport
+            | ComponentInstanceDef::Reexport => {
+                inst.child_instances.push(ComponentInstance::default());
             }
-            ComponentInstanceDef::Reexport { source_index } => {
-                push_aliased_child(inst, *source_index)?;
-            }
-            ComponentInstanceDef::FromExports(exports) => {
-                let mut child = ComponentInstance::default();
-                populate_from_exports_instance(&mut child, exports, inst);
-                inst.child_instances.push(child);
+            ComponentInstanceDef::FromExports(_exports) => {
+                inst.child_instances.push(ComponentInstance::default());
             }
         }
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Instance aliasing helpers
-// ---------------------------------------------------------------------------
-
-/// Create an aliased child component instance that shares the exports
-/// of the source child instance at `source_index`.
-fn push_aliased_child(inst: &mut ComponentInstance, source_index: u32) -> Result<(), String> {
-    let src_idx = source_index as usize;
-    if src_idx >= inst.child_instances.len() {
-        return Err(format!(
-            "component instance {} out of bounds for alias",
-            source_index
-        ));
-    }
-    let source = &inst.child_instances[src_idx];
-    let cloned = clone_for_export(source);
-    inst.child_instances.push(cloned);
-    Ok(())
-}
-
-/// Create an aliased child component instance by extracting a named
-/// sub-instance from the source child.
-fn push_aliased_child_by_name(
-    inst: &mut ComponentInstance,
-    source_index: u32,
-    name: &str,
-) -> Result<(), String> {
-    let src_idx = source_index as usize;
-    if src_idx >= inst.child_instances.len() {
-        return Err(format!(
-            "component instance {} out of bounds for alias",
-            source_index
-        ));
-    }
-    let source = &inst.child_instances[src_idx];
-    if let Some(sub_instance) = source.exported_instances.get(name) {
-        let cloned = clone_for_export(sub_instance);
-        inst.child_instances.push(cloned);
-    } else {
-        let cloned = clone_for_export(source);
-        inst.child_instances.push(cloned);
-    }
-    Ok(())
-}
-
-/// Clone a ComponentInstance for aliasing or export, copying all
-/// export-related fields while resetting transient state.
-pub(super) fn clone_for_export(source: &ComponentInstance) -> ComponentInstance {
-    ComponentInstance {
-        core_instances: source.core_instances.clone(),
-        exports: source.exports.clone(),
-        child_instances: source.child_instances.clone(),
-        exported_instances: source.exported_instances.clone(),
-        resource_table: source.resource_table.clone(),
-        ..Default::default()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Alias resolution
-// ---------------------------------------------------------------------------
-
-/// Apply self-referencing outer aliases (count=1 at top level).
-///
-/// For standalone components, `count=1` outer aliases reference earlier
-/// items in the same component. This copies the source bytes into the
-/// placeholder slots.
-fn apply_self_aliases(component: &mut ParsedComponent) {
-    for alias in &component.outer_aliases.clone() {
-        if alias.count != 1 {
-            continue;
-        }
-        let src_idx = alias.index as usize;
-        let dst_idx = alias.placeholder_index as usize;
-        match alias.kind {
-            OuterAliasKind::CoreModule => {
-                if let Some(bytes) = component.core_modules.get(src_idx).cloned() {
-                    if let Some(slot) = component.core_modules.get_mut(dst_idx) {
-                        *slot = bytes;
-                    }
-                }
-            }
-            OuterAliasKind::Component => {
-                if let Some(bytes) = component.inner_components.get(src_idx).cloned() {
-                    if let Some(slot) = component.inner_components.get_mut(dst_idx) {
-                        *slot = bytes;
-                    }
-                }
-            }
-            OuterAliasKind::Type | OuterAliasKind::CoreType => {}
-        }
-    }
-}
-
-/// Apply outer aliases from a parent component into a child.
-///
-/// For an outer alias with count=1, copies the source bytes from the
-/// parent into the child's placeholder slot.
-fn apply_outer_aliases(child: &mut ParsedComponent, parent: &ParsedComponent) {
-    for alias in &child.outer_aliases.clone() {
-        if alias.count != 1 {
-            continue;
-        }
-        let src_idx = alias.index as usize;
-        let dst_idx = alias.placeholder_index as usize;
-        match alias.kind {
-            OuterAliasKind::CoreModule => {
-                if let Some(bytes) = parent.core_modules.get(src_idx) {
-                    if let Some(slot) = child.core_modules.get_mut(dst_idx) {
-                        *slot = bytes.clone();
-                    }
-                }
-            }
-            OuterAliasKind::Component => {
-                if let Some(bytes) = parent.inner_components.get(src_idx) {
-                    if let Some(slot) = child.inner_components.get_mut(dst_idx) {
-                        *slot = bytes.clone();
-                    }
-                }
-            }
-            OuterAliasKind::Type | OuterAliasKind::CoreType => {}
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +500,7 @@ fn instantiate_child(
             &mut import_instances,
         )?;
     } else {
-        import_instances = default_import_instances(inner_component);
+        import_instances = Vec::new();
     }
 
     ComponentInstance::instantiate_inner(

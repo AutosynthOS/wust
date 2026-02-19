@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::component::Component;
-use crate::parse::types::{ComponentFuncDef, ComponentImportKind, ParsedComponent};
+use crate::parse::types::{ComponentFuncDef, ComponentImportKind};
 use crate::runtime::component::instance::ComponentInstance;
 
 /// Entry in the linker registry.
@@ -122,9 +122,7 @@ impl Linker {
         if func_patches.is_empty() {
             ComponentInstance::instantiate_with_imports(component, import_instances, types, features)
         } else {
-            let shift = func_patches.len() as u32;
             let mut patched = component.clone();
-            let mut patched_slots = Vec::new();
             for (slot_idx, name, host_inst) in func_patches {
                 let child_idx = import_instances.len() as u32;
                 patched.component_funcs[slot_idx] = ComponentFuncDef::AliasInstanceExport {
@@ -132,9 +130,7 @@ impl Linker {
                     name,
                 };
                 import_instances.push(host_inst);
-                patched_slots.push(slot_idx);
             }
-            shift_component_instance_indices(&mut patched, shift, &patched_slots);
             ComponentInstance::instantiate_with_imports(&patched, import_instances, types, features)
         }
     }
@@ -166,27 +162,3 @@ fn find_func_import_slot(funcs: &[ComponentFuncDef], name: &str) -> Option<usize
     })
 }
 
-/// Shift all component instance index references in a component by `shift`.
-fn shift_component_instance_indices(component: &mut ParsedComponent, shift: u32, skip: &[usize]) {
-    component.instance_import_count += shift;
-    for (i, func) in component.component_funcs.iter_mut().enumerate() {
-        if skip.contains(&i) {
-            continue;
-        }
-        if let ComponentFuncDef::AliasInstanceExport { instance_index, .. } = func {
-            if *instance_index != u32::MAX {
-                *instance_index += shift;
-            }
-        }
-    }
-    let mut new_aliased_modules = HashMap::new();
-    for (k, (inst_idx, name)) in &component.aliased_core_modules {
-        new_aliased_modules.insert(*k, (*inst_idx + shift, name.clone()));
-    }
-    component.aliased_core_modules = new_aliased_modules;
-    let mut new_aliased_components = HashMap::new();
-    for (k, (inst_idx, name)) in &component.aliased_inner_components {
-        new_aliased_components.insert(*k, (*inst_idx + shift, name.clone()));
-    }
-    component.aliased_inner_components = new_aliased_components;
-}

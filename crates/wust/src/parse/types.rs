@@ -89,7 +89,6 @@ impl StringEncoding {
 /// operations (lower, resource ops) and async builtins also occupy slots
 /// in the core func index space.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) enum CoreFuncDef {
     /// Alias of a core instance export (the common case).
     AliasInstanceExport { instance_index: u32, name: String },
@@ -223,10 +222,11 @@ pub(crate) enum ComponentInstanceDef {
         args: Vec<(String, ComponentInstanceArg)>,
     },
     /// Alias a component instance from another component instance's export.
-    AliasInstanceExport { instance_index: u32, name: String },
+    /// Fields unused at runtime — only occupies an index slot.
+    AliasInstanceExport,
     /// Re-export of an existing component instance (from `export` section).
-    /// The index references an earlier component instance.
-    Reexport { source_index: u32 },
+    /// Only occupies an index slot at runtime.
+    Reexport,
     /// A synthetic component instance built from explicit exports.
     ///
     /// At the component level these typically export types and other
@@ -309,29 +309,6 @@ pub struct ComponentImportDef {
     pub required_exports: Vec<String>,
 }
 
-/// An outer alias request recorded during parsing, to be resolved when the
-/// parent context is available.
-#[derive(Debug, Clone)]
-pub(crate) struct OuterAlias {
-    /// Which index space this alias occupies.
-    pub kind: OuterAliasKind,
-    /// Nesting depth (1 = direct parent).
-    pub count: u32,
-    /// Index in the parent's index space for this kind.
-    pub index: u32,
-    /// Index of the placeholder slot in the child's index space.
-    pub placeholder_index: u32,
-}
-
-/// The kind of an outer alias, matching `ComponentOuterAliasKind`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OuterAliasKind {
-    CoreModule,
-    Component,
-    CoreType,
-    Type,
-}
-
 /// A parsed component — immutable "code" side, analogous to `Module`.
 #[derive(Clone)]
 pub struct ParsedComponent {
@@ -346,12 +323,6 @@ pub struct ParsedComponent {
     pub(crate) exports: Vec<ComponentExportDef>,
     /// Number of component-level type entries (for index space tracking).
     pub(crate) component_type_count: u32,
-    /// Tracks core modules that are aliased from component instance exports.
-    /// Key is the core module index, value is (component instance index, export name).
-    pub(crate) aliased_core_modules: HashMap<u32, (u32, String)>,
-    /// Tracks inner components that are aliased from component instance exports.
-    /// Key is the inner component index, value is (component instance index, export name).
-    pub(crate) aliased_inner_components: HashMap<u32, (u32, String)>,
     /// Raw bytes for inner component definitions.
     pub(crate) inner_components: Vec<Vec<u8>>,
     /// Component-level instance definitions.
@@ -364,9 +335,6 @@ pub struct ParsedComponent {
     /// Required export names for instance types, keyed by type index.
     /// Populated from `ComponentType::Instance` declarations in the type section.
     pub(crate) instance_type_exports: HashMap<u32, Vec<String>>,
-    /// Outer alias requests that need resolution when the parent context
-    /// is available.
-    pub(crate) outer_aliases: Vec<OuterAlias>,
 }
 
 impl ParsedComponent {
@@ -388,14 +356,11 @@ impl ParsedComponent {
             component_funcs: Vec::new(),
             exports: Vec::new(),
             component_type_count: 0,
-            aliased_core_modules: HashMap::new(),
-            aliased_inner_components: HashMap::new(),
             inner_components: Vec::new(),
             component_instances: Vec::new(),
             instance_import_count: 0,
             imports: Vec::new(),
             instance_type_exports: HashMap::new(),
-            outer_aliases: Vec::new(),
         }
     }
 }

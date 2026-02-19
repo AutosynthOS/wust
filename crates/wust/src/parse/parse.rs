@@ -317,46 +317,31 @@ fn parse_alias_section(
                     name.to_string(),
                 );
             }
-            wasmparser::ComponentAlias::Outer { kind, count, index } => {
-                register_outer_alias(component, kind, count, index);
+            wasmparser::ComponentAlias::Outer { kind, .. } => {
+                register_outer_alias(component, kind);
             }
         }
     }
     Ok(())
 }
 
-/// Record an outer alias and insert a placeholder in the appropriate
-/// index space.
+/// Insert a placeholder in the appropriate index space for an outer alias.
 fn register_outer_alias(
     component: &mut ParsedComponent,
     kind: wasmparser::ComponentOuterAliasKind,
-    count: u32,
-    index: u32,
 ) {
-    let (alias_kind, placeholder_index) = match kind {
+    match kind {
         wasmparser::ComponentOuterAliasKind::CoreModule => {
-            let idx = component.core_modules.len() as u32;
             component.core_modules.push(Vec::new());
-            (OuterAliasKind::CoreModule, idx)
         }
         wasmparser::ComponentOuterAliasKind::Component => {
-            let idx = component.inner_components.len() as u32;
             component.inner_components.push(Vec::new());
-            (OuterAliasKind::Component, idx)
         }
-        wasmparser::ComponentOuterAliasKind::CoreType => (OuterAliasKind::CoreType, 0),
+        wasmparser::ComponentOuterAliasKind::CoreType => {}
         wasmparser::ComponentOuterAliasKind::Type => {
-            let idx = component.component_type_count;
             component.component_type_count += 1;
-            (OuterAliasKind::Type, idx)
         }
-    };
-    component.outer_aliases.push(OuterAlias {
-        kind: alias_kind,
-        count,
-        index,
-        placeholder_index,
-    });
+    }
 }
 
 /// Push a core instance export alias into the appropriate index space.
@@ -418,28 +403,17 @@ fn register_component_instance_export(
                 });
         }
         wasmparser::ComponentExternalKind::Module => {
-            let idx = component.core_modules.len() as u32;
-            component
-                .aliased_core_modules
-                .insert(idx, (instance_index, name));
             component.core_modules.push(Vec::new());
         }
         wasmparser::ComponentExternalKind::Instance => {
             component
                 .component_instances
-                .push(ComponentInstanceDef::AliasInstanceExport {
-                    instance_index,
-                    name,
-                });
+                .push(ComponentInstanceDef::AliasInstanceExport);
         }
         wasmparser::ComponentExternalKind::Type => {
             component.component_type_count += 1;
         }
         wasmparser::ComponentExternalKind::Component => {
-            let idx = component.inner_components.len() as u32;
-            component
-                .aliased_inner_components
-                .insert(idx, (instance_index, name));
             component.inner_components.push(Vec::new());
         }
         _ => {}
@@ -654,18 +628,10 @@ fn register_export_index_space(
         ComponentExternalKind::Instance => {
             component
                 .component_instances
-                .push(ComponentInstanceDef::Reexport {
-                    source_index: index,
-                });
+                .push(ComponentInstanceDef::Reexport);
         }
         ComponentExternalKind::Module => {
-            let new_idx = component.core_modules.len() as u32;
-            if let Some(alias_info) = component.aliased_core_modules.get(&index) {
-                component
-                    .aliased_core_modules
-                    .insert(new_idx, alias_info.clone());
-                component.core_modules.push(Vec::new());
-            } else if let Some(bytes) = component.core_modules.get(index as usize) {
+            if let Some(bytes) = component.core_modules.get(index as usize) {
                 component.core_modules.push(bytes.clone());
             } else {
                 component.core_modules.push(Vec::new());
