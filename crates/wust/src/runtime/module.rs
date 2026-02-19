@@ -445,6 +445,7 @@ fn dispatch_payload(builder: &mut ModuleBuilder, payload: Payload<'_>) -> Result
                     wasmparser::ExternalKind::Memory => ExportKind::Memory,
                     wasmparser::ExternalKind::Global => ExportKind::Global,
                     wasmparser::ExternalKind::Table => ExportKind::Table,
+                    wasmparser::ExternalKind::Tag => ExportKind::Tag,
                     _ => continue,
                 };
                 builder.exports.push(Export {
