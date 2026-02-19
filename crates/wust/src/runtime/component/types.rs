@@ -5,6 +5,7 @@
 //! data that describes what the component contains.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use crate::runtime::value::Value;
 
@@ -436,4 +437,22 @@ pub struct Component {
     /// Defined component-level types that carry runtime validation info.
     /// Keyed by type index. Currently tracks variant case counts.
     pub(crate) defined_val_types: HashMap<u32, ComponentResultType>,
+}
+
+/// A component with all static aliases resolved and inner components
+/// recursively parsed.
+///
+/// Produced by the resolve phase. `def` contains the parsed component with
+/// `core_modules` and `inner_components` bytes filled in wherever outer
+/// aliases and self aliases applied. `inner` holds recursively resolved
+/// inner components; `None` entries are placeholders for components that
+/// will be resolved from child instance exports during instantiation.
+#[derive(Clone)]
+pub(crate) struct ResolvedComponent {
+    /// The parsed component with alias bytes applied.
+    pub def: Component,
+    /// Recursively resolved inner components. `None` for instance-export
+    /// alias placeholders (resolved during instantiation from child
+    /// instances).
+    pub inner: Vec<Option<Rc<ResolvedComponent>>>,
 }

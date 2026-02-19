@@ -6,11 +6,14 @@
 //! - [`types`] — parsed component definitions (immutable "code" side)
 //! - [`validate`] — wasmparser validation and wasmtime-specific restriction checks
 //! - [`parse`] — binary section parsing
+//! - [`resolve`] — resolve phase: apply static aliases, recursively parse inner components
+//! - [`link`] — alias and export resolution (core func → core instance export)
 //! - [`instance`] — live state, instantiation, and export resolution
 
 mod types;
 mod validate;
 mod parse;
+mod link;
 mod resolve;
 mod instance;
 mod trampoline;
@@ -22,38 +25,6 @@ pub use types::{Component, ComponentArg, ComponentImportDef, ComponentImportKind
 pub(crate) use types::StringEncoding;
 pub use instance::ComponentInstance;
 pub(crate) use instance::CoreInstance;
-
-/// Resolve outer aliases that reference items in the same component.
-///
-/// For standalone components, `count=1` outer aliases reference earlier
-/// items in the same component. This copies the source bytes into the
-/// placeholder slots.
-fn resolve_self_outer_aliases(component: &mut Component) {
-    for alias in &component.outer_aliases.clone() {
-        if alias.count != 1 {
-            continue;
-        }
-        let src_idx = alias.index as usize;
-        let dst_idx = alias.placeholder_index as usize;
-        match alias.kind {
-            types::OuterAliasKind::CoreModule => {
-                if let Some(bytes) = component.core_modules.get(src_idx).cloned() {
-                    if let Some(slot) = component.core_modules.get_mut(dst_idx) {
-                        *slot = bytes;
-                    }
-                }
-            }
-            types::OuterAliasKind::Component => {
-                if let Some(bytes) = component.inner_components.get(src_idx).cloned() {
-                    if let Some(slot) = component.inner_components.get_mut(dst_idx) {
-                        *slot = bytes;
-                    }
-                }
-            }
-            types::OuterAliasKind::Type | types::OuterAliasKind::CoreType => {}
-        }
-    }
-}
 
 impl Component {
     /// Whether this component declares any component-level imports.
@@ -73,10 +44,7 @@ impl Component {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
         validate::validate_component(bytes)?;
         validate::validate_component_restrictions(bytes)?;
-        let mut component = Self::parse_sections(bytes)?;
-        // Resolve self-referencing outer aliases (count=1 at the top level).
-        resolve_self_outer_aliases(&mut component);
-        Ok(component)
+        Self::parse_sections(bytes)
     }
 
     /// Parse a component binary without validation.

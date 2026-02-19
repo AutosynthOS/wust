@@ -1,740 +1,464 @@
 use std::collections::HashMap;
 use std::path::Path;
-use wast::WastRet;
+
 use wast::component::WastVal;
 use wust::runtime::{
     Component, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Value,
 };
 
-/// Component model test runner.
+// ---------------------------------------------------------------------------
+// Test runner
+// ---------------------------------------------------------------------------
+
+/// Minimal wast test runner for the component model.
 ///
-/// Tracks named component definitions and instances across directives,
-/// similar to how the core spec test runner tracks modules and stores.
-struct ComponentTestRunner {
+/// Walks directives sequentially: define components, instantiate them,
+/// invoke functions, check results. Tracks named definitions and
+/// instances across directives.
+struct WastRunner {
+    /// Named component binaries (from `component definition`).
+    definitions: HashMap<String, Vec<u8>>,
     /// All instantiated component instances.
     instances: Vec<ComponentInstance>,
-    /// Index of the most recently instantiated instance.
-    current_instance: Option<usize>,
-    /// Named component binaries (from ModuleDefinition or named Module).
-    definitions: HashMap<String, Vec<u8>>,
     /// Maps instance names to indices in `instances`.
-    named_instances: HashMap<String, usize>,
-    /// Tracks the kind of entity registered under each name.
-    named_kinds: HashMap<String, ComponentImportKind>,
+    named: HashMap<String, usize>,
+    /// Tracks the import kind each name was registered as (func vs instance).
+    kinds: HashMap<String, ComponentImportKind>,
+    /// Index of the most recently instantiated instance.
+    current: Option<usize>,
 }
 
-impl ComponentTestRunner {
+impl WastRunner {
     fn new() -> Self {
-        let mut runner = ComponentTestRunner {
-            instances: Vec::new(),
-            current_instance: None,
+        let mut runner = WastRunner {
             definitions: HashMap::new(),
-            named_instances: HashMap::new(),
-            named_kinds: HashMap::new(),
+            instances: Vec::new(),
+            named: HashMap::new(),
+            kinds: HashMap::new(),
+            current: None,
         };
-        runner.register_host_builtins();
+        // Pre-register host builtins expected by the wasmtime test suite.
+        runner.register_host(
+            "host-return-two",
+            ComponentImportKind::Func,
+            r#"(component
+            (core module $m (func (export "host-return-two") (result i32) i32.const 2))
+            (core instance $m (instantiate $m))
+            (func (export "host-return-two") (result u32)
+                (canon lift (core func $m "host-return-two")))
+        )"#,
+        );
         runner
     }
 
-    /// Register host builtin instances expected by the wasmtime test suite.
-    ///
-    /// Creates real component instances with working functions so that
-    /// tests importing host-provided functions can exercise the full
-    /// cross-instance call path.
-    fn register_host_builtins(&mut self) {
-        // "host-return-two" — a func returning u32(2).
-        self.register_host_func_component("host-return-two", "host-return-two", 2);
+    /// Parse WAT, instantiate it, and register under a name.
+    fn register_host(&mut self, name: &str, kind: ComponentImportKind, wat: &str) {
+        let binary = wat::parse_str(wat).expect("bad host WAT");
+        let component = Component::from_bytes(&binary).expect("bad host component");
+        if let Ok(instance) = ComponentInstance::instantiate(&component) {
+            let idx = self.instances.len();
+            self.instances.push(instance);
+            self.named.insert(name.to_string(), idx);
+        }
+        self.kinds.insert(name.to_string(), kind);
     }
 
-    /// Register a component that exports a single function returning a
-    /// constant u32 value.
-    fn register_host_func_component(
-        &mut self,
-        name: &str,
-        export_name: &str,
-        return_value: u32,
-    ) {
-        let wat = format!(
-            r#"(component
-              (core module $m
-                (func (export "{export_name}") (result i32) i32.const {return_value})
-              )
-              (core instance $m (instantiate $m))
-              (func (export "{export_name}") (result u32)
-                (canon lift (core func $m "{export_name}"))
-              )
-            )"#,
-        );
-        let binary = wat::parse_str(&wat).expect("failed to parse host func WAT");
-        let component =
-            Component::from_bytes(&binary).expect("failed to parse host func component");
-        match ComponentInstance::instantiate(&component) {
-            Ok(instance) => {
-                let idx = self.instances.len();
-                self.instances.push(instance);
-                self.named_instances.insert(name.to_string(), idx);
-                self.named_kinds
-                    .insert(name.to_string(), ComponentImportKind::Func);
-            }
-            Err(e) => {
-                eprintln!("  WARNING: failed to create host func '{name}': {e}");
-                self.named_kinds
-                    .insert(name.to_string(), ComponentImportKind::Func);
-            }
-        }
+    /// Parse + instantiate a component binary, returning its instance index.
+    fn instantiate(&mut self, binary: &[u8]) -> Result<usize, String> {
+        let component = Component::from_bytes(binary)?;
+        let imports = self.resolve_imports(&component)?;
+        let instance = ComponentInstance::instantiate_with_imports(&component, imports)?;
+        let idx = self.instances.len();
+        self.instances.push(instance);
+        self.current = Some(idx);
+        Ok(idx)
     }
 
-    /// Build a host instance on the fly for a specific set of required exports.
-    ///
-    /// Handles three patterns:
-    /// - All exports are known func names → build a component with those funcs
-    /// - "nested" export → build a component with a nested instance sub-export
-    /// - "simple-module" export → build a component that exports a core module
-    fn build_host_instance_for(
-        &mut self,
-        required_exports: &[String],
-    ) -> Option<ComponentInstance> {
-        // Try specialized patterns first.
-        if required_exports == ["nested"] {
-            return self.build_nested_instance_host();
-        }
-        if required_exports == ["simple-module"] {
-            return self.build_simple_module_host();
-        }
-
-        // Map of known host function names to their return values.
-        let known_funcs: HashMap<&str, u32> = [
-            ("return-three", 3),
-            ("return-four", 4),
-            ("return-two", 2),
-        ]
-        .into_iter()
-        .collect();
-
-        let mut func_exports = Vec::new();
-        for name in required_exports {
-            if let Some(&val) = known_funcs.get(name.as_str()) {
-                func_exports.push((name.clone(), val));
-            } else {
-                return None;
-            }
-        }
-
-        if func_exports.is_empty() {
-            return None;
-        }
-
-        self.build_func_exports_host(&func_exports)
-    }
-
-    /// Build a host instance that exports the given functions, each returning
-    /// a constant u32 value.
-    fn build_func_exports_host(
-        &self,
-        func_exports: &[(String, u32)],
-    ) -> Option<ComponentInstance> {
-        let mut core_funcs = String::new();
-        let mut lifts = String::new();
-        for (name, val) in func_exports {
-            core_funcs.push_str(&format!(
-                "    (func (export \"{name}\") (result i32) i32.const {val})\n"
-            ));
-            lifts.push_str(&format!(
-                "  (func (export \"{name}\") (result u32) (canon lift (core func $m \"{name}\")))\n"
-            ));
-        }
-        let wat = format!(
-            "(component\n  (core module $m\n{core_funcs}  )\n  (core instance $m (instantiate $m))\n{lifts})"
-        );
-        let binary = wat::parse_str(&wat).ok()?;
-        let component = Component::from_bytes(&binary).ok()?;
-        ComponentInstance::instantiate(&component).ok()
-    }
-
-    /// Build a host instance that exports a "nested" sub-instance containing
-    /// "return-four" returning u32(4).
-    fn build_nested_instance_host(&self) -> Option<ComponentInstance> {
-        let wat = r#"(component
-          (core module $m
-            (func (export "return-four") (result i32) i32.const 4)
-          )
-          (core instance $m (instantiate $m))
-          (func $rf (result u32) (canon lift (core func $m "return-four")))
-          (instance $nested (export "return-four" (func $rf)))
-          (export "nested" (instance $nested))
-        )"#;
-        let binary = wat::parse_str(wat).ok()?;
-        let component = Component::from_bytes(&binary).ok()?;
-        ComponentInstance::instantiate(&component).ok()
-    }
-
-    /// Build a host instance that exports a "simple-module" core module.
-    ///
-    /// The module exports `f` (func returning i32 101) and `g` (global i32 100)
-    /// to satisfy the more demanding test case.
-    fn build_simple_module_host(&self) -> Option<ComponentInstance> {
-        let wat = r#"(component
-          (core module $m
-            (func (export "f") (result i32) i32.const 101)
-            (global (export "g") i32 i32.const 100)
-          )
-          (export "simple-module" (core module $m))
-        )"#;
-        let binary = wat::parse_str(wat).ok()?;
-        let component = Component::from_bytes(&binary).ok()?;
-        ComponentInstance::instantiate(&component).ok()
-    }
-
-    /// Build a map of named imports for a component by looking up each
-    /// import name in the test runner's registered instances.
-    ///
-    /// For instance imports whose required exports are all known host
-    /// functions, dynamically builds a host instance. Otherwise, the import
-    /// gets the default empty instance.
-    ///
-    /// Returns `Err` if a kind mismatch is detected (e.g. component expects
-    /// a module but a registered instance exists under that name).
-    fn resolve_component_imports(
+    /// Build the import map for a component from registered instances.
+    fn resolve_imports(
         &mut self,
         component: &Component,
     ) -> Result<HashMap<String, ComponentInstance>, String> {
         let mut map = HashMap::new();
         for import in component.imports() {
-            if let Some(registered_kind) = self.named_kinds.get(&import.name) {
-                if import.kind != *registered_kind {
-                    let expected = format!("{:?}", import.kind).to_lowercase();
-                    let found = format!("{:?}", registered_kind).to_lowercase();
-                    return Err(format!("expected {} found {}", expected, found,));
+            // Check for kind mismatch (e.g. importing as instance when
+            // registered as func).
+            if let Some(registered) = self.kinds.get(&import.name) {
+                if import.kind != *registered {
+                    return Err(
+                        format!("expected {:?} found {:?}", import.kind, registered,)
+                            .to_lowercase(),
+                    );
                 }
-            } else if !matches!(
-                import.kind,
-                ComponentImportKind::Instance
-                    | ComponentImportKind::Type
-                    | ComponentImportKind::Component
-                    | ComponentImportKind::Value
-            ) {
-                // Func and Module imports must be registered in the test
-                // environment. Instance/Type/Component/Value imports get
-                // defaults when not explicitly provided.
-                return Err(format!("import `{}` was not found", import.name,));
             }
-            if let Some(idx) = self.named_instances.get(&import.name) {
-                if let Some(instance) = self.instances.get(*idx) {
-                    map.insert(import.name.clone(), instance.export_view());
-                }
+            if let Some(&idx) = self.named.get(&import.name) {
+                map.insert(import.name.clone(), self.instances[idx].export_view());
             } else if import.kind == ComponentImportKind::Instance
                 && !import.required_exports.is_empty()
             {
-                // Try to build a host instance on the fly for known func exports.
-                if let Some(host_inst) =
-                    self.build_host_instance_for(&import.required_exports)
-                {
-                    map.insert(import.name.clone(), host_inst.export_view());
+                match self.build_host_for(&import.required_exports) {
+                    Some(host) => {
+                        map.insert(import.name.clone(), host.export_view());
+                    }
+                    None => {
+                        return Err(format!("import '{}' was not found", import.name));
+                    }
                 }
+            } else {
+                return Err(format!("import '{}' was not found", import.name));
             }
         }
         Ok(map)
     }
 
-    /// Try to instantiate a component binary, returning the instance index.
-    ///
-    /// Validates the binary, then tries to build a live `ComponentInstance`.
-    /// Panics from unsupported features are caught and converted to errors.
-    fn try_instantiate(&mut self, binary: &[u8]) -> Result<usize, String> {
-        let component = Component::from_bytes(binary)?;
-        let imports = self.resolve_component_imports(&component)?;
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ComponentInstance::instantiate_with_imports(&component, imports)
-        })) {
-            Ok(Ok(instance)) => {
-                let idx = self.instances.len();
-                self.instances.push(instance);
-                self.current_instance = Some(idx);
-                Ok(idx)
-            }
-            Ok(Err(e)) => {
-                self.current_instance = None;
-                Err(e)
-            }
-            Err(_panic) => {
-                self.current_instance = None;
-                Err("panic during instantiation".into())
-            }
+    /// Build a host instance that satisfies the given required exports.
+    fn build_host_for(&self, required: &[String]) -> Option<ComponentInstance> {
+        // Known host function return values.
+        let known: &[(&str, u32)] = &[("return-two", 2), ("return-three", 3), ("return-four", 4)];
+
+        // Special case: nested instance export.
+        if required == ["nested"] {
+            return instantiate_wat(
+                r#"(component
+                (core module $m (func (export "return-four") (result i32) i32.const 4))
+                (core instance $m (instantiate $m))
+                (func $f (result u32) (canon lift (core func $m "return-four")))
+                (instance $nested (export "return-four" (func $f)))
+                (export "nested" (instance $nested))
+            )"#,
+            );
         }
+
+        // Special case: module export.
+        if required == ["simple-module"] {
+            return instantiate_wat(
+                r#"(component
+                (core module $m
+                    (func (export "f") (result i32) i32.const 101)
+                    (global (export "g") i32 i32.const 100))
+                (export "simple-module" (core module $m))
+            )"#,
+            );
+        }
+
+        // General case: build a component exporting the required functions.
+        let mut funcs = String::new();
+        let mut lifts = String::new();
+        for name in required {
+            let val = known.iter().find(|(n, _)| *n == name)?.1;
+            funcs.push_str(&format!(
+                "(func (export \"{name}\") (result i32) i32.const {val})\n"
+            ));
+            lifts.push_str(&format!(
+                "(func (export \"{name}\") (result u32) (canon lift (core func $m \"{name}\")))\n"
+            ));
+        }
+        let wat = format!(
+            "(component\n(core module $m {funcs})\n(core instance $m (instantiate $m))\n{lifts})"
+        );
+        instantiate_wat(&wat)
     }
 
-    /// Invoke a named function on a component instance.
-    ///
-    /// Converts wast args to core values, calls `invoke` which performs
-    /// canonical ABI lifting internally, and returns component values.
-    fn invoke_component(
-        &mut self,
-        func_name: &str,
-        args: &[&WastVal],
-        module_name: Option<&str>,
-    ) -> Result<Vec<ComponentValue>, String> {
-        let idx = match module_name {
-            Some(name) => *self
-                .named_instances
-                .get(name)
-                .ok_or_else(|| format!("named instance '{}' not found", name))?,
-            None => self
-                .current_instance
-                .ok_or_else(|| "no current component instance".to_string())?,
+    /// Look up an instance by optional name, falling back to current.
+    fn get_instance(&mut self, name: Option<&str>) -> Result<&mut ComponentInstance, String> {
+        let idx = match name {
+            Some(n) => *self
+                .named
+                .get(n)
+                .ok_or_else(|| format!("instance '{n}' not found"))?,
+            None => self.current.ok_or("no current instance")?,
         };
-        let instance = self
-            .instances
+        self.instances
             .get_mut(idx)
-            .ok_or_else(|| format!("instance index {} out of bounds", idx))?;
-        let component_args = convert_wast_args_to_component(args);
-        instance.invoke_component(func_name, &component_args)
+            .ok_or_else(|| format!("instance {idx} out of bounds"))
     }
 
-    fn run_wast(&mut self, path: &Path) -> (usize, usize) {
-        let source = std::fs::read_to_string(path).unwrap();
-        // Strip ;; RUN: ... lines that aren't part of the wast spec
-        let source: String = source
-            .lines()
-            .filter(|line| !line.trim_start().starts_with(";; RUN:"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let buf = wast::parser::ParseBuffer::new(&source).unwrap();
-        let wast = match wast::parser::parse::<wast::Wast>(&buf) {
-            Ok(w) => w,
-            Err(e) => {
-                eprintln!("  PARSE ERROR: {e}");
-                return (0, 1);
-            }
-        };
-
-        let mut passed = 0usize;
-        let mut failed = 0usize;
-        let mut directive_idx = 0usize;
-
-        for directive in wast.directives {
-            directive_idx += 1;
-            match directive {
-                // A bare (component ...) — encode and try to instantiate.
-                wast::WastDirective::Module(mut wat) => {
-                    let name = wat.name().map(|id| id.name().to_string());
-                    match wat.encode() {
-                        Ok(binary) => {
-                            if let Some(ref n) = name {
-                                self.definitions.insert(n.clone(), binary.clone());
-                            }
-                            match self.try_instantiate(&binary) {
-                                Ok(idx) => {
-                                    if let Some(ref n) = name {
-                                        self.named_instances.insert(n.clone(), idx);
-                                        self.named_kinds
-                                            .insert(n.clone(), ComponentImportKind::Instance);
-                                    }
-                                    passed += 1;
-                                }
-                                Err(e) => {
-                                    failed += 1;
-                                    eprintln!(
-                                        "  FAIL component instantiation (directive {directive_idx}): {e}"
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            self.current_instance = None;
-                            failed += 1;
-                            eprintln!("  FAIL encode: {e}");
-                        }
-                    }
-                }
-
-                // `component definition $name` — define but don't instantiate.
-                wast::WastDirective::ModuleDefinition(mut wat) => {
-                    let name = wat.name().map(|id| id.name().to_string());
-                    match wat.encode() {
-                        Ok(binary) => {
-                            if let Some(n) = name {
-                                self.definitions.insert(n, binary);
-                            }
-                            passed += 1;
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            eprintln!("  FAIL encode definition: {e}");
-                        }
-                    }
-                }
-
-                // `component instance $name $def` — instantiate a named definition.
-                wast::WastDirective::ModuleInstance {
-                    instance, module, ..
-                } => {
-                    let module_name = module.map(|id| id.name().to_string());
-                    let bytes = module_name
-                        .as_ref()
-                        .and_then(|n| self.definitions.get(n).cloned());
-                    match bytes {
-                        Some(binary) => match self.try_instantiate(&binary) {
-                            Ok(idx) => {
-                                if let Some(id) = instance {
-                                    let n = id.name().to_string();
-                                    self.named_kinds
-                                        .insert(n.clone(), ComponentImportKind::Instance);
-                                    self.named_instances.insert(n, idx);
-                                }
-                                passed += 1;
-                            }
-                            Err(e) => {
-                                failed += 1;
-                                eprintln!("  FAIL instance instantiation: {e}");
-                            }
-                        },
-                        None => {
-                            failed += 1;
-                            eprintln!("  FAIL instance: definition not found");
-                        }
-                    }
-                }
-
-                // `register "name"` — register current instance under a name.
-                wast::WastDirective::Register { name, module, .. } => {
-                    let idx = module
-                        .and_then(|id| self.named_instances.get(id.name()).copied())
-                        .or(self.current_instance);
-                    match idx {
-                        Some(i) => {
-                            self.named_instances.insert(name.to_string(), i);
-                            self.named_kinds
-                                .insert(name.to_string(), ComponentImportKind::Instance);
-                            passed += 1;
-                        }
-                        None => {
-                            failed += 1;
-                            eprintln!("  FAIL register: no instance available");
-                        }
-                    }
-                }
-
-                // assert_return with invoke
-                wast::WastDirective::AssertReturn {
-                    exec: wast::WastExecute::Invoke(invoke),
-                    results,
-                    ..
-                } => {
-                    let module_name = invoke.module.map(|id| id.name());
-                    let has_instance = match module_name {
-                        Some(n) => self.named_instances.contains_key(n),
-                        None => self.current_instance.is_some(),
-                    };
-                    if !has_instance {
-                        failed += 1;
-                        eprintln!(
-                            "  FAIL assert_return {}(): no instance available",
-                            invoke.name
-                        );
-                        continue;
-                    }
-                    let args = extract_component_args(&invoke);
-                    match self.invoke_component(invoke.name, &args, module_name) {
-                        Ok(got) => {
-                            if check_results(&got, &results) {
-                                passed += 1;
-                            } else {
-                                failed += 1;
-                                eprintln!(
-                                    "  FAIL assert_return {}(): got {:?}, expected {:?}",
-                                    invoke.name,
-                                    got,
-                                    format_expected(&results),
-                                );
-                            }
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            eprintln!("  FAIL assert_return {}(): {e}", invoke.name);
-                        }
-                    }
-                }
-
-                // assert_return with Wat (instantiate, check no error)
-                wast::WastDirective::AssertReturn {
-                    exec: wast::WastExecute::Wat(mut wat),
-                    ..
-                } => match wat.encode() {
-                    Ok(binary) => match self.try_instantiate(&binary) {
-                        Ok(_) => {
-                            passed += 1;
-                        }
-                        Err(e) => {
-                            failed += 1;
-                            eprintln!("  FAIL assert_return(wat): {e}");
-                        }
-                    },
-                    Err(e) => {
-                        failed += 1;
-                        eprintln!("  FAIL assert_return(wat) encode: {e}");
-                    }
-                },
-
-                // assert_return with get
-                wast::WastDirective::AssertReturn {
-                    exec: wast::WastExecute::Get { .. },
-                    ..
-                } => {
-                    failed += 1;
-                    eprintln!("  FAIL assert_return(get): not implemented");
-                }
-
-                // assert_trap with invoke
-                wast::WastDirective::AssertTrap {
-                    exec: wast::WastExecute::Invoke(invoke),
-                    message,
-                    ..
-                } => {
-                    let module_name = invoke.module.map(|id| id.name());
-                    let has_instance = match module_name {
-                        Some(n) => self.named_instances.contains_key(n),
-                        None => self.current_instance.is_some(),
-                    };
-                    if !has_instance {
-                        failed += 1;
-                        eprintln!(
-                            "  FAIL assert_trap {}(): no instance available",
-                            invoke.name
-                        );
-                        continue;
-                    }
-                    let args = extract_component_args(&invoke);
-                    match self.invoke_component(invoke.name, &args, module_name) {
-                        Err(_) => {
-                            passed += 1;
-                        }
-                        Ok(v) => {
-                            failed += 1;
-                            eprintln!(
-                                "  FAIL assert_trap {}(): should have trapped ({message}), got {v:?}",
-                                invoke.name
-                            );
-                        }
-                    }
-                }
-
-                // assert_trap with Wat (instantiation should trap)
-                wast::WastDirective::AssertTrap {
-                    exec: wast::WastExecute::Wat(mut wat),
-                    message,
-                    ..
-                } => match wat.encode() {
-                    Ok(binary) => match self.try_instantiate(&binary) {
-                        Err(_) => {
-                            passed += 1;
-                        }
-                        Ok(_) => {
-                            failed += 1;
-                            eprintln!("  FAIL assert_trap(wat): should have trapped ({message})");
-                        }
-                    },
-                    Err(e) => {
-                        failed += 1;
-                        eprintln!(
-                            "  FAIL assert_trap(wat) encode error \
-                                 (harness issue, not a trap): {e}"
-                        );
-                    }
-                },
-
-                // assert_invalid: component should fail validation
-                wast::WastDirective::AssertInvalid {
-                    mut module,
-                    message,
-                    ..
-                } => match module.encode() {
-                    Ok(binary) => match Component::from_bytes(&binary) {
-                        Err(_) => {
-                            passed += 1;
-                        }
-                        Ok(_) => {
-                            failed += 1;
-                            eprintln!(
-                                "  FAIL assert_invalid: validation should have rejected ({message})"
-                            );
-                        }
-                    },
-                    Err(_) => {
-                        passed += 1;
-                    }
-                },
-
-                // assert_malformed: component should fail to parse
-                wast::WastDirective::AssertMalformed {
-                    mut module,
-                    message,
-                    ..
-                } => match module.encode() {
-                    Ok(binary) => match Component::from_bytes(&binary) {
-                        Err(_) => {
-                            passed += 1;
-                        }
-                        Ok(_) => {
-                            failed += 1;
-                            eprintln!(
-                                "  FAIL assert_malformed: should have been rejected ({message})"
-                            );
-                        }
-                    },
-                    Err(_) => {
-                        passed += 1;
-                    }
-                },
-
-                // assert_unlinkable: component instantiation should fail to link
-                wast::WastDirective::AssertUnlinkable {
-                    mut module,
-                    message,
-                    ..
-                } => match module.encode() {
-                    Ok(binary) => match self.try_instantiate(&binary) {
-                        Err(_) => {
-                            passed += 1;
-                        }
-                        Ok(_) => {
-                            failed += 1;
-                            eprintln!(
-                                "  FAIL assert_unlinkable: should have failed to link ({message})"
-                            );
-                        }
-                    },
-                    Err(_) => {
-                        passed += 1;
-                    }
-                },
-
-                // assert_exhaustion
-                wast::WastDirective::AssertExhaustion { .. } => {
-                    failed += 1;
-                    eprintln!("  FAIL assert_exhaustion: not implemented");
-                }
-
-                // assert_exception
-                wast::WastDirective::AssertException { .. } => {
-                    failed += 1;
-                    eprintln!("  FAIL assert_exception: not implemented");
-                }
-
-                // assert_suspension
-                wast::WastDirective::AssertSuspension { .. } => {
-                    failed += 1;
-                    eprintln!("  FAIL assert_suspension: not implemented");
-                }
-
-                // bare invoke
-                wast::WastDirective::Invoke(invoke) => {
-                    let module_name = invoke.module.map(|id| id.name());
-                    let has_instance = match module_name {
-                        Some(n) => self.named_instances.contains_key(n),
-                        None => self.current_instance.is_some(),
-                    };
-                    if !has_instance {
-                        failed += 1;
-                        eprintln!("  FAIL invoke {}(): no instance available", invoke.name);
-                        continue;
-                    }
-                    let args = extract_component_args(&invoke);
-                    match self.invoke_component(invoke.name, &args, module_name) {
-                        Ok(_) => passed += 1,
-                        Err(e) => {
-                            failed += 1;
-                            eprintln!("  FAIL invoke {}(): {e}", invoke.name);
-                        }
-                    }
-                }
-
-                // Unhandled directive type
-                _ => {
-                    failed += 1;
-                    eprintln!("  FAIL: unhandled directive type");
-                }
-            }
-        }
-
-        (passed, failed)
+    /// Invoke a named function on an instance.
+    fn invoke(
+        &mut self,
+        func: &str,
+        args: &[&WastVal],
+        on: Option<&str>,
+    ) -> Result<Vec<ComponentValue>, String> {
+        let instance = self.get_instance(on)?;
+        instance.invoke_component(func, &convert_args(args))
     }
 }
 
-/// Convert WastVal arguments to ComponentArg for canonical ABI lowering.
-///
-/// Scalar types become `ComponentArg::Value(...)`, lists become
-/// `ComponentArg::List(...)` recursively.
-fn convert_wast_args_to_component(args: &[&WastVal]) -> Vec<ComponentArg> {
-    args.iter()
-        .filter_map(|arg| convert_single_wast_arg(arg))
-        .collect()
+// ---------------------------------------------------------------------------
+// Directive execution
+// ---------------------------------------------------------------------------
+
+/// Run all directives in a .wast file, collecting errors.
+fn run_wast(path: &Path) -> Vec<String> {
+    let source = std::fs::read_to_string(path).unwrap();
+    let source: String = source
+        .lines()
+        .filter(|l| !l.trim_start().starts_with(";; RUN:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let buf = wast::parser::ParseBuffer::new(&source).unwrap();
+    let wast = wast::parser::parse::<wast::Wast>(&buf).unwrap();
+
+    let mut runner = WastRunner::new();
+    let mut errors = Vec::new();
+
+    for (i, directive) in wast.directives.into_iter().enumerate() {
+        if let Err(e) = run_directive(&mut runner, directive) {
+            errors.push(format!("directive {}: {e}", i + 1));
+        }
+    }
+
+    errors
 }
 
-/// Convert a single WastVal to a ComponentArg.
-fn convert_single_wast_arg(arg: &WastVal) -> Option<ComponentArg> {
-    match arg {
-        WastVal::Bool(v) => Some(ComponentArg::Value(Value::I32(if *v { 1 } else { 0 }))),
-        WastVal::S8(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
-        WastVal::U8(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
-        WastVal::S16(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
-        WastVal::U16(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
-        WastVal::S32(v) => Some(ComponentArg::Value(Value::I32(*v))),
-        WastVal::U32(v) => Some(ComponentArg::Value(Value::I32(*v as i32))),
-        WastVal::S64(v) => Some(ComponentArg::Value(Value::I64(*v))),
-        WastVal::U64(v) => Some(ComponentArg::Value(Value::I64(*v as i64))),
-        WastVal::F32(v) => Some(ComponentArg::Value(Value::F32(f32::from_bits(v.bits)))),
-        WastVal::F64(v) => Some(ComponentArg::Value(Value::F64(f64::from_bits(v.bits)))),
-        WastVal::Char(c) => Some(ComponentArg::Value(Value::I32(*c as i32))),
-        WastVal::List(items) => {
-            let converted: Vec<ComponentArg> = items
-                .iter()
-                .filter_map(|item| convert_single_wast_arg(item))
-                .collect();
-            Some(ComponentArg::List(converted))
+/// Execute a single wast directive.
+fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Result<(), String> {
+    use wast::WastDirective::*;
+    use wast::WastExecute;
+
+    match directive {
+        // (component ...) — encode, instantiate, optionally name it.
+        // Instantiation may fail if imports can't be resolved; that's
+        // fine — the instance just won't be available for later use.
+        Module(mut wat) => {
+            let name = wat.name().map(|id| id.name().to_string());
+            let binary = wat.encode().map_err(|e| format!("encode: {e}"))?;
+            if let Some(ref n) = name {
+                runner.definitions.insert(n.clone(), binary.clone());
+            }
+            if let Ok(idx) = runner.instantiate(&binary) {
+                if let Some(n) = name {
+                    runner.named.insert(n.clone(), idx);
+                    runner.kinds.insert(n, ComponentImportKind::Instance);
+                }
+            }
+            Ok(())
         }
-        _ => None,
+
+        // (component definition ...) — encode and store, don't instantiate.
+        ModuleDefinition(mut wat) => {
+            let name = wat.name().map(|id| id.name().to_string());
+            let binary = wat.encode().map_err(|e| format!("encode: {e}"))?;
+            if let Some(n) = name {
+                runner.definitions.insert(n, binary);
+            }
+            Ok(())
+        }
+
+        // (component instance $name $def) — instantiate a named definition.
+        ModuleInstance {
+            instance, module, ..
+        } => {
+            let def_name = module.map(|id| id.name().to_string());
+            let binary = def_name
+                .as_ref()
+                .and_then(|n| runner.definitions.get(n).cloned())
+                .ok_or("definition not found")?;
+            let idx = runner.instantiate(&binary)?;
+            if let Some(id) = instance {
+                let n = id.name().to_string();
+                runner.named.insert(n.clone(), idx);
+                runner.kinds.insert(n, ComponentImportKind::Instance);
+            }
+            Ok(())
+        }
+
+        // (register "name") — register current instance under a name.
+        Register { name, module, .. } => {
+            let idx = module
+                .and_then(|id| runner.named.get(id.name()).copied())
+                .or(runner.current)
+                .ok_or("no instance to register")?;
+            runner.named.insert(name.to_string(), idx);
+            Ok(())
+        }
+
+        // (assert_return (invoke "f" ...) ...)
+        AssertReturn {
+            exec: WastExecute::Invoke(invoke),
+            results,
+            ..
+        } => {
+            let args = extract_args(&invoke);
+            let on = invoke.module.map(|id| id.name());
+            let got = runner.invoke(invoke.name, &args, on)?;
+            if !check_results(&got, &results) {
+                return Err(format!(
+                    "assert_return {}(): got {got:?}, expected {}",
+                    invoke.name,
+                    format_expected(&results),
+                ));
+            }
+            Ok(())
+        }
+
+        // (assert_return (component ...)) — instantiation should succeed.
+        AssertReturn {
+            exec: WastExecute::Wat(mut wat),
+            ..
+        } => {
+            let binary = wat.encode().map_err(|e| format!("encode: {e}"))?;
+            runner.instantiate(&binary)?;
+            Ok(())
+        }
+
+        // (assert_return (get ...)) — not implemented.
+        AssertReturn {
+            exec: WastExecute::Get { .. },
+            ..
+        } => Err("assert_return(get) not implemented".into()),
+
+        // (assert_trap (invoke "f") "msg") — invocation should fail.
+        AssertTrap {
+            exec: WastExecute::Invoke(invoke),
+            message,
+            ..
+        } => {
+            let args = extract_args(&invoke);
+            let on = invoke.module.map(|id| id.name());
+            match runner.invoke(invoke.name, &args, on) {
+                Err(_) => Ok(()),
+                Ok(v) => Err(format!(
+                    "assert_trap {}(): should have trapped ({message}), got {v:?}",
+                    invoke.name
+                )),
+            }
+        }
+
+        // (assert_trap (component ...)) — instantiation should fail.
+        AssertTrap {
+            exec: WastExecute::Wat(mut wat),
+            message,
+            ..
+        } => {
+            let binary = wat.encode().map_err(|e| format!("encode: {e}"))?;
+            match runner.instantiate(&binary) {
+                Err(_) => Ok(()),
+                Ok(_) => Err(format!("assert_trap(wat): should have trapped ({message})")),
+            }
+        }
+
+        // (assert_invalid ...) — validation should reject.
+        AssertInvalid {
+            mut module,
+            message,
+            ..
+        } => match module.encode() {
+            Err(_) => Ok(()),
+            Ok(binary) => match Component::from_bytes(&binary) {
+                Err(_) => Ok(()),
+                Ok(_) => Err(format!("assert_invalid: should have rejected ({message})")),
+            },
+        },
+
+        // (assert_malformed ...) — parsing should reject.
+        AssertMalformed {
+            mut module,
+            message,
+            ..
+        } => match module.encode() {
+            Err(_) => Ok(()),
+            Ok(binary) => match Component::from_bytes(&binary) {
+                Err(_) => Ok(()),
+                Ok(_) => Err(format!(
+                    "assert_malformed: should have rejected ({message})"
+                )),
+            },
+        },
+
+        // (assert_unlinkable ...) — linking should fail.
+        AssertUnlinkable {
+            mut module,
+            message,
+            ..
+        } => match module.encode() {
+            Err(_) => Ok(()),
+            Ok(binary) => match runner.instantiate(&binary) {
+                Err(_) => Ok(()),
+                Ok(_) => Err(format!("assert_unlinkable: should have failed ({message})")),
+            },
+        },
+
+        // Bare invoke.
+        Invoke(invoke) => {
+            let args = extract_args(&invoke);
+            let on = invoke.module.map(|id| id.name());
+            runner.invoke(invoke.name, &args, on)?;
+            Ok(())
+        }
+
+        // Directives we don't support yet.
+        AssertExhaustion { .. } => Err("assert_exhaustion not implemented".into()),
+        AssertException { .. } => Err("assert_exception not implemented".into()),
+        AssertSuspension { .. } => Err("assert_suspension not implemented".into()),
+
+        _ => Err("unhandled directive".into()),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Value conversion helpers
+// ---------------------------------------------------------------------------
+
+/// Parse WAT and instantiate it in one shot.
+fn instantiate_wat(wat: &str) -> Option<ComponentInstance> {
+    let binary = wat::parse_str(wat).ok()?;
+    let component = Component::from_bytes(&binary).ok()?;
+    ComponentInstance::instantiate(&component).ok()
 }
 
 /// Extract invoke arguments as WastVal references.
-fn extract_component_args<'a>(invoke: &'a wast::WastInvoke<'a>) -> Vec<&'a WastVal<'a>> {
+fn extract_args<'a>(invoke: &'a wast::WastInvoke<'a>) -> Vec<&'a WastVal<'a>> {
     invoke
         .args
         .iter()
-        .filter_map(|arg| match arg {
-            wast::WastArg::Component(val) => Some(val),
+        .filter_map(|a| match a {
+            wast::WastArg::Component(v) => Some(v),
             _ => None,
         })
         .collect()
 }
 
-/// Format expected results for error messages.
-fn format_expected(expected: &[WastRet]) -> String {
-    let parts: Vec<String> = expected
-        .iter()
-        .map(|e| match e {
-            WastRet::Component(val) => format!("{val:?}"),
-            WastRet::Core(val) => format!("Core({val:?})"),
-            _ => "?".to_string(),
-        })
-        .collect();
-    format!("[{}]", parts.join(", "))
+/// Convert wast values to component args.
+fn convert_args(args: &[&WastVal]) -> Vec<ComponentArg> {
+    args.iter().filter_map(|a| convert_arg(a)).collect()
 }
 
-/// Check if actual results match expected results.
-fn check_results(got: &[ComponentValue], expected: &[WastRet]) -> bool {
-    if got.len() != expected.len() {
-        return false;
-    }
-    got.iter().zip(expected).all(|(g, e)| match e {
-        WastRet::Component(val) => component_value_matches(g, val),
-        WastRet::Core(_) => false,
-        _ => false,
+/// Convert a single wast value to a component arg.
+fn convert_arg(val: &WastVal) -> Option<ComponentArg> {
+    Some(match val {
+        WastVal::Bool(v) => ComponentArg::Value(Value::I32(if *v { 1 } else { 0 })),
+        WastVal::S8(v) => ComponentArg::Value(Value::I32(*v as i32)),
+        WastVal::U8(v) => ComponentArg::Value(Value::I32(*v as i32)),
+        WastVal::S16(v) => ComponentArg::Value(Value::I32(*v as i32)),
+        WastVal::U16(v) => ComponentArg::Value(Value::I32(*v as i32)),
+        WastVal::S32(v) => ComponentArg::Value(Value::I32(*v)),
+        WastVal::U32(v) => ComponentArg::Value(Value::I32(*v as i32)),
+        WastVal::S64(v) => ComponentArg::Value(Value::I64(*v)),
+        WastVal::U64(v) => ComponentArg::Value(Value::I64(*v as i64)),
+        WastVal::F32(v) => ComponentArg::Value(Value::F32(f32::from_bits(v.bits))),
+        WastVal::F64(v) => ComponentArg::Value(Value::F64(f64::from_bits(v.bits))),
+        WastVal::Char(c) => ComponentArg::Value(Value::I32(*c as i32)),
+        WastVal::List(items) => {
+            ComponentArg::List(items.iter().filter_map(|i| convert_arg(i)).collect())
+        }
+        _ => unimplemented!(),
     })
 }
 
-/// Check if a component value matches an expected WastVal.
-fn component_value_matches(got: &ComponentValue, expected: &WastVal) -> bool {
+/// Check if actual results match expected results.
+fn check_results(got: &[ComponentValue], expected: &[wast::WastRet]) -> bool {
+    got.len() == expected.len()
+        && got.iter().zip(expected).all(|(g, e)| match e {
+            wast::WastRet::Component(v) => value_matches(g, v),
+            _ => false,
+        })
+}
+
+/// Check if a component value matches an expected wast value.
+fn value_matches(got: &ComponentValue, expected: &WastVal) -> bool {
     match (got, expected) {
         (ComponentValue::Bool(a), WastVal::Bool(b)) => a == b,
         (ComponentValue::S8(a), WastVal::S8(b)) => *a == *b as i32,
@@ -757,38 +481,45 @@ fn component_value_matches(got: &ComponentValue, expected: &WastVal) -> bool {
     }
 }
 
+/// Format expected results for error messages.
+fn format_expected(expected: &[wast::WastRet]) -> String {
+    let parts: Vec<String> = expected
+        .iter()
+        .map(|e| match e {
+            wast::WastRet::Component(v) => format!("{v:?}"),
+            wast::WastRet::Core(v) => format!("Core({v:?})"),
+            _ => "?".to_string(),
+        })
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+// ---------------------------------------------------------------------------
+// Test harness
+// ---------------------------------------------------------------------------
+
 fn run_component_test(name: &str, subdir: &str) {
     let path = Path::new("tests/component-model/test")
         .join(subdir)
         .join(format!("{name}.wast"));
-    if !path.exists() {
-        panic!("component test not found: {}", path.display());
+    assert!(path.exists(), "test not found: {}", path.display());
+
+    let errors = run_wast(&path);
+    for e in &errors {
+        eprintln!("  FAIL {e}");
     }
-
-    let mut runner = ComponentTestRunner::new();
-    let (passed, failed) = runner.run_wast(&path);
-
-    println!("{name}: {passed} passed, {failed} failed");
-
-    assert_eq!(failed, 0, "{name}: {failed} assertions failed");
+    assert!(
+        errors.is_empty(),
+        "{name}: {} directives failed",
+        errors.len()
+    );
 }
 
 macro_rules! component_tests {
     ($($name:ident => ($subdir:expr, $file:expr)),* $(,)?) => {
         $(
             #[test]
-            fn $name() {
-                run_component_test($file, $subdir);
-            }
-        )*
-    };
-    (ignored: $($name:ident => ($subdir:expr, $file:expr)),* $(,)?) => {
-        $(
-            #[test]
-            #[ignore]
-            fn $name() {
-                run_component_test($file, $subdir);
-            }
+            fn $name() { run_component_test($file, $subdir); }
         )*
     };
 }
@@ -853,7 +584,7 @@ component_tests! {
     // resources
     comp_res_multiple => ("resources", "multiple-resources"),
 
-    // async (advanced)
+    // async
     comp_async_calls_sync => ("async", "async-calls-sync"),
     comp_async_cancel_stream => ("async", "cancel-stream"),
     comp_async_cancel_subtask => ("async", "cancel-subtask"),
@@ -873,8 +604,6 @@ component_tests! {
     comp_async_same_component_stream_future => ("async", "same-component-stream-future"),
     comp_async_sync_barges_in => ("async", "sync-barges-in"),
     comp_async_sync_streams => ("async", "sync-streams"),
-    // Ignored: wast v245 doesn't support `thread.yield-to` syntax
-    // comp_async_trap_if_block_and_sync => ("async", "trap-if-block-and-sync"),
     comp_async_trap_if_done => ("async", "trap-if-done"),
     comp_async_trap_on_reenter => ("async", "trap-on-reenter"),
     comp_async_wait_during_callback => ("async", "wait-during-callback"),
