@@ -29,12 +29,10 @@ pub(super) fn instantiate_core_module(
     module_index: u32,
     args: &[(String, CoreInstanceArg)],
 ) -> Result<(), String> {
-    // Check resolved_modules first (for aliased core modules from
-    // component instance exports), then fall back to component.core_modules.
-    let module_bytes = inst
-        .resolved_modules
-        .get(&module_index)
-        .or_else(|| component.core_modules.get(module_index as usize))
+    let module_bytes = component
+        .core_modules
+        .get(module_index as usize)
+        .filter(|b| !b.is_empty())
         .ok_or_else(|| format!("module index {} out of bounds", module_index))?;
     let module = Rc::new(Module::from_bytes(module_bytes)?);
 

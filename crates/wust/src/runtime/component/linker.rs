@@ -10,7 +10,6 @@ use std::rc::Rc;
 use super::instance::{
     find_func_import_slot, shift_component_instance_indices, ComponentInstance,
 };
-use super::module_validate::validate_module_type_constraints;
 use super::types::{Component, ComponentFuncDef, ComponentImportKind};
 
 /// Entry in the linker registry.
@@ -102,10 +101,6 @@ impl Linker {
                 ComponentImportKind::Instance => {
                     let instance = entry.instance.export_view();
                     validate_required_exports(&instance, &import_def.name, &import_def.required_exports)?;
-                    validate_module_type_constraints(
-                        &instance,
-                        &import_def.module_type_constraints,
-                    )?;
                     import_instances.push(instance);
                 }
                 ComponentImportKind::Func => {
@@ -151,8 +146,6 @@ fn validate_required_exports(
 ) -> Result<(), String> {
     for required in required_exports {
         let has_export = instance.exports.contains_key(required)
-            || instance.exported_modules.contains_key(required)
-            || instance.exported_components.contains_key(required)
             || instance.exported_instances.contains_key(required);
         if !has_export {
             return Err(format!(

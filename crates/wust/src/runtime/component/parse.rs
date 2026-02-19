@@ -290,15 +290,11 @@ fn parse_component_import_section(
     for import in reader {
         let import = import.map_err(|e| format!("import parse error: {e}"))?;
         let mut required_exports = Vec::new();
-        let mut module_type_constraints = std::collections::HashMap::new();
         let kind = match import.ty {
             wasmparser::ComponentTypeRef::Instance(type_idx) => {
                 component.instance_import_count += 1;
                 if let Some(exports) = component.instance_type_exports.get(&type_idx) {
                     required_exports = exports.clone();
-                }
-                if let Some(constraints) = component.instance_type_module_constraints.get(&type_idx) {
-                    module_type_constraints = constraints.clone();
                 }
                 ComponentImportKind::Instance
             }
@@ -336,7 +332,6 @@ fn parse_component_import_section(
             name: import.name.0.to_string(),
             kind,
             required_exports,
-            module_type_constraints,
         });
     }
     Ok(())
@@ -589,12 +584,6 @@ fn parse_type_section(
                         .instance_type_exports
                         .insert(type_index, export_names.clone());
                 }
-                let module_constraints = extract_instance_module_constraints(&decls);
-                if !module_constraints.is_empty() {
-                    component
-                        .instance_type_module_constraints
-                        .insert(type_index, module_constraints);
-                }
                 component.component_types.push(None);
             }
             wasmparser::ComponentType::Defined(def) => {
@@ -629,114 +618,6 @@ fn extract_instance_type_exports(
 
 /// Extract module type constraints from instance type declarations.
 ///
-/// For each export of kind Module, look up the core module type and extract
-/// the expected imports and exports. Returns a map from export name to
-/// module type constraint.
-fn extract_instance_module_constraints(
-    decls: &[wasmparser::InstanceTypeDeclaration],
-) -> std::collections::HashMap<String, ModuleTypeConstraint> {
-    // First pass: collect core module types declared in this instance type.
-    // These are local to the instance type declaration and indexed in order.
-    let mut core_module_types: Vec<ModuleTypeConstraint> = Vec::new();
-    for decl in decls {
-        if let wasmparser::InstanceTypeDeclaration::CoreType(core_type) = decl {
-            if let wasmparser::CoreType::Module(module_decls) = core_type {
-                core_module_types.push(parse_module_type_decls(module_decls));
-            }
-        }
-    }
-
-    // Second pass: match exports of kind Module to their types.
-    let mut result = std::collections::HashMap::new();
-    for decl in decls {
-        if let wasmparser::InstanceTypeDeclaration::Export { name, ty } = decl {
-            if let wasmparser::ComponentTypeRef::Module(type_idx) = ty {
-                if let Some(constraint) = core_module_types.get(*type_idx as usize) {
-                    result.insert(name.0.to_string(), constraint.clone());
-                }
-            }
-        }
-    }
-    result
-}
-
-/// Parse module type declarations into a `ModuleTypeConstraint`.
-///
-/// Extracts the func types defined in the module type, then maps each
-/// export and import declaration to a typed constraint using those types.
-fn parse_module_type_decls(decls: &[wasmparser::ModuleTypeDeclaration]) -> ModuleTypeConstraint {
-    // Collect func types declared in this module type.
-    let mut func_types: Vec<wasmparser::FuncType> = Vec::new();
-    for decl in decls {
-        if let wasmparser::ModuleTypeDeclaration::Type(rec_group) = decl {
-            for sub_type in rec_group.types() {
-                if let wasmparser::CompositeInnerType::Func(ft) = &sub_type.composite_type.inner {
-                    func_types.push(ft.clone());
-                }
-            }
-        }
-    }
-
-    let mut expected_exports = Vec::new();
-    let mut expected_imports = Vec::new();
-
-    for decl in decls {
-        match decl {
-            wasmparser::ModuleTypeDeclaration::Export { name, ty } => {
-                if let Some(item_type) = convert_type_ref(ty, &func_types) {
-                    expected_exports.push(ModuleItemConstraint {
-                        name: name.to_string(),
-                        item_type,
-                    });
-                }
-            }
-            wasmparser::ModuleTypeDeclaration::Import(import) => {
-                if let Some(item_type) = convert_type_ref(&import.ty, &func_types) {
-                    expected_imports.push(ModuleImportConstraint {
-                        module: import.module.to_string(),
-                        name: import.name.to_string(),
-                        item_type,
-                    });
-                }
-            }
-            _ => {}
-        }
-    }
-
-    ModuleTypeConstraint {
-        expected_exports,
-        expected_imports,
-    }
-}
-
-/// Convert a wasmparser `TypeRef` to our `ModuleItemType`.
-fn convert_type_ref(
-    ty: &wasmparser::TypeRef,
-    func_types: &[wasmparser::FuncType],
-) -> Option<ModuleItemType> {
-    match ty {
-        wasmparser::TypeRef::Func(idx) => {
-            let ft = func_types.get(*idx as usize)?;
-            Some(ModuleItemType::Func {
-                params: ft.params().to_vec(),
-                results: ft.results().to_vec(),
-            })
-        }
-        wasmparser::TypeRef::Global(gt) => Some(ModuleItemType::Global {
-            ty: gt.content_type,
-            mutable: gt.mutable,
-        }),
-        wasmparser::TypeRef::Memory(mt) => Some(ModuleItemType::Memory {
-            min: mt.initial,
-        }),
-        wasmparser::TypeRef::Table(tt) => Some(ModuleItemType::Table {
-            min: tt.initial,
-            element_type: tt.element_type,
-        }),
-        _ => None,
-    }
-}
-
 /// Propagate defined value type info through type bounds.
 ///
 /// When a type import has an `eq` bound (e.g. `(import "a" (type $a (eq $a')))`),

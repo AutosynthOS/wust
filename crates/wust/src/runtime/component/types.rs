@@ -314,45 +314,6 @@ pub enum ComponentImportKind {
     Value,
 }
 
-/// The expected kind and type of a single item in a module type constraint.
-#[derive(Debug, Clone)]
-pub(crate) enum ModuleItemType {
-    /// Expected function with a specific signature (param types, result types).
-    Func { params: Vec<wasmparser::ValType>, results: Vec<wasmparser::ValType> },
-    /// Expected global with a specific value type and mutability.
-    Global { ty: wasmparser::ValType, mutable: bool },
-    /// Expected memory with a minimum page count.
-    Memory { min: u64 },
-    /// Expected table with a minimum size and element type.
-    Table { min: u64, element_type: wasmparser::RefType },
-}
-
-/// A single expected export or import in a module type constraint.
-#[derive(Debug, Clone)]
-pub(crate) struct ModuleItemConstraint {
-    pub name: String,
-    pub item_type: ModuleItemType,
-}
-
-/// A single expected import in a module type constraint, including the
-/// module namespace.
-#[derive(Debug, Clone)]
-pub(crate) struct ModuleImportConstraint {
-    pub module: String,
-    pub name: String,
-    pub item_type: ModuleItemType,
-}
-
-/// Describes the expected shape of a core module exported from an instance.
-///
-/// Contains the module's required exports and imports, as declared in the
-/// component's instance type.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct ModuleTypeConstraint {
-    pub expected_exports: Vec<ModuleItemConstraint>,
-    pub expected_imports: Vec<ModuleImportConstraint>,
-}
-
 /// A parsed component-level import declaration.
 #[derive(Clone)]
 pub struct ComponentImportDef {
@@ -361,9 +322,6 @@ pub struct ComponentImportDef {
     /// For instance imports, the names of exports required by the instance
     /// type. Empty for non-instance imports.
     pub required_exports: Vec<String>,
-    /// For instance imports that export core modules, the type constraints
-    /// on those modules. Keyed by export name.
-    pub(crate) module_type_constraints: HashMap<String, ModuleTypeConstraint>,
 }
 
 /// An outer alias request recorded during parsing, to be resolved when the
@@ -422,9 +380,6 @@ pub struct Component {
     /// Required export names for instance types, keyed by type index.
     /// Populated from `ComponentType::Instance` declarations in the type section.
     pub(crate) instance_type_exports: HashMap<u32, Vec<String>>,
-    /// Module type constraints for instance types, keyed by type index.
-    /// Each entry maps an export name to the expected module type.
-    pub(crate) instance_type_module_constraints: HashMap<u32, HashMap<String, ModuleTypeConstraint>>,
     /// Outer alias requests that need resolution when the parent context
     /// is available.
     pub(crate) outer_aliases: Vec<OuterAlias>,

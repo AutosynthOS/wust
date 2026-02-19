@@ -18,9 +18,7 @@ mod resolve;
 mod instance;
 mod linker;
 mod trampoline;
-mod alias;
 mod imports;
-mod module_validate;
 
 pub use types::{Component, ComponentArg, ComponentImportDef, ComponentImportKind, ComponentResultType, ComponentValue};
 pub(crate) use types::StringEncoding;
@@ -81,7 +79,6 @@ impl Component {
             instance_import_count: 0,
             imports: Vec::new(),
             instance_type_exports: std::collections::HashMap::new(),
-            instance_type_module_constraints: std::collections::HashMap::new(),
             outer_aliases: Vec::new(),
             pre_resolved_inner: std::collections::HashMap::new(),
             defined_val_types: std::collections::HashMap::new(),
