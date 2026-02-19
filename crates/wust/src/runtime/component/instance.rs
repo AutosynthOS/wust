@@ -345,7 +345,7 @@ impl ComponentInstance {
                 patched_slots.push(slot_idx);
             }
             shift_component_instance_indices(&mut patched, shift, &patched_slots);
-            eprintln!("[FUNC-IMPORT] patched instance_import_count={}, comp_funcs:", patched.instance_import_count);
+            eprintln!("[FUNC-IMPORT] patched instance_import_count={}, comp_funcs len={}:", patched.instance_import_count, patched.component_funcs.len());
             for (i, f) in patched.component_funcs.iter().enumerate() {
                 match f {
                     ComponentFuncDef::AliasInstanceExport { instance_index, name } => {
@@ -385,6 +385,24 @@ impl ComponentInstance {
         pre_resolved_components: HashMap<u32, Component>,
         ancestors: &[&Component],
     ) -> Result<Self, String> {
+        let resource_table = Rc::new(RefCell::new(vec![None]));
+        Self::instantiate_inner_with_resource_table(
+            component, import_instances, pre_resolved_components, ancestors, resource_table,
+        )
+    }
+
+    /// Inner instantiation with a shared resource table from the parent.
+    ///
+    /// Child components share their parent's resource table so that
+    /// resource handles created by one component are visible when passed
+    /// to another through imports/exports.
+    fn instantiate_inner_with_resource_table(
+        component: &Component,
+        import_instances: Vec<ComponentInstance>,
+        pre_resolved_components: HashMap<u32, Component>,
+        ancestors: &[&Component],
+        resource_table: SharedResourceTable,
+    ) -> Result<Self, String> {
         // Guard against infinite recursion from cyclic component instantiation.
         if ancestors.len() > 100 {
             return Err("component instantiation depth limit exceeded".into());
@@ -402,7 +420,7 @@ impl ComponentInstance {
             exported_instances: HashMap::new(),
             instantiating: instantiating.clone(),
             pre_resolved_components,
-            resource_table: Rc::new(RefCell::new(vec![None])),
+            resource_table,
         };
 
         // Resolve self-referencing outer aliases (count=1 with no parent).
@@ -659,10 +677,29 @@ fn populate_from_exports_func_exports(inst: &mut ComponentInstance, component: &
                 ComponentFuncDef::AliasInstanceExport {
                     instance_index,
                     name,
-                } => ResolvedExport::Child {
-                    child_index: *instance_index as usize,
-                    export_name: name.clone(),
-                },
+                } => {
+                    let src = *instance_index as usize;
+                    if child_idx < inst.child_instances.len()
+                        && src < inst.child_instances.len()
+                    {
+                        let copy = inst.child_instances[src].export_view();
+                        let new_idx = inst.child_instances[child_idx]
+                            .child_instances
+                            .len();
+                        inst.child_instances[child_idx]
+                            .child_instances
+                            .push(copy);
+                        ResolvedExport::Child {
+                            child_index: new_idx,
+                            export_name: name.clone(),
+                        }
+                    } else {
+                        ResolvedExport::Child {
+                            child_index: src,
+                            export_name: name.clone(),
+                        }
+                    }
+                }
             };
             if child_idx < inst.child_instances.len() {
                 inst.child_instances[child_idx]
@@ -850,11 +887,12 @@ fn instantiate_child_components(
                     } else {
                         Vec::new()
                     };
-                    ComponentInstance::instantiate_inner_with_ancestors(
+                    ComponentInstance::instantiate_inner_with_resource_table(
                         &inner_component,
                         import_instances,
                         HashMap::new(),
                         &inner_ancestors,
+                        Rc::clone(&inst.resource_table),
                     )?
                 };
                 inst.child_instances.push(child);
@@ -1506,11 +1544,12 @@ fn instantiate_with_instance_args(
         }
     }
 
-    ComponentInstance::instantiate_inner_with_ancestors(
+    ComponentInstance::instantiate_inner_with_resource_table(
         inner_component,
         import_instances,
         pre_resolved,
         ancestors,
+        Rc::clone(&outer.resource_table),
     )
 }
 

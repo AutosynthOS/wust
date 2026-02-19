@@ -177,6 +177,10 @@ pub enum ComponentResultType {
     /// when passed across the ABI boundary. The alignment is the maximum
     /// alignment of the type's fields (e.g. 4 for tuples of u32).
     Compound { alignment: u32 },
+    /// An owned resource handle — transferred across the ABI boundary.
+    Own,
+    /// A borrowed resource handle — the callee receives the rep value.
+    Borrow,
     /// A type we don't yet handle — pass through raw.
     Unknown,
 }
