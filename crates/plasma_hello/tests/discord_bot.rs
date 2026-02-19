@@ -29,7 +29,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use plasma_hello::{eval_js_with_polyfills, load_plasma_module, EvalResult};
+use plasma_hello::{eval_js, load_plasma_module, EvalResult};
 
 const BUNDLE_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -78,13 +78,13 @@ fn discord_bot_bundle_loads_and_reports_missing_apis() {
 
 /// Patch the Bun bundle to be evaluable in script mode.
 ///
-/// 1. Replace `import.meta.require` with a stub that throws.
+/// 1. Replace `import.meta.require` with plasma's built-in `require`.
 /// 2. Strip the entry point (top-level await) and replace with a
 ///    synchronous probe that tries to instantiate the Client class.
 fn patch_bundle_for_eval(source: &str) -> String {
     let patched = source.replace(
         "var __require = import.meta.require;",
-        "var __require = function(mod) { throw new Error('require is not available: ' + mod); };",
+        "var __require = require;",
     );
     strip_entry_point_and_add_probe(&patched)
 }
@@ -99,7 +99,7 @@ fn eval_with_timeout(js_source: &str, timeout: Duration) -> EvalResult {
 
     thread::spawn(move || {
         let module = load_plasma_module();
-        let result = eval_js_with_polyfills(&module, &source);
+        let result = eval_js(&module, &source);
         let _ = tx.send(result);
     });
 
@@ -159,7 +159,7 @@ fn binary_search_bundle_freeze_point() {
 
     let patched = bundle_source.replace(
         "var __require = import.meta.require;",
-        "var __require = function(mod) { throw new Error('require not available: ' + mod); };",
+        "var __require = require;",
     );
 
     let lines: Vec<&str> = patched.lines().collect();
@@ -168,8 +168,8 @@ fn binary_search_bundle_freeze_point() {
 
     eprintln!("Total bundle lines (before entry point): {max_lines}");
 
-    let sizes = [5000, 10000, 15000, 20000, 25000, 30000, 35000];
-    let timeout = Duration::from_secs(10);
+    let sizes = [1000, 2000, 3000, 4000, 5000, 7500, 10000, 15000, 20000];
+    let timeout = Duration::from_secs(20);
 
     for &size in &sizes {
         let take = size.min(max_lines);

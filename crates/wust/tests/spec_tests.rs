@@ -188,7 +188,7 @@ fn try_instantiate(
 ) -> Result<(Arc<Module>, Store), String> {
     let m = Module::from_bytes(binary)?;
     let (host_funcs, imported_globals, pending_funcrefs) = build_imports(&m, registered);
-    let mut store = Store::new_with_imports(&m, host_funcs, imported_globals)?;
+    let mut store = Store::new_with_imports(&m, host_funcs, imported_globals, vec![])?;
     for (_global_idx, src_module, src_store, src_func_idx) in pending_funcrefs {
         let reg_module = src_module.clone();
         let reg_store = src_store.clone();

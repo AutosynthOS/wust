@@ -141,6 +141,15 @@ fn resolve_core_func_def_to_export(
                 _ => Ok(CoreExport::Trampoline),
             }
         }
+        CoreFuncDef::ResourceNew { resource } => {
+            Ok(CoreExport::ResourceNew { resource_type: *resource })
+        }
+        CoreFuncDef::ResourceRep { resource } => {
+            Ok(CoreExport::ResourceRep { resource_type: *resource })
+        }
+        CoreFuncDef::ResourceDrop { resource } => {
+            Ok(CoreExport::ResourceDrop { resource_type: *resource })
+        }
         _ => Ok(CoreExport::Trampoline),
     }
 }

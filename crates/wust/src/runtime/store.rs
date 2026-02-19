@@ -11,6 +11,13 @@ use crate::runtime::value::Value;
 /// a component) while still permitting mutable access via `borrow_mut()`.
 pub type SharedStore = Rc<RefCell<Store>>;
 
+/// A shared table that can be imported across module instances.
+///
+/// When one module exports a table and another imports it, both instances
+/// hold an `Rc` to the same underlying vector so mutations (e.g. element
+/// segment initialization, `table.set`) are visible to both sides.
+pub type SharedTable = Rc<RefCell<Vec<Option<u32>>>>;
+
 const PAGE_SIZE: usize = 65536; // 64KB WASM pages
 
 /// Evaluate a const expression to a Value, supporting all WASM types and extended const ops.
@@ -103,8 +110,11 @@ pub struct Store {
     /// Max memory size in pages (None = unlimited up to 4GB).
     pub memory_max: Option<u32>,
     pub globals: Vec<Value>,
-    /// tables[i][j] = function index at table i, element j (None = uninitialized)
-    pub tables: Vec<Vec<Option<u32>>>,
+    /// tables[i] = shared table; element j = function index (None = uninitialized).
+    ///
+    /// Tables are reference-counted so that imported tables share the same
+    /// backing storage as the exporting instance.
+    pub tables: Vec<SharedTable>,
     /// Host functions for imported function indices 0..num_func_imports.
     pub host_funcs: Vec<HostFunc>,
     /// Element segment data for table.init (None = dropped).
@@ -121,14 +131,19 @@ pub struct Store {
 impl Store {
     /// Create a Store with no imports (for modules that don't import anything).
     pub fn new(module: &Module) -> Result<Self, String> {
-        Self::new_with_imports(module, Vec::new(), Vec::new())
+        Self::new_with_imports(module, Vec::new(), Vec::new(), Vec::new())
     }
 
-    /// Create a Store with imported globals and host functions.
+    /// Create a Store with imported globals, host functions, and shared tables.
+    ///
+    /// `imported_tables` contains one `SharedTable` for each table import the
+    /// module declares (in declaration order). These are placed at the front
+    /// of the tables vector, followed by any tables the module defines itself.
     pub fn new_with_imports(
         module: &Module,
         host_funcs: Vec<HostFunc>,
         imported_globals: Vec<Value>,
+        imported_tables: Vec<SharedTable>,
     ) -> Result<Self, String> {
         // Init memory
         let mut memory = Vec::new();
@@ -165,9 +180,12 @@ impl Store {
             }
         }
 
-        // Init tables (with optional init expressions)
-        let mut tables: Vec<Vec<Option<u32>>> = Vec::new();
-        for t in &module.tables {
+        // Init tables: imported tables first, then module-defined tables.
+        // The module.tables vec includes entries for both imports and
+        // definitions (imports come first, in declaration order).
+        let num_table_imports = imported_tables.len();
+        let mut tables: Vec<SharedTable> = imported_tables;
+        for t in module.tables.iter().skip(num_table_imports) {
             let init_val = match &t.init {
                 Some(instrs) => {
                     match eval_const_expr(instrs, &globals) {
@@ -178,7 +196,7 @@ impl Store {
                 }
                 None => None,
             };
-            tables.push(vec![init_val; t.min as usize]);
+            tables.push(Rc::new(RefCell::new(vec![init_val; t.min as usize])));
         }
 
         // Apply active element segments to tables
@@ -188,7 +206,8 @@ impl Store {
                     Some(Value::I32(v)) => v as u32 as usize,
                     _ => continue,
                 };
-                if let Some(table) = tables.get_mut(elem.table_idx as usize) {
+                if let Some(shared_table) = tables.get(elem.table_idx as usize) {
+                    let mut table = shared_table.borrow_mut();
                     let end = offset.checked_add(elem.items.len())
                         .ok_or("out of bounds table access")?;
                     if end > table.len() {

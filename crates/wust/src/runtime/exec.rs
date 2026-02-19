@@ -535,8 +535,9 @@ fn execute_table_init(
             elems[src as usize..src as usize + count as usize].to_vec()
         }
     };
-    let table = store.tables.get_mut(table_idx)
+    let shared_table = store.tables.get(table_idx)
         .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+    let mut table = shared_table.borrow_mut();
     if dst as usize + count as usize > table.len() {
         return Err(ExecError::Trap("out of bounds table access".into()));
     }
@@ -587,9 +588,9 @@ fn execute_table_copy(
     count: u32,
 ) -> Result<(), ExecError> {
     let src_len = store.tables.get(src_table)
-        .ok_or_else(|| ExecError::Trap("undefined table".into()))?.len();
+        .ok_or_else(|| ExecError::Trap("undefined table".into()))?.borrow().len();
     let dst_len = store.tables.get(dst_table)
-        .ok_or_else(|| ExecError::Trap("undefined table".into()))?.len();
+        .ok_or_else(|| ExecError::Trap("undefined table".into()))?.borrow().len();
     if src as u64 + count as u64 > src_len as u64
         || dst as u64 + count as u64 > dst_len as u64
     {
@@ -597,14 +598,18 @@ fn execute_table_copy(
     }
     if count > 0 {
         if src_table == dst_table {
-            let table = &mut store.tables[src_table];
+            let mut table = store.tables[src_table].borrow_mut();
             table.copy_within(src as usize..(src + count) as usize, dst as usize);
         } else {
-            let tmp: Vec<_> = (0..count as usize)
-                .map(|i| store.tables[src_table][src as usize + i])
-                .collect();
+            let tmp: Vec<_> = {
+                let src_t = store.tables[src_table].borrow();
+                (0..count as usize)
+                    .map(|i| src_t[src as usize + i])
+                    .collect()
+            };
+            let mut dst_t = store.tables[dst_table].borrow_mut();
             for (i, val) in tmp.into_iter().enumerate() {
-                store.tables[dst_table][dst as usize + i] = val;
+                dst_t[dst as usize + i] = val;
             }
         }
     }
@@ -613,8 +618,9 @@ fn execute_table_copy(
 
 /// Look up a function index from a table element, returning an error if out of bounds or null.
 fn resolve_table_element(store: &Store, table_idx: u32, elem_idx: u32) -> Result<u32, ExecError> {
-    let table = store.tables.get(table_idx as usize)
+    let shared_table = store.tables.get(table_idx as usize)
         .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+    let table = shared_table.borrow();
     let entry = table.get(elem_idx as usize)
         .ok_or_else(|| ExecError::Trap("undefined element".into()))?;
     entry.ok_or_else(|| ExecError::Trap("uninitialized element".into()))
@@ -1270,8 +1276,9 @@ pub fn call(
             OP_TABLE_GET => {
                 let idx = pop_i32(&mut stack) as u32;
                 let table_idx = op.imm as usize;
-                let table = store.tables.get(table_idx)
+                let shared_table = store.tables.get(table_idx)
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                let table = shared_table.borrow();
                 if idx as usize >= table.len() {
                     return Err(ExecError::Trap("out of bounds table access".into()));
                 }
@@ -1284,8 +1291,9 @@ pub fn call(
                 let val = pop_raw(&mut stack);
                 let idx = pop_i32(&mut stack) as u32;
                 let table_idx = op.imm as usize;
-                let table = store.tables.get_mut(table_idx)
+                let shared_table = store.tables.get(table_idx)
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                let mut table = shared_table.borrow_mut();
                 if idx as usize >= table.len() {
                     return Err(ExecError::Trap("out of bounds table access".into()));
                 }
@@ -1293,20 +1301,19 @@ pub fn call(
             }
             OP_TABLE_SIZE => {
                 let table_idx = op.imm as usize;
-                let table = store.tables.get(table_idx)
+                let shared_table = store.tables.get(table_idx)
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
-                push_i32!(stack, table.len() as i32);
+                push_i32!(stack, shared_table.borrow().len() as i32);
             }
             OP_TABLE_GROW => {
                 let n = pop_i32(&mut stack) as u32;
                 let init_val = pop_raw(&mut stack);
                 let table_idx = op.imm as usize;
-                // Read table_defs before mutably borrowing tables to
-                // avoid a split-borrow conflict through Deref.
                 let max = store.table_defs.get(table_idx)
                     .and_then(|(_, max)| *max);
-                let table = store.tables.get_mut(table_idx)
+                let shared_table = store.tables.get(table_idx)
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                let mut table = shared_table.borrow_mut();
                 let old_size = table.len() as u32;
                 let new_size = old_size as u64 + n as u64;
                 // Check max limit
@@ -1335,8 +1342,9 @@ pub fn call(
                 let val = pop_raw(&mut stack);
                 let i = pop_i32(&mut stack) as u32;
                 let table_idx = op.imm as usize;
-                let table = store.tables.get_mut(table_idx)
+                let shared_table = store.tables.get(table_idx)
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+                let mut table = shared_table.borrow_mut();
                 if i as u64 + n as u64 > table.len() as u64 {
                     return Err(ExecError::Trap("out of bounds table access".into()));
                 }

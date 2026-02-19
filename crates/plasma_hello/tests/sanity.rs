@@ -10,7 +10,7 @@
 //! cargo build -p plasma --target wasm32-unknown-unknown --release
 //! ```
 
-use plasma_hello::{eval_js, eval_js_with_polyfills, load_plasma_module};
+use plasma_hello::{eval_js, load_plasma_module};
 
 #[test]
 fn eval_simple_expression() {
@@ -39,18 +39,9 @@ fn eval_syntax_error_returns_error_code() {
 }
 
 #[test]
-fn eval_with_polyfills_console_log() {
+fn eval_process_exists() {
     let module = load_plasma_module();
-    let result = eval_js_with_polyfills(&module, r#"console.log("polyfills work")"#);
-
-    assert_eq!(result.return_code, 0, "eval with polyfills returned error: {}", result.log_output);
-    assert_eq!(result.log_output, "polyfills work");
-}
-
-#[test]
-fn eval_with_polyfills_process_exists() {
-    let module = load_plasma_module();
-    let result = eval_js_with_polyfills(
+    let result = eval_js(
         &module,
         r#"console.log(typeof process !== "undefined" ? "yes" : "no")"#,
     );
@@ -60,9 +51,9 @@ fn eval_with_polyfills_process_exists() {
 }
 
 #[test]
-fn eval_with_polyfills_buffer_exists() {
+fn eval_buffer_exists() {
     let module = load_plasma_module();
-    let result = eval_js_with_polyfills(
+    let result = eval_js(
         &module,
         r#"console.log(typeof Buffer !== "undefined" ? "yes" : "no")"#,
     );
@@ -72,9 +63,9 @@ fn eval_with_polyfills_buffer_exists() {
 }
 
 #[test]
-fn eval_with_polyfills_event_emitter_exists() {
+fn eval_event_emitter_exists() {
     let module = load_plasma_module();
-    let result = eval_js_with_polyfills(
+    let result = eval_js(
         &module,
         r#"console.log(typeof EventEmitter !== "undefined" ? "yes" : "no")"#,
     );
@@ -89,7 +80,7 @@ fn eval_polyfills_timing() {
     let module = load_plasma_module();
 
     let start = Instant::now();
-    let result = eval_js_with_polyfills(&module, "console.log('done')");
+    let result = eval_js(&module, "console.log('done')");
     let elapsed = start.elapsed();
 
     eprintln!("Polyfills eval time: {elapsed:?}");
@@ -116,7 +107,7 @@ var require_foo = __commonJS(function(exports, module) {
 var foo = require_foo();
 console.log(foo.hello);
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "world");
 }
@@ -130,7 +121,7 @@ var ee = new events();
 ee.on("test", function() { console.log("event fired"); });
 ee.emit("test");
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "event fired");
 }
@@ -142,7 +133,7 @@ fn require_node_events_default_is_event_emitter() {
 var EventEmitter = require("node:events");
 console.log(typeof EventEmitter === "function" ? "yes" : "no");
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "yes");
 }
@@ -154,7 +145,7 @@ fn require_node_buffer_returns_buffer() {
 var buf = require("node:buffer");
 console.log(typeof buf.Buffer === "function" ? "yes" : "no");
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "yes");
 }
@@ -166,7 +157,7 @@ fn require_node_process_returns_process() {
 var proc = require("node:process");
 console.log(proc.platform);
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "wasm");
 }
@@ -178,7 +169,7 @@ fn require_node_timers_returns_timer_functions() {
 var timers = require("node:timers");
 console.log(typeof timers.setTimeout === "function" ? "yes" : "no");
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "yes");
 }
@@ -191,7 +182,7 @@ var url = require("node:url");
 var u = new url.URL("https://example.com/path");
 console.log(u.hostname);
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "example.com");
 }
@@ -204,7 +195,7 @@ var util = require("node:util");
 var fn = util.deprecate(function() { return 42; }, "deprecated");
 console.log(typeof fn === "function" ? "yes" : "no");
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "yes");
 }
@@ -217,7 +208,7 @@ var path = require("node:path");
 var parsed = path.parse("/foo/bar/baz.txt");
 console.log(parsed.base);
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "baz.txt");
 }
@@ -233,7 +224,7 @@ try {
     console.log("caught: " + e.message);
 }
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert!(
         result.log_output.contains("nonexistent-module"),
@@ -249,7 +240,7 @@ fn require_node_timers_promises_returns_promise_timers() {
 var tp = require("node:timers/promises");
 console.log(typeof tp.setTimeout === "function" ? "yes" : "no");
 "#;
-    let result = eval_js_with_polyfills(&module, js);
+    let result = eval_js(&module, js);
     assert_eq!(result.return_code, 0, "eval failed: {}", result.log_output);
     assert_eq!(result.log_output, "yes");
 }

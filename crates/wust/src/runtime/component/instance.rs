@@ -11,7 +11,7 @@ use std::rc::Rc;
 use crate::runtime::canonical_abi;
 use crate::runtime::exec;
 use crate::runtime::module::{ExportKind, ImportKind, Module};
-use crate::runtime::store::{HostFunc, SharedStore, Store};
+use crate::runtime::store::{HostFunc, SharedStore, SharedTable, Store};
 use crate::runtime::value::Value;
 
 use super::types::*;
@@ -24,14 +24,41 @@ use super::types::*;
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
 pub(crate) enum CoreExport {
-    Func { instance: usize, index: u32 },
-    Global { instance: usize, index: u32 },
-    Memory { instance: usize, index: u32 },
-    Table { instance: usize, index: u32 },
-    Tag { instance: usize, index: u32 },
-    /// A no-op trampoline for intrinsic core funcs (resource ops, async
-    /// builtins) that don't resolve to a real instance export.
+    Func {
+        instance: usize,
+        index: u32,
+    },
+    Global {
+        instance: usize,
+        index: u32,
+    },
+    Memory {
+        instance: usize,
+        index: u32,
+    },
+    Table {
+        instance: usize,
+        index: u32,
+    },
+    Tag {
+        instance: usize,
+        index: u32,
+    },
+    /// A no-op trampoline for intrinsic core funcs (async builtins) that
+    /// don't resolve to a real instance export.
     Trampoline,
+    /// `canon resource.new` — allocates a handle in the resource table.
+    ResourceNew {
+        resource_type: u32,
+    },
+    /// `canon resource.rep` — retrieves the rep value for a handle.
+    ResourceRep {
+        resource_type: u32,
+    },
+    /// `canon resource.drop` — removes a handle and invokes its destructor.
+    ResourceDrop {
+        resource_type: u32,
+    },
     /// A lowered component function that delegates to a child component
     /// instance. The trampoline calls the child's exported function.
     LoweredFunc {
@@ -96,7 +123,11 @@ impl CoreInstance {
                 CoreExport::Memory { index, .. } => (ExportKind::Memory, *index),
                 CoreExport::Table { index, .. } => (ExportKind::Table, *index),
                 CoreExport::Tag { index, .. } => (ExportKind::Tag, *index),
-                CoreExport::Trampoline | CoreExport::LoweredFunc { .. } => (ExportKind::Func, 0),
+                CoreExport::Trampoline
+                | CoreExport::LoweredFunc { .. }
+                | CoreExport::ResourceNew { .. }
+                | CoreExport::ResourceRep { .. }
+                | CoreExport::ResourceDrop { .. } => (ExportKind::Func, 0),
                 CoreExport::LoweredCoreFunc { index, .. } => (ExportKind::Func, *index),
             }),
         }
@@ -134,6 +165,21 @@ pub(super) struct ResolvedFunc {
     pub(super) realloc_func_index: Option<u32>,
 }
 
+/// An entry in the resource handle table.
+#[derive(Clone, Debug)]
+struct ResourceEntry {
+    /// The i32 representation value stored when the resource was created.
+    rep: i32,
+    /// The resource type index (used to select the correct destructor).
+    resource_type: u32,
+}
+
+/// A shared resource handle table for a component instance.
+///
+/// Handles are 1-indexed. Index 0 is unused so that the first allocated
+/// handle is 1, matching the Component Model spec expectations.
+type SharedResourceTable = Rc<RefCell<Vec<Option<ResourceEntry>>>>;
+
 /// A live component instance — analogous to `Store` for core modules.
 #[derive(Clone)]
 pub struct ComponentInstance {
@@ -159,6 +205,11 @@ pub struct ComponentInstance {
     /// state. This map stores the parsed Component with outer aliases already
     /// resolved, so consumers get the correct module bytes.
     exported_pre_resolved: HashMap<String, Component>,
+    /// Named sub-instance exports, keyed by export name.
+    /// When a component exports an instance (e.g. `(export "nested" (instance ...))`),
+    /// this maps the export name to the child `ComponentInstance` so that
+    /// alias-instance-export resolution can extract the correct sub-instance.
+    exported_instances: HashMap<String, ComponentInstance>,
     /// Whether this component instance is currently being instantiated.
     /// Used to prevent re-entrance via lowered functions during start.
     instantiating: Rc<Cell<bool>>,
@@ -168,6 +219,11 @@ pub struct ComponentInstance {
     /// result is stored here so inner instantiation doesn't re-parse and
     /// fail to resolve outer aliases.
     pre_resolved_components: HashMap<u32, Component>,
+    /// Shared resource handle table for this component instance.
+    ///
+    /// All resource types within this component share the same handle
+    /// table. Handles are 1-indexed (slot 0 is a placeholder).
+    resource_table: SharedResourceTable,
 }
 
 impl Default for ComponentInstance {
@@ -181,8 +237,10 @@ impl Default for ComponentInstance {
             exported_modules: HashMap::new(),
             exported_components: HashMap::new(),
             exported_pre_resolved: HashMap::new(),
+            exported_instances: HashMap::new(),
             instantiating: Rc::new(Cell::new(false)),
             pre_resolved_components: HashMap::new(),
+            resource_table: Rc::new(RefCell::new(vec![None])),
         }
     }
 }
@@ -227,13 +285,12 @@ impl ComponentInstance {
         mut imports: HashMap<String, ComponentInstance>,
     ) -> Result<Self, String> {
         let mut import_instances = Vec::new();
+        let mut func_patches: Vec<(usize, String, ComponentInstance)> = Vec::new();
         for import_def in component.imports() {
             match import_def.kind {
                 ComponentImportKind::Instance => {
                     let explicitly_provided = imports.contains_key(&import_def.name);
-                    let instance = imports
-                        .remove(&import_def.name)
-                        .unwrap_or_default();
+                    let instance = imports.remove(&import_def.name).unwrap_or_default();
                     // Only validate required exports when the caller explicitly
                     // provided an instance. Unprovided instance imports default
                     // to empty instances, which is valid per the component model
@@ -241,10 +298,10 @@ impl ComponentInstance {
                     // runtime instantiation concern.
                     if explicitly_provided {
                         for required in &import_def.required_exports {
-                            let has_export =
-                                instance.exports.contains_key(required)
+                            let has_export = instance.exports.contains_key(required)
                                 || instance.exported_modules.contains_key(required)
-                                || instance.exported_components.contains_key(required);
+                                || instance.exported_components.contains_key(required)
+                                || instance.exported_instances.contains_key(required);
                             if !has_export {
                                 return Err(format!(
                                     "import '{}': required export '{}' was not found",
@@ -260,14 +317,51 @@ impl ComponentInstance {
                     }
                     import_instances.push(instance);
                 }
-                _ => {
-                    // Non-instance imports are not yet supported at runtime.
-                    // Silently skip — the component may still work if it
-                    // doesn't actually use the import at runtime.
+                ComponentImportKind::Func => {
+                    if let Some(host_inst) = imports.remove(&import_def.name) {
+                        let slot =
+                            find_func_import_slot(&component.component_funcs, &import_def.name);
+                        if let Some(slot_idx) = slot {
+                            func_patches.push((slot_idx, import_def.name.clone(), host_inst));
+                        }
+                    }
                 }
+                _ => {}
             }
         }
-        Self::instantiate_inner(component, import_instances)
+        if func_patches.is_empty() {
+            Self::instantiate_inner(component, import_instances)
+        } else {
+            let shift = func_patches.len() as u32;
+            let mut patched = component.clone();
+            let mut patched_slots = Vec::new();
+            for (slot_idx, name, host_inst) in func_patches {
+                let child_idx = import_instances.len() as u32;
+                patched.component_funcs[slot_idx] = ComponentFuncDef::AliasInstanceExport {
+                    instance_index: child_idx,
+                    name,
+                };
+                import_instances.push(host_inst);
+                patched_slots.push(slot_idx);
+            }
+            shift_component_instance_indices(&mut patched, shift, &patched_slots);
+            eprintln!("[FUNC-IMPORT] patched instance_import_count={}, comp_funcs:", patched.instance_import_count);
+            for (i, f) in patched.component_funcs.iter().enumerate() {
+                match f {
+                    ComponentFuncDef::AliasInstanceExport { instance_index, name } => {
+                        eprintln!("  comp_func[{i}] = AliasInstanceExport {{ inst={instance_index}, name={name:?} }}");
+                    }
+                    ComponentFuncDef::Lift { .. } => {
+                        eprintln!("  comp_func[{i}] = Lift");
+                    }
+                }
+            }
+            eprintln!("[FUNC-IMPORT] import_instances.len()={}, child exports:", import_instances.len());
+            for (i, inst) in import_instances.iter().enumerate() {
+                eprintln!("  import[{i}]: exports={:?}, child_count={}", inst.exports.keys().collect::<Vec<_>>(), inst.child_instances.len());
+            }
+            Self::instantiate_inner(&patched, import_instances)
+        }
     }
 
     /// Inner instantiation with positional instance imports.
@@ -275,9 +369,7 @@ impl ComponentInstance {
         component: &Component,
         import_instances: Vec<ComponentInstance>,
     ) -> Result<Self, String> {
-        Self::instantiate_inner_with_ancestors(
-            component, import_instances, HashMap::new(), &[],
-        )
+        Self::instantiate_inner_with_ancestors(component, import_instances, HashMap::new(), &[])
     }
 
     /// Inner instantiation with positional instance imports, pre-resolved
@@ -307,8 +399,10 @@ impl ComponentInstance {
             exported_modules: HashMap::new(),
             exported_components: HashMap::new(),
             exported_pre_resolved: HashMap::new(),
+            exported_instances: HashMap::new(),
             instantiating: instantiating.clone(),
             pre_resolved_components,
+            resource_table: Rc::new(RefCell::new(vec![None])),
         };
 
         // Resolve self-referencing outer aliases (count=1 with no parent).
@@ -340,8 +434,8 @@ impl ComponentInstance {
             }
         }
 
-        inst.exports =
-            super::resolve::resolve_component_exports(&inst.core_instances, component)?;
+        inst.exports = super::resolve::resolve_component_exports(&inst.core_instances, component)?;
+        populate_from_exports_func_exports(&mut inst, component);
         populate_exported_bytes(&mut inst, component, ancestors);
         instantiating.set(false);
         Ok(inst)
@@ -363,8 +457,10 @@ impl ComponentInstance {
             exported_modules: self.exported_modules.clone(),
             exported_components: self.exported_components.clone(),
             exported_pre_resolved: self.exported_pre_resolved.clone(),
+            exported_instances: self.exported_instances.clone(),
             instantiating: Rc::new(Cell::new(false)),
             pre_resolved_components: HashMap::new(),
+            resource_table: self.resource_table.clone(),
         }
     }
 
@@ -372,11 +468,7 @@ impl ComponentInstance {
     ///
     /// Convenience wrapper around `invoke_component` that wraps each
     /// `Value` in `ComponentArg::Value`.
-    pub fn invoke(
-        &mut self,
-        name: &str,
-        args: &[Value],
-    ) -> Result<Vec<ComponentValue>, String> {
+    pub fn invoke(&mut self, name: &str, args: &[Value]) -> Result<Vec<ComponentValue>, String> {
         let component_args: Vec<ComponentArg> =
             args.iter().map(|v| ComponentArg::Value(*v)).collect();
         self.invoke_component(name, &component_args)
@@ -403,15 +495,9 @@ impl ComponentInstance {
                 child_index,
                 export_name,
             } => {
-                let child = self
-                    .child_instances
-                    .get_mut(child_index)
-                    .ok_or_else(|| {
-                        format!(
-                            "child component instance {} out of bounds",
-                            child_index
-                        )
-                    })?;
+                let child = self.child_instances.get_mut(child_index).ok_or_else(|| {
+                    format!("child component instance {} out of bounds", child_index)
+                })?;
                 child.invoke_component(&export_name, args)
             }
             ResolvedExport::Local(resolved) => {
@@ -439,9 +525,7 @@ impl ComponentInstance {
                             .map_err(|e| format!("trap: {e}"))?
                     }
                     CoreInstance::Synthetic { .. } => {
-                        return Err(
-                            "cannot invoke function on synthetic instance".into(),
-                        );
+                        return Err("cannot invoke function on synthetic instance".into());
                     }
                 };
                 canonical_abi::lift_results(
@@ -453,7 +537,6 @@ impl ComponentInstance {
             }
         }
     }
-
 }
 
 /// Populate a FromExports component instance's exported items.
@@ -497,26 +580,102 @@ fn populate_from_exports_instance(
             }
             ComponentExternalKind::Instance => {
                 // For instance exports in FromExports, propagate the
-                // child instance's exported items.
+                // child instance's exported items and store as a named
+                // sub-instance for alias-instance-export resolution.
                 let idx = export.index as usize;
                 if idx < inst.child_instances.len() {
                     let source = &inst.child_instances[idx];
-                    // Create a child view with the source's exports
                     child.exported_modules.extend(
-                        source.exported_modules.iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
+                        source
+                            .exported_modules
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
                     );
                     child.exported_components.extend(
-                        source.exported_components.iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
+                        source
+                            .exported_components
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
                     );
                     child.exported_pre_resolved.extend(
-                        source.exported_pre_resolved.iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
+                        source
+                            .exported_pre_resolved
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone())),
                     );
+                    let sub = clone_child_instance(source);
+                    child.exported_instances.insert(export.name.clone(), sub);
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Populate func exports on FromExports child component instances.
+///
+/// After component-level export resolution, iterates over each
+/// `FromExports` component instance definition and copies resolved
+/// func entries into the child's `exports` map. This runs after
+/// `resolve_component_exports` so that the parent's `ResolvedExport`
+/// entries are available for copying.
+fn populate_from_exports_func_exports(inst: &mut ComponentInstance, component: &Component) {
+    let import_count = component.instance_import_count as usize;
+    for (def_idx, def) in component.component_instances.iter().enumerate() {
+        let ComponentInstanceDef::FromExports(exports) = def else {
+            continue;
+        };
+        let child_idx = import_count + def_idx;
+        for export in exports {
+            if export.kind != ComponentExternalKind::Func {
+                continue;
+            }
+            let comp_func = component.component_funcs.get(export.index as usize);
+            let Some(comp_func) = comp_func else { continue };
+            let resolved = match comp_func {
+                ComponentFuncDef::Lift {
+                    core_func_index,
+                    type_index,
+                    memory_index,
+                    realloc_func_index,
+                } => {
+                    let core_func = component.core_funcs.get(*core_func_index as usize);
+                    let Some(core_func) = core_func else { continue };
+                    let param_types = super::resolve::lookup_param_types(component, *type_index);
+                    let result_type = super::resolve::lookup_result_type(component, *type_index);
+                    match super::resolve::resolve_core_func_to_resolved(
+                        &inst.core_instances,
+                        component,
+                        core_func,
+                        param_types,
+                        result_type,
+                        *memory_index,
+                        *realloc_func_index,
+                    ) {
+                        Ok(resolved) => ResolvedExport::Local(resolved),
+                        Err(_) => continue,
+                    }
+                }
+                ComponentFuncDef::AliasInstanceExport {
+                    instance_index,
+                    name,
+                } => ResolvedExport::Child {
+                    child_index: *instance_index as usize,
+                    export_name: name.clone(),
+                },
+            };
+            if child_idx < inst.child_instances.len() {
+                inst.child_instances[child_idx]
+                    .exports
+                    .insert(export.name.clone(), resolved);
+            }
+        }
+        // Share the parent's core instances with the FromExports child so
+        // that ResolvedExport::Local entries can find their core store.
+        if child_idx < inst.child_instances.len()
+            && inst.child_instances[child_idx].core_instances.is_empty()
+        {
+            inst.child_instances[child_idx].core_instances = inst.core_instances.clone();
         }
     }
 }
@@ -560,7 +719,8 @@ fn populate_exported_bytes(
                     .or_else(|| component.inner_components.get(idx).cloned());
                 if let Some(ref b) = bytes {
                     if !b.is_empty() {
-                        inst.exported_components.insert(export.name.clone(), b.clone());
+                        inst.exported_components
+                            .insert(export.name.clone(), b.clone());
                     }
                 }
                 // Also store a pre-resolved Component if the inner component
@@ -578,10 +738,19 @@ fn populate_exported_bytes(
                             inner_ancestors.push(component);
                             inner_ancestors.extend_from_slice(ancestors);
                             resolve_outer_aliases(&mut parsed, &inner_ancestors);
+                            pre_resolve_inner_components(&mut parsed, &inner_ancestors);
                             inst.exported_pre_resolved
                                 .insert(export.name.clone(), parsed);
                         }
                     }
+                }
+            }
+            ComponentExternalKind::Instance => {
+                let idx = export.index as usize;
+                if idx < inst.child_instances.len() {
+                    let child_clone = clone_child_instance(&inst.child_instances[idx]);
+                    inst.exported_instances
+                        .insert(export.name.clone(), child_clone);
                 }
             }
             _ => {}
@@ -617,8 +786,7 @@ fn instantiate_child_components(
 
     // Keep parsed inner components around so we can resolve aliased
     // core modules after all child instances are created.
-    let mut parsed_inner_components: HashMap<u32, Component> =
-        HashMap::new();
+    let mut parsed_inner_components: HashMap<u32, Component> = HashMap::new();
 
     for def in &component.component_instances {
         match def {
@@ -637,15 +805,18 @@ fn instantiate_child_components(
                     // Use the pre-resolved version whose outer aliases were
                     // already resolved against the correct defining context.
                     (**pre).clone()
-                } else if let Some(pre) = find_pre_resolved_from_alias(
-                    inst, component, *component_index,
-                ) {
+                } else if let Some(pre) =
+                    find_pre_resolved_from_alias(inst, component, *component_index)
+                {
                     // The component is aliased from a child instance that has
                     // a pre-resolved version with correct outer aliases.
                     pre
                 } else {
                     let inner_bytes = get_inner_component_bytes(
-                        inst, component, *component_index, &parsed_inner_components,
+                        inst,
+                        component,
+                        *component_index,
+                        &parsed_inner_components,
                     )?;
                     let mut parsed =
                         Component::from_bytes_no_validate(&inner_bytes)
@@ -661,36 +832,41 @@ fn instantiate_child_components(
 
                 let child = if inner_component.has_imports() && !args.is_empty() {
                     instantiate_with_instance_args(
-                        inst, &mut inner_component, args, component,
+                        inst,
+                        &mut inner_component,
+                        args,
+                        component,
                         &inner_ancestors,
                     )?
                 } else {
-                    let import_instances: Vec<ComponentInstance> =
-                        if inner_component.has_imports() {
-                            inner_component.imports()
-                                .iter()
-                                .filter(|i| i.kind == ComponentImportKind::Instance)
-                                .map(|_| ComponentInstance::default())
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
+                    let import_instances: Vec<ComponentInstance> = if inner_component.has_imports()
+                    {
+                        inner_component
+                            .imports()
+                            .iter()
+                            .filter(|i| i.kind == ComponentImportKind::Instance)
+                            .map(|_| ComponentInstance::default())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     ComponentInstance::instantiate_inner_with_ancestors(
-                        &inner_component, import_instances,
-                        HashMap::new(), &inner_ancestors,
+                        &inner_component,
+                        import_instances,
+                        HashMap::new(),
+                        &inner_ancestors,
                     )?
                 };
                 inst.child_instances.push(child);
 
                 // Store the parsed component for later module resolution
-                parsed_inner_components
-                    .insert(*component_index, inner_component);
+                parsed_inner_components.insert(*component_index, inner_component);
             }
             ComponentInstanceDef::AliasInstanceExport {
                 instance_index,
-                name: _,
+                name,
             } => {
-                push_aliased_child(inst, *instance_index)?;
+                push_aliased_child_by_name(inst, *instance_index, name)?;
             }
             ComponentInstanceDef::Reexport { source_index } => {
                 push_aliased_child(inst, *source_index)?;
@@ -700,27 +876,17 @@ fn instantiate_child_components(
                 // Populate exported_modules and exported_components
                 // from the export entries.
                 let mut child = ComponentInstance::default();
-                populate_from_exports_instance(
-                    &mut child, exports, component, inst,
-                );
+                populate_from_exports_instance(&mut child, exports, component, inst);
                 inst.child_instances.push(child);
             }
         }
     }
 
     // Resolve aliased core modules from component instance exports.
-    resolve_aliased_core_modules(
-        inst,
-        component,
-        &parsed_inner_components,
-    )?;
+    resolve_aliased_core_modules(inst, component, &parsed_inner_components)?;
 
     // Resolve aliased inner components from component instance exports.
-    resolve_aliased_inner_components(
-        inst,
-        component,
-        &parsed_inner_components,
-    )?;
+    resolve_aliased_inner_components(inst, component, &parsed_inner_components)?;
 
     Ok(())
 }
@@ -763,15 +929,12 @@ fn resolve_aliased_core_modules(
         }
 
         match &component.component_instances[def_idx] {
-            ComponentInstanceDef::Instantiate { component_index, .. } => {
-                if let Some(inner) =
-                    parsed_inner_components.get(component_index)
-                {
-                    if let Some(module_bytes) =
-                        find_exported_core_module(inner, export_name)
-                    {
-                        inst.resolved_modules
-                            .insert(*module_idx, module_bytes);
+            ComponentInstanceDef::Instantiate {
+                component_index, ..
+            } => {
+                if let Some(inner) = parsed_inner_components.get(component_index) {
+                    if let Some(module_bytes) = find_exported_core_module(inner, export_name) {
+                        inst.resolved_modules.insert(*module_idx, module_bytes);
                     }
                 }
             }
@@ -806,9 +969,9 @@ fn get_inner_component_bytes(
     }
 
     // Try on-demand alias resolution.
-    if let Some(bytes) = resolve_component_alias_on_demand(
-        inst, component, comp_idx, parsed_inner_components,
-    )? {
+    if let Some(bytes) =
+        resolve_component_alias_on_demand(inst, component, comp_idx, parsed_inner_components)?
+    {
         return Ok(bytes);
     }
 
@@ -816,15 +979,33 @@ fn get_inner_component_bytes(
         "inner component index {} out of bounds (inner_components len={}, inner_comp_empty=[{}], resolved_components={:?}, aliased={:?}, imports={:?}, comp_instances={}, outer_aliases=[{}])",
         comp_idx,
         component.inner_components.len(),
-        component.inner_components.iter().enumerate().map(|(i,b)| format!("{}:{}", i, b.is_empty())).collect::<Vec<_>>().join(","),
+        component
+            .inner_components
+            .iter()
+            .enumerate()
+            .map(|(i, b)| format!("{}:{}", i, b.is_empty()))
+            .collect::<Vec<_>>()
+            .join(","),
         inst.resolved_components.keys().collect::<Vec<_>>(),
-        component.aliased_inner_components.keys().collect::<Vec<_>>(),
-        component.imports.iter().map(|i| format!("{}:{:?}", i.name, i.kind)).collect::<Vec<_>>(),
+        component
+            .aliased_inner_components
+            .keys()
+            .collect::<Vec<_>>(),
+        component
+            .imports
+            .iter()
+            .map(|i| format!("{}:{:?}", i.name, i.kind))
+            .collect::<Vec<_>>(),
         component.component_instances.len(),
-        component.outer_aliases.iter()
-            .map(|a| format!("kind={:?} count={} index={} placeholder={}",
-                a.kind, a.count, a.index, a.placeholder_index))
-            .collect::<Vec<_>>().join(", "),
+        component
+            .outer_aliases
+            .iter()
+            .map(|a| format!(
+                "kind={:?} count={} index={} placeholder={}",
+                a.kind, a.count, a.index, a.placeholder_index
+            ))
+            .collect::<Vec<_>>()
+            .join(", "),
     ))
 }
 
@@ -839,7 +1020,8 @@ fn resolve_component_alias_on_demand(
     comp_idx: u32,
     parsed_inner_components: &HashMap<u32, Component>,
 ) -> Result<Option<Vec<u8>>, String> {
-    let Some((comp_inst_idx, export_name)) = component.aliased_inner_components.get(&comp_idx) else {
+    let Some((comp_inst_idx, export_name)) = component.aliased_inner_components.get(&comp_idx)
+    else {
         return Ok(None);
     };
     let total_idx = *comp_inst_idx as usize;
@@ -866,10 +1048,13 @@ fn resolve_component_alias_on_demand(
         return Ok(None);
     }
     match &component.component_instances[def_idx] {
-        ComponentInstanceDef::Instantiate { component_index, .. } => {
+        ComponentInstanceDef::Instantiate {
+            component_index, ..
+        } => {
             if let Some(inner) = parsed_inner_components.get(component_index) {
                 if let Some(comp_bytes) = find_exported_inner_component(inner, export_name) {
-                    inst.resolved_components.insert(comp_idx, comp_bytes.clone());
+                    inst.resolved_components
+                        .insert(comp_idx, comp_bytes.clone());
                     return Ok(Some(comp_bytes));
                 }
             }
@@ -941,11 +1126,11 @@ fn resolve_aliased_inner_components(
         }
 
         match &component.component_instances[def_idx] {
-            ComponentInstanceDef::Instantiate { component_index, .. } => {
+            ComponentInstanceDef::Instantiate {
+                component_index, ..
+            } => {
                 if let Some(inner) = parsed_inner_components.get(component_index) {
-                    if let Some(comp_bytes) =
-                        find_exported_inner_component(inner, export_name)
-                    {
+                    if let Some(comp_bytes) = find_exported_inner_component(inner, export_name) {
                         inst.resolved_components.insert(*comp_idx, comp_bytes);
                     }
                 }
@@ -957,14 +1142,9 @@ fn resolve_aliased_inner_components(
 }
 
 /// Find inner component bytes for a named export from a parsed component.
-fn find_exported_inner_component(
-    component: &Component,
-    export_name: &str,
-) -> Option<Vec<u8>> {
+fn find_exported_inner_component(component: &Component, export_name: &str) -> Option<Vec<u8>> {
     for export in &component.exports {
-        if export.name == export_name
-            && export.kind == ComponentExternalKind::Component
-        {
+        if export.name == export_name && export.kind == ComponentExternalKind::Component {
             return component
                 .inner_components
                 .get(export.index as usize)
@@ -1027,10 +1207,9 @@ fn resolve_outer_aliases(child: &mut Component, ancestors: &[&Component]) {
                             // `ancestor`, so its count=1 aliases reference
                             // ancestor's own context = ancestors[ancestor_idx..].
                             resolve_outer_aliases(&mut parsed, &ancestors[ancestor_idx..]);
-                            child.pre_resolved_inner.insert(
-                                dst_idx as u32,
-                                Box::new(parsed),
-                            );
+                            child
+                                .pre_resolved_inner
+                                .insert(dst_idx as u32, Box::new(parsed));
                         }
                     }
                 }
@@ -1040,6 +1219,56 @@ fn resolve_outer_aliases(child: &mut Component, ancestors: &[&Component]) {
             }
         }
     }
+}
+
+/// Recursively pre-resolve inner components' outer aliases.
+///
+/// After resolving a component's own outer aliases, its inner components may
+/// still have unresolved outer aliases that reference ancestors further up the
+/// chain. This function parses each inner component and resolves its outer
+/// aliases using the correct ancestor chain.
+fn pre_resolve_inner_components(component: &mut Component, parent_ancestors: &[&Component]) {
+    for idx in 0..component.inner_components.len() {
+        let bytes = &component.inner_components[idx];
+        if bytes.is_empty() {
+            continue;
+        }
+        if component.pre_resolved_inner.contains_key(&(idx as u32)) {
+            continue;
+        }
+        let Ok(mut parsed) = super::Component::from_bytes_no_validate(bytes) else {
+            continue;
+        };
+        if parsed.outer_aliases.is_empty() && !has_deep_outer_aliases(&parsed) {
+            continue;
+        }
+        let mut inner_ancestors: Vec<&Component> = Vec::with_capacity(parent_ancestors.len() + 1);
+        inner_ancestors.push(component);
+        inner_ancestors.extend_from_slice(parent_ancestors);
+        resolve_outer_aliases(&mut parsed, &inner_ancestors);
+        pre_resolve_inner_components(&mut parsed, &inner_ancestors);
+        component
+            .pre_resolved_inner
+            .insert(idx as u32, Box::new(parsed));
+    }
+}
+
+/// Check whether any inner component has outer aliases that need resolution.
+fn has_deep_outer_aliases(component: &Component) -> bool {
+    for bytes in &component.inner_components {
+        if bytes.is_empty() {
+            continue;
+        }
+        if let Ok(parsed) = super::Component::from_bytes_no_validate(bytes) {
+            if !parsed.outer_aliases.is_empty() {
+                return true;
+            }
+            if has_deep_outer_aliases(&parsed) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Resolve self-referencing outer aliases in a top-level component.
@@ -1076,18 +1305,10 @@ fn resolve_self_aliases(inst: &mut ComponentInstance, component: &Component) {
 }
 
 /// Find the core module bytes for a named export from a parsed component.
-fn find_exported_core_module(
-    component: &Component,
-    export_name: &str,
-) -> Option<Vec<u8>> {
+fn find_exported_core_module(component: &Component, export_name: &str) -> Option<Vec<u8>> {
     for export in &component.exports {
-        if export.name == export_name
-            && export.kind == ComponentExternalKind::Module
-        {
-            return component
-                .core_modules
-                .get(export.index as usize)
-                .cloned();
+        if export.name == export_name && export.kind == ComponentExternalKind::Module {
+            return component.core_modules.get(export.index as usize).cloned();
         }
     }
     None
@@ -1095,9 +1316,31 @@ fn find_exported_core_module(
 
 /// Create an aliased child component instance that shares the exports
 /// of the source child instance at `source_index`.
-fn push_aliased_child(
+fn push_aliased_child(inst: &mut ComponentInstance, source_index: u32) -> Result<(), String> {
+    let src_idx = source_index as usize;
+    if src_idx >= inst.child_instances.len() {
+        return Err(format!(
+            "component instance {} out of bounds for alias",
+            source_index
+        ));
+    }
+    let source = &inst.child_instances[src_idx];
+    let cloned = clone_child_instance(source);
+    inst.child_instances.push(cloned);
+    Ok(())
+}
+
+/// Create an aliased child component instance by extracting a named
+/// sub-instance from the source child.
+///
+/// If the source has an `exported_instances` entry for `name`, uses that
+/// sub-instance. Otherwise, falls back to cloning the source wholesale
+/// (backward-compatible for simple cases where the source directly exports
+/// the needed functions).
+fn push_aliased_child_by_name(
     inst: &mut ComponentInstance,
     source_index: u32,
+    name: &str,
 ) -> Result<(), String> {
     let src_idx = source_index as usize;
     if src_idx >= inst.child_instances.len() {
@@ -1107,23 +1350,33 @@ fn push_aliased_child(
         ));
     }
     let source = &inst.child_instances[src_idx];
-    let aliased_exports = source.exports.clone();
-    let exported_modules = source.exported_modules.clone();
-    let exported_components = source.exported_components.clone();
-    let exported_pre_resolved = source.exported_pre_resolved.clone();
-    inst.child_instances.push(ComponentInstance {
-        core_instances: Vec::new(),
-        exports: aliased_exports,
-        child_instances: Vec::new(),
+    if let Some(sub_instance) = source.exported_instances.get(name) {
+        let cloned = clone_child_instance(sub_instance);
+        inst.child_instances.push(cloned);
+    } else {
+        let cloned = clone_child_instance(source);
+        inst.child_instances.push(cloned);
+    }
+    Ok(())
+}
+
+/// Clone a ComponentInstance for use as an aliased child, copying all
+/// export-related fields.
+fn clone_child_instance(source: &ComponentInstance) -> ComponentInstance {
+    ComponentInstance {
+        core_instances: source.core_instances.clone(),
+        exports: source.exports.clone(),
+        child_instances: source.child_instances.clone(),
         resolved_modules: HashMap::new(),
         resolved_components: HashMap::new(),
-        exported_modules,
-        exported_components,
-        exported_pre_resolved,
+        exported_modules: source.exported_modules.clone(),
+        exported_components: source.exported_components.clone(),
+        exported_pre_resolved: source.exported_pre_resolved.clone(),
+        exported_instances: source.exported_instances.clone(),
         instantiating: Rc::new(Cell::new(false)),
         pre_resolved_components: HashMap::new(),
-    });
-    Ok(())
+        resource_table: source.resource_table.clone(),
+    }
 }
 
 /// Instantiate an inner component whose imports are satisfied by passing
@@ -1171,9 +1424,7 @@ fn instantiate_with_instance_args(
                         outer.child_instances.len()
                     ));
                 }
-                let taken = std::mem::take(
-                    &mut outer.child_instances[src_idx],
-                );
+                let taken = std::mem::take(&mut outer.child_instances[src_idx]);
                 import_instances.push(taken);
             }
             ComponentInstanceArg::Module(idx) => {
@@ -1181,19 +1432,15 @@ fn instantiate_with_instance_args(
                 // Check resolved_modules first (for aliased core modules),
                 // then component.core_modules, then try on-demand alias
                 // resolution from child instance's exported_modules.
-                let mut bytes = outer
-                    .resolved_modules
-                    .get(&(*idx))
-                    .cloned()
-                    .or_else(|| {
-                        outer_component.core_modules.get(src_idx)
-                            .filter(|b| !b.is_empty())
-                            .cloned()
-                    });
+                let mut bytes = outer.resolved_modules.get(&(*idx)).cloned().or_else(|| {
+                    outer_component
+                        .core_modules
+                        .get(src_idx)
+                        .filter(|b| !b.is_empty())
+                        .cloned()
+                });
                 if bytes.is_none() {
-                    bytes = resolve_module_arg_from_exports(
-                        outer, outer_component, *idx,
-                    );
+                    bytes = resolve_module_arg_from_exports(outer, outer_component, *idx);
                 }
                 if let Some(bytes) = bytes {
                     if next_module_slot < module_import_slot {
@@ -1209,23 +1456,22 @@ fn instantiate_with_instance_args(
                 // Check resolved_components first (for aliased inner components),
                 // then component.inner_components, then try on-demand alias
                 // resolution from child instance's exported_components.
-                let mut bytes = outer
-                    .resolved_components
-                    .get(&(*idx))
-                    .cloned()
-                    .or_else(|| {
-                        outer_component.inner_components.get(src_idx)
-                            .filter(|b| !b.is_empty())
-                            .cloned()
-                    });
+                let mut bytes = outer.resolved_components.get(&(*idx)).cloned().or_else(|| {
+                    outer_component
+                        .inner_components
+                        .get(src_idx)
+                        .filter(|b| !b.is_empty())
+                        .cloned()
+                });
                 if bytes.is_none() {
-                    bytes = resolve_component_arg_from_exports(
-                        outer, outer_component, *idx,
-                    );
+                    bytes = resolve_component_arg_from_exports(outer, outer_component, *idx);
                 }
                 if let Some(ref bytes) = bytes {
                     if next_component_slot < component_import_slot {
-                        if let Some(slot) = inner_component.inner_components.get_mut(next_component_slot) {
+                        if let Some(slot) = inner_component
+                            .inner_components
+                            .get_mut(next_component_slot)
+                        {
                             *slot = bytes.clone();
                         }
                         // Use the pre-resolved inner component if
@@ -1234,7 +1480,9 @@ fn instantiate_with_instance_args(
                         // and resolve against the current ancestor chain.
                         if let Some(pre) = outer_component.pre_resolved_inner.get(&(*idx)) {
                             pre_resolved.insert(next_component_slot as u32, (**pre).clone());
-                        } else if let Ok(mut parsed) = super::Component::from_bytes_no_validate(bytes) {
+                        } else if let Ok(mut parsed) =
+                            super::Component::from_bytes_no_validate(bytes)
+                        {
                             resolve_outer_aliases(&mut parsed, ancestors);
                             pre_resolved.insert(next_component_slot as u32, parsed);
                         }
@@ -1244,8 +1492,12 @@ fn instantiate_with_instance_args(
             }
             ComponentInstanceArg::Func(idx) => {
                 wire_func_import(
-                    outer, inner_component, _name, *idx,
-                    outer_component, &mut import_instances,
+                    outer,
+                    inner_component,
+                    _name,
+                    *idx,
+                    outer_component,
+                    &mut import_instances,
                 );
             }
             ComponentInstanceArg::Type(_) => {
@@ -1255,8 +1507,54 @@ fn instantiate_with_instance_args(
     }
 
     ComponentInstance::instantiate_inner_with_ancestors(
-        inner_component, import_instances, pre_resolved, ancestors,
+        inner_component,
+        import_instances,
+        pre_resolved,
+        ancestors,
     )
+}
+
+/// Find the component_funcs slot for a func import placeholder.
+///
+/// Func imports are stored as `AliasInstanceExport` with `instance_index ==
+/// u32::MAX`. Returns the index if found.
+fn find_func_import_slot(funcs: &[ComponentFuncDef], name: &str) -> Option<usize> {
+    funcs.iter().position(|f| {
+        matches!(f, ComponentFuncDef::AliasInstanceExport {
+            instance_index, name: n
+        } if *instance_index == u32::MAX && n == name)
+    })
+}
+
+/// Shift all component instance index references in a component by `shift`.
+///
+/// When func import instances are injected into the child_instances array
+/// before the regular component instances, all existing references to
+/// component instance indices must be incremented to account for the shift.
+fn shift_component_instance_indices(component: &mut Component, shift: u32, skip: &[usize]) {
+    component.instance_import_count += shift;
+    for (i, func) in component.component_funcs.iter_mut().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        if let ComponentFuncDef::AliasInstanceExport { instance_index, .. } = func {
+            if *instance_index != u32::MAX {
+                *instance_index += shift;
+            }
+        }
+    }
+    // Shift aliased_core_modules instance indices.
+    let mut new_aliased_modules = HashMap::new();
+    for (k, (inst_idx, name)) in &component.aliased_core_modules {
+        new_aliased_modules.insert(*k, (*inst_idx + shift, name.clone()));
+    }
+    component.aliased_core_modules = new_aliased_modules;
+    // Shift aliased_inner_components instance indices.
+    let mut new_aliased_components = HashMap::new();
+    for (k, (inst_idx, name)) in &component.aliased_inner_components {
+        new_aliased_components.insert(*k, (*inst_idx + shift, name.clone()));
+    }
+    component.aliased_inner_components = new_aliased_components;
 }
 
 /// Wire a func import arg from the outer component into the inner component.
@@ -1286,7 +1584,11 @@ fn wire_func_import(
 
     // Step 2: Resolve the outer component func to find the source.
     let outer_func = outer_component.component_funcs.get(outer_func_idx as usize);
-    let Some(ComponentFuncDef::AliasInstanceExport { instance_index, name }) = outer_func else {
+    let Some(ComponentFuncDef::AliasInstanceExport {
+        instance_index,
+        name,
+    }) = outer_func
+    else {
         return;
     };
 
@@ -1308,22 +1610,22 @@ fn wire_func_import(
         exported_modules: HashMap::new(),
         exported_components: HashMap::new(),
         exported_pre_resolved: HashMap::new(),
+        exported_instances: HashMap::new(),
         instantiating: Rc::new(Cell::new(false)),
         pre_resolved_components: HashMap::new(),
+        resource_table: src.resource_table.clone(),
     };
 
     // Step 4: Add this child as a new import instance for the inner component.
     // The instance import count determines the child instance offset.
-    let new_child_idx = import_instances.len() as u32
-        + inner_component.instance_import_count;
+    let new_child_idx = import_instances.len() as u32 + inner_component.instance_import_count;
     import_instances.push(child_view);
 
     // Step 5: Patch the inner component's component func entry.
-    inner_component.component_funcs[inner_slot] =
-        ComponentFuncDef::AliasInstanceExport {
-            instance_index: new_child_idx,
-            name: name.clone(),
-        };
+    inner_component.component_funcs[inner_slot] = ComponentFuncDef::AliasInstanceExport {
+        instance_index: new_child_idx,
+        name: name.clone(),
+    };
 }
 
 /// Resolve a module arg by looking up aliased_core_modules and then checking
@@ -1388,8 +1690,8 @@ fn instantiate_core_module(
         .ok_or_else(|| format!("module index {} out of bounds", module_index))?;
     let module = Rc::new(Module::from_bytes(module_bytes)?);
 
-    let (host_funcs, imported_globals) = resolve_imports(&module, args, inst)?;
-    let store = Store::new_with_imports(&module, host_funcs, imported_globals)?;
+    let (host_funcs, imported_globals, imported_tables) = resolve_imports(&module, args, inst)?;
+    let store = Store::new_with_imports(&module, host_funcs, imported_globals, imported_tables)?;
     let store = Rc::new(RefCell::new(store));
 
     if let Some(start_idx) = module.start {
@@ -1409,28 +1711,36 @@ fn instantiate_core_module(
 
 /// Resolve a module's imports against the provided arg instances.
 ///
-/// Returns (host_funcs, imported_globals) suitable for `Store::new_with_imports`.
+/// Returns (host_funcs, imported_globals, imported_tables) suitable for
+/// `Store::new_with_imports`.
 fn resolve_imports(
     module: &Module,
     args: &[(String, CoreInstanceArg)],
     inst: &ComponentInstance,
-) -> Result<(Vec<HostFunc>, Vec<Value>), String> {
+) -> Result<(Vec<HostFunc>, Vec<Value>, Vec<SharedTable>), String> {
     let mut host_funcs: Vec<HostFunc> = Vec::new();
     let mut imported_globals: Vec<Value> = Vec::new();
+    let mut imported_tables: Vec<SharedTable> = Vec::new();
     let mut func_import_idx: usize = 0;
 
     for import in &module.imports {
         let is_func = matches!(&import.kind, ImportKind::Func(_));
         resolve_single_import(
-            import, args, inst, module, func_import_idx,
-            &mut host_funcs, &mut imported_globals,
+            import,
+            args,
+            inst,
+            module,
+            func_import_idx,
+            &mut host_funcs,
+            &mut imported_globals,
+            &mut imported_tables,
         )?;
         if is_func {
             func_import_idx += 1;
         }
     }
 
-    Ok((host_funcs, imported_globals))
+    Ok((host_funcs, imported_globals, imported_tables))
 }
 
 /// Resolve one module import against the arg instances, appending to the
@@ -1447,6 +1757,7 @@ fn resolve_single_import(
     func_import_idx: usize,
     host_funcs: &mut Vec<HostFunc>,
     imported_globals: &mut Vec<Value>,
+    imported_tables: &mut Vec<SharedTable>,
 ) -> Result<(), String> {
     let arg_instance_idx = find_arg_instance(args, &import.module);
     let result_count = func_result_count(module, func_import_idx);
@@ -1470,20 +1781,25 @@ fn resolve_single_import(
 
     match (&import.kind, &export_kind) {
         (ImportKind::Func(_), ExportKind::Func) => {
-            host_funcs.push(make_cross_instance_trampoline(
-                inst, arg_idx, &import.name, export_index, result_count,
-            ));
+            if let Some(resource_func) = make_resource_trampoline(inst, arg_idx, &import.name) {
+                host_funcs.push(resource_func);
+            } else {
+                host_funcs.push(make_cross_instance_trampoline(
+                    inst, arg_idx, &import.name, export_index, result_count,
+                ));
+            }
         }
         (ImportKind::Global { .. }, ExportKind::Global) => {
             let val = get_global_value(inst, arg_idx, export_index)?;
             imported_globals.push(val);
         }
-        // Memory and table imports are accepted but not yet wired up to
-        // share the exporting instance's backing storage.  The importing
-        // module will get its own fresh memory/table, which is sufficient
-        // for validation-only tests.
+        // Memory imports are accepted but not yet wired up to share the
+        // exporting instance's backing storage.
         (ImportKind::Memory(_), ExportKind::Memory) => {}
-        (ImportKind::Table(_), ExportKind::Table) => {}
+        (ImportKind::Table(_), ExportKind::Table) => {
+            let shared_table = get_shared_table(inst, arg_idx, export_index)?;
+            imported_tables.push(shared_table);
+        }
         _ => {
             return Err(format!(
                 "unsupported import kind for '{}::{}'",
@@ -1546,6 +1862,71 @@ fn make_trampoline(result_count: usize) -> HostFunc {
     Box::new(move |_args, _mem| Ok(vec![Value::I32(0); result_count]))
 }
 
+/// Check if a synthetic instance export is a resource operation and return
+/// the appropriate host function trampoline.
+///
+/// Returns `None` if the export is not a resource operation, in which case
+/// the caller should fall back to a regular cross-instance trampoline.
+fn make_resource_trampoline(
+    inst: &ComponentInstance,
+    source_idx: usize,
+    export_name: &str,
+) -> Option<HostFunc> {
+    let source = inst.core_instances.get(source_idx)?;
+    let CoreInstance::Synthetic { exports } = source else {
+        return None;
+    };
+    let core_export = exports.get(export_name)?;
+    match core_export {
+        CoreExport::ResourceNew { resource_type } => {
+            let resource_type = *resource_type;
+            let table = Rc::clone(&inst.resource_table);
+            Some(Box::new(move |args: &[Value], _mem: &mut [u8]| {
+                let rep = match args.first() {
+                    Some(Value::I32(v)) => *v,
+                    _ => 0,
+                };
+                let mut tbl = table.borrow_mut();
+                let handle = tbl.len() as i32;
+                tbl.push(Some(ResourceEntry { rep, resource_type }));
+                Ok(vec![Value::I32(handle)])
+            }))
+        }
+        CoreExport::ResourceRep { .. } => {
+            let table = Rc::clone(&inst.resource_table);
+            Some(Box::new(move |args: &[Value], _mem: &mut [u8]| {
+                let handle = match args.first() {
+                    Some(Value::I32(v)) => *v as usize,
+                    _ => return Err("resource.rep: expected i32 handle".into()),
+                };
+                let tbl = table.borrow();
+                match tbl.get(handle) {
+                    Some(Some(entry)) => Ok(vec![Value::I32(entry.rep)]),
+                    _ => Err(format!("resource.rep: invalid handle {handle}")),
+                }
+            }))
+        }
+        CoreExport::ResourceDrop { .. } => {
+            let table = Rc::clone(&inst.resource_table);
+            Some(Box::new(move |args: &[Value], _mem: &mut [u8]| {
+                let handle = match args.first() {
+                    Some(Value::I32(v)) => *v as usize,
+                    _ => return Err("resource.drop: expected i32 handle".into()),
+                };
+                let mut tbl = table.borrow_mut();
+                match tbl.get_mut(handle) {
+                    Some(slot @ Some(_)) => {
+                        *slot = None;
+                        Ok(vec![])
+                    }
+                    _ => Err(format!("resource.drop: invalid handle {handle}")),
+                }
+            }))
+        }
+        _ => None,
+    }
+}
+
 /// Create a host function that calls into a source core instance.
 ///
 /// Captures the source instance's `Rc<Module>` and `SharedStore`, then
@@ -1559,11 +1940,9 @@ fn make_cross_instance_trampoline(
     func_index: u32,
     result_count: usize,
 ) -> HostFunc {
-
     let source = &inst.core_instances[source_idx];
     match source {
         CoreInstance::Instantiated { module, store } => {
-
             let module = Rc::clone(module);
             let store = Rc::clone(store);
             Box::new(move |args, _mem| {
@@ -1582,47 +1961,62 @@ fn make_cross_instance_trampoline(
             let export = exports.get(export_name);
 
             match export {
-                Some(CoreExport::LoweredFunc { child_index, export_name, string_encoding }) => {
-                    make_child_instance_trampoline(
-                        inst, *child_index, export_name.clone(), result_count,
-                        *string_encoding,
-                    )
-                }
+                Some(CoreExport::LoweredFunc {
+                    child_index,
+                    export_name,
+                    string_encoding,
+                }) => make_child_instance_trampoline(
+                    inst,
+                    *child_index,
+                    export_name.clone(),
+                    result_count,
+                    *string_encoding,
+                ),
                 Some(CoreExport::LoweredCoreFunc { instance, index }) => {
-                    make_lowered_core_trampoline(
-                        inst, *instance, *index, result_count,
-                    )
+                    make_lowered_core_trampoline(inst, *instance, *index, result_count)
                 }
-                Some(CoreExport::Func { instance, index }) => {
-                    make_cross_instance_trampoline(
-                        inst, *instance, export_name, *index, result_count,
-                    )
-                }
+                Some(CoreExport::Func { instance, index }) => make_cross_instance_trampoline(
+                    inst,
+                    *instance,
+                    export_name,
+                    *index,
+                    result_count,
+                ),
                 _ => {
                     // Fallback: try any matching export by kind.
-                    let lowered = exports.values().find(|e| {
-                        matches!(e, CoreExport::LoweredFunc { .. })
-                    });
-                    if let Some(CoreExport::LoweredFunc { child_index, export_name, string_encoding }) = lowered {
+                    let lowered = exports
+                        .values()
+                        .find(|e| matches!(e, CoreExport::LoweredFunc { .. }));
+                    if let Some(CoreExport::LoweredFunc {
+                        child_index,
+                        export_name,
+                        string_encoding,
+                    }) = lowered
+                    {
                         return make_child_instance_trampoline(
-                            inst, *child_index, export_name.clone(), result_count,
+                            inst,
+                            *child_index,
+                            export_name.clone(),
+                            result_count,
                             *string_encoding,
                         );
                     }
-                    let lowered_core = exports.values().find(|e| {
-                        matches!(e, CoreExport::LoweredCoreFunc { .. })
-                    });
+                    let lowered_core = exports
+                        .values()
+                        .find(|e| matches!(e, CoreExport::LoweredCoreFunc { .. }));
                     if let Some(CoreExport::LoweredCoreFunc { instance, index }) = lowered_core {
-                        return make_lowered_core_trampoline(
-                            inst, *instance, *index, result_count,
-                        );
+                        return make_lowered_core_trampoline(inst, *instance, *index, result_count);
                     }
-                    let real = exports.values().find(|e| {
-                        matches!(e, CoreExport::Func { index, .. } if *index == func_index)
-                    });
+                    let real = exports.values().find(
+                        |e| matches!(e, CoreExport::Func { index, .. } if *index == func_index),
+                    );
                     if let Some(CoreExport::Func { instance, index }) = real {
                         make_cross_instance_trampoline(
-                            inst, *instance, export_name, *index, result_count,
+                            inst,
+                            *instance,
+                            export_name,
+                            *index,
+                            result_count,
                         )
                     } else {
                         make_trampoline(result_count)
@@ -1704,8 +2098,7 @@ fn fused_memory_transfer(
     callee_realloc_idx: Option<u32>,
     result_count: usize,
 ) -> Result<Vec<Value>, String> {
-    let has_compound_result =
-        matches!(result_type, ComponentResultType::Compound { .. });
+    let has_compound_result = matches!(result_type, ComponentResultType::Compound { .. });
 
     // Extract caller argptr (first arg) and optional retptr (last arg).
     let caller_argptr = match args.first() {
@@ -1725,6 +2118,9 @@ fn fused_memory_transfer(
     let param_count = param_types.len();
     let param_values =
         canonical_abi::read_i32s_from_memory(caller_mem, caller_argptr, param_count)?;
+    eprintln!(
+        "[FUSED-MEM] caller_argptr={caller_argptr} caller_retptr={caller_retptr:?} params={param_values:?}"
+    );
 
     // Normalize params through lift-then-lower round-trip.
     let normalized = canonical_abi::normalize_args(&param_values, param_types)?;
@@ -1733,7 +2129,9 @@ fn fused_memory_transfer(
     let callee_argptr = match callee_realloc_idx {
         Some(realloc_idx) => {
             let byte_size = (param_count as u32) * 4;
-            canonical_abi::callee_realloc(module, store, realloc_idx, 4, byte_size)?
+            let ptr = canonical_abi::callee_realloc(module, store, realloc_idx, 4, byte_size)?;
+            eprintln!("[FUSED-MEM] callee_realloc returned ptr={ptr}");
+            ptr
         }
         None => return Err("callee has no realloc for argptr-mode call".into()),
     };
@@ -1747,11 +2145,12 @@ fn fused_memory_transfer(
 
     // Step 4: Call callee core func with callee argptr.
     let callee_args = vec![Value::I32(callee_argptr as i32)];
+    eprintln!("[FUSED-MEM] calling func_idx={func_idx} with callee_argptr={callee_argptr}");
     let call_results = {
         let mut s = store.borrow_mut();
-        exec::call(module, &mut s, func_idx, &callee_args)
-            .map_err(|e| format!("trap: {e}"))?
+        exec::call(module, &mut s, func_idx, &callee_args).map_err(|e| format!("trap: {e}"))?
     };
+    eprintln!("[FUSED-MEM] call returned: {call_results:?}");
 
     // Step 5: If compound result, read results from callee memory.
     if has_compound_result {
@@ -1810,11 +2209,11 @@ fn make_child_instance_trampoline(
             // Capture callee's memory store if it differs from the func store.
             let callee_mem_store: Option<SharedStore> =
                 callee_memory_instance.and_then(|mem_idx| {
-                    if mem_idx == idx { return None; }
+                    if mem_idx == idx {
+                        return None;
+                    }
                     match child.core_instances.get(mem_idx)? {
-                        CoreInstance::Instantiated { store, .. } => {
-                            Some(Rc::clone(store))
-                        }
+                        CoreInstance::Instantiated { store, .. } => Some(Rc::clone(store)),
                         _ => None,
                     }
                 });
@@ -1824,24 +2223,36 @@ fn make_child_instance_trampoline(
                     let module = Rc::clone(module);
                     let store = Rc::clone(store);
                     Box::new(move |args, caller_mem| {
-                        let use_argptr = canonical_abi::is_argptr_mode(
-                            args.len(), &param_types, result_type,
-                        );
+                        let use_argptr =
+                            canonical_abi::is_argptr_mode(args.len(), &param_types, result_type);
                         eprintln!(
                             "[FUSED] args={} param_types={} result={:?} argptr={} realloc={:?}",
-                            args.len(), param_types.len(), result_type, use_argptr, callee_realloc_idx
+                            args.len(),
+                            param_types.len(),
+                            result_type,
+                            use_argptr,
+                            callee_realloc_idx
                         );
                         if use_argptr {
                             fused_memory_transfer(
-                                args, caller_mem, &param_types, result_type,
-                                &module, &store, &callee_mem_store,
-                                func_idx, callee_realloc_idx,
+                                args,
+                                caller_mem,
+                                &param_types,
+                                result_type,
+                                &module,
+                                &store,
+                                &callee_mem_store,
+                                func_idx,
+                                callee_realloc_idx,
                                 result_count,
                             )
                         } else {
                             canonical_abi::validate_fused_args(
-                                args, &param_types, result_type,
-                                caller_mem, caller_string_encoding,
+                                args,
+                                &param_types,
+                                result_type,
+                                caller_mem,
+                                caller_string_encoding,
                                 callee_realloc_idx.is_some(),
                             )?;
                             canonical_abi::validate_callee_argptr(
@@ -1850,16 +2261,13 @@ fn make_child_instance_trampoline(
                                 &module,
                                 &store,
                             )?;
-                            let normalized =
-                                canonical_abi::normalize_args(args, &param_types)?;
+                            let normalized = canonical_abi::normalize_args(args, &param_types)?;
                             let Ok(mut s) = store.try_borrow_mut() else {
                                 return Ok(vec![Value::I32(0); result_count]);
                             };
                             match exec::call(&module, &mut s, func_idx, &normalized) {
                                 Ok(values) => {
-                                    canonical_abi::validate_fused_results(
-                                        &values, result_type,
-                                    )?;
+                                    canonical_abi::validate_fused_results(&values, result_type)?;
                                     canonical_abi::normalize_result(&values, result_type)
                                 }
                                 Err(_) => Ok(vec![Value::I32(0); result_count]),
@@ -1870,10 +2278,16 @@ fn make_child_instance_trampoline(
                 CoreInstance::Synthetic { .. } => make_trampoline(result_count),
             }
         }
-        ResolvedExport::Child { child_index: grandchild_idx, export_name: inner_name } => {
+        ResolvedExport::Child {
+            child_index: grandchild_idx,
+            export_name: inner_name,
+        } => {
             // Delegate to grandchild.
             make_child_instance_trampoline(
-                child, *grandchild_idx, inner_name.clone(), result_count,
+                child,
+                *grandchild_idx,
+                inner_name.clone(),
+                result_count,
                 caller_string_encoding,
             )
         }
@@ -1972,10 +2386,7 @@ fn check_export_type_matches(
             let actual_ft = type_idx.and_then(|&idx| module.types.get(idx as usize));
             if let Some(ft) = actual_ft {
                 if ft.params() != params.as_slice() || ft.results() != results.as_slice() {
-                    return Err(format!(
-                        "export `{}` has the wrong type",
-                        actual.name,
-                    ));
+                    return Err(format!("export `{}` has the wrong type", actual.name,));
                 }
             }
         }
@@ -1987,13 +2398,16 @@ fn check_export_type_matches(
                 // It's an imported global — find it in the imports.
                 let mut global_count = 0usize;
                 for import in &module.imports {
-                    if let ImportKind::Global { ty: actual_ty, mutable: actual_mut } = &import.kind {
+                    if let ImportKind::Global {
+                        ty: actual_ty,
+                        mutable: actual_mut,
+                    } = &import.kind
+                    {
                         if global_count == global_local_idx {
                             if actual_ty != ty || actual_mut != mutable {
-                                return Err(format!(
-                                    "export `{}` has the wrong type",
-                                    actual.name,
-                                ));
+                                return Err(
+                                    format!("export `{}` has the wrong type", actual.name,),
+                                );
                             }
                             break;
                         }
@@ -2004,10 +2418,7 @@ fn check_export_type_matches(
                 let local_idx = global_local_idx - num_global_imports;
                 if let Some(global_def) = module.globals.get(local_idx) {
                     if global_def.ty != *ty || global_def.mutable != *mutable {
-                        return Err(format!(
-                            "export `{}` has the wrong type",
-                            actual.name,
-                        ));
+                        return Err(format!("export `{}` has the wrong type", actual.name,));
                     }
                 }
             }
@@ -2015,20 +2426,14 @@ fn check_export_type_matches(
         ModuleItemType::Memory { min } => {
             if let Some(mem) = module.memories.get(actual.index as usize) {
                 if mem.min < *min {
-                    return Err(format!(
-                        "export `{}` has the wrong type",
-                        actual.name,
-                    ));
+                    return Err(format!("export `{}` has the wrong type", actual.name,));
                 }
             }
         }
         ModuleItemType::Table { min, element_type } => {
             if let Some(table) = module.tables.get(actual.index as usize) {
                 if table.min < *min || table.element_type != *element_type {
-                    return Err(format!(
-                        "export `{}` has the wrong type",
-                        actual.name,
-                    ));
+                    return Err(format!("export `{}` has the wrong type", actual.name,));
                 }
             }
         }
@@ -2062,11 +2467,7 @@ fn validate_module_imports(
             &actual.module,
             &actual.name,
         )?;
-        check_import_type_matches(
-            module,
-            actual,
-            &constraint.item_type,
-        )?;
+        check_import_type_matches(module, actual, &constraint.item_type)?;
     }
     Ok(())
 }
@@ -2100,10 +2501,7 @@ fn check_import_type_matches(
     expected_type: &ModuleItemType,
 ) -> Result<(), String> {
     match (expected_type, &actual.kind) {
-        (
-            ModuleItemType::Func { params, results },
-            ImportKind::Func(type_idx),
-        ) => {
+        (ModuleItemType::Func { params, results }, ImportKind::Func(type_idx)) => {
             if let Some(ft) = module.types.get(*type_idx as usize) {
                 if ft.params() != params.as_slice() || ft.results() != results.as_slice() {
                     return Err(format!(
@@ -2115,7 +2513,10 @@ fn check_import_type_matches(
         }
         (
             ModuleItemType::Global { ty, mutable },
-            ImportKind::Global { ty: actual_ty, mutable: actual_mut },
+            ImportKind::Global {
+                ty: actual_ty,
+                mutable: actual_mut,
+            },
         ) => {
             if actual_ty != ty || actual_mut != mutable {
                 return Err(format!(
@@ -2124,10 +2525,7 @@ fn check_import_type_matches(
                 ));
             }
         }
-        (
-            ModuleItemType::Memory { min: offered_min },
-            ImportKind::Memory(actual_mem),
-        ) => {
+        (ModuleItemType::Memory { min: offered_min }, ImportKind::Memory(actual_mem)) => {
             // Import subtyping: the constraint offers offered_min pages.
             // The module needs actual_mem.min pages. The constraint must
             // offer at least what the module needs.
@@ -2139,7 +2537,10 @@ fn check_import_type_matches(
             }
         }
         (
-            ModuleItemType::Table { min: offered_min, element_type },
+            ModuleItemType::Table {
+                min: offered_min,
+                element_type,
+            },
             ImportKind::Table(actual_table),
         ) => {
             // Import subtyping: the constraint must offer at least what
@@ -2215,9 +2616,9 @@ fn get_global_value(
             // Since resolve_single_import calls resolve_export which returns
             // (ExportKind::Global, index), and the index comes from the
             // CoreExport, we need to search by index.
-            let real_export = exports.values().find(|e| {
-                matches!(e, CoreExport::Global { index, .. } if *index == global_idx)
-            });
+            let real_export = exports
+                .values()
+                .find(|e| matches!(e, CoreExport::Global { index, .. } if *index == global_idx));
             match real_export {
                 Some(CoreExport::Global { instance, index }) => {
                     get_global_value(inst, *instance, *index)
@@ -2232,3 +2633,39 @@ fn get_global_value(
     }
 }
 
+/// Get a shared table reference from a core instance.
+///
+/// For `Instantiated` instances, clones the `Rc` handle so the importing
+/// module shares the same underlying table storage. For `Synthetic`
+/// instances, follows the `CoreExport::Table` chain to the real instance.
+fn get_shared_table(
+    inst: &ComponentInstance,
+    instance_idx: usize,
+    table_idx: u32,
+) -> Result<SharedTable, String> {
+    match inst.core_instances.get(instance_idx) {
+        Some(CoreInstance::Instantiated { store, .. }) => {
+            let store = store.borrow();
+            store
+                .tables
+                .get(table_idx as usize)
+                .cloned()
+                .ok_or_else(|| format!("table {} out of bounds", table_idx))
+        }
+        Some(CoreInstance::Synthetic { exports }) => {
+            let real_export = exports
+                .values()
+                .find(|e| matches!(e, CoreExport::Table { index, .. } if *index == table_idx));
+            match real_export {
+                Some(CoreExport::Table { instance, index }) => {
+                    get_shared_table(inst, *instance, *index)
+                }
+                _ => Err(format!(
+                    "table {} not found in synthetic instance {}",
+                    table_idx, instance_idx,
+                )),
+            }
+        }
+        None => Err(format!("instance {} out of bounds", instance_idx)),
+    }
+}

@@ -86,12 +86,22 @@ impl ComponentTestRunner {
 
     /// Build a host instance on the fly for a specific set of required exports.
     ///
-    /// Returns a ComponentInstance that exports the given functions, each
-    /// returning a constant u32 value.
+    /// Handles three patterns:
+    /// - All exports are known func names → build a component with those funcs
+    /// - "nested" export → build a component with a nested instance sub-export
+    /// - "simple-module" export → build a component that exports a core module
     fn build_host_instance_for(
         &mut self,
         required_exports: &[String],
     ) -> Option<ComponentInstance> {
+        // Try specialized patterns first.
+        if required_exports == ["nested"] {
+            return self.build_nested_instance_host();
+        }
+        if required_exports == ["simple-module"] {
+            return self.build_simple_module_host();
+        }
+
         // Map of known host function names to their return values.
         let known_funcs: HashMap<&str, u32> = [
             ("return-three", 3),
@@ -101,10 +111,6 @@ impl ComponentTestRunner {
         .into_iter()
         .collect();
 
-        // Check if all required exports are known functions.
-        // If any required export is not a known func (e.g. "nested",
-        // "simple-module", "x", type exports), we can't satisfy it
-        // and should return None to let the default empty instance be used.
         let mut func_exports = Vec::new();
         for name in required_exports {
             if let Some(&val) = known_funcs.get(name.as_str()) {
@@ -118,10 +124,18 @@ impl ComponentTestRunner {
             return None;
         }
 
-        // Build a component WAT with all the needed exports.
+        self.build_func_exports_host(&func_exports)
+    }
+
+    /// Build a host instance that exports the given functions, each returning
+    /// a constant u32 value.
+    fn build_func_exports_host(
+        &self,
+        func_exports: &[(String, u32)],
+    ) -> Option<ComponentInstance> {
         let mut core_funcs = String::new();
         let mut lifts = String::new();
-        for (name, val) in &func_exports {
+        for (name, val) in func_exports {
             core_funcs.push_str(&format!(
                 "    (func (export \"{name}\") (result i32) i32.const {val})\n"
             ));
@@ -133,6 +147,40 @@ impl ComponentTestRunner {
             "(component\n  (core module $m\n{core_funcs}  )\n  (core instance $m (instantiate $m))\n{lifts})"
         );
         let binary = wat::parse_str(&wat).ok()?;
+        let component = Component::from_bytes(&binary).ok()?;
+        ComponentInstance::instantiate(&component).ok()
+    }
+
+    /// Build a host instance that exports a "nested" sub-instance containing
+    /// "return-four" returning u32(4).
+    fn build_nested_instance_host(&self) -> Option<ComponentInstance> {
+        let wat = r#"(component
+          (core module $m
+            (func (export "return-four") (result i32) i32.const 4)
+          )
+          (core instance $m (instantiate $m))
+          (func $rf (result u32) (canon lift (core func $m "return-four")))
+          (instance $nested (export "return-four" (func $rf)))
+          (export "nested" (instance $nested))
+        )"#;
+        let binary = wat::parse_str(wat).ok()?;
+        let component = Component::from_bytes(&binary).ok()?;
+        ComponentInstance::instantiate(&component).ok()
+    }
+
+    /// Build a host instance that exports a "simple-module" core module.
+    ///
+    /// The module exports `f` (func returning i32 101) and `g` (global i32 100)
+    /// to satisfy the more demanding test case.
+    fn build_simple_module_host(&self) -> Option<ComponentInstance> {
+        let wat = r#"(component
+          (core module $m
+            (func (export "f") (result i32) i32.const 101)
+            (global (export "g") i32 i32.const 100)
+          )
+          (export "simple-module" (core module $m))
+        )"#;
+        let binary = wat::parse_str(wat).ok()?;
         let component = Component::from_bytes(&binary).ok()?;
         ComponentInstance::instantiate(&component).ok()
     }

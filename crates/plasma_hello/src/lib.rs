@@ -41,7 +41,7 @@ pub fn eval_js(module: &Module, js_source: &str) -> EvalResult {
     let log_output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let host_funcs = build_host_funcs(module, log_output.clone());
     let mut store =
-        Store::new_with_imports(module, host_funcs, vec![]).expect("failed to instantiate plasma");
+        Store::new_with_imports(module, host_funcs, vec![], vec![]).expect("failed to instantiate plasma");
 
     let ptr = call_alloc(module, &mut store, js_source.len());
     store.memory[ptr..ptr + js_source.len()].copy_from_slice(js_source.as_bytes());

@@ -17,6 +17,9 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
     Ok(())
 }
 
+mod modules;
+mod polyfills;
+
 use alloc::alloc::Layout;
 use alloc::string::ToString;
 use boa_engine::native_function::NativeFunction;
@@ -53,6 +56,7 @@ pub extern "C" fn eval(ptr: *const u8, len: usize) -> i32 {
 
     let mut context = Context::default();
     register_console(&mut context);
+    modules::register_modules(&mut context);
 
     match context.eval(Source::from_bytes(source)) {
         Ok(_) => 0,
