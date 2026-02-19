@@ -10,7 +10,7 @@ use std::rc::Rc;
 use super::instance::{
     find_func_import_slot, shift_component_instance_indices, ComponentInstance,
 };
-use super::types::{Component, ComponentFuncDef, ComponentImportKind};
+use super::types::{ParsedComponent, ComponentFuncDef, ComponentImportKind};
 
 /// Entry in the linker registry.
 struct LinkerEntry {
@@ -83,7 +83,7 @@ impl Linker {
     /// 6. Resolve and instantiate.
     ///
     /// Returns an error if any import is missing or has a kind mismatch.
-    pub fn instantiate(&self, component: &Component) -> Result<ComponentInstance, String> {
+    pub fn instantiate(&self, component: &ParsedComponent) -> Result<ComponentInstance, String> {
         let mut import_instances = Vec::new();
         let mut func_patches: Vec<(usize, String, ComponentInstance)> = Vec::new();
 

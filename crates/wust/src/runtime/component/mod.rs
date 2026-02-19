@@ -10,9 +10,8 @@
 //! - [`link`] — alias and export resolution (core func → core instance export)
 //! - [`instance`] — live state, instantiation, and export resolution
 
-mod types;
+pub(crate) mod types;
 mod validate;
-mod parse;
 mod link;
 mod resolve;
 mod instance;
@@ -20,13 +19,13 @@ mod linker;
 mod trampoline;
 mod imports;
 
-pub use types::{Component, ComponentArg, ComponentImportDef, ComponentImportKind, ComponentResultType, ComponentValue};
+pub use types::{ParsedComponent, ComponentArg, ComponentImportDef, ComponentImportKind, ComponentResultType, ComponentValue};
 pub(crate) use types::StringEncoding;
 pub use instance::ComponentInstance;
 pub(crate) use instance::CoreInstance;
 pub use linker::Linker;
 
-impl Component {
+impl ParsedComponent {
     /// Whether this component declares any component-level imports.
     pub fn has_imports(&self) -> bool {
         !self.imports.is_empty()
@@ -61,7 +60,7 @@ impl Component {
 
     /// Extract sections from a component binary into a `Component`.
     fn parse_sections(bytes: &[u8]) -> Result<Self, String> {
-        let mut component = Component {
+        let mut component = ParsedComponent {
             core_modules: Vec::new(),
             core_instances: Vec::new(),
             core_funcs: Vec::new(),
@@ -84,7 +83,7 @@ impl Component {
             defined_val_types: std::collections::HashMap::new(),
         };
 
-        parse::parse_component_sections(&mut component, bytes)?;
+        crate::parse::parse_component_sections(&mut component, bytes)?;
         Ok(component)
     }
 }

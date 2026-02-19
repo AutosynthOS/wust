@@ -25,7 +25,7 @@ use super::types::*;
 /// shared via Rc handles.
 pub(super) fn instantiate_core_module(
     inst: &mut ComponentInstance,
-    component: &Component,
+    component: &ParsedComponent,
     module_index: u32,
     args: &[(String, CoreInstanceArg)],
 ) -> Result<(), String> {

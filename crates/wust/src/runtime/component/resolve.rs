@@ -25,8 +25,8 @@ use super::types::*;
 ///    infinite recursion — they will be resolved during instantiation
 ///    with the correct ancestor chain.
 pub(crate) fn resolve(
-    component: Component,
-    ancestors: &[&Component],
+    component: ParsedComponent,
+    ancestors: &[&ParsedComponent],
 ) -> Result<ResolvedComponent, String> {
     let mut def = component;
 
@@ -51,7 +51,7 @@ pub(crate) fn resolve(
     apply_outer_aliases(&mut def, ancestors);
 
     // 3. Parse and resolve inner components.
-    let mut inner_ancestors: Vec<&Component> = Vec::with_capacity(ancestors.len() + 1);
+    let mut inner_ancestors: Vec<&ParsedComponent> = Vec::with_capacity(ancestors.len() + 1);
     inner_ancestors.push(&def);
     inner_ancestors.extend_from_slice(ancestors);
 
@@ -66,7 +66,7 @@ pub(crate) fn resolve(
             // ancestor context.
             inner.push(None);
         } else {
-            let parsed = super::Component::from_bytes_no_validate(bytes)?;
+            let parsed = super::ParsedComponent::from_bytes_no_validate(bytes)?;
             let resolved = resolve(parsed, &inner_ancestors)?;
             inner.push(Some(Rc::new(resolved)));
         }
@@ -80,7 +80,7 @@ pub(crate) fn resolve(
 /// For standalone components, `count=1` outer aliases reference earlier
 /// items in the same component. This copies the source bytes into the
 /// placeholder slots.
-fn apply_self_aliases(component: &mut Component) {
+fn apply_self_aliases(component: &mut ParsedComponent) {
     for alias in &component.outer_aliases.clone() {
         if alias.count != 1 {
             continue;
@@ -111,7 +111,7 @@ fn apply_self_aliases(component: &mut Component) {
 ///
 /// For an outer alias with count N, looks up ancestors[N-1] and copies
 /// the source bytes into the child's placeholder slot.
-fn apply_outer_aliases(child: &mut Component, ancestors: &[&Component]) {
+fn apply_outer_aliases(child: &mut ParsedComponent, ancestors: &[&ParsedComponent]) {
     for alias in &child.outer_aliases.clone() {
         let ancestor_idx = (alias.count as usize).wrapping_sub(1);
         let Some(ancestor) = ancestors.get(ancestor_idx) else {

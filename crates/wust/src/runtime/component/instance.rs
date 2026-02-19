@@ -216,7 +216,7 @@ impl Default for ComponentInstance {
             instantiating: Rc::new(Cell::new(false)),
             resource_table: Rc::new(RefCell::new(vec![None])),
             resolved: Rc::new(ResolvedComponent {
-                def: Component {
+                def: ParsedComponent {
                     core_modules: Vec::new(),
                     core_instances: Vec::new(),
                     core_funcs: Vec::new(),
@@ -260,7 +260,7 @@ impl ComponentInstance {
     /// 3. Resolve component-level exports by following the chain:
     ///    component export → component func (canon lift) → core func
     ///    (alias) → core instance export → actual func index.
-    pub fn instantiate(component: &Component) -> Result<Self, String> {
+    pub fn instantiate(component: &ParsedComponent) -> Result<Self, String> {
         let resolved = Rc::new(super::resolve::resolve(component.clone(), &[])?);
         let import_instances = default_import_instances(component);
         Self::instantiate_from_resolved(&resolved, import_instances)
@@ -288,7 +288,7 @@ impl ComponentInstance {
     pub(super) fn instantiate_resolved_with_resource_table(
         resolved: &Rc<ResolvedComponent>,
         import_instances: Vec<ComponentInstance>,
-        ancestors: &[&Component],
+        ancestors: &[&ParsedComponent],
         resource_table: SharedResourceTable,
     ) -> Result<Self, String> {
         let component = &resolved.def;
@@ -443,7 +443,7 @@ impl ComponentInstance {
 ///
 /// Used when instantiating a component without explicit imports — each
 /// instance import slot gets a placeholder so positional indexing works.
-fn default_import_instances(component: &Component) -> Vec<ComponentInstance> {
+fn default_import_instances(component: &ParsedComponent) -> Vec<ComponentInstance> {
     component
         .imports()
         .iter()
@@ -478,7 +478,7 @@ fn populate_from_exports_instance(
 /// After component-level export resolution, iterates over each
 /// `FromExports` component instance definition and copies resolved
 /// func entries into the child's `exports` map.
-fn populate_from_exports_func_exports(inst: &mut ComponentInstance, component: &Component) {
+fn populate_from_exports_func_exports(inst: &mut ComponentInstance, component: &ParsedComponent) {
     let import_count = component.instance_import_count as usize;
     for (def_idx, def) in component.component_instances.iter().enumerate() {
         let ComponentInstanceDef::FromExports(exports) = def else {
@@ -559,7 +559,7 @@ fn populate_from_exports_func_exports(inst: &mut ComponentInstance, component: &
 }
 
 /// Populate exported sub-instances from component exports.
-fn populate_exported_instances(inst: &mut ComponentInstance, component: &Component) {
+fn populate_exported_instances(inst: &mut ComponentInstance, component: &ParsedComponent) {
     for export in &component.exports {
         if export.kind == ComponentExternalKind::Instance {
             let idx = export.index as usize;
@@ -579,13 +579,13 @@ fn populate_exported_instances(inst: &mut ComponentInstance, component: &Compone
 /// Instantiate all child component instances defined in the component.
 fn instantiate_child_components(
     inst: &mut ComponentInstance,
-    component: &Component,
+    component: &ParsedComponent,
     resolved: &Rc<ResolvedComponent>,
-    ancestors: &[&Component],
+    ancestors: &[&ParsedComponent],
 ) -> Result<(), String> {
-    use super::Component;
+    use super::ParsedComponent;
 
-    let mut inner_ancestors: Vec<&Component> = Vec::with_capacity(ancestors.len() + 1);
+    let mut inner_ancestors: Vec<&ParsedComponent> = Vec::with_capacity(ancestors.len() + 1);
     inner_ancestors.push(component);
     inner_ancestors.extend_from_slice(ancestors);
 
@@ -708,9 +708,9 @@ pub(super) fn clone_for_export(source: &ComponentInstance) -> ComponentInstance 
 /// 3. Alias-resolved pre-resolved components
 /// 4. Raw bytes → parse → resolve outer aliases
 fn resolve_inner_component(
-    component: &Component,
+    component: &ParsedComponent,
     component_index: u32,
-) -> Result<Component, String> {
+) -> Result<ParsedComponent, String> {
     if let Some(pre) = component.pre_resolved_inner.get(&component_index) {
         return Ok((**pre).clone());
     }
@@ -719,7 +719,7 @@ fn resolve_inner_component(
         .get(component_index as usize)
         .filter(|b| !b.is_empty())
         .ok_or_else(|| format!("inner component {component_index} not found"))?;
-    Component::from_bytes_no_validate(inner_bytes)
+    ParsedComponent::from_bytes_no_validate(inner_bytes)
         .map_err(|e| format!("{e} (component_index={component_index})"))
 }
 
@@ -730,10 +730,10 @@ fn resolve_inner_component(
 /// patching, it is used directly to avoid re-resolving.
 fn instantiate_child(
     outer: &mut ComponentInstance,
-    inner_component: &mut Component,
+    inner_component: &mut ParsedComponent,
     args: &[(String, ComponentInstanceArg)],
-    outer_component: &Component,
-    ancestors: &[&Component],
+    outer_component: &ParsedComponent,
+    ancestors: &[&ParsedComponent],
     resolved_inner: Option<&Rc<ResolvedComponent>>,
 ) -> Result<ComponentInstance, String> {
     let mut import_instances = Vec::new();
@@ -779,10 +779,10 @@ fn instantiate_child(
 /// component (already resolved by the resolve phase).
 fn wire_instance_args(
     outer: &mut ComponentInstance,
-    inner_component: &mut Component,
+    inner_component: &mut ParsedComponent,
     args: &[(String, ComponentInstanceArg)],
-    outer_component: &Component,
-    _ancestors: &[&Component],
+    outer_component: &ParsedComponent,
+    _ancestors: &[&ParsedComponent],
     import_instances: &mut Vec<ComponentInstance>,
 ) -> Result<(), String> {
     let module_import_slot = inner_component
@@ -872,7 +872,7 @@ pub(super) fn find_func_import_slot(funcs: &[ComponentFuncDef], name: &str) -> O
 }
 
 /// Shift all component instance index references in a component by `shift`.
-pub(super) fn shift_component_instance_indices(component: &mut Component, shift: u32, skip: &[usize]) {
+pub(super) fn shift_component_instance_indices(component: &mut ParsedComponent, shift: u32, skip: &[usize]) {
     component.instance_import_count += shift;
     for (i, func) in component.component_funcs.iter_mut().enumerate() {
         if skip.contains(&i) {
@@ -899,10 +899,10 @@ pub(super) fn shift_component_instance_indices(component: &mut Component, shift:
 /// Wire a func import arg from the outer component into the inner component.
 fn wire_func_import(
     outer: &mut ComponentInstance,
-    inner_component: &mut Component,
+    inner_component: &mut ParsedComponent,
     arg_name: &str,
     outer_func_idx: u32,
-    outer_component: &Component,
+    outer_component: &ParsedComponent,
     import_instances: &mut Vec<ComponentInstance>,
 ) {
     let inner_func_slot = inner_component.component_funcs.iter().position(|f| {

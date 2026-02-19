@@ -3,7 +3,7 @@ use std::path::Path;
 
 use wast::component::WastVal;
 use wust::runtime::{
-    Component, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Linker, Value,
+    ParsedComponent, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Linker, Value,
 };
 
 // ---------------------------------------------------------------------------
@@ -54,7 +54,7 @@ impl WastRunner {
     /// Parse WAT, instantiate it, and register under a name.
     fn register_host(&mut self, name: &str, kind: ComponentImportKind, wat: &str) {
         let binary = wat::parse_str(wat).expect("bad host WAT");
-        let component = Component::from_bytes(&binary).expect("bad host component");
+        let component = ParsedComponent::from_bytes(&binary).expect("bad host component");
         if let Ok(instance) = ComponentInstance::instantiate(&component) {
             match kind {
                 ComponentImportKind::Instance => self.linker.instance(name, instance.export_view()),
@@ -66,7 +66,7 @@ impl WastRunner {
 
     /// Parse + instantiate a component binary, returning its instance index.
     fn instantiate(&mut self, binary: &[u8]) -> Result<usize, String> {
-        let component = Component::from_bytes(binary)?;
+        let component = ParsedComponent::from_bytes(binary)?;
         // Auto-register host shims for instance imports we can satisfy.
         for import in component.imports() {
             if import.kind == ComponentImportKind::Instance
@@ -323,7 +323,7 @@ fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Res
             ..
         } => match module.encode() {
             Err(_) => Ok(()),
-            Ok(binary) => match Component::from_bytes(&binary) {
+            Ok(binary) => match ParsedComponent::from_bytes(&binary) {
                 Err(_) => Ok(()),
                 Ok(_) => Err(format!("assert_invalid: should have rejected ({message})")),
             },
@@ -336,7 +336,7 @@ fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Res
             ..
         } => match module.encode() {
             Err(_) => Ok(()),
-            Ok(binary) => match Component::from_bytes(&binary) {
+            Ok(binary) => match ParsedComponent::from_bytes(&binary) {
                 Err(_) => Ok(()),
                 Ok(_) => Err(format!(
                     "assert_malformed: should have rejected ({message})"
@@ -381,7 +381,7 @@ fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Res
 /// Parse WAT and instantiate it in one shot.
 fn instantiate_wat(wat: &str) -> Option<ComponentInstance> {
     let binary = wat::parse_str(wat).ok()?;
-    let component = Component::from_bytes(&binary).ok()?;
+    let component = ParsedComponent::from_bytes(&binary).ok()?;
     ComponentInstance::instantiate(&component).ok()
 }
 

@@ -25,7 +25,7 @@ use crate::runtime::module::ExportKind;
 /// resolve that against the live instances to produce a `CoreExport`.
 pub(super) fn build_synthetic_instance(
     core_instances: &[CoreInstance],
-    component: &Component,
+    component: &ParsedComponent,
     export_defs: &[CoreInstanceExportDef],
 ) -> Result<CoreInstance, String> {
     let mut exports = HashMap::new();
@@ -62,7 +62,7 @@ fn get_alias_coords<'a>(
 /// builtins) which resolves to a no-op trampoline.
 fn resolve_alias_to_core_export(
     core_instances: &[CoreInstance],
-    component: &Component,
+    component: &ParsedComponent,
     kind: wasmparser::ExternalKind,
     index: u32,
 ) -> Result<CoreExport, String> {
@@ -95,7 +95,7 @@ fn resolve_alias_to_core_export(
 /// a `CoreExport::Trampoline`.
 fn resolve_core_func_def_to_export(
     core_instances: &[CoreInstance],
-    component: &Component,
+    component: &ParsedComponent,
     index: u32,
 ) -> Result<CoreExport, String> {
     let func_def = component
@@ -203,7 +203,7 @@ fn resolve_aliased_export(
 /// component export → component func → core func alias → core instance export.
 pub(super) fn resolve_component_exports(
     core_instances: &[CoreInstance],
-    component: &Component,
+    component: &ParsedComponent,
 ) -> Result<HashMap<String, ResolvedExport>, String> {
     let mut exports = HashMap::new();
     for export_def in &component.exports {
@@ -223,7 +223,7 @@ pub(super) fn resolve_component_exports(
 fn resolve_single_export(
     exports: &mut HashMap<String, ResolvedExport>,
     core_instances: &[CoreInstance],
-    component: &Component,
+    component: &ParsedComponent,
     export_def: &ComponentExportDef,
 ) -> Result<(), String> {
     let comp_func = component
@@ -283,7 +283,7 @@ fn resolve_single_export(
 /// unsupported and return an error.
 pub(super) fn resolve_core_func_to_resolved(
     core_instances: &[CoreInstance],
-    component: &Component,
+    component: &ParsedComponent,
     core_func: &CoreFuncDef,
     param_types: Vec<ComponentResultType>,
     result_type: ComponentResultType,
@@ -395,7 +395,7 @@ pub(super) fn resolve_core_func_to_resolved(
 /// Returns `None` if `memory_index` is `None` (no memory option on canon lift).
 fn resolve_memory_instance(
     core_instances: &[CoreInstance],
-    component: &Component,
+    component: &ParsedComponent,
     memory_index: Option<u32>,
 ) -> Result<Option<usize>, String> {
     let Some(idx) = memory_index else {
@@ -417,7 +417,7 @@ fn resolve_memory_instance(
 
 /// Look up the result type from a component func type index.
 pub(super) fn lookup_result_type(
-    component: &Component,
+    component: &ParsedComponent,
     type_index: u32,
 ) -> ComponentResultType {
     component
@@ -430,7 +430,7 @@ pub(super) fn lookup_result_type(
 
 /// Look up the param types from a component func type index.
 pub(super) fn lookup_param_types(
-    component: &Component,
+    component: &ParsedComponent,
     type_index: u32,
 ) -> Vec<ComponentResultType> {
     component

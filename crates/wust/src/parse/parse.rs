@@ -2,7 +2,7 @@
 //!
 //! Extracts component sections from raw bytes into our parsed types.
 
-use super::types::*;
+use crate::runtime::component::types::*;
 
 // ---------------------------------------------------------------------------
 // Section parsing
@@ -15,7 +15,7 @@ use super::types::*;
 /// sections are ignored — they belong to nested components and must not
 /// leak into the outer component's index spaces.
 pub(crate) fn parse_component_sections(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     bytes: &[u8],
 ) -> Result<(), String> {
     let parser = wasmparser::Parser::new(0);
@@ -77,7 +77,7 @@ pub(crate) fn parse_component_sections(
 }
 
 fn parse_instance_section(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     reader: wasmparser::InstanceSectionReader,
 ) -> Result<(), String> {
     for instance in reader {
@@ -111,7 +111,7 @@ fn parse_instance_section(
 }
 
 fn parse_alias_section(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     reader: wasmparser::ComponentAliasSectionReader,
 ) -> Result<(), String> {
     for alias in reader {
@@ -150,7 +150,7 @@ fn parse_alias_section(
 /// The placeholder is filled in later when the parent context is
 /// available during instantiation.
 fn register_outer_alias(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     kind: wasmparser::ComponentOuterAliasKind,
     count: u32,
     index: u32,
@@ -186,7 +186,7 @@ fn register_outer_alias(
 /// Push a core instance export alias into the appropriate index space
 /// on the component.
 fn register_core_instance_export(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     instance_index: u32,
     kind: wasmparser::ExternalKind,
     name: String,
@@ -230,7 +230,7 @@ fn register_core_instance_export(
 /// The alias creates a new entry in the component-level index space for
 /// the given kind.
 fn register_component_instance_export(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     instance_index: u32,
     kind: wasmparser::ComponentExternalKind,
     name: String,
@@ -284,7 +284,7 @@ fn register_component_instance_export(
 /// Instance imports occupy the first N component instance indices. We count
 /// them so that later component instance definitions are indexed correctly.
 fn parse_component_import_section(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     reader: wasmparser::ComponentImportSectionReader,
 ) -> Result<(), String> {
     for import in reader {
@@ -340,7 +340,7 @@ fn parse_component_import_section(
 /// Parse the component instance section (component-level instances, not
 /// core instances).
 fn parse_component_instance_section(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     reader: wasmparser::ComponentInstanceSectionReader,
 ) -> Result<(), String> {
     for instance in reader {
@@ -403,7 +403,7 @@ fn parse_component_instance_section(
 }
 
 fn parse_canonical_section(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     reader: wasmparser::ComponentCanonicalSectionReader,
 ) -> Result<(), String> {
     for canonical in reader {
@@ -451,7 +451,7 @@ fn parse_canonical_section(
 
 /// Parse a `canon lift` entry, extracting memory and realloc options.
 fn parse_canon_lift(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     core_func_index: u32,
     type_index: u32,
     options: &[wasmparser::CanonicalOption],
@@ -492,7 +492,7 @@ fn parse_string_encoding(options: &[wasmparser::CanonicalOption]) -> StringEncod
 /// that aliases instance 0. This mirrors the spec behavior where each export
 /// contributes to its kind's index space.
 fn register_export_index_space(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     kind: &ComponentExternalKind,
     index: u32,
 ) {
@@ -537,7 +537,7 @@ fn register_export_index_space(
 }
 
 fn parse_export_section(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     reader: wasmparser::ComponentExportSectionReader,
 ) -> Result<(), String> {
     for export in reader {
@@ -558,7 +558,7 @@ fn parse_export_section(
 }
 
 fn parse_type_section(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     reader: wasmparser::ComponentTypeSectionReader,
 ) -> Result<(), String> {
     for ty in reader {
@@ -625,7 +625,7 @@ fn extract_instance_type_exports(
 /// type is a variant (or other defined type we track), the import inherits
 /// that info so that canonical ABI validation works on the aliased type.
 fn propagate_type_bounds(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     new_idx: u32,
     bounds: wasmparser::TypeBounds,
 ) {
@@ -641,7 +641,7 @@ fn propagate_type_bounds(
 /// Currently only records variant types (with their case count) so that
 /// the canonical ABI can validate discriminant values at runtime.
 fn record_defined_type(
-    component: &mut Component,
+    component: &mut ParsedComponent,
     type_index: u32,
     def: &wasmparser::ComponentDefinedType,
 ) {
@@ -684,7 +684,7 @@ fn record_defined_type(
 /// Falls back to 4 if any field type is unknown (safe default for i32-based
 /// compound types).
 fn compute_tuple_alignment(
-    component: &Component,
+    component: &ParsedComponent,
     fields: &[wasmparser::ComponentValType],
 ) -> u32 {
     let mut max_align = 1u32;
@@ -726,7 +726,7 @@ fn primitive_alignment(p: wasmparser::PrimitiveValType) -> u32 {
 /// Convert a `ComponentValType` to a `ComponentResultType`, looking up
 /// defined types (like variants) when the type is a reference.
 fn convert_val_type(
-    component: &Component,
+    component: &ParsedComponent,
     ty: &wasmparser::ComponentValType,
 ) -> ComponentResultType {
     match ty {

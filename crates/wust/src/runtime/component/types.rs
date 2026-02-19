@@ -349,7 +349,7 @@ pub(crate) enum OuterAliasKind {
 
 /// A parsed component — immutable "code" side, analogous to `Module`.
 #[derive(Clone)]
-pub struct Component {
+pub struct ParsedComponent {
     pub(crate) core_modules: Vec<Vec<u8>>,
     pub(crate) core_instances: Vec<CoreInstanceDef>,
     pub(crate) core_funcs: Vec<CoreFuncDef>,
@@ -388,7 +388,7 @@ pub struct Component {
     /// resolution, its own outer aliases may reference a parent that is no
     /// longer in the current ancestor chain.  Storing the resolved Component
     /// here avoids re-resolution with the wrong ancestors.
-    pub(crate) pre_resolved_inner: HashMap<u32, Box<Component>>,
+    pub(crate) pre_resolved_inner: HashMap<u32, Box<ParsedComponent>>,
     /// Defined component-level types that carry runtime validation info.
     /// Keyed by type index. Currently tracks variant case counts.
     pub(crate) defined_val_types: HashMap<u32, ComponentResultType>,
@@ -405,7 +405,7 @@ pub struct Component {
 #[derive(Clone)]
 pub(crate) struct ResolvedComponent {
     /// The parsed component with alias bytes applied.
-    pub def: Component,
+    pub def: ParsedComponent,
     /// Recursively resolved inner components. `None` for instance-export
     /// alias placeholders (resolved during instantiation from child
     /// instances).
