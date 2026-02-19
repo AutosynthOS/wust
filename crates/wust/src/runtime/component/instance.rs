@@ -16,7 +16,6 @@ use crate::runtime::value::Value;
 
 use super::alias;
 use super::imports;
-use super::module_validate::validate_module_type_constraints;
 use super::types::*;
 
 // ---------------------------------------------------------------------------
@@ -297,116 +296,21 @@ impl ComponentInstance {
     ///    (alias) → core instance export → actual func index.
     pub fn instantiate(component: &Component) -> Result<Self, String> {
         let resolved = Rc::new(super::resolve::resolve(component.clone(), &[])?);
-        if component.has_imports() {
-            let import_instances: Vec<ComponentInstance> = component
-                .imports()
-                .iter()
-                .filter(|i| i.kind == ComponentImportKind::Instance)
-                .map(|_| ComponentInstance::default())
-                .collect();
-            Self::instantiate_from_resolved(&resolved, import_instances)
-        } else {
-            Self::instantiate_from_resolved(&resolved, Vec::new())
-        }
-    }
-
-    /// Instantiate a component with named imports resolved from a map.
-    ///
-    /// For each instance import, looks up the name in the map and uses the
-    /// provided instance, or falls back to an empty instance. Non-instance
-    /// imports without a match produce an error.
-    pub fn instantiate_with_imports(
-        component: &Component,
-        mut imports: HashMap<String, ComponentInstance>,
-    ) -> Result<Self, String> {
-        let mut import_instances = Vec::new();
-        let mut func_patches: Vec<(usize, String, ComponentInstance)> = Vec::new();
-        for import_def in component.imports() {
-            match import_def.kind {
-                ComponentImportKind::Instance => {
-                    let explicitly_provided = imports.contains_key(&import_def.name);
-                    let instance = imports.remove(&import_def.name).unwrap_or_default();
-                    if explicitly_provided {
-                        for required in &import_def.required_exports {
-                            let has_export = instance.exports.contains_key(required)
-                                || instance.exported_modules.contains_key(required)
-                                || instance.exported_components.contains_key(required)
-                                || instance.exported_instances.contains_key(required);
-                            if !has_export {
-                                return Err(format!(
-                                    "import '{}': required export '{}' was not found",
-                                    import_def.name, required,
-                                ));
-                            }
-                        }
-                        validate_module_type_constraints(
-                            &instance,
-                            &import_def.module_type_constraints,
-                        )?;
-                    }
-                    import_instances.push(instance);
-                }
-                ComponentImportKind::Func => {
-                    if let Some(host_inst) = imports.remove(&import_def.name) {
-                        let slot =
-                            find_func_import_slot(&component.component_funcs, &import_def.name);
-                        if let Some(slot_idx) = slot {
-                            func_patches.push((slot_idx, import_def.name.clone(), host_inst));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        if func_patches.is_empty() {
-            let resolved = Rc::new(super::resolve::resolve(component.clone(), &[])?);
-            Self::instantiate_from_resolved(&resolved, import_instances)
-        } else {
-            let shift = func_patches.len() as u32;
-            let mut patched = component.clone();
-            let mut patched_slots = Vec::new();
-            for (slot_idx, name, host_inst) in func_patches {
-                let child_idx = import_instances.len() as u32;
-                patched.component_funcs[slot_idx] = ComponentFuncDef::AliasInstanceExport {
-                    instance_index: child_idx,
-                    name,
-                };
-                import_instances.push(host_inst);
-                patched_slots.push(slot_idx);
-            }
-            shift_component_instance_indices(&mut patched, shift, &patched_slots);
-            let resolved = Rc::new(super::resolve::resolve(patched, &[])?);
-            Self::instantiate_from_resolved(&resolved, import_instances)
-        }
+        let import_instances = default_import_instances(component);
+        Self::instantiate_from_resolved(&resolved, import_instances)
     }
 
     /// Instantiate from a resolved component with positional imports.
-    fn instantiate_from_resolved(
+    pub(super) fn instantiate_from_resolved(
         resolved: &Rc<ResolvedComponent>,
         import_instances: Vec<ComponentInstance>,
-    ) -> Result<Self, String> {
-        Self::instantiate_resolved_with_ancestors(
-            resolved,
-            import_instances,
-            HashMap::new(),
-            &[],
-        )
-    }
-
-    /// Inner instantiation with positional instance imports, pre-resolved
-    /// components, and an ancestor chain for multi-level outer alias resolution.
-    fn instantiate_resolved_with_ancestors(
-        resolved: &Rc<ResolvedComponent>,
-        import_instances: Vec<ComponentInstance>,
-        pre_resolved_components: HashMap<u32, Component>,
-        ancestors: &[&Component],
     ) -> Result<Self, String> {
         let resource_table = Rc::new(RefCell::new(vec![None]));
         Self::instantiate_resolved_with_resource_table(
             resolved,
             import_instances,
-            pre_resolved_components,
-            ancestors,
+            HashMap::new(),
+            &[],
             resource_table,
         )
     }
@@ -576,6 +480,23 @@ impl ComponentInstance {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Import helpers
+// ---------------------------------------------------------------------------
+
+/// Build a default (empty) `ComponentInstance` for each instance import.
+///
+/// Used when instantiating a component without explicit imports — each
+/// instance import slot gets a placeholder so positional indexing works.
+fn default_import_instances(component: &Component) -> Vec<ComponentInstance> {
+    component
+        .imports()
+        .iter()
+        .filter(|i| i.kind == ComponentImportKind::Instance)
+        .map(|_| ComponentInstance::default())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -816,106 +737,25 @@ fn instantiate_child_components(
                 component_index,
                 args,
             } => {
-                // Try to get the resolved inner component directly.
                 let resolved_inner = resolved.inner.get(*component_index as usize)
-                    .and_then(|opt| opt.as_ref())
-                    .cloned();
+                    .and_then(|opt| opt.as_ref());
 
-                let mut inner_component = if let Some(pre) =
-                    inst.pre_resolved_components.remove(component_index)
-                {
-                    pre
-                } else if let Some(pre) = component.pre_resolved_inner.get(component_index) {
-                    (**pre).clone()
-                } else if let Some(pre) =
-                    alias::find_pre_resolved_from_alias(inst, component, *component_index)
-                {
-                    pre
-                } else {
-                    let inner_bytes = alias::get_inner_component_bytes(
-                        inst,
-                        component,
-                        *component_index,
-                        &parsed_inner_components,
-                    )?;
-                    let mut parsed =
-                        Component::from_bytes_no_validate(&inner_bytes)
-                            .map_err(|e| format!("{e} (component_index={}, inner_comps={}, resolved={:?}, ancestors={})",
-                                component_index,
-                                component.inner_components.len(),
-                                inst.resolved_components.keys().collect::<Vec<_>>(),
-                                inner_ancestors.len(),
-                            ))?;
-                    alias::resolve_outer_aliases(&mut parsed, &inner_ancestors);
-                    parsed
-                };
+                let mut inner_component = resolve_inner_component(
+                    inst,
+                    component,
+                    *component_index,
+                    &parsed_inner_components,
+                    &inner_ancestors,
+                )?;
 
-                // If we have a resolved inner component from the resolve phase,
-                // use it for child instantiation to avoid re-parsing.
-                let child = if let Some(ref resolved_child) = resolved_inner {
-                    if inner_component.has_imports() && !args.is_empty() {
-                        // For components with args, we need to patch the
-                        // component so fall through to the old path.
-                        instantiate_with_instance_args(
-                            inst,
-                            &mut inner_component,
-                            args,
-                            component,
-                            &inner_ancestors,
-                        )?
-                    } else {
-                        let import_instances: Vec<ComponentInstance> =
-                            if inner_component.has_imports() {
-                                inner_component
-                                    .imports()
-                                    .iter()
-                                    .filter(|i| i.kind == ComponentImportKind::Instance)
-                                    .map(|_| ComponentInstance::default())
-                                    .collect()
-                            } else {
-                                Vec::new()
-                            };
-                        ComponentInstance::instantiate_resolved_with_resource_table(
-                            resolved_child,
-                            import_instances,
-                            HashMap::new(),
-                            &inner_ancestors,
-                            Rc::clone(&inst.resource_table),
-                        )?
-                    }
-                } else if inner_component.has_imports() && !args.is_empty() {
-                    instantiate_with_instance_args(
-                        inst,
-                        &mut inner_component,
-                        args,
-                        component,
-                        &inner_ancestors,
-                    )?
-                } else {
-                    let import_instances: Vec<ComponentInstance> = if inner_component.has_imports()
-                    {
-                        inner_component
-                            .imports()
-                            .iter()
-                            .filter(|i| i.kind == ComponentImportKind::Instance)
-                            .map(|_| ComponentInstance::default())
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    // Fall back to old path: resolve on the fly.
-                    let child_resolved = Rc::new(super::resolve::resolve(
-                        inner_component.clone(),
-                        &inner_ancestors,
-                    )?);
-                    ComponentInstance::instantiate_resolved_with_resource_table(
-                        &child_resolved,
-                        import_instances,
-                        HashMap::new(),
-                        &inner_ancestors,
-                        Rc::clone(&inst.resource_table),
-                    )?
-                };
+                let child = instantiate_child(
+                    inst,
+                    &mut inner_component,
+                    args,
+                    component,
+                    &inner_ancestors,
+                    resolved_inner,
+                )?;
                 inst.child_instances.push(child);
 
                 parsed_inner_components.insert(*component_index, inner_component);
@@ -1012,30 +852,120 @@ pub(super) fn clone_for_export(source: &ComponentInstance) -> ComponentInstance 
 // Instance arg wiring
 // ---------------------------------------------------------------------------
 
-/// Instantiate an inner component whose imports are satisfied by passing
-/// existing child instances from the outer scope.
-fn instantiate_with_instance_args(
+/// Resolve an inner component definition by index.
+///
+/// Tries, in order:
+/// 1. Pre-resolved components (from arg wiring)
+/// 2. Parent's pre-resolved inner components
+/// 3. Alias-resolved pre-resolved components
+/// 4. Raw bytes → parse → resolve outer aliases
+fn resolve_inner_component(
+    inst: &mut ComponentInstance,
+    component: &Component,
+    component_index: u32,
+    parsed_cache: &HashMap<u32, Component>,
+    ancestors: &[&Component],
+) -> Result<Component, String> {
+    if let Some(pre) = inst.pre_resolved_components.remove(&component_index) {
+        return Ok(pre);
+    }
+    if let Some(pre) = component.pre_resolved_inner.get(&component_index) {
+        return Ok((**pre).clone());
+    }
+    if let Some(pre) = alias::find_pre_resolved_from_alias(inst, component, component_index) {
+        return Ok(pre);
+    }
+    let inner_bytes = alias::get_inner_component_bytes(
+        inst,
+        component,
+        component_index,
+        parsed_cache,
+    )?;
+    let mut parsed = Component::from_bytes_no_validate(&inner_bytes)
+        .map_err(|e| format!("{e} (component_index={component_index})"))?;
+    alias::resolve_outer_aliases(&mut parsed, ancestors);
+    Ok(parsed)
+}
+
+/// Instantiate an inner component, wiring args from the outer scope.
+///
+/// When `args` is empty this degenerates into a plain child instantiation.
+/// When a pre-resolved `ResolvedComponent` is available and no args need
+/// patching, it is used directly to avoid re-resolving.
+fn instantiate_child(
     outer: &mut ComponentInstance,
     inner_component: &mut Component,
     args: &[(String, ComponentInstanceArg)],
     outer_component: &Component,
     ancestors: &[&Component],
+    resolved_inner: Option<&Rc<ResolvedComponent>>,
 ) -> Result<ComponentInstance, String> {
     let mut import_instances = Vec::new();
-    let mut module_import_slot: usize = 0;
-    let mut component_import_slot: usize = 0;
+    let mut pre_resolved: HashMap<u32, Component> = HashMap::new();
 
-    for import_def in &inner_component.imports {
-        match import_def.kind {
-            ComponentImportKind::Module => module_import_slot += 1,
-            ComponentImportKind::Component => component_import_slot += 1,
-            _ => {}
-        }
+    if !args.is_empty() {
+        wire_instance_args(
+            outer,
+            inner_component,
+            args,
+            outer_component,
+            ancestors,
+            &mut import_instances,
+            &mut pre_resolved,
+        )?;
+    } else {
+        import_instances = default_import_instances(inner_component);
     }
+
+    // Use the pre-resolved component if available and args didn't patch
+    // anything (arg wiring mutates the component, invalidating the
+    // pre-resolved version).
+    let child_resolved = if args.is_empty() {
+        if let Some(rc) = resolved_inner {
+            Rc::clone(rc)
+        } else {
+            Rc::new(super::resolve::resolve(inner_component.clone(), ancestors)?)
+        }
+    } else {
+        Rc::new(super::resolve::resolve(inner_component.clone(), ancestors)?)
+    };
+
+    ComponentInstance::instantiate_resolved_with_resource_table(
+        &child_resolved,
+        import_instances,
+        pre_resolved,
+        ancestors,
+        Rc::clone(&outer.resource_table),
+    )
+}
+
+/// Wire instance args from the outer scope into an inner component.
+///
+/// Fills `import_instances` with child instances taken from the outer
+/// scope, patches module/component slots with resolved bytes, and
+/// records pre-resolved components for inner slots.
+fn wire_instance_args(
+    outer: &mut ComponentInstance,
+    inner_component: &mut Component,
+    args: &[(String, ComponentInstanceArg)],
+    outer_component: &Component,
+    ancestors: &[&Component],
+    import_instances: &mut Vec<ComponentInstance>,
+    pre_resolved: &mut HashMap<u32, Component>,
+) -> Result<(), String> {
+    let module_import_slot = inner_component
+        .imports
+        .iter()
+        .filter(|i| i.kind == ComponentImportKind::Module)
+        .count();
+    let component_import_slot = inner_component
+        .imports
+        .iter()
+        .filter(|i| i.kind == ComponentImportKind::Component)
+        .count();
 
     let mut next_module_slot: usize = 0;
     let mut next_component_slot: usize = 0;
-    let mut pre_resolved: HashMap<u32, Component> = HashMap::new();
 
     for (_name, arg) in args {
         match arg {
@@ -1052,22 +982,14 @@ fn instantiate_with_instance_args(
                 import_instances.push(taken);
             }
             ComponentInstanceArg::Module(idx) => {
-                let src_idx = *idx as usize;
-                let mut bytes = outer.resolved_modules.get(&(*idx)).cloned().or_else(|| {
-                    outer_component
-                        .core_modules
-                        .get(src_idx)
-                        .filter(|b| !b.is_empty())
-                        .cloned()
-                });
-                if bytes.is_none() {
-                    bytes = resolve_aliased_arg_from_exports(
-                        outer,
-                        &outer_component.aliased_core_modules,
-                        *idx,
-                        |ci| &ci.exported_modules,
-                    );
-                }
+                let bytes = resolve_arg_bytes(
+                    outer,
+                    *idx,
+                    &outer_component.core_modules,
+                    &outer.resolved_modules,
+                    &outer_component.aliased_core_modules,
+                    |ci| &ci.exported_modules,
+                );
                 if let Some(bytes) = bytes {
                     if next_module_slot < module_import_slot {
                         if let Some(slot) = inner_component.core_modules.get_mut(next_module_slot) {
@@ -1078,22 +1000,14 @@ fn instantiate_with_instance_args(
                 }
             }
             ComponentInstanceArg::Component(idx) => {
-                let src_idx = *idx as usize;
-                let mut bytes = outer.resolved_components.get(&(*idx)).cloned().or_else(|| {
-                    outer_component
-                        .inner_components
-                        .get(src_idx)
-                        .filter(|b| !b.is_empty())
-                        .cloned()
-                });
-                if bytes.is_none() {
-                    bytes = resolve_aliased_arg_from_exports(
-                        outer,
-                        &outer_component.aliased_inner_components,
-                        *idx,
-                        |ci| &ci.exported_components,
-                    );
-                }
+                let bytes = resolve_arg_bytes(
+                    outer,
+                    *idx,
+                    &outer_component.inner_components,
+                    &outer.resolved_components,
+                    &outer_component.aliased_inner_components,
+                    |ci| &ci.exported_components,
+                );
                 if let Some(ref bytes) = bytes {
                     if next_component_slot < component_import_slot {
                         if let Some(slot) = inner_component
@@ -1102,7 +1016,7 @@ fn instantiate_with_instance_args(
                         {
                             *slot = bytes.clone();
                         }
-                        if let Some(pre) = outer_component.pre_resolved_inner.get(&(*idx)) {
+                        if let Some(pre) = outer_component.pre_resolved_inner.get(idx) {
                             pre_resolved.insert(next_component_slot as u32, (**pre).clone());
                         } else if let Ok(mut parsed) =
                             super::Component::from_bytes_no_validate(bytes)
@@ -1121,31 +1035,39 @@ fn instantiate_with_instance_args(
                     _name,
                     *idx,
                     outer_component,
-                    &mut import_instances,
+                    import_instances,
                 );
             }
-            ComponentInstanceArg::Type(_) => {
-                // Type args don't need runtime wiring.
-            }
+            ComponentInstanceArg::Type(_) => {}
         }
     }
+    Ok(())
+}
 
-    // Resolve the patched inner component before instantiation.
-    let child_resolved = Rc::new(super::resolve::resolve(
-        inner_component.clone(),
-        ancestors,
-    )?);
-    ComponentInstance::instantiate_resolved_with_resource_table(
-        &child_resolved,
-        import_instances,
-        pre_resolved,
-        ancestors,
-        Rc::clone(&outer.resource_table),
-    )
+/// Resolve arg bytes from the outer scope — tries the resolved map,
+/// the static index space, then aliased exports.
+fn resolve_arg_bytes(
+    outer: &ComponentInstance,
+    idx: u32,
+    static_items: &[Vec<u8>],
+    resolved_map: &HashMap<u32, Vec<u8>>,
+    alias_map: &HashMap<u32, (u32, String)>,
+    get_exports: fn(&ComponentInstance) -> &HashMap<String, Vec<u8>>,
+) -> Option<Vec<u8>> {
+    resolved_map
+        .get(&idx)
+        .cloned()
+        .or_else(|| {
+            static_items
+                .get(idx as usize)
+                .filter(|b| !b.is_empty())
+                .cloned()
+        })
+        .or_else(|| resolve_aliased_arg_from_exports(outer, alias_map, idx, get_exports))
 }
 
 /// Find the component_funcs slot for a func import placeholder.
-fn find_func_import_slot(funcs: &[ComponentFuncDef], name: &str) -> Option<usize> {
+pub(super) fn find_func_import_slot(funcs: &[ComponentFuncDef], name: &str) -> Option<usize> {
     funcs.iter().position(|f| {
         matches!(f, ComponentFuncDef::AliasInstanceExport {
             instance_index, name: n
@@ -1154,7 +1076,7 @@ fn find_func_import_slot(funcs: &[ComponentFuncDef], name: &str) -> Option<usize
 }
 
 /// Shift all component instance index references in a component by `shift`.
-fn shift_component_instance_indices(component: &mut Component, shift: u32, skip: &[usize]) {
+pub(super) fn shift_component_instance_indices(component: &mut Component, shift: u32, skip: &[usize]) {
     component.instance_import_count += shift;
     for (i, func) in component.component_funcs.iter_mut().enumerate() {
         if skip.contains(&i) {

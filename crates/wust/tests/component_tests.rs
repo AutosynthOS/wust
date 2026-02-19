@@ -3,7 +3,7 @@ use std::path::Path;
 
 use wast::component::WastVal;
 use wust::runtime::{
-    Component, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Value,
+    Component, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Linker, Value,
 };
 
 // ---------------------------------------------------------------------------
@@ -22,8 +22,8 @@ struct WastRunner {
     instances: Vec<ComponentInstance>,
     /// Maps instance names to indices in `instances`.
     named: HashMap<String, usize>,
-    /// Tracks the import kind each name was registered as (func vs instance).
-    kinds: HashMap<String, ComponentImportKind>,
+    /// Resolves component imports during instantiation.
+    linker: Linker,
     /// Index of the most recently instantiated instance.
     current: Option<usize>,
 }
@@ -34,7 +34,7 @@ impl WastRunner {
             definitions: HashMap::new(),
             instances: Vec::new(),
             named: HashMap::new(),
-            kinds: HashMap::new(),
+            linker: Linker::new(),
             current: None,
         };
         // Pre-register host builtins expected by the wasmtime test suite.
@@ -56,59 +56,33 @@ impl WastRunner {
         let binary = wat::parse_str(wat).expect("bad host WAT");
         let component = Component::from_bytes(&binary).expect("bad host component");
         if let Ok(instance) = ComponentInstance::instantiate(&component) {
-            let idx = self.instances.len();
-            self.instances.push(instance);
-            self.named.insert(name.to_string(), idx);
+            match kind {
+                ComponentImportKind::Instance => self.linker.instance(name, instance.export_view()),
+                ComponentImportKind::Func => self.linker.func(name, instance.export_view()),
+                _ => {}
+            }
         }
-        self.kinds.insert(name.to_string(), kind);
     }
 
     /// Parse + instantiate a component binary, returning its instance index.
     fn instantiate(&mut self, binary: &[u8]) -> Result<usize, String> {
         let component = Component::from_bytes(binary)?;
-        let imports = self.resolve_imports(&component)?;
-        let instance = ComponentInstance::instantiate_with_imports(&component, imports)?;
+        // Auto-register host shims for instance imports we can satisfy.
+        for import in component.imports() {
+            if import.kind == ComponentImportKind::Instance
+                && !self.linker.has(&import.name)
+                && !import.required_exports.is_empty()
+            {
+                if let Some(host) = self.build_host_for(&import.required_exports) {
+                    self.linker.instance(&import.name, host.export_view());
+                }
+            }
+        }
+        let instance = self.linker.instantiate(&component)?;
         let idx = self.instances.len();
         self.instances.push(instance);
         self.current = Some(idx);
         Ok(idx)
-    }
-
-    /// Build the import map for a component from registered instances.
-    fn resolve_imports(
-        &mut self,
-        component: &Component,
-    ) -> Result<HashMap<String, ComponentInstance>, String> {
-        let mut map = HashMap::new();
-        for import in component.imports() {
-            // Check for kind mismatch (e.g. importing as instance when
-            // registered as func).
-            if let Some(registered) = self.kinds.get(&import.name) {
-                if import.kind != *registered {
-                    return Err(
-                        format!("expected {:?} found {:?}", import.kind, registered,)
-                            .to_lowercase(),
-                    );
-                }
-            }
-            if let Some(&idx) = self.named.get(&import.name) {
-                map.insert(import.name.clone(), self.instances[idx].export_view());
-            } else if import.kind == ComponentImportKind::Instance
-                && !import.required_exports.is_empty()
-            {
-                match self.build_host_for(&import.required_exports) {
-                    Some(host) => {
-                        map.insert(import.name.clone(), host.export_view());
-                    }
-                    None => {
-                        return Err(format!("import '{}' was not found", import.name));
-                    }
-                }
-            } else {
-                return Err(format!("import '{}' was not found", import.name));
-            }
-        }
-        Ok(map)
     }
 
     /// Build a host instance that satisfies the given required exports.
@@ -230,8 +204,9 @@ fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Res
             }
             if let Ok(idx) = runner.instantiate(&binary) {
                 if let Some(n) = name {
-                    runner.named.insert(n.clone(), idx);
-                    runner.kinds.insert(n, ComponentImportKind::Instance);
+                    let inst = runner.instances[idx].export_view();
+                    runner.linker.instance(&n, inst);
+                    runner.named.insert(n, idx);
                 }
             }
             Ok(())
@@ -259,8 +234,9 @@ fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Res
             let idx = runner.instantiate(&binary)?;
             if let Some(id) = instance {
                 let n = id.name().to_string();
-                runner.named.insert(n.clone(), idx);
-                runner.kinds.insert(n, ComponentImportKind::Instance);
+                let inst = runner.instances[idx].export_view();
+                runner.linker.instance(&n, inst);
+                runner.named.insert(n, idx);
             }
             Ok(())
         }

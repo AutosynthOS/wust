@@ -16,6 +16,7 @@ mod parse;
 mod link;
 mod resolve;
 mod instance;
+mod linker;
 mod trampoline;
 mod alias;
 mod imports;
@@ -25,6 +26,7 @@ pub use types::{Component, ComponentArg, ComponentImportDef, ComponentImportKind
 pub(crate) use types::StringEncoding;
 pub use instance::ComponentInstance;
 pub(crate) use instance::CoreInstance;
+pub use linker::Linker;
 
 impl Component {
     /// Whether this component declares any component-level imports.
