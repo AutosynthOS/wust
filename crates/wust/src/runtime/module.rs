@@ -85,6 +85,19 @@ pub enum ExportKind {
     Tag,
 }
 
+impl From<wasmparser::ExternalKind> for ExportKind {
+    fn from(kind: wasmparser::ExternalKind) -> Self {
+        match kind {
+            wasmparser::ExternalKind::Func => Self::Func,
+            wasmparser::ExternalKind::Memory => Self::Memory,
+            wasmparser::ExternalKind::Global => Self::Global,
+            wasmparser::ExternalKind::Table => Self::Table,
+            wasmparser::ExternalKind::Tag => Self::Tag,
+            _ => Self::Func, // unsupported kinds default to Func
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct DataSegment {
     /// Offset expression for active segments; empty for passive segments.
@@ -325,11 +338,22 @@ impl ModuleBuilder {
 
 impl Module {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
-        validate_module(bytes)?;
+        let mut validator = wasmparser::Validator::new_with_features(
+            wasmparser::WasmFeatures::default(),
+        );
         let mut builder = ModuleBuilder::new();
 
         for payload in Parser::new(0).parse_all(bytes) {
             let payload = payload.map_err(|e| format!("parse error: {e}"))?;
+            let valid = validator.payload(&payload)
+                .map_err(|e| format!("validation error: {e}"))?;
+            // For function bodies, the validator returns a FuncToValidate
+            // that must be driven to completion to check the body's opcodes.
+            if let wasmparser::ValidPayload::Func(func_validator, body) = valid {
+                func_validator.into_validator(Default::default())
+                    .validate(&body)
+                    .map_err(|e| format!("validation error: {e}"))?;
+            }
             dispatch_payload(&mut builder, payload)?;
         }
 
@@ -360,14 +384,6 @@ impl Module {
             None
         })
     }
-}
-
-/// Validate a WASM module's bytes before parsing.
-fn validate_module(bytes: &[u8]) -> Result<(), String> {
-    wasmparser::Validator::new_with_features(wasmparser::WasmFeatures::default())
-        .validate_all(bytes)
-        .map_err(|e| format!("validation error: {e}"))?;
-    Ok(())
 }
 
 /// Route a single parsed payload to the appropriate builder method.
@@ -440,17 +456,9 @@ fn dispatch_payload(builder: &mut ModuleBuilder, payload: Payload<'_>) -> Result
         Payload::ExportSection(reader) => {
             for export in reader {
                 let export = export.map_err(|e| format!("export error: {e}"))?;
-                let kind = match export.kind {
-                    wasmparser::ExternalKind::Func => ExportKind::Func,
-                    wasmparser::ExternalKind::Memory => ExportKind::Memory,
-                    wasmparser::ExternalKind::Global => ExportKind::Global,
-                    wasmparser::ExternalKind::Table => ExportKind::Table,
-                    wasmparser::ExternalKind::Tag => ExportKind::Tag,
-                    _ => continue,
-                };
                 builder.exports.push(Export {
                     name: export.name.to_string(),
-                    kind,
+                    kind: ExportKind::from(export.kind),
                     index: export.index,
                 });
             }

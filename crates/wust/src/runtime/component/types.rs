@@ -150,6 +150,9 @@ pub enum ComponentArg {
     /// A scalar value passed directly as a core wasm value.
     Value(Value),
     /// A list of component values, lowered via canonical ABI.
+    // TODO: list lowering is incomplete — element_size is hardcoded to 1 and
+    // no actual element data is written to memory. See `lower_list` in
+    // canonical_abi.rs.
     List(Vec<ComponentArg>),
 }
 

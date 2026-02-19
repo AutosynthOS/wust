@@ -53,6 +53,35 @@ impl Value {
         }
     }
 
+    /// Returns the `wasmparser::ValType` corresponding to this Value variant.
+    #[inline(always)]
+    pub fn val_type(&self) -> wasmparser::ValType {
+        match self {
+            Value::I32(_) => wasmparser::ValType::I32,
+            Value::I64(_) => wasmparser::ValType::I64,
+            Value::F32(_) => wasmparser::ValType::F32,
+            Value::F64(_) => wasmparser::ValType::F64,
+            Value::V128(_) => wasmparser::ValType::V128,
+            Value::FuncRef(_) => wasmparser::ValType::Ref(wasmparser::RefType::FUNCREF),
+        }
+    }
+
+    /// Reconstruct a Value from raw u64 bits and a type tag (inverse of `to_bits()`).
+    #[inline(always)]
+    pub fn from_bits(bits: u64, ty: wasmparser::ValType) -> Self {
+        match ty {
+            wasmparser::ValType::I32 => Value::I32(bits as i32),
+            wasmparser::ValType::I64 => Value::I64(bits as i64),
+            wasmparser::ValType::F32 => Value::F32(f32::from_bits(bits as u32)),
+            wasmparser::ValType::F64 => Value::F64(f64::from_bits(bits)),
+            wasmparser::ValType::Ref(_) => {
+                if bits == u64::MAX { Value::FuncRef(None) }
+                else { Value::FuncRef(Some(bits as u32)) }
+            }
+            _ => Value::I32(0),
+        }
+    }
+
     /// Pack a Value into a raw u64 for the untyped stack.
     #[inline(always)]
     pub fn to_bits(self) -> u64 {

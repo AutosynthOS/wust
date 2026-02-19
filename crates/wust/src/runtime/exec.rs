@@ -13,6 +13,14 @@ pub enum ExecError {
     NotFound(String),
 }
 
+impl ExecError {
+    pub(crate) fn execution_limit() -> Self { Self::Trap("execution limit".into()) }
+    fn divide_by_zero() -> Self { Self::Trap("integer divide by zero".into()) }
+    fn integer_overflow() -> Self { Self::Trap("integer overflow".into()) }
+    fn oob_memory() -> Self { Self::Trap("out of bounds memory access".into()) }
+    fn oob_table() -> Self { Self::Trap("out of bounds table access".into()) }
+}
+
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -269,11 +277,11 @@ macro_rules! trunc_op {
             return Err(ExecError::Trap("invalid conversion to integer".into()));
         }
         if a.is_infinite() {
-            return Err(ExecError::Trap("integer overflow".into()));
+            return Err(ExecError::integer_overflow());
         }
         let t = a.trunc();
         if t >= $max_bound || t < $min_bound {
-            return Err(ExecError::Trap("integer overflow".into()));
+            return Err(ExecError::integer_overflow());
         }
         $push_macro!($stack, t as $int_ty);
     }};
@@ -286,11 +294,11 @@ macro_rules! trunc_op_u {
             return Err(ExecError::Trap("invalid conversion to integer".into()));
         }
         if a.is_infinite() {
-            return Err(ExecError::Trap("integer overflow".into()));
+            return Err(ExecError::integer_overflow());
         }
         let t = a.trunc();
         if t >= $max_bound || t < 0.0 {
-            return Err(ExecError::Trap("integer overflow".into()));
+            return Err(ExecError::integer_overflow());
         }
         $push_macro!($stack, t as $uint_ty as $int_ty);
     }};
@@ -300,8 +308,8 @@ macro_rules! div_s {
     ($stack:expr, $pop_fn:ident, $push_macro:ident, $int_ty:ty) => {{
         let b = $pop_fn(&mut $stack);
         let a = $pop_fn(&mut $stack);
-        if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-        if a == <$int_ty>::MIN && b == -1 { return Err(ExecError::Trap("integer overflow".into())); }
+        if b == 0 { return Err(ExecError::divide_by_zero()); }
+        if a == <$int_ty>::MIN && b == -1 { return Err(ExecError::integer_overflow()); }
         $push_macro!($stack, a.wrapping_div(b));
     }};
 }
@@ -310,7 +318,7 @@ macro_rules! div_u {
     ($stack:expr, $pop_fn:ident, $push_macro:ident, $uint_ty:ty, $int_ty:ty) => {{
         let b = $pop_fn(&mut $stack) as $uint_ty;
         let a = $pop_fn(&mut $stack) as $uint_ty;
-        if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
+        if b == 0 { return Err(ExecError::divide_by_zero()); }
         $push_macro!($stack, (a / b) as $int_ty);
     }};
 }
@@ -319,7 +327,7 @@ macro_rules! rem_s {
     ($stack:expr, $pop_fn:ident, $push_macro:ident, $int_ty:ty) => {{
         let b = $pop_fn(&mut $stack);
         let a = $pop_fn(&mut $stack);
-        if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
+        if b == 0 { return Err(ExecError::divide_by_zero()); }
         $push_macro!($stack, if a == <$int_ty>::MIN && b == -1 { 0 } else { a.wrapping_rem(b) });
     }};
 }
@@ -328,7 +336,7 @@ macro_rules! rem_u {
     ($stack:expr, $pop_fn:ident, $push_macro:ident, $uint_ty:ty, $int_ty:ty) => {{
         let b = $pop_fn(&mut $stack) as $uint_ty;
         let a = $pop_fn(&mut $stack) as $uint_ty;
-        if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
+        if b == 0 { return Err(ExecError::divide_by_zero()); }
         $push_macro!($stack, (a % b) as $int_ty);
     }};
 }
@@ -355,32 +363,15 @@ macro_rules! trunc_sat_u {
 /// Convert raw bits to a Value matching the type of an existing global.
 fn coerce_bits_to_global(bits: u64, existing: &Value) -> Result<Value, ExecError> {
     match existing {
-        Value::I32(_) => Ok(Value::I32(bits as i32)),
-        Value::I64(_) => Ok(Value::I64(bits as i64)),
-        Value::F32(_) => Ok(Value::F32(f32::from_bits(bits as u32))),
-        Value::F64(_) => Ok(Value::F64(f64::from_bits(bits))),
-        Value::FuncRef(_) => {
-            if bits == u64::MAX { Ok(Value::FuncRef(None)) }
-            else { Ok(Value::FuncRef(Some(bits as u32))) }
-        }
         Value::V128(_) => Err(ExecError::Trap("v128 globals not supported".into())),
+        _ => Ok(Value::from_bits(bits, existing.val_type())),
     }
 }
 
 /// Convert a raw u64 on the stack to a Value based on its ValType.
 #[inline(always)]
 fn bits_to_value(bits: u64, ty: wasmparser::ValType) -> Value {
-    match ty {
-        wasmparser::ValType::I32 => Value::I32(bits as i32),
-        wasmparser::ValType::I64 => Value::I64(bits as i64),
-        wasmparser::ValType::F32 => Value::F32(f32::from_bits(bits as u32)),
-        wasmparser::ValType::F64 => Value::F64(f64::from_bits(bits)),
-        wasmparser::ValType::Ref(_) => {
-            if bits == u64::MAX { Value::FuncRef(None) }
-            else { Value::FuncRef(Some(bits as u32)) }
-        }
-        _ => Value::I32(0),
-    }
+    Value::from_bits(bits, ty)
 }
 
 /// Pop N args from the stack, convert to Values based on param types.
@@ -426,13 +417,13 @@ fn execute_table_init(
     let elems = match seg {
         None => {
             if count > 0 {
-                return Err(ExecError::Trap("out of bounds table access".into()));
+                return Err(ExecError::oob_table());
             }
             return Ok(());
         }
         Some(elems) => {
             if src as usize + count as usize > elems.len() {
-                return Err(ExecError::Trap("out of bounds table access".into()));
+                return Err(ExecError::oob_table());
             }
             elems[src as usize..src as usize + count as usize].to_vec()
         }
@@ -441,7 +432,7 @@ fn execute_table_init(
         .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
     let mut table = shared_table.borrow_mut();
     if dst as usize + count as usize > table.len() {
-        return Err(ExecError::Trap("out of bounds table access".into()));
+        return Err(ExecError::oob_table());
     }
     for (i, elem) in elems.iter().enumerate() {
         table[dst as usize + i] = *elem;
@@ -462,15 +453,15 @@ fn execute_memory_init(
     match seg {
         None => {
             if count > 0 || src > 0 {
-                return Err(ExecError::Trap("out of bounds memory access".into()));
+                return Err(ExecError::oob_memory());
             }
         }
         Some(data) => {
             if src as u64 + count as u64 > data.len() as u64 {
-                return Err(ExecError::Trap("out of bounds memory access".into()));
+                return Err(ExecError::oob_memory());
             }
             if dst as u64 + count as u64 > store.memory.len() as u64 {
-                return Err(ExecError::Trap("out of bounds memory access".into()));
+                return Err(ExecError::oob_memory());
             }
             let src_copy = data[src as usize..(src + count) as usize].to_vec();
             store.memory[dst as usize..(dst + count) as usize]
@@ -496,7 +487,7 @@ fn execute_table_copy(
     if src as u64 + count as u64 > src_len as u64
         || dst as u64 + count as u64 > dst_len as u64
     {
-        return Err(ExecError::Trap("out of bounds table access".into()));
+        return Err(ExecError::oob_table());
     }
     if count > 0 {
         if src_table == dst_table {
@@ -586,7 +577,7 @@ pub fn call(
         // tokenizer/parser) that never call imported functions.
         steps += 1;
         if steps > MAX_STEPS {
-            return Err(ExecError::Trap("execution limit".into()));
+            return Err(ExecError::execution_limit());
         }
 
         if frame.pc >= frame.body.len() {
@@ -696,7 +687,7 @@ pub fn call(
                 let idx = op.imm_u32();
                 steps += 1;
                 if steps > MAX_STEPS {
-                    return Err(ExecError::Trap("execution limit".into()));
+                    return Err(ExecError::execution_limit());
                 }
                 if module.is_import(idx) {
                     let type_idx = *module.func_types.get(idx as usize)
@@ -1074,7 +1065,7 @@ pub fn call(
                 if s as u64 + n as u64 > store.memory.len() as u64
                     || d as u64 + n as u64 > store.memory.len() as u64
                 {
-                    return Err(ExecError::Trap("out of bounds memory access".into()));
+                    return Err(ExecError::oob_memory());
                 }
                 // memmove semantics: handle overlapping regions
                 store.memory.copy_within(s as usize..(s + n) as usize, d as usize);
@@ -1084,7 +1075,7 @@ pub fn call(
                 let val = pop_i32(&mut stack) as u8;
                 let d = pop_i32(&mut stack) as u32;
                 if d as u64 + n as u64 > store.memory.len() as u64 {
-                    return Err(ExecError::Trap("out of bounds memory access".into()));
+                    return Err(ExecError::oob_memory());
                 }
                 store.memory[d as usize..(d + n) as usize].fill(val);
             }
@@ -1096,7 +1087,7 @@ pub fn call(
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
                 let table = shared_table.borrow();
                 if idx as usize >= table.len() {
-                    return Err(ExecError::Trap("out of bounds table access".into()));
+                    return Err(ExecError::oob_table());
                 }
                 match table[idx as usize] {
                     Some(func_idx) => stack.push(func_idx as u64),
@@ -1111,7 +1102,7 @@ pub fn call(
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
                 let mut table = shared_table.borrow_mut();
                 if idx as usize >= table.len() {
-                    return Err(ExecError::Trap("out of bounds table access".into()));
+                    return Err(ExecError::oob_table());
                 }
                 table[idx as usize] = if val == u64::MAX { None } else { Some(val as u32) };
             }
@@ -1162,7 +1153,7 @@ pub fn call(
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
                 let mut table = shared_table.borrow_mut();
                 if i as u64 + n as u64 > table.len() as u64 {
-                    return Err(ExecError::Trap("out of bounds table access".into()));
+                    return Err(ExecError::oob_table());
                 }
                 let fill = if val == u64::MAX { None } else { Some(val as u32) };
                 for j in 0..n as usize {

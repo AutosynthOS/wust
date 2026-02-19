@@ -76,15 +76,16 @@ fn lift_value(v: Value, result_type: ComponentResultType) -> Result<ComponentVal
 /// The core function returns a single i32 which is a pointer to a
 /// `{ptr: u32, len: u32}` struct in linear memory. We read the struct,
 /// validate bounds, and decode the bytes as UTF-8.
+///
+/// Borrows the store's memory only for the duration of the read,
+/// avoiding a full clone of linear memory.
 fn lift_string_result(
     values: &[Value],
     core_instances: &[CoreInstance],
     memory_instance: Option<usize>,
 ) -> Result<Vec<ComponentValue>, String> {
     let retptr = extract_retptr(values)?;
-    let memory = get_memory_bytes(core_instances, memory_instance)?;
-    let (ptr, len) = read_string_descriptor(&memory, retptr)?;
-    let s = read_utf8_string(&memory, ptr, len)?;
+    let s = read_string_from_memory(core_instances, memory_instance, retptr)?;
     Ok(vec![ComponentValue::String(s)])
 }
 
@@ -96,20 +97,25 @@ fn extract_retptr(values: &[Value]) -> Result<u32, String> {
     }
 }
 
-/// Get the linear memory bytes from the core instance that owns the memory.
+/// Read a UTF-8 string from linear memory at the given return pointer.
 ///
-/// Returns a copy of the memory content because the Store is behind a
-/// RefCell and we cannot return a borrow that outlives the RefCell guard.
-fn get_memory_bytes(
+/// Borrows the store's memory, reads the `(ptr, len)` descriptor at
+/// `retptr`, then decodes the string bytes -- all while the borrow is
+/// active. Only the resulting `String` is returned, avoiding a full
+/// clone of linear memory.
+fn read_string_from_memory(
     core_instances: &[CoreInstance],
     memory_instance: Option<usize>,
-) -> Result<Vec<u8>, String> {
+    retptr: u32,
+) -> Result<String, String> {
     let inst_idx = memory_instance
         .ok_or("string result requires a memory option on canon lift")?;
     match core_instances.get(inst_idx) {
         Some(CoreInstance::Instantiated { store, .. }) => {
             let store = store.borrow();
-            Ok(store.memory.clone())
+            let memory = &store.memory;
+            let (ptr, len) = read_string_descriptor(memory, retptr)?;
+            read_utf8_string(memory, ptr, len)
         }
         _ => Err(format!("memory instance {} not available", inst_idx)),
     }
@@ -229,23 +235,7 @@ pub(crate) fn validate_callee_argptr(
     // callee's memory. The byte_size doesn't matter for alignment validation;
     // we just need the returned pointer to check alignment.
     let byte_size = alignment * 25;
-    let realloc_args = [
-        Value::I32(0),
-        Value::I32(0),
-        Value::I32(alignment as i32),
-        Value::I32(byte_size as i32),
-    ];
-
-    let results = {
-        let mut s = store.borrow_mut();
-        exec::call(module, &mut s, realloc_idx, &realloc_args)
-            .map_err(|e| format!("trap: {e}"))?
-    };
-
-    let ptr = match results.first() {
-        Some(Value::I32(p)) => *p as u32,
-        _ => return Err("realloc did not return an i32".into()),
-    };
+    let ptr = callee_realloc(module, store, realloc_idx, alignment, byte_size)?;
 
     if ptr % alignment != 0 {
         return Err(format!(
@@ -510,7 +500,10 @@ fn lower_list(
         .ok_or("list argument requires a realloc option on canon lift")?;
 
     let element_count = elements.len() as u32;
-    // TODO: compute real element size and alignment from the component type
+    // TODO: list lowering is incomplete — element_size is hardcoded to 1,
+    // alignment is hardcoded to 1, and no actual element data is written to
+    // the allocated memory. Need to compute real element size/alignment from
+    // the component type and serialize each element into the allocation.
     let element_size: u32 = 1;
     let alignment: u32 = 1;
     let byte_length = element_count.checked_mul(element_size)
@@ -527,23 +520,7 @@ fn lower_list(
         }
     };
 
-    let realloc_args = [
-        Value::I32(0),                  // original ptr
-        Value::I32(0),                  // original size
-        Value::I32(alignment as i32),   // alignment
-        Value::I32(byte_length as i32), // new size
-    ];
-
-    let results = {
-        let mut store = shared_store.borrow_mut();
-        exec::call(module, &mut store, realloc_idx, &realloc_args)
-            .map_err(|e| format!("trap: {e}"))?
-    };
-
-    let ptr = match results.first() {
-        Some(Value::I32(p)) => *p as u32,
-        _ => return Err("realloc did not return an i32".into()),
-    };
+    let ptr = callee_realloc(module, shared_store, realloc_idx, alignment, byte_length)?;
 
     // Validate: ptr + byte_length must not exceed memory size
     let memory_size = shared_store.borrow().memory.len() as u64;
