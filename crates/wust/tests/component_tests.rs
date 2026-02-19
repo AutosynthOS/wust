@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use wast::WastRet;
 use wast::component::WastVal;
-use wust::runtime::{Component, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Value};
+use wust::runtime::{
+    Component, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Value,
+};
 
 /// Component model test runner.
 ///
@@ -23,26 +25,129 @@ struct ComponentTestRunner {
 
 impl ComponentTestRunner {
     fn new() -> Self {
-        let mut named_kinds = HashMap::new();
-        // Pre-register host builtins expected by the wasmtime test suite.
-        // "host-return-two" is a func provided by the host environment.
-        named_kinds.insert("host-return-two".to_string(), ComponentImportKind::Func);
-        ComponentTestRunner {
+        let mut runner = ComponentTestRunner {
             instances: Vec::new(),
             current_instance: None,
             definitions: HashMap::new(),
             named_instances: HashMap::new(),
-            named_kinds,
+            named_kinds: HashMap::new(),
+        };
+        runner.register_host_builtins();
+        runner
+    }
+
+    /// Register host builtin instances expected by the wasmtime test suite.
+    ///
+    /// Creates real component instances with working functions so that
+    /// tests importing host-provided functions can exercise the full
+    /// cross-instance call path.
+    fn register_host_builtins(&mut self) {
+        // "host-return-two" — a func returning u32(2).
+        self.register_host_func_component("host-return-two", "host-return-two", 2);
+    }
+
+    /// Register a component that exports a single function returning a
+    /// constant u32 value.
+    fn register_host_func_component(
+        &mut self,
+        name: &str,
+        export_name: &str,
+        return_value: u32,
+    ) {
+        let wat = format!(
+            r#"(component
+              (core module $m
+                (func (export "{export_name}") (result i32) i32.const {return_value})
+              )
+              (core instance $m (instantiate $m))
+              (func (export "{export_name}") (result u32)
+                (canon lift (core func $m "{export_name}"))
+              )
+            )"#,
+        );
+        let binary = wat::parse_str(&wat).expect("failed to parse host func WAT");
+        let component =
+            Component::from_bytes(&binary).expect("failed to parse host func component");
+        match ComponentInstance::instantiate(&component) {
+            Ok(instance) => {
+                let idx = self.instances.len();
+                self.instances.push(instance);
+                self.named_instances.insert(name.to_string(), idx);
+                self.named_kinds
+                    .insert(name.to_string(), ComponentImportKind::Func);
+            }
+            Err(e) => {
+                eprintln!("  WARNING: failed to create host func '{name}': {e}");
+                self.named_kinds
+                    .insert(name.to_string(), ComponentImportKind::Func);
+            }
         }
+    }
+
+    /// Build a host instance on the fly for a specific set of required exports.
+    ///
+    /// Returns a ComponentInstance that exports the given functions, each
+    /// returning a constant u32 value.
+    fn build_host_instance_for(
+        &mut self,
+        required_exports: &[String],
+    ) -> Option<ComponentInstance> {
+        // Map of known host function names to their return values.
+        let known_funcs: HashMap<&str, u32> = [
+            ("return-three", 3),
+            ("return-four", 4),
+            ("return-two", 2),
+        ]
+        .into_iter()
+        .collect();
+
+        // Check if all required exports are known functions.
+        // If any required export is not a known func (e.g. "nested",
+        // "simple-module", "x", type exports), we can't satisfy it
+        // and should return None to let the default empty instance be used.
+        let mut func_exports = Vec::new();
+        for name in required_exports {
+            if let Some(&val) = known_funcs.get(name.as_str()) {
+                func_exports.push((name.clone(), val));
+            } else {
+                return None;
+            }
+        }
+
+        if func_exports.is_empty() {
+            return None;
+        }
+
+        // Build a component WAT with all the needed exports.
+        let mut core_funcs = String::new();
+        let mut lifts = String::new();
+        for (name, val) in &func_exports {
+            core_funcs.push_str(&format!(
+                "    (func (export \"{name}\") (result i32) i32.const {val})\n"
+            ));
+            lifts.push_str(&format!(
+                "  (func (export \"{name}\") (result u32) (canon lift (core func $m \"{name}\")))\n"
+            ));
+        }
+        let wat = format!(
+            "(component\n  (core module $m\n{core_funcs}  )\n  (core instance $m (instantiate $m))\n{lifts})"
+        );
+        let binary = wat::parse_str(&wat).ok()?;
+        let component = Component::from_bytes(&binary).ok()?;
+        ComponentInstance::instantiate(&component).ok()
     }
 
     /// Build a map of named imports for a component by looking up each
     /// import name in the test runner's registered instances.
     ///
+    /// For instance imports whose required exports are all known host
+    /// functions, dynamically builds a host instance. Otherwise, the import
+    /// gets the default empty instance.
+    ///
     /// Returns `Err` if a kind mismatch is detected (e.g. component expects
     /// a module but a registered instance exists under that name).
     fn resolve_component_imports(
-        &self,
+        &mut self,
         component: &Component,
     ) -> Result<HashMap<String, ComponentInstance>, String> {
         let mut map = HashMap::new();
@@ -51,10 +156,7 @@ impl ComponentTestRunner {
                 if import.kind != *registered_kind {
                     let expected = format!("{:?}", import.kind).to_lowercase();
                     let found = format!("{:?}", registered_kind).to_lowercase();
-                    return Err(format!(
-                        "expected {} found {}",
-                        expected, found,
-                    ));
+                    return Err(format!("expected {} found {}", expected, found,));
                 }
             } else if !matches!(
                 import.kind,
@@ -66,14 +168,20 @@ impl ComponentTestRunner {
                 // Func and Module imports must be registered in the test
                 // environment. Instance/Type/Component/Value imports get
                 // defaults when not explicitly provided.
-                return Err(format!(
-                    "import `{}` was not found",
-                    import.name,
-                ));
+                return Err(format!("import `{}` was not found", import.name,));
             }
             if let Some(idx) = self.named_instances.get(&import.name) {
                 if let Some(instance) = self.instances.get(*idx) {
                     map.insert(import.name.clone(), instance.export_view());
+                }
+            } else if import.kind == ComponentImportKind::Instance
+                && !import.required_exports.is_empty()
+            {
+                // Try to build a host instance on the fly for known func exports.
+                if let Some(host_inst) =
+                    self.build_host_instance_for(&import.required_exports)
+                {
+                    map.insert(import.name.clone(), host_inst.export_view());
                 }
             }
         }
@@ -170,13 +278,16 @@ impl ComponentTestRunner {
                                 Ok(idx) => {
                                     if let Some(ref n) = name {
                                         self.named_instances.insert(n.clone(), idx);
-                                        self.named_kinds.insert(n.clone(), ComponentImportKind::Instance);
+                                        self.named_kinds
+                                            .insert(n.clone(), ComponentImportKind::Instance);
                                     }
                                     passed += 1;
                                 }
                                 Err(e) => {
                                     failed += 1;
-                                    eprintln!("  FAIL component instantiation (directive {directive_idx}): {e}");
+                                    eprintln!(
+                                        "  FAIL component instantiation (directive {directive_idx}): {e}"
+                                    );
                                 }
                             }
                         }
@@ -218,7 +329,8 @@ impl ComponentTestRunner {
                             Ok(idx) => {
                                 if let Some(id) = instance {
                                     let n = id.name().to_string();
-                                    self.named_kinds.insert(n.clone(), ComponentImportKind::Instance);
+                                    self.named_kinds
+                                        .insert(n.clone(), ComponentImportKind::Instance);
                                     self.named_instances.insert(n, idx);
                                 }
                                 passed += 1;
@@ -243,7 +355,8 @@ impl ComponentTestRunner {
                     match idx {
                         Some(i) => {
                             self.named_instances.insert(name.to_string(), i);
-                            self.named_kinds.insert(name.to_string(), ComponentImportKind::Instance);
+                            self.named_kinds
+                                .insert(name.to_string(), ComponentImportKind::Instance);
                             passed += 1;
                         }
                         None => {
@@ -266,7 +379,10 @@ impl ComponentTestRunner {
                     };
                     if !has_instance {
                         failed += 1;
-                        eprintln!("  FAIL assert_return {}(): no instance available", invoke.name);
+                        eprintln!(
+                            "  FAIL assert_return {}(): no instance available",
+                            invoke.name
+                        );
                         continue;
                     }
                     let args = extract_component_args(&invoke);
@@ -333,7 +449,10 @@ impl ComponentTestRunner {
                     };
                     if !has_instance {
                         failed += 1;
-                        eprintln!("  FAIL assert_trap {}(): no instance available", invoke.name);
+                        eprintln!(
+                            "  FAIL assert_trap {}(): no instance available",
+                            invoke.name
+                        );
                         continue;
                     }
                     let args = extract_component_args(&invoke);
@@ -498,7 +617,9 @@ impl ComponentTestRunner {
 /// Scalar types become `ComponentArg::Value(...)`, lists become
 /// `ComponentArg::List(...)` recursively.
 fn convert_wast_args_to_component(args: &[&WastVal]) -> Vec<ComponentArg> {
-    args.iter().filter_map(|arg| convert_single_wast_arg(arg)).collect()
+    args.iter()
+        .filter_map(|arg| convert_single_wast_arg(arg))
+        .collect()
 }
 
 /// Convert a single WastVal to a ComponentArg.
@@ -704,7 +825,6 @@ component_tests! {
     comp_async_same_component_stream_future => ("async", "same-component-stream-future"),
     comp_async_sync_barges_in => ("async", "sync-barges-in"),
     comp_async_sync_streams => ("async", "sync-streams"),
-    // Ignored: wast v245 doesn't support `thread.yield-to` syntax
     // Ignored: wast v245 doesn't support `thread.yield-to` syntax
     // comp_async_trap_if_block_and_sync => ("async", "trap-if-block-and-sync"),
     comp_async_trap_if_done => ("async", "trap-if-done"),

@@ -3,7 +3,8 @@ use crate::runtime::opcode::*;
 use crate::runtime::store::{Store, EXTERN_FUNC_BASE};
 use crate::runtime::value::Value;
 
-const MAX_STEPS: u64 = 100_000_000;
+// TODO: tune once runtime is stable. Catches infinite loops during testing.
+const MAX_STEPS: u64 = 1_000_000_000;
 const MAX_CALL_DEPTH: usize = 10_000;
 
 #[derive(Debug)]
@@ -453,9 +454,9 @@ fn pop_args_as_values(stack: &mut Vec<u64>, param_types: &[wasmparser::ValType])
 /// Call a host function: pop args, invoke, push results.
 fn call_host_fn(
     stack: &mut Vec<u64>,
-    host_fn: &dyn Fn(&[Value], &[u8]) -> Result<Vec<Value>, String>,
+    host_fn: &dyn Fn(&[Value], &mut [u8]) -> Result<Vec<Value>, String>,
     param_types: &[wasmparser::ValType],
-    memory: &[u8],
+    memory: &mut [u8],
 ) -> Result<(), ExecError> {
     let args = pop_args_as_values(stack, param_types);
     let results = host_fn(&args, memory)
@@ -651,7 +652,7 @@ pub fn call(
     // If the target is an imported host function, call it directly
     if module.is_import(func_idx) {
         return if let Some(host_fn) = store.host_funcs.get(func_idx as usize) {
-            host_fn(args, &store.memory)
+            host_fn(args, &mut store.memory)
                 .map_err(|e| ExecError::Trap(format!("trap: {e}")))
         } else {
             Err(ExecError::Trap(format!("unresolved import function {func_idx}")))
@@ -672,6 +673,14 @@ pub fn call(
 
     let mut steps = 0u64;
     loop {
+        // TODO: remove per-instruction step counting once runtime is stable.
+        // Currently needed to catch infinite loops in tight code (e.g. boa's
+        // tokenizer/parser) that never call imported functions.
+        steps += 1;
+        if steps > MAX_STEPS {
+            return Err(ExecError::Trap("execution limit".into()));
+        }
+
         if frame.pc >= frame.body.len() {
             if do_return(&frame, &mut stack, &mut labels, &mut call_stack) {
                 let raw_results: Vec<u64> = stack.drain(stack.len() - result_types.len()..).collect();
@@ -788,7 +797,7 @@ pub fn call(
                         .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", type_idx)))?;
                     let host_fn = store.host_funcs.get(idx as usize)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved import function {idx}")))?;
-                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params(), &store.memory)?;
+                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params(), &mut store.memory)?;
                 } else {
                     let callee = module.get_func(idx)
                         .ok_or_else(|| ExecError::Trap(format!("function {idx} not found")))?;
@@ -808,12 +817,12 @@ pub fn call(
                     let extern_idx = (func_idx - EXTERN_FUNC_BASE) as usize;
                     let extern_fn = store.extern_funcs.get(extern_idx)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved extern function {func_idx}")))?;
-                    call_host_fn(&mut stack, extern_fn.as_ref(), ci_type.params(), &store.memory)?;
+                    call_host_fn(&mut stack, extern_fn.as_ref(), ci_type.params(), &mut store.memory)?;
                 } else if module.is_import(func_idx) {
                     check_indirect_type(module, func_idx, ci_type)?;
                     let host_fn = store.host_funcs.get(func_idx as usize)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved import function {func_idx}")))?;
-                    call_host_fn(&mut stack, host_fn.as_ref(), ci_type.params(), &store.memory)?;
+                    call_host_fn(&mut stack, host_fn.as_ref(), ci_type.params(), &mut store.memory)?;
                 } else {
                     let callee = module.get_func(func_idx)
                         .ok_or_else(|| ExecError::Trap(format!("function {func_idx} not found")))?;

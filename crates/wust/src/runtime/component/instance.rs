@@ -37,6 +37,9 @@ pub(crate) enum CoreExport {
     LoweredFunc {
         child_index: usize,
         export_name: String,
+        /// String encoding from the `canon lower` that created this lowered
+        /// func. Used by the fused adapter to validate string pointer alignment.
+        string_encoding: super::types::StringEncoding,
     },
     /// A lowered-then-lifted core func (`canon lower` of `canon lift`).
     /// Resolves to a real core func but must trap during instantiation
@@ -132,6 +135,7 @@ pub(super) struct ResolvedFunc {
 }
 
 /// A live component instance — analogous to `Store` for core modules.
+#[derive(Clone)]
 pub struct ComponentInstance {
     core_instances: Vec<CoreInstance>,
     exports: HashMap<String, ResolvedExport>,
@@ -149,6 +153,12 @@ pub struct ComponentInstance {
     /// Exported inner component bytes, keyed by export name.
     /// Allows consumers to access inner component bytes from this instance.
     exported_components: HashMap<String, Vec<u8>>,
+    /// Pre-resolved exported components, keyed by export name.
+    /// When an inner component has outer aliases that reference the parent's
+    /// state (e.g. module imports), the raw bytes don't capture the resolved
+    /// state. This map stores the parsed Component with outer aliases already
+    /// resolved, so consumers get the correct module bytes.
+    exported_pre_resolved: HashMap<String, Component>,
     /// Whether this component instance is currently being instantiated.
     /// Used to prevent re-entrance via lowered functions during start.
     instantiating: Rc<Cell<bool>>,
@@ -170,6 +180,7 @@ impl Default for ComponentInstance {
             resolved_components: HashMap::new(),
             exported_modules: HashMap::new(),
             exported_components: HashMap::new(),
+            exported_pre_resolved: HashMap::new(),
             instantiating: Rc::new(Cell::new(false)),
             pre_resolved_components: HashMap::new(),
         }
@@ -295,6 +306,7 @@ impl ComponentInstance {
             resolved_components: HashMap::new(),
             exported_modules: HashMap::new(),
             exported_components: HashMap::new(),
+            exported_pre_resolved: HashMap::new(),
             instantiating: instantiating.clone(),
             pre_resolved_components,
         };
@@ -330,24 +342,27 @@ impl ComponentInstance {
 
         inst.exports =
             super::resolve::resolve_component_exports(&inst.core_instances, component)?;
-        populate_exported_bytes(&mut inst, component);
+        populate_exported_bytes(&mut inst, component, ancestors);
         instantiating.set(false);
         Ok(inst)
     }
 
-    /// Create a lightweight view of this instance containing only its exports.
+    /// Create a view of this instance suitable for passing as an import.
     ///
-    /// Used when passing an instantiated component as an import to another
-    /// component — the consumer only needs access to the exports.
+    /// Includes core instances and child instances so that resolved exports
+    /// (which reference core instance indices) can still be invoked through
+    /// trampolines. Also carries exported module/component bytes for alias
+    /// resolution.
     pub fn export_view(&self) -> ComponentInstance {
         ComponentInstance {
-            core_instances: Vec::new(),
+            core_instances: self.core_instances.clone(),
             exports: self.exports.clone(),
-            child_instances: Vec::new(),
+            child_instances: self.child_instances.clone(),
             resolved_modules: HashMap::new(),
             resolved_components: HashMap::new(),
             exported_modules: self.exported_modules.clone(),
             exported_components: self.exported_components.clone(),
+            exported_pre_resolved: self.exported_pre_resolved.clone(),
             instantiating: Rc::new(Cell::new(false)),
             pre_resolved_components: HashMap::new(),
         }
@@ -495,6 +510,10 @@ fn populate_from_exports_instance(
                         source.exported_components.iter()
                             .map(|(k, v)| (k.clone(), v.clone()))
                     );
+                    child.exported_pre_resolved.extend(
+                        source.exported_pre_resolved.iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                    );
                 }
             }
             _ => {}
@@ -507,7 +526,15 @@ fn populate_from_exports_instance(
 /// For each component-level export of kind Module or Component, stores the
 /// raw bytes in the instance so that consumers (via export_view) can access
 /// them when aliasing core modules or inner components from this instance.
-fn populate_exported_bytes(inst: &mut ComponentInstance, component: &Component) {
+///
+/// For component exports that have outer aliases, also stores a pre-resolved
+/// parsed Component so consumers get the correct module bytes even when the
+/// outer alias context changes.
+fn populate_exported_bytes(
+    inst: &mut ComponentInstance,
+    component: &Component,
+    ancestors: &[&Component],
+) {
     for export in &component.exports {
         match export.kind {
             ComponentExternalKind::Module => {
@@ -531,9 +558,29 @@ fn populate_exported_bytes(inst: &mut ComponentInstance, component: &Component) 
                     .get(&export.index)
                     .cloned()
                     .or_else(|| component.inner_components.get(idx).cloned());
-                if let Some(b) = bytes {
+                if let Some(ref b) = bytes {
                     if !b.is_empty() {
-                        inst.exported_components.insert(export.name.clone(), b);
+                        inst.exported_components.insert(export.name.clone(), b.clone());
+                    }
+                }
+                // Also store a pre-resolved Component if the inner component
+                // has outer aliases. This ensures consumers get correctly
+                // resolved module bytes even when re-parsed in a different
+                // ancestor context.
+                if let Some(pre) = component.pre_resolved_inner.get(&(idx as u32)) {
+                    inst.exported_pre_resolved
+                        .insert(export.name.clone(), (**pre).clone());
+                } else if let Some(b) = bytes {
+                    if !b.is_empty() {
+                        if let Ok(mut parsed) = super::Component::from_bytes_no_validate(&b) {
+                            let mut inner_ancestors: Vec<&Component> =
+                                Vec::with_capacity(ancestors.len() + 1);
+                            inner_ancestors.push(component);
+                            inner_ancestors.extend_from_slice(ancestors);
+                            resolve_outer_aliases(&mut parsed, &inner_ancestors);
+                            inst.exported_pre_resolved
+                                .insert(export.name.clone(), parsed);
+                        }
                     }
                 }
             }
@@ -590,6 +637,12 @@ fn instantiate_child_components(
                     // Use the pre-resolved version whose outer aliases were
                     // already resolved against the correct defining context.
                     (**pre).clone()
+                } else if let Some(pre) = find_pre_resolved_from_alias(
+                    inst, component, *component_index,
+                ) {
+                    // The component is aliased from a child instance that has
+                    // a pre-resolved version with correct outer aliases.
+                    pre
                 } else {
                     let inner_bytes = get_inner_component_bytes(
                         inst, component, *component_index, &parsed_inner_components,
@@ -826,6 +879,30 @@ fn resolve_component_alias_on_demand(
     Ok(None)
 }
 
+/// Look up a pre-resolved Component from a child instance's export.
+///
+/// If the component at `comp_idx` is aliased from a child instance's export,
+/// and that child has a pre-resolved version (with correct outer aliases),
+/// return it. This avoids re-parsing raw bytes in a different ancestor context
+/// where outer aliases would resolve incorrectly.
+fn find_pre_resolved_from_alias(
+    inst: &ComponentInstance,
+    component: &Component,
+    comp_idx: u32,
+) -> Option<Component> {
+    let (comp_inst_idx, export_name) = component.aliased_inner_components.get(&comp_idx)?;
+    let total_idx = *comp_inst_idx as usize;
+    if total_idx < inst.child_instances.len() {
+        if let Some(pre) = inst.child_instances[total_idx]
+            .exported_pre_resolved
+            .get(export_name.as_str())
+        {
+            return Some(pre.clone());
+        }
+    }
+    None
+}
+
 /// Resolve inner components that are aliased from component instance exports.
 ///
 /// For each entry in `component.aliased_inner_components`, looks up the
@@ -1033,6 +1110,7 @@ fn push_aliased_child(
     let aliased_exports = source.exports.clone();
     let exported_modules = source.exported_modules.clone();
     let exported_components = source.exported_components.clone();
+    let exported_pre_resolved = source.exported_pre_resolved.clone();
     inst.child_instances.push(ComponentInstance {
         core_instances: Vec::new(),
         exports: aliased_exports,
@@ -1041,6 +1119,7 @@ fn push_aliased_child(
         resolved_components: HashMap::new(),
         exported_modules,
         exported_components,
+        exported_pre_resolved,
         instantiating: Rc::new(Cell::new(false)),
         pre_resolved_components: HashMap::new(),
     });
@@ -1228,6 +1307,7 @@ fn wire_func_import(
         resolved_components: HashMap::new(),
         exported_modules: HashMap::new(),
         exported_components: HashMap::new(),
+        exported_pre_resolved: HashMap::new(),
         instantiating: Rc::new(Cell::new(false)),
         pre_resolved_components: HashMap::new(),
     };
@@ -1502,9 +1582,10 @@ fn make_cross_instance_trampoline(
             let export = exports.get(export_name);
 
             match export {
-                Some(CoreExport::LoweredFunc { child_index, export_name }) => {
+                Some(CoreExport::LoweredFunc { child_index, export_name, string_encoding }) => {
                     make_child_instance_trampoline(
                         inst, *child_index, export_name.clone(), result_count,
+                        *string_encoding,
                     )
                 }
                 Some(CoreExport::LoweredCoreFunc { instance, index }) => {
@@ -1522,9 +1603,10 @@ fn make_cross_instance_trampoline(
                     let lowered = exports.values().find(|e| {
                         matches!(e, CoreExport::LoweredFunc { .. })
                     });
-                    if let Some(CoreExport::LoweredFunc { child_index, export_name }) = lowered {
+                    if let Some(CoreExport::LoweredFunc { child_index, export_name, string_encoding }) = lowered {
                         return make_child_instance_trampoline(
                             inst, *child_index, export_name.clone(), result_count,
+                            *string_encoding,
                         );
                     }
                     let lowered_core = exports.values().find(|e| {
@@ -1592,11 +1674,118 @@ fn make_lowered_core_trampoline(
 /// This handles `canon lower` of a function imported from a child
 /// component instance. The trampoline invokes the child's function
 /// and returns the results.
+///
+/// The trampoline validates:
+/// - Caller retptr/argptr alignment for compound types
+/// - Callee retptr alignment for compound result types
+/// - String pointer alignment based on the caller's string encoding
+/// - String content bounds in the caller's memory
+/// Perform a fused adapter call using memory-based parameter passing.
+///
+/// When a component function has too many params to pass flat, `canon lower`
+/// packs them into the caller's linear memory and passes `(argptr [, retptr])`.
+/// This function:
+/// 1. Reads param values from caller memory at argptr
+/// 2. Calls callee's realloc to allocate in callee memory
+/// 3. Writes params to callee memory
+/// 4. Calls the core func with callee argptr
+/// 5. Reads results from callee memory at returned retptr
+/// 6. Writes results to caller memory at caller retptr
+#[allow(clippy::too_many_arguments)]
+fn fused_memory_transfer(
+    args: &[Value],
+    caller_mem: &mut [u8],
+    param_types: &[ComponentResultType],
+    result_type: ComponentResultType,
+    module: &Rc<Module>,
+    store: &SharedStore,
+    callee_mem_store: &Option<SharedStore>,
+    func_idx: u32,
+    callee_realloc_idx: Option<u32>,
+    result_count: usize,
+) -> Result<Vec<Value>, String> {
+    let has_compound_result =
+        matches!(result_type, ComponentResultType::Compound { .. });
+
+    // Extract caller argptr (first arg) and optional retptr (last arg).
+    let caller_argptr = match args.first() {
+        Some(Value::I32(p)) => *p as u32,
+        _ => return Err("expected i32 argptr in fused memory call".into()),
+    };
+    let caller_retptr = if has_compound_result && args.len() >= 2 {
+        match args.last() {
+            Some(Value::I32(p)) => Some(*p as u32),
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // Step 1: Read param values from caller memory.
+    let param_count = param_types.len();
+    let param_values =
+        canonical_abi::read_i32s_from_memory(caller_mem, caller_argptr, param_count)?;
+
+    // Normalize params through lift-then-lower round-trip.
+    let normalized = canonical_abi::normalize_args(&param_values, param_types)?;
+
+    // Step 2: Allocate in callee memory via realloc.
+    let callee_argptr = match callee_realloc_idx {
+        Some(realloc_idx) => {
+            let byte_size = (param_count as u32) * 4;
+            canonical_abi::callee_realloc(module, store, realloc_idx, 4, byte_size)?
+        }
+        None => return Err("callee has no realloc for argptr-mode call".into()),
+    };
+
+    // Step 3: Write params to callee memory.
+    {
+        let mem_store = callee_mem_store.as_ref().unwrap_or(store);
+        let mut s = mem_store.borrow_mut();
+        canonical_abi::write_i32s_to_memory(&mut s.memory, callee_argptr, &normalized)?;
+    }
+
+    // Step 4: Call callee core func with callee argptr.
+    let callee_args = vec![Value::I32(callee_argptr as i32)];
+    let call_results = {
+        let mut s = store.borrow_mut();
+        exec::call(module, &mut s, func_idx, &callee_args)
+            .map_err(|e| format!("trap: {e}"))?
+    };
+
+    // Step 5: If compound result, read results from callee memory.
+    if has_compound_result {
+        let callee_retptr = match call_results.first() {
+            Some(Value::I32(p)) => *p as u32,
+            _ => return Err("callee did not return retptr for compound result".into()),
+        };
+
+        // Determine result count from the compound type.
+        let result_values = {
+            let mem_store = callee_mem_store.as_ref().unwrap_or(store);
+            let s = mem_store.borrow();
+            canonical_abi::read_i32s_from_memory(&s.memory, callee_retptr, result_count)?
+        };
+
+        // Step 6: Write results to caller memory at caller retptr.
+        if let Some(retptr) = caller_retptr {
+            canonical_abi::write_i32s_to_memory(caller_mem, retptr, &result_values)?;
+            Ok(vec![])
+        } else {
+            Ok(result_values)
+        }
+    } else {
+        // Scalar result: normalize and return directly.
+        canonical_abi::normalize_result(&call_results, result_type)
+    }
+}
+
 fn make_child_instance_trampoline(
     inst: &ComponentInstance,
     child_index: usize,
     export_name: String,
     result_count: usize,
+    caller_string_encoding: super::types::StringEncoding,
 ) -> HostFunc {
     // Resolve the child's export to find the actual core instance and func.
     let Some(child) = inst.child_instances.get(child_index) else {
@@ -1611,23 +1800,70 @@ fn make_child_instance_trampoline(
             let func_idx = func.core_func_index;
             let param_types = func.param_types.clone();
             let result_type = func.result_type;
+            let callee_realloc_idx = func.realloc_func_index;
+            let callee_memory_instance = func.memory_instance;
 
             let Some(core_inst) = child.core_instances.get(idx) else {
-
                 return make_trampoline(result_count);
             };
+
+            // Capture callee's memory store if it differs from the func store.
+            let callee_mem_store: Option<SharedStore> =
+                callee_memory_instance.and_then(|mem_idx| {
+                    if mem_idx == idx { return None; }
+                    match child.core_instances.get(mem_idx)? {
+                        CoreInstance::Instantiated { store, .. } => {
+                            Some(Rc::clone(store))
+                        }
+                        _ => None,
+                    }
+                });
+
             match core_inst {
                 CoreInstance::Instantiated { module, store } => {
                     let module = Rc::clone(module);
                     let store = Rc::clone(store);
-                    Box::new(move |args, _mem| {
-                        let normalized = canonical_abi::normalize_args(args, &param_types)?;
-                        let Ok(mut s) = store.try_borrow_mut() else {
-                            return Ok(vec![Value::I32(0); result_count]);
-                        };
-                        match exec::call(&module, &mut s, func_idx, &normalized) {
-                            Ok(values) => canonical_abi::normalize_result(&values, result_type),
-                            Err(_) => Ok(vec![Value::I32(0); result_count]),
+                    Box::new(move |args, caller_mem| {
+                        let use_argptr = canonical_abi::is_argptr_mode(
+                            args.len(), &param_types, result_type,
+                        );
+                        eprintln!(
+                            "[FUSED] args={} param_types={} result={:?} argptr={} realloc={:?}",
+                            args.len(), param_types.len(), result_type, use_argptr, callee_realloc_idx
+                        );
+                        if use_argptr {
+                            fused_memory_transfer(
+                                args, caller_mem, &param_types, result_type,
+                                &module, &store, &callee_mem_store,
+                                func_idx, callee_realloc_idx,
+                                result_count,
+                            )
+                        } else {
+                            canonical_abi::validate_fused_args(
+                                args, &param_types, result_type,
+                                caller_mem, caller_string_encoding,
+                                callee_realloc_idx.is_some(),
+                            )?;
+                            canonical_abi::validate_callee_argptr(
+                                &param_types,
+                                callee_realloc_idx,
+                                &module,
+                                &store,
+                            )?;
+                            let normalized =
+                                canonical_abi::normalize_args(args, &param_types)?;
+                            let Ok(mut s) = store.try_borrow_mut() else {
+                                return Ok(vec![Value::I32(0); result_count]);
+                            };
+                            match exec::call(&module, &mut s, func_idx, &normalized) {
+                                Ok(values) => {
+                                    canonical_abi::validate_fused_results(
+                                        &values, result_type,
+                                    )?;
+                                    canonical_abi::normalize_result(&values, result_type)
+                                }
+                                Err(_) => Ok(vec![Value::I32(0); result_count]),
+                            }
                         }
                     })
                 }
@@ -1638,6 +1874,7 @@ fn make_child_instance_trampoline(
             // Delegate to grandchild.
             make_child_instance_trampoline(
                 child, *grandchild_idx, inner_name.clone(), result_count,
+                caller_string_encoding,
             )
         }
     }

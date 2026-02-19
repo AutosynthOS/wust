@@ -15,6 +15,7 @@ mod resolve;
 mod instance;
 
 pub use types::{Component, ComponentArg, ComponentImportDef, ComponentImportKind, ComponentResultType, ComponentValue};
+pub(crate) use types::StringEncoding;
 pub use instance::ComponentInstance;
 pub(crate) use instance::CoreInstance;
 

@@ -111,7 +111,7 @@ fn resolve_core_func_def_to_export(
                 wasmparser::ExternalKind::Func,
             )
         }
-        CoreFuncDef::Lower { func_index } => {
+        CoreFuncDef::Lower { func_index, string_encoding, .. } => {
             // canon lower wraps a component func. If the component func is
             // a Lift over a core func, resolve to a LoweredCoreFunc that
             // will trap during instantiation (re-entrance check).
@@ -136,6 +136,7 @@ fn resolve_core_func_def_to_export(
                 }) => Ok(CoreExport::LoweredFunc {
                     child_index: *instance_index as usize,
                     export_name: name.clone(),
+                    string_encoding: *string_encoding,
                 }),
                 _ => Ok(CoreExport::Trampoline),
             }
@@ -323,7 +324,7 @@ pub(super) fn resolve_core_func_to_resolved(
                 },
             }
         }
-        CoreFuncDef::Lower { func_index } => {
+        CoreFuncDef::Lower { func_index, .. } => {
             // canon lower wraps a component func as a core func.
             // If the component func is an alias to a child instance export,
             // delegate there. Otherwise, resolve via the first available core

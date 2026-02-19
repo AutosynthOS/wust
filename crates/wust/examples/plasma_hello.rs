@@ -50,7 +50,7 @@ fn run_test(module: &Module, name: &str, js_source: &str, expected: &str) {
 
     let log_output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let host_funcs = build_host_funcs(module, log_output.clone());
-    let mut store = Store::new_with_imports(module, host_funcs, vec![], None, vec![])
+    let mut store = Store::new_with_imports(module, host_funcs, vec![])
         .expect("failed to instantiate");
 
     let ptr = call_alloc(module, &mut store, js_source.len());
@@ -93,14 +93,14 @@ fn build_host_funcs(module: &Module, log_output: Arc<Mutex<String>>) -> Vec<Host
                     if let Ok(msg) = std::str::from_utf8(&memory[ptr..ptr + len]) {
                         output.lock().unwrap().push_str(msg);
                     }
-                    vec![]
+                    Ok(vec![])
                 }));
             } else if has_result {
                 // wasm-bindgen stub that returns a value — return 0.
                 host_funcs.push(Box::new(|_args, _memory| Ok(vec![Value::I32(0)])));
             } else {
                 // wasm-bindgen stub — no-op.
-                host_funcs.push(Box::new(|_args, _memory| vec![]));
+                host_funcs.push(Box::new(|_args, _memory| Ok(vec![])));
             }
         }
     }

@@ -440,8 +440,17 @@ fn parse_canonical_section(
             } => {
                 parse_canon_lift(component, core_func_index, type_index, &options);
             }
-            wasmparser::CanonicalFunction::Lower { func_index, .. } => {
-                component.core_funcs.push(CoreFuncDef::Lower { func_index });
+            wasmparser::CanonicalFunction::Lower { func_index, options } => {
+                let string_encoding = parse_string_encoding(&options);
+                let memory_index = options.iter().find_map(|opt| match opt {
+                    wasmparser::CanonicalOption::Memory(idx) => Some(*idx),
+                    _ => None,
+                });
+                component.core_funcs.push(CoreFuncDef::Lower {
+                    func_index,
+                    string_encoding,
+                    memory_index,
+                });
             }
             wasmparser::CanonicalFunction::ResourceNew { resource } => {
                 component.core_funcs.push(CoreFuncDef::ResourceNew { resource });
@@ -485,6 +494,20 @@ fn parse_canon_lift(
         memory_index,
         realloc_func_index,
     });
+}
+
+/// Extract the string encoding from canonical options.
+///
+/// Defaults to UTF-8 if no encoding option is specified.
+fn parse_string_encoding(options: &[wasmparser::CanonicalOption]) -> StringEncoding {
+    for opt in options {
+        match opt {
+            wasmparser::CanonicalOption::UTF16 => return StringEncoding::Utf16,
+            wasmparser::CanonicalOption::CompactUTF16 => return StringEncoding::Latin1Utf16,
+            _ => {}
+        }
+    }
+    StringEncoding::Utf8
 }
 
 /// Component exports introduce a new item in the corresponding index space.
@@ -774,7 +797,74 @@ fn record_defined_type(
                 ComponentResultType::Variant { case_count: cases.len() as u32 },
             );
         }
+        wasmparser::ComponentDefinedType::Tuple(fields) => {
+            let alignment = compute_tuple_alignment(component, fields);
+            component.defined_val_types.insert(
+                type_index,
+                ComponentResultType::Compound { alignment },
+            );
+        }
+        wasmparser::ComponentDefinedType::Record(fields) => {
+            let field_types: Vec<wasmparser::ComponentValType> =
+                fields.iter().map(|(_, ty)| *ty).collect();
+            let alignment = compute_tuple_alignment(component, &field_types);
+            component.defined_val_types.insert(
+                type_index,
+                ComponentResultType::Compound { alignment },
+            );
+        }
+        wasmparser::ComponentDefinedType::List(_) => {
+            component.defined_val_types.insert(
+                type_index,
+                ComponentResultType::Compound { alignment: 4 },
+            );
+        }
         _ => {}
+    }
+}
+
+/// Compute the alignment of a tuple type from its field types.
+///
+/// The alignment of a tuple is the maximum alignment of any of its fields.
+/// Falls back to 4 if any field type is unknown (safe default for i32-based
+/// compound types).
+fn compute_tuple_alignment(
+    component: &Component,
+    fields: &[wasmparser::ComponentValType],
+) -> u32 {
+    let mut max_align = 1u32;
+    for field in fields {
+        let align = match field {
+            wasmparser::ComponentValType::Primitive(p) => primitive_alignment(*p),
+            wasmparser::ComponentValType::Type(idx) => {
+                match component.defined_val_types.get(&(*idx as u32)) {
+                    Some(ComponentResultType::Compound { alignment }) => *alignment,
+                    _ => 4,
+                }
+            }
+        };
+        max_align = max_align.max(align);
+    }
+    max_align
+}
+
+/// Return the byte alignment of a primitive component value type.
+fn primitive_alignment(p: wasmparser::PrimitiveValType) -> u32 {
+    match p {
+        wasmparser::PrimitiveValType::Bool
+        | wasmparser::PrimitiveValType::S8
+        | wasmparser::PrimitiveValType::U8 => 1,
+        wasmparser::PrimitiveValType::S16
+        | wasmparser::PrimitiveValType::U16 => 2,
+        wasmparser::PrimitiveValType::S32
+        | wasmparser::PrimitiveValType::U32
+        | wasmparser::PrimitiveValType::F32
+        | wasmparser::PrimitiveValType::Char => 4,
+        wasmparser::PrimitiveValType::S64
+        | wasmparser::PrimitiveValType::U64
+        | wasmparser::PrimitiveValType::F64 => 8,
+        wasmparser::PrimitiveValType::String => 4,
+        wasmparser::PrimitiveValType::ErrorContext => 4,
     }
 }
 

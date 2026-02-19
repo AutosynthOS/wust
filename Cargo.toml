@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "crates/wust",
     "crates/plasma",
+    "crates/plasma_hello",
 ]

@@ -59,6 +59,31 @@ pub(crate) struct CoreAliasDef {
     pub name: String,
 }
 
+/// String encoding used by `canon lower` / `canon lift`.
+///
+/// Determines alignment requirements for string pointers in the
+/// canonical ABI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StringEncoding {
+    /// UTF-8 encoding. String pointers have 1-byte alignment.
+    Utf8,
+    /// UTF-16 encoding. String pointers must be 2-byte aligned.
+    Utf16,
+    /// Latin-1 or UTF-16 encoding. String pointers must be 2-byte aligned.
+    Latin1Utf16,
+}
+
+impl StringEncoding {
+    /// Return the required byte alignment for a string pointer with this
+    /// encoding.
+    pub(crate) fn pointer_alignment(self) -> u32 {
+        match self {
+            StringEncoding::Utf8 => 1,
+            StringEncoding::Utf16 | StringEncoding::Latin1Utf16 => 2,
+        }
+    }
+}
+
 /// How a core func is defined within a component.
 ///
 /// Most core funcs are aliases of core instance exports, but canonical
@@ -70,7 +95,16 @@ pub(crate) enum CoreFuncDef {
     /// Alias of a core instance export (the common case).
     AliasInstanceExport { instance_index: u32, name: String },
     /// `canon lower` — lowers a component func to a core func.
-    Lower { func_index: u32 },
+    Lower {
+        func_index: u32,
+        /// String encoding specified on `canon lower` (e.g. utf8, utf16,
+        /// latin1+utf16). Determines alignment requirements for string
+        /// pointers in the fused adapter path.
+        string_encoding: StringEncoding,
+        /// Core memory index for the caller's memory, used for reading
+        /// string/list data and validating bounds in the fused path.
+        memory_index: Option<u32>,
+    },
     /// `canon resource.new` — creates a new resource handle.
     ResourceNew { resource: u32 },
     /// `canon resource.rep` — gets the i32 representation of a resource.
@@ -139,6 +173,10 @@ pub enum ComponentResultType {
     Unit,
     /// A variant type with a known number of cases.
     Variant { case_count: u32 },
+    /// A compound type (tuple, record, list) that uses retptr/argptr
+    /// when passed across the ABI boundary. The alignment is the maximum
+    /// alignment of the type's fields (e.g. 4 for tuples of u32).
+    Compound { alignment: u32 },
     /// A type we don't yet handle — pass through raw.
     Unknown,
 }
