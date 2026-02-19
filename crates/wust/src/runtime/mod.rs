@@ -1,5 +1,4 @@
 pub mod module;
-pub mod instruction;
 pub(crate) mod opcode;
 mod store;
 pub mod exec;
@@ -12,7 +11,6 @@ mod canonical_abi;
 // pub mod jit;
 
 pub use module::{Module, ExportKind};
-pub use instruction::Instruction;
 pub use opcode::Op;
 pub use store::{Store, SharedStore, HostFunc, EXTERN_FUNC_BASE};
 pub use exec::ExecError;

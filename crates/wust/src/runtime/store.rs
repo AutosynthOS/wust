@@ -1,8 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::runtime::instruction::Instruction;
-use crate::runtime::module::{ElemItem, Module};
+use crate::runtime::module::{ConstOp, ElemItem, Module};
 use crate::runtime::value::Value;
 
 /// A shared, interior-mutable handle to a `Store`.
@@ -246,26 +245,25 @@ macro_rules! const_binop {
 }
 
 /// Evaluate a const expression to a Value, supporting all WASM types and extended const ops.
-fn eval_const_expr(instrs: &[Instruction], globals: &[Value]) -> Option<Value> {
+fn eval_const_expr(ops: &[ConstOp], globals: &[Value]) -> Option<Value> {
     let mut stack: Vec<Value> = Vec::new();
-    for instr in instrs {
-        match instr {
-            Instruction::I32Const(v) => stack.push(Value::I32(*v)),
-            Instruction::I64Const(v) => stack.push(Value::I64(*v)),
-            Instruction::F32Const(v) => stack.push(Value::F32(*v)),
-            Instruction::F64Const(v) => stack.push(Value::F64(*v)),
-            Instruction::RefFunc(idx) => stack.push(Value::FuncRef(Some(*idx))),
-            Instruction::RefNull => stack.push(Value::FuncRef(None)),
-            Instruction::GlobalGet(idx) => {
+    for op in ops {
+        match op {
+            ConstOp::I32Const(v) => stack.push(Value::I32(*v)),
+            ConstOp::I64Const(v) => stack.push(Value::I64(*v)),
+            ConstOp::F32Const(v) => stack.push(Value::F32(*v)),
+            ConstOp::F64Const(v) => stack.push(Value::F64(*v)),
+            ConstOp::RefFunc(idx) => stack.push(Value::FuncRef(Some(*idx))),
+            ConstOp::RefNull => stack.push(Value::FuncRef(None)),
+            ConstOp::GlobalGet(idx) => {
                 stack.push(*globals.get(*idx as usize)?);
             }
-            Instruction::I32Add => const_binop!(stack, I32, wrapping_add),
-            Instruction::I32Sub => const_binop!(stack, I32, wrapping_sub),
-            Instruction::I32Mul => const_binop!(stack, I32, wrapping_mul),
-            Instruction::I64Add => const_binop!(stack, I64, wrapping_add),
-            Instruction::I64Sub => const_binop!(stack, I64, wrapping_sub),
-            Instruction::I64Mul => const_binop!(stack, I64, wrapping_mul),
-            _ => return None,
+            ConstOp::I32Add => const_binop!(stack, I32, wrapping_add),
+            ConstOp::I32Sub => const_binop!(stack, I32, wrapping_sub),
+            ConstOp::I32Mul => const_binop!(stack, I32, wrapping_mul),
+            ConstOp::I64Add => const_binop!(stack, I64, wrapping_add),
+            ConstOp::I64Sub => const_binop!(stack, I64, wrapping_sub),
+            ConstOp::I64Mul => const_binop!(stack, I64, wrapping_mul),
         }
     }
     stack.pop()
@@ -276,17 +274,17 @@ fn resolve_elem_item(item: &ElemItem, globals: &[Value]) -> Option<u32> {
     match item {
         ElemItem::Func(idx) => Some(*idx),
         ElemItem::Null => None,
-        ElemItem::Expr(instrs) => {
+        ElemItem::Expr(ops) => {
             // Evaluate expression — could be global.get for a funcref
-            for instr in instrs {
-                match instr {
-                    Instruction::GlobalGet(idx) => match globals.get(*idx as usize) {
+            for op in ops {
+                match op {
+                    ConstOp::GlobalGet(idx) => match globals.get(*idx as usize) {
                         Some(&Value::FuncRef(func_ref)) => return func_ref,
                         Some(&Value::I32(v)) => return Some(v as u32),
                         _ => return None,
                     },
-                    Instruction::RefFunc(idx) => return Some(*idx),
-                    Instruction::RefNull => return None,
+                    ConstOp::RefFunc(idx) => return Some(*idx),
+                    ConstOp::RefNull => return None,
                     _ => {}
                 }
             }

@@ -32,9 +32,7 @@ pub(crate) fn lift_results(
     memory_instance: Option<usize>,
 ) -> Result<Vec<ComponentValue>, String> {
     match result_type {
-        ComponentResultType::String => {
-            lift_string_result(values, core_instances, memory_instance)
-        }
+        ComponentResultType::String => lift_string_result(values, core_instances, memory_instance),
         ComponentResultType::Unit => Ok(Vec::new()),
         _ => values.iter().map(|v| lift_value(*v, result_type)).collect(),
     }
@@ -45,30 +43,28 @@ pub(crate) fn lift_results(
 /// Applies masking, sign extension, and type conversion per the canonical ABI.
 /// Returns an error (trap) for invalid values like out-of-range char code points.
 fn lift_value(v: Value, result_type: ComponentResultType) -> Result<ComponentValue, String> {
-    match (v, result_type) {
-        (Value::I32(x), ComponentResultType::Bool) => Ok(ComponentValue::Bool(x != 0)),
-        (Value::I32(x), ComponentResultType::U8) => Ok(ComponentValue::U8((x as u32) & 0xFF)),
-        (Value::I32(x), ComponentResultType::S8) => Ok(ComponentValue::S8((x as i8) as i32)),
-        (Value::I32(x), ComponentResultType::U16) => Ok(ComponentValue::U16((x as u32) & 0xFFFF)),
-        (Value::I32(x), ComponentResultType::S16) => Ok(ComponentValue::S16((x as i16) as i32)),
-        (Value::I32(x), ComponentResultType::U32) => Ok(ComponentValue::U32(x as u32)),
-        (Value::I32(x), ComponentResultType::S32) => Ok(ComponentValue::S32(x)),
-        (Value::I64(x), ComponentResultType::U64) => Ok(ComponentValue::U64(x as u64)),
-        (Value::I64(x), ComponentResultType::S64) => Ok(ComponentValue::S64(x)),
-        (Value::F32(x), ComponentResultType::F32) => Ok(ComponentValue::F32(x)),
-        (Value::F64(x), ComponentResultType::F64) => Ok(ComponentValue::F64(x)),
-        (Value::I32(x), ComponentResultType::Char) => {
-            char::from_u32(x as u32)
-                .map(ComponentValue::Char)
-                .ok_or_else(|| format!("invalid char code point: {:#x}", x as u32))
-        }
+    Ok(match (v, result_type) {
+        (Value::I32(x), ComponentResultType::Bool) => ComponentValue::Bool(x != 0),
+        (Value::I32(x), ComponentResultType::U8) => ComponentValue::U8((x as u32) & 0xFF),
+        (Value::I32(x), ComponentResultType::S8) => ComponentValue::S8((x as i8) as i32),
+        (Value::I32(x), ComponentResultType::U16) => ComponentValue::U16((x as u32) & 0xFFFF),
+        (Value::I32(x), ComponentResultType::S16) => ComponentValue::S16((x as i16) as i32),
+        (Value::I32(x), ComponentResultType::U32) => ComponentValue::U32(x as u32),
+        (Value::I32(x), ComponentResultType::S32) => ComponentValue::S32(x),
+        (Value::I64(x), ComponentResultType::U64) => ComponentValue::U64(x as u64),
+        (Value::I64(x), ComponentResultType::S64) => ComponentValue::S64(x),
+        (Value::F32(x), ComponentResultType::F32) => ComponentValue::F32(x),
+        (Value::F64(x), ComponentResultType::F64) => ComponentValue::F64(x),
+        (Value::I32(x), ComponentResultType::Char) => char::from_u32(x as u32)
+            .map(ComponentValue::Char)
+            .ok_or_else(|| format!("invalid char code point: {:#x}", x as u32))?,
         // Fallback: pass through as S32/S64
-        (Value::I32(x), _) => Ok(ComponentValue::S32(x)),
-        (Value::I64(x), _) => Ok(ComponentValue::S64(x)),
-        (Value::F32(x), _) => Ok(ComponentValue::F32(x)),
-        (Value::F64(x), _) => Ok(ComponentValue::F64(x)),
-        _ => Ok(ComponentValue::S32(0)),
-    }
+        (Value::I32(x), _) => ComponentValue::S32(x),
+        (Value::I64(x), _) => ComponentValue::S64(x),
+        (Value::F32(x), _) => ComponentValue::F32(x),
+        (Value::F64(x), _) => ComponentValue::F64(x),
+        _ => return Err("unimplemented".into()),
+    })
 }
 
 /// Lift a string result from linear memory.
@@ -108,8 +104,7 @@ fn read_string_from_memory(
     memory_instance: Option<usize>,
     retptr: u32,
 ) -> Result<String, String> {
-    let inst_idx = memory_instance
-        .ok_or("string result requires a memory option on canon lift")?;
+    let inst_idx = memory_instance.ok_or("string result requires a memory option on canon lift")?;
     match core_instances.get(inst_idx) {
         Some(CoreInstance::Instantiated { store, .. }) => {
             let store = store.borrow();
@@ -126,7 +121,9 @@ fn read_string_from_memory(
 /// Validates alignment (retptr must be 4-byte aligned) and bounds.
 fn read_string_descriptor(memory: &[u8], retptr: u32) -> Result<(u32, u32), String> {
     if retptr % 4 != 0 {
-        return Err(format!("unaligned pointer: retptr {retptr:#x} is not 4-byte aligned"));
+        return Err(format!(
+            "unaligned pointer: retptr {retptr:#x} is not 4-byte aligned"
+        ));
     }
     let retptr = retptr as usize;
     if retptr + 8 > memory.len() {
@@ -150,8 +147,7 @@ fn read_utf8_string(memory: &[u8], ptr: u32, len: u32) -> Result<String, String>
         ));
     }
     let bytes = &memory[ptr as usize..(ptr + len) as usize];
-    String::from_utf8(bytes.to_vec())
-        .map_err(|e| format!("invalid UTF-8 in string: {e}"))
+    String::from_utf8(bytes.to_vec()).map_err(|e| format!("invalid UTF-8 in string: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -251,10 +247,7 @@ pub(crate) fn validate_callee_argptr(
 /// When a function returns a compound type, `canon lower` adds a retptr
 /// as the last argument. This pointer must be aligned to the result type's
 /// alignment.
-fn validate_caller_retptr(
-    args: &[Value],
-    result_type: ComponentResultType,
-) -> Result<(), String> {
+fn validate_caller_retptr(args: &[Value], result_type: ComponentResultType) -> Result<(), String> {
     if let ComponentResultType::Compound { alignment } = result_type {
         if let Some(Value::I32(retptr)) = args.last() {
             let ptr = *retptr as u32;
@@ -376,7 +369,10 @@ pub(crate) fn normalize_args(
     args.iter()
         .enumerate()
         .map(|(i, v)| {
-            let ty = param_types.get(i).copied().unwrap_or(ComponentResultType::Unknown);
+            let ty = param_types
+                .get(i)
+                .copied()
+                .unwrap_or(ComponentResultType::Unknown);
             normalize_value(*v, ty)
         })
         .collect()
@@ -393,12 +389,17 @@ pub(crate) fn normalize_result(
     if results.is_empty() || result_type == ComponentResultType::Unit {
         return Ok(results.to_vec());
     }
-    results.iter()
+    results
+        .iter()
         .enumerate()
         .map(|(i, v)| {
             // Only normalize the first result value by the declared type.
             // Multi-value results with different types aren't yet supported.
-            let ty = if i == 0 { result_type } else { ComponentResultType::Unknown };
+            let ty = if i == 0 {
+                result_type
+            } else {
+                ComponentResultType::Unknown
+            };
             normalize_value(*v, ty)
         })
         .collect()
@@ -412,26 +413,14 @@ pub(crate) fn normalize_result(
 /// For char: validate the code point is a valid Unicode scalar value.
 fn normalize_value(v: Value, ty: ComponentResultType) -> Result<Value, String> {
     match (v, ty) {
-        (Value::I32(x), ComponentResultType::Bool) => {
-            Ok(Value::I32(if x != 0 { 1 } else { 0 }))
-        }
-        (Value::I32(x), ComponentResultType::U8) => {
-            Ok(Value::I32((x & 0xFF) as i32))
-        }
-        (Value::I32(x), ComponentResultType::S8) => {
-            Ok(Value::I32((x as i8) as i32))
-        }
-        (Value::I32(x), ComponentResultType::U16) => {
-            Ok(Value::I32((x & 0xFFFF) as i32))
-        }
-        (Value::I32(x), ComponentResultType::S16) => {
-            Ok(Value::I32((x as i16) as i32))
-        }
-        (Value::I32(x), ComponentResultType::Char) => {
-            char::from_u32(x as u32)
-                .map(|c| Value::I32(c as i32))
-                .ok_or_else(|| format!("invalid char code point: {:#x}", x as u32))
-        }
+        (Value::I32(x), ComponentResultType::Bool) => Ok(Value::I32(if x != 0 { 1 } else { 0 })),
+        (Value::I32(x), ComponentResultType::U8) => Ok(Value::I32((x & 0xFF) as i32)),
+        (Value::I32(x), ComponentResultType::S8) => Ok(Value::I32((x as i8) as i32)),
+        (Value::I32(x), ComponentResultType::U16) => Ok(Value::I32((x & 0xFFFF) as i32)),
+        (Value::I32(x), ComponentResultType::S16) => Ok(Value::I32((x as i16) as i32)),
+        (Value::I32(x), ComponentResultType::Char) => char::from_u32(x as u32)
+            .map(|c| Value::I32(c as i32))
+            .ok_or_else(|| format!("invalid char code point: {:#x}", x as u32)),
         (Value::I32(x), ComponentResultType::Variant { case_count }) => {
             let disc = x as u32;
             if disc >= case_count {
@@ -468,12 +457,8 @@ pub(crate) fn lower_component_args(
         match arg {
             ComponentArg::Value(v) => core_args.push(*v),
             ComponentArg::List(elements) => {
-                let (ptr, len) = lower_list(
-                    elements,
-                    realloc_func_index,
-                    core_instances,
-                    instance_index,
-                )?;
+                let (ptr, len) =
+                    lower_list(elements, realloc_func_index, core_instances, instance_index)?;
                 core_args.push(Value::I32(ptr as i32));
                 core_args.push(Value::I32(len as i32));
             }
@@ -496,8 +481,8 @@ fn lower_list(
     core_instances: &mut [CoreInstance],
     instance_index: usize,
 ) -> Result<(u32, u32), String> {
-    let realloc_idx = realloc_func_index
-        .ok_or("list argument requires a realloc option on canon lift")?;
+    let realloc_idx =
+        realloc_func_index.ok_or("list argument requires a realloc option on canon lift")?;
 
     let element_count = elements.len() as u32;
     // TODO: list lowering is incomplete — element_size is hardcoded to 1,
@@ -506,7 +491,8 @@ fn lower_list(
     // the component type and serialize each element into the allocation.
     let element_size: u32 = 1;
     let alignment: u32 = 1;
-    let byte_length = element_count.checked_mul(element_size)
+    let byte_length = element_count
+        .checked_mul(element_size)
         .ok_or("list byte length overflow")?;
 
     let instance = core_instances
@@ -553,7 +539,11 @@ pub(crate) fn is_argptr_mode(
     // The caller passes argptr as the first arg.
     // If the result is compound, the caller also passes retptr as the last arg.
     let expected_flat = param_types.len()
-        + if matches!(result_type, ComponentResultType::Compound { .. }) { 1 } else { 0 };
+        + if matches!(result_type, ComponentResultType::Compound { .. }) {
+            1
+        } else {
+            0
+        };
     // If caller args < expected flat count, we're in argptr mode.
     // Typically: 1 arg (argptr only) or 2 args (argptr + retptr).
     caller_arg_count < expected_flat && caller_arg_count <= 2
@@ -580,9 +570,7 @@ pub(crate) fn read_i32s_from_memory(
     let mut values = Vec::with_capacity(count);
     for i in 0..count {
         let offset = base + i * 4;
-        let v = i32::from_le_bytes(
-            memory[offset..offset + 4].try_into().unwrap(),
-        );
+        let v = i32::from_le_bytes(memory[offset..offset + 4].try_into().unwrap());
         values.push(Value::I32(v));
     }
     Ok(values)
@@ -637,8 +625,7 @@ pub(crate) fn callee_realloc(
     ];
     let results = {
         let mut s = store.borrow_mut();
-        exec::call(module, &mut s, realloc_idx, &realloc_args)
-            .map_err(|e| format!("trap: {e}"))?
+        exec::call(module, &mut s, realloc_idx, &realloc_args).map_err(|e| format!("trap: {e}"))?
     };
     match results.first() {
         Some(Value::I32(p)) => Ok(*p as u32),

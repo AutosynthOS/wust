@@ -2,10 +2,48 @@ use wasmparser::{
     FuncType, Operator, Parser, Payload, ValType,
 };
 
-use crate::runtime::instruction::{
-    Instruction, decode_op, peephole_optimize, resolve_block_targets,
-};
 use crate::runtime::opcode::{Op, compile_body};
+
+/// Small instruction enum used only for const expressions (global inits,
+/// data segment offsets, table inits, element items). These only need a
+/// handful of variants — far fewer than the full instruction set.
+#[derive(Debug, Clone)]
+pub enum ConstOp {
+    I32Const(i32),
+    I64Const(i64),
+    F32Const(f32),
+    F64Const(f64),
+    RefFunc(u32),
+    RefNull,
+    GlobalGet(u32),
+    I32Add,
+    I32Sub,
+    I32Mul,
+    I64Add,
+    I64Sub,
+    I64Mul,
+}
+
+/// Decode a single wasmparser operator into a ConstOp, if it is valid in
+/// a const expression context. Returns None for unsupported operators.
+fn decode_const_op(op: &Operator) -> Option<ConstOp> {
+    Some(match *op {
+        Operator::I32Const { value } => ConstOp::I32Const(value),
+        Operator::I64Const { value } => ConstOp::I64Const(value),
+        Operator::F32Const { value } => ConstOp::F32Const(f32::from_bits(value.bits())),
+        Operator::F64Const { value } => ConstOp::F64Const(f64::from_bits(value.bits())),
+        Operator::RefFunc { function_index } => ConstOp::RefFunc(function_index),
+        Operator::RefNull { .. } => ConstOp::RefNull,
+        Operator::GlobalGet { global_index } => ConstOp::GlobalGet(global_index),
+        Operator::I32Add => ConstOp::I32Add,
+        Operator::I32Sub => ConstOp::I32Sub,
+        Operator::I32Mul => ConstOp::I32Mul,
+        Operator::I64Add => ConstOp::I64Add,
+        Operator::I64Sub => ConstOp::I64Sub,
+        Operator::I64Mul => ConstOp::I64Mul,
+        _ => return None,
+    })
+}
 
 /// A parsed WASM module — types, functions, memory, etc.
 /// This is the immutable "code" side. Instance state lives in Store.
@@ -66,7 +104,7 @@ pub struct MemoryType {
 pub struct GlobalDef {
     pub ty: ValType,
     pub mutable: bool,
-    pub init: Vec<Instruction>,
+    pub init: Vec<ConstOp>,
 }
 
 #[derive(Debug, Clone)]
@@ -101,7 +139,7 @@ impl From<wasmparser::ExternalKind> for ExportKind {
 #[derive(Debug)]
 pub struct DataSegment {
     /// Offset expression for active segments; empty for passive segments.
-    pub offset: Vec<Instruction>,
+    pub offset: Vec<ConstOp>,
     pub data: Vec<u8>,
     /// True for active segments that get applied to memory at instantiation.
     pub active: bool,
@@ -112,7 +150,7 @@ pub struct TableDef {
     pub min: u64,
     pub max: Option<u64>,
     /// Init expression for each element (None = ref.null).
-    pub init: Option<Vec<Instruction>>,
+    pub init: Option<Vec<ConstOp>>,
     /// The element type of the table (funcref, externref, etc.).
     pub element_type: wasmparser::RefType,
 }
@@ -120,7 +158,7 @@ pub struct TableDef {
 #[derive(Debug)]
 pub struct ElemSegment {
     pub table_idx: u32,
-    pub offset: Vec<Instruction>,
+    pub offset: Vec<ConstOp>,
     /// Each item is either a direct func index or an expression needing evaluation.
     pub items: Vec<ElemItem>,
     /// True for active segments that get applied to a table at instantiation.
@@ -134,7 +172,7 @@ pub enum ElemItem {
     /// Null reference.
     Null,
     /// Expression to evaluate at instantiation time (e.g. global.get for funcref).
-    Expr(Vec<Instruction>),
+    Expr(Vec<ConstOp>),
 }
 
 /// Accumulates parsed sections while walking through WASM payloads.
@@ -153,7 +191,8 @@ struct ModuleBuilder {
     num_global_imports: u32,
     num_memory_imports: u32,
     num_table_imports: u32,
-    func_bodies: Vec<(Vec<ValType>, Vec<Instruction>)>,
+    /// Pre-compiled function bodies: (locals, compiled ops, br_tables).
+    func_bodies: Vec<(Vec<ValType>, Vec<Op>, Vec<(Vec<u32>, u32)>)>,
     code_idx: u32,
 }
 
@@ -276,11 +315,13 @@ impl ModuleBuilder {
         Ok(())
     }
 
-    /// Decode a single code section entry into locals + instructions.
+    /// Decode a single code section entry, compiling directly to Op bytecode.
     fn parse_code_entry(&mut self, body: wasmparser::FunctionBody<'_>) -> Result<(), String> {
         let locals = self.collect_locals(&body)?;
-        let instructions = decode_function_body(&body)?;
-        self.func_bodies.push((locals, instructions));
+        let ops_reader = body.get_operators_reader()
+            .map_err(|e| format!("ops error: {e}"))?;
+        let (compiled, br_tables) = compile_body(ops_reader, &self.types)?;
+        self.func_bodies.push((locals, compiled, br_tables));
         self.code_idx += 1;
         Ok(())
     }
@@ -302,14 +343,16 @@ impl ModuleBuilder {
         Ok(locals)
     }
 
-    /// Compile function bodies into optimized Func entries.
+    /// Build Func entries from pre-compiled bodies.
     fn build_funcs(&self) -> Vec<Func> {
-        self.func_bodies.iter().enumerate().map(|(i, (locals, instr_body))| {
+        self.func_bodies.iter().enumerate().map(|(i, (locals, compiled, br_tables))| {
             let type_idx = self.func_types[self.num_func_imports as usize + i];
-            let mut body = instr_body.clone();
-            peephole_optimize(&mut body);
-            let (compiled, br_tables) = compile_body(&body, &self.types);
-            Func { type_idx, locals: locals.clone(), body: compiled, br_tables }
+            Func {
+                type_idx,
+                locals: locals.clone(),
+                body: compiled.clone(),
+                br_tables: br_tables.clone(),
+            }
         }).collect()
     }
 
@@ -477,21 +520,6 @@ fn dispatch_payload(builder: &mut ModuleBuilder, payload: Payload<'_>) -> Result
     Ok(())
 }
 
-/// Decode operators from a function body into a list of instructions.
-fn decode_function_body(body: &wasmparser::FunctionBody<'_>) -> Result<Vec<Instruction>, String> {
-    let ops_reader = body.get_operators_reader()
-        .map_err(|e| format!("ops error: {e}"))?;
-    let mut instructions = Vec::new();
-    for op in ops_reader {
-        let op = op.map_err(|e| format!("op error: {e}"))?;
-        if let Some(instr) = decode_op(&op) {
-            instructions.push(instr);
-        }
-    }
-    resolve_block_targets(&mut instructions);
-    Ok(instructions)
-}
-
 /// Parse element items from a wasmparser ElementItems into our ElemItem representation.
 fn parse_elem_items(items: &wasmparser::ElementItems) -> Result<Vec<ElemItem>, String> {
     let mut result = Vec::new();
@@ -505,24 +533,24 @@ fn parse_elem_items(items: &wasmparser::ElementItems) -> Result<Vec<ElemItem>, S
         wasmparser::ElementItems::Expressions(_, reader) => {
             for expr in reader.clone() {
                 let expr = expr.map_err(|e| format!("elem expr error: {e}"))?;
-                let instrs = decode_const_expr_multi(&expr)?;
-                if instrs.len() == 1 {
-                    match &instrs[0] {
-                        Instruction::RefFunc(idx) => {
+                let const_ops = decode_const_expr_multi(&expr)?;
+                if const_ops.len() == 1 {
+                    match &const_ops[0] {
+                        ConstOp::RefFunc(idx) => {
                             result.push(ElemItem::Func(*idx));
                             continue;
                         }
-                        Instruction::RefNull => {
+                        ConstOp::RefNull => {
                             result.push(ElemItem::Null);
                             continue;
                         }
                         _ => {}
                     }
                 }
-                if instrs.is_empty() {
+                if const_ops.is_empty() {
                     result.push(ElemItem::Null);
                 } else {
-                    result.push(ElemItem::Expr(instrs));
+                    result.push(ElemItem::Expr(const_ops));
                 }
             }
         }
@@ -530,22 +558,22 @@ fn parse_elem_items(items: &wasmparser::ElementItems) -> Result<Vec<ElemItem>, S
     Ok(result)
 }
 
-fn decode_const_expr_multi(expr: &wasmparser::ConstExpr) -> Result<Vec<Instruction>, String> {
+/// Decode operators from a const expression into a list of ConstOps.
+fn decode_const_expr_multi(expr: &wasmparser::ConstExpr) -> Result<Vec<ConstOp>, String> {
     let mut reader = expr.get_operators_reader();
-    let mut instrs = Vec::new();
+    let mut ops = Vec::new();
     loop {
         let op = reader.read().map_err(|e| format!("const expr error: {e}"))?;
         match op {
             Operator::End => break,
             _ => {
-                if let Some(instr) = decode_op(&op) {
-                    instrs.push(instr);
+                if let Some(const_op) = decode_const_op(&op) {
+                    ops.push(const_op);
                 } else {
                     return Err(format!("unsupported const expr op: {op:?}"));
                 }
             }
         }
     }
-    Ok(instrs)
+    Ok(ops)
 }
-
