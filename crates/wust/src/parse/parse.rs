@@ -8,18 +8,111 @@ use super::types::*;
 // Section parsing
 // ---------------------------------------------------------------------------
 
-/// Walk all payloads in a component binary and dispatch each recognized
-/// section to the appropriate parser.
+/// Validate and parse a component binary.
 ///
-/// Only processes sections at depth 1 (root-level). Inner component
-/// sections are ignored — they belong to nested components and must not
-/// leak into the outer component's index spaces.
-pub(crate) fn parse_component_sections(
-    component: &mut ParsedComponent,
+/// Validates the binary with the provided validator (which returns the
+/// `Types` object), then extracts structural information into a
+/// `ParsedComponent`.
+pub(crate) fn parse_and_validate(
     bytes: &[u8],
-) -> Result<(), String> {
+    validator: &mut wasmparser::Validator,
+) -> Result<(ParsedComponent, wasmparser::types::Types), anyhow::Error> {
+    let types = validator.validate_all(bytes)?;
+    check_type_nesting_depth(&types)?;
+    let component = parse_component_sections(bytes)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    Ok((component, types))
+}
+
+const MAX_TYPE_NESTING_DEPTH: u32 = 100;
+
+/// Reject components with type nesting deeper than [`MAX_TYPE_NESTING_DEPTH`].
+///
+/// wasmparser doesn't enforce a nesting limit, but wasmtime does (to bound
+/// recursive canonical ABI operations). We match that limit here.
+fn check_type_nesting_depth(types: &wasmparser::types::Types) -> Result<(), anyhow::Error> {
+    use wasmparser::component_types::*;
+
+    fn val_type_depth(types: &wasmparser::types::Types, ty: &ComponentValType) -> u32 {
+        match ty {
+            ComponentValType::Primitive(_) => 0,
+            ComponentValType::Type(id) => defined_type_depth(types, *id),
+        }
+    }
+
+    fn defined_type_depth(
+        types: &wasmparser::types::Types,
+        id: ComponentDefinedTypeId,
+    ) -> u32 {
+        let Some(defined) = types.as_ref().get(id) else {
+            return 0;
+        };
+        let inner = match defined {
+            ComponentDefinedType::Primitive(_) => 0,
+            ComponentDefinedType::List(inner) => val_type_depth(types, inner),
+            ComponentDefinedType::Option(inner) => val_type_depth(types, inner),
+            ComponentDefinedType::Tuple(t) => t
+                .types
+                .iter()
+                .map(|f| val_type_depth(types, f))
+                .max()
+                .unwrap_or(0),
+            ComponentDefinedType::Record(r) => r
+                .fields
+                .iter()
+                .map(|(_, f)| val_type_depth(types, f))
+                .max()
+                .unwrap_or(0),
+            ComponentDefinedType::Variant(v) => v
+                .cases
+                .iter()
+                .filter_map(|(_, c)| c.ty.as_ref())
+                .map(|f| val_type_depth(types, f))
+                .max()
+                .unwrap_or(0),
+            ComponentDefinedType::Result { ok, err } => {
+                let ok_d = ok.as_ref().map(|t| val_type_depth(types, t)).unwrap_or(0);
+                let err_d = err.as_ref().map(|t| val_type_depth(types, t)).unwrap_or(0);
+                ok_d.max(err_d)
+            }
+            ComponentDefinedType::Map(k, v) => {
+                val_type_depth(types, k).max(val_type_depth(types, v))
+            }
+            ComponentDefinedType::FixedLengthList(inner, _) => val_type_depth(types, inner),
+            ComponentDefinedType::Future(inner) | ComponentDefinedType::Stream(inner) => {
+                inner.as_ref().map(|t| val_type_depth(types, t)).unwrap_or(0)
+            }
+            ComponentDefinedType::Flags(_)
+            | ComponentDefinedType::Enum(_)
+            | ComponentDefinedType::Own(_)
+            | ComponentDefinedType::Borrow(_) => 0,
+        };
+        1 + inner
+    }
+
+    let type_count = types.as_ref().component_type_count();
+    for i in 0..type_count {
+        let any_id = types.as_ref().component_any_type_at(i);
+        if let ComponentAnyTypeId::Defined(id) = any_id {
+            let depth = defined_type_depth(types, id);
+            if depth > MAX_TYPE_NESTING_DEPTH {
+                return Err(anyhow::anyhow!("type nesting is too deep"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Parse a component binary into structural information.
+///
+/// Walks root-level sections and populates a `ParsedComponent` with
+/// core modules, instances, funcs, exports, imports, etc.
+fn parse_component_sections(bytes: &[u8]) -> Result<ParsedComponent, String> {
+    let mut component = ParsedComponent::empty();
     let parser = wasmparser::Parser::new(0);
     let mut depth: u32 = 0;
+    let mut imported_func_count: u32 = 0;
+
     for payload in parser.parse_all(bytes) {
         let payload = payload.map_err(|e| format!("parse error: {e}"))?;
         match payload {
@@ -36,41 +129,129 @@ pub(crate) fn parse_component_sections(
         if depth != 1 {
             continue;
         }
-        match payload {
-            wasmparser::Payload::ModuleSection {
-                unchecked_range, ..
-            } => {
-                component.core_modules.push(bytes[unchecked_range].to_vec());
-            }
-            wasmparser::Payload::InstanceSection(reader) => {
-                parse_instance_section(component, reader)?;
-            }
-            wasmparser::Payload::ComponentAliasSection(reader) => {
-                parse_alias_section(component, reader)?;
-            }
-            wasmparser::Payload::ComponentCanonicalSection(reader) => {
-                parse_canonical_section(component, reader)?;
-            }
-            wasmparser::Payload::ComponentExportSection(reader) => {
-                parse_export_section(component, reader)?;
-            }
-            wasmparser::Payload::ComponentTypeSection(reader) => {
-                parse_type_section(component, reader)?;
-            }
-            wasmparser::Payload::ComponentSection {
-                unchecked_range, ..
-            } => {
+        dispatch_section(&mut component, payload, bytes, &mut imported_func_count)?;
+    }
+    Ok(component)
+}
+
+/// Dispatch a single root-level payload to the appropriate section parser.
+fn dispatch_section(
+    component: &mut ParsedComponent,
+    payload: wasmparser::Payload,
+    bytes: &[u8],
+    imported_func_count: &mut u32,
+) -> Result<(), String> {
+    match payload {
+        wasmparser::Payload::ModuleSection {
+            unchecked_range, ..
+        } => {
+            component.core_modules.push(bytes[unchecked_range].to_vec());
+        }
+        wasmparser::Payload::InstanceSection(reader) => {
+            parse_instance_section(component, reader)?;
+        }
+        wasmparser::Payload::ComponentAliasSection(reader) => {
+            parse_alias_section(component, reader)?;
+        }
+        wasmparser::Payload::ComponentCanonicalSection(reader) => {
+            parse_canonical_section(component, reader)?;
+        }
+        wasmparser::Payload::ComponentExportSection(reader) => {
+            check_export_restrictions(reader.clone(), *imported_func_count)?;
+            parse_export_section(component, reader)?;
+        }
+        wasmparser::Payload::ComponentTypeSection(reader) => {
+            count_types(component, reader)?;
+        }
+        wasmparser::Payload::ComponentSection {
+            unchecked_range, ..
+        } => {
+            component
+                .inner_components
+                .push(bytes[unchecked_range].to_vec());
+        }
+        wasmparser::Payload::ComponentInstanceSection(reader) => {
+            parse_component_instance_section(component, reader)?;
+        }
+        wasmparser::Payload::ComponentImportSection(reader) => {
+            check_import_restrictions(reader.clone(), imported_func_count)?;
+            parse_component_import_section(component, reader)?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Reject unsupported root-level component imports and count func imports.
+fn check_import_restrictions(
+    reader: wasmparser::ComponentImportSectionReader,
+    imported_func_count: &mut u32,
+) -> Result<(), String> {
+    for import in reader {
+        let import = import.map_err(|e| format!("import parse error: {e}"))?;
+        if matches!(import.ty, wasmparser::ComponentTypeRef::Component(_)) {
+            return Err("root-level component imports are not supported".into());
+        }
+        if matches!(import.ty, wasmparser::ComponentTypeRef::Func(_)) {
+            *imported_func_count += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Reject unsupported root-level component exports and func reexports.
+fn check_export_restrictions(
+    reader: wasmparser::ComponentExportSectionReader,
+    imported_func_count: u32,
+) -> Result<(), String> {
+    for export in reader {
+        let export = export.map_err(|e| format!("export parse error: {e}"))?;
+        if export.kind == wasmparser::ComponentExternalKind::Component {
+            return Err("exporting a component from the root component is not supported".into());
+        }
+        if export.kind == wasmparser::ComponentExternalKind::Func
+            && export.index < imported_func_count
+        {
+            return Err(format!(
+                "component export `{}` is a reexport of an imported \
+                 function which is not implemented",
+                export.name.0
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Count type entries to maintain the type index space.
+///
+/// We don't store type definitions — the validator's `Types` object
+/// provides all type information at runtime. We just need to track
+/// instance type exports for import validation.
+fn count_types(
+    component: &mut ParsedComponent,
+    reader: wasmparser::ComponentTypeSectionReader,
+) -> Result<(), String> {
+    for ty in reader {
+        let ty = ty.map_err(|e| format!("type parse error: {e}"))?;
+        let type_index = component.component_type_count;
+        component.component_type_count += 1;
+
+        // Extract instance type export names for import validation.
+        if let wasmparser::ComponentType::Instance(decls) = ty {
+            let export_names: Vec<String> = decls
+                .iter()
+                .filter_map(|d| match d {
+                    wasmparser::InstanceTypeDeclaration::Export { name, .. } => {
+                        Some(name.0.to_string())
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !export_names.is_empty() {
                 component
-                    .inner_components
-                    .push(bytes[unchecked_range].to_vec());
+                    .instance_type_exports
+                    .insert(type_index, export_names);
             }
-            wasmparser::Payload::ComponentInstanceSection(reader) => {
-                parse_component_instance_section(component, reader)?;
-            }
-            wasmparser::Payload::ComponentImportSection(reader) => {
-                parse_component_import_section(component, reader)?;
-            }
-            _ => {}
         }
     }
     Ok(())
@@ -146,9 +327,6 @@ fn parse_alias_section(
 
 /// Record an outer alias and insert a placeholder in the appropriate
 /// index space.
-///
-/// The placeholder is filled in later when the parent context is
-/// available during instantiation.
 fn register_outer_alias(
     component: &mut ParsedComponent,
     kind: wasmparser::ComponentOuterAliasKind,
@@ -168,8 +346,8 @@ fn register_outer_alias(
         }
         wasmparser::ComponentOuterAliasKind::CoreType => (OuterAliasKind::CoreType, 0),
         wasmparser::ComponentOuterAliasKind::Type => {
-            let idx = component.component_types.len() as u32;
-            component.component_types.push(None);
+            let idx = component.component_type_count;
+            component.component_type_count += 1;
             (OuterAliasKind::Type, idx)
         }
     };
@@ -181,8 +359,7 @@ fn register_outer_alias(
     });
 }
 
-/// Push a core instance export alias into the appropriate index space
-/// on the component.
+/// Push a core instance export alias into the appropriate index space.
 fn register_core_instance_export(
     component: &mut ParsedComponent,
     instance_index: u32,
@@ -220,17 +397,11 @@ fn register_core_instance_export(
                 name,
             });
         }
-        // Type aliases are handled separately by wasmparser
         _ => {}
     }
 }
 
-/// Push a component instance export alias into the appropriate
-/// component-level index space.
-///
-/// `instance_index` refers to a component instance (not a core instance).
-/// The alias creates a new entry in the component-level index space for
-/// the given kind.
+/// Push a component instance export alias into the appropriate index space.
 fn register_component_instance_export(
     component: &mut ParsedComponent,
     instance_index: u32,
@@ -247,9 +418,6 @@ fn register_component_instance_export(
                 });
         }
         wasmparser::ComponentExternalKind::Module => {
-            // Core modules aliased from component instance exports.
-            // At parse time we insert a placeholder; the actual bytes
-            // are resolved at instantiation time.
             let idx = component.core_modules.len() as u32;
             component
                 .aliased_core_modules
@@ -265,12 +433,9 @@ fn register_component_instance_export(
                 });
         }
         wasmparser::ComponentExternalKind::Type => {
-            component.component_types.push(None);
+            component.component_type_count += 1;
         }
         wasmparser::ComponentExternalKind::Component => {
-            // Inner components aliased from component instance exports.
-            // At parse time we insert a placeholder; the actual bytes
-            // are resolved at instantiation time.
             let idx = component.inner_components.len() as u32;
             component
                 .aliased_inner_components
@@ -281,10 +446,6 @@ fn register_component_instance_export(
     }
 }
 
-/// Parse the component-level import section, tracking instance imports.
-///
-/// Instance imports occupy the first N component instance indices. We count
-/// them so that later component instance definitions are indexed correctly.
 fn parse_component_import_section(
     component: &mut ParsedComponent,
     reader: wasmparser::ComponentImportSectionReader,
@@ -301,7 +462,6 @@ fn parse_component_import_section(
                 ComponentImportKind::Instance
             }
             wasmparser::ComponentTypeRef::Func(_) => {
-                // Func imports occupy a slot in the component func index space.
                 component
                     .component_funcs
                     .push(ComponentFuncDef::AliasInstanceExport {
@@ -311,22 +471,14 @@ fn parse_component_import_section(
                 ComponentImportKind::Func
             }
             wasmparser::ComponentTypeRef::Module(_) => {
-                // Module imports occupy a slot in the core module index space.
                 component.core_modules.push(Vec::new());
                 ComponentImportKind::Module
             }
-            wasmparser::ComponentTypeRef::Type(bounds) => {
-                // Type imports occupy a slot in the component type index space.
-                let new_idx = component.component_types.len() as u32;
-                component.component_types.push(None);
-                // If the type bound is `eq`, propagate the defined type info
-                // so that variant case counts flow through type aliases.
-                propagate_type_bounds(component, new_idx, bounds);
+            wasmparser::ComponentTypeRef::Type(_) => {
+                component.component_type_count += 1;
                 ComponentImportKind::Type
             }
             wasmparser::ComponentTypeRef::Component(_) => {
-                // Component imports occupy a slot in the inner components
-                // index space.
                 component.inner_components.push(Vec::new());
                 ComponentImportKind::Component
             }
@@ -341,8 +493,6 @@ fn parse_component_import_section(
     Ok(())
 }
 
-/// Parse the component instance section (component-level instances, not
-/// core instances).
 fn parse_component_instance_section(
     component: &mut ParsedComponent,
     reader: wasmparser::ComponentInstanceSectionReader,
@@ -371,7 +521,7 @@ fn parse_component_instance_section(
                                 ComponentInstanceArg::Func(a.index)
                             }
                             wasmparser::ComponentExternalKind::Type => {
-                                ComponentInstanceArg::Type(a.index)
+                                ComponentInstanceArg::Type(())
                             }
                             _ => return None,
                         };
@@ -451,9 +601,6 @@ fn parse_canonical_section(
                     .core_funcs
                     .push(CoreFuncDef::ResourceDrop { resource });
             }
-            // All other canonical builtins (async, threads, etc.) are
-            // placeholders — they occupy a core func index slot but we
-            // don't implement their semantics yet.
             _ => {
                 component.core_funcs.push(CoreFuncDef::AsyncBuiltin);
             }
@@ -486,8 +633,6 @@ fn parse_canon_lift(
 }
 
 /// Extract the string encoding from canonical options.
-///
-/// Defaults to UTF-8 if no encoding option is specified.
 fn parse_string_encoding(options: &[wasmparser::CanonicalOption]) -> StringEncoding {
     for opt in options {
         match opt {
@@ -499,11 +644,7 @@ fn parse_string_encoding(options: &[wasmparser::CanonicalOption]) -> StringEncod
     StringEncoding::Utf8
 }
 
-/// Component exports introduce a new item in the corresponding index space.
-///
-/// For example, `(export "a" (instance 0))` creates a new component instance
-/// that aliases instance 0. This mirrors the spec behavior where each export
-/// contributes to its kind's index space.
+/// Register export in the appropriate index space.
 fn register_export_index_space(
     component: &mut ParsedComponent,
     kind: &ComponentExternalKind,
@@ -517,15 +658,8 @@ fn register_export_index_space(
                     source_index: index,
                 });
         }
-        ComponentExternalKind::Func => {
-            // Func exports reference an existing component func index.
-            // No new entry needed — the export def already stores the index.
-        }
         ComponentExternalKind::Module => {
-            // Module exports introduce a new core module index that is
-            // an alias of the existing module at `index`.
             let new_idx = component.core_modules.len() as u32;
-            // If the source is itself an alias, propagate the alias info
             if let Some(alias_info) = component.aliased_core_modules.get(&index) {
                 component
                     .aliased_core_modules
@@ -538,12 +672,7 @@ fn register_export_index_space(
             }
         }
         ComponentExternalKind::Type => {
-            let new_idx = component.component_types.len() as u32;
-            component.component_types.push(None);
-            // Propagate defined value type info from the source type.
-            if let Some(val_type) = component.defined_val_types.get(&index).copied() {
-                component.defined_val_types.insert(new_idx, val_type);
-            }
+            component.component_type_count += 1;
         }
         _ => {}
     }
@@ -556,11 +685,7 @@ fn parse_export_section(
     for export in reader {
         let export = export.map_err(|e| format!("export parse error: {e}"))?;
         let kind = ComponentExternalKind::from(export.kind);
-
-        // Component exports introduce a new item in the corresponding
-        // index space. The new item references the original at `export.index`.
         register_export_index_space(component, &kind, export.index);
-
         component.exports.push(ComponentExportDef {
             name: export.name.0.to_string(),
             kind,
@@ -568,201 +693,4 @@ fn parse_export_section(
         });
     }
     Ok(())
-}
-
-fn parse_type_section(
-    component: &mut ParsedComponent,
-    reader: wasmparser::ComponentTypeSectionReader,
-) -> Result<(), String> {
-    for ty in reader {
-        let ty = ty.map_err(|e| format!("type parse error: {e}"))?;
-        let type_index = component.component_types.len() as u32;
-        match ty {
-            wasmparser::ComponentType::Func(func_ty) => {
-                let params: Vec<ComponentResultType> = func_ty
-                    .params
-                    .iter()
-                    .map(|(_name, ty)| convert_val_type(component, ty))
-                    .collect();
-                let result = match func_ty.result {
-                    None => ComponentResultType::Unit,
-                    Some(ref ty) => convert_val_type(component, ty),
-                };
-                component
-                    .component_types
-                    .push(Some(ComponentFuncTypeDef { params, result }));
-            }
-            wasmparser::ComponentType::Instance(decls) => {
-                let export_names = extract_instance_type_exports(&decls);
-                if !export_names.is_empty() {
-                    component
-                        .instance_type_exports
-                        .insert(type_index, export_names.clone());
-                }
-                component.component_types.push(None);
-            }
-            wasmparser::ComponentType::Defined(def) => {
-                record_defined_type(component, type_index, &def);
-                component.component_types.push(None);
-            }
-            _ => {
-                // Non-func types get a placeholder
-                component.component_types.push(None);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Extract export names from an instance type declaration.
-///
-/// Scans the declarations for `Export` entries and collects their names.
-fn extract_instance_type_exports(decls: &[wasmparser::InstanceTypeDeclaration]) -> Vec<String> {
-    decls
-        .iter()
-        .filter_map(|d| match d {
-            wasmparser::InstanceTypeDeclaration::Export { name, .. } => Some(name.0.to_string()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Extract module type constraints from instance type declarations.
-///
-/// Propagate defined value type info through type bounds.
-///
-/// When a type import has an `eq` bound (e.g. `(import "a" (type $a (eq $a')))`),
-/// the imported type is equivalent to the referenced type. If the referenced
-/// type is a variant (or other defined type we track), the import inherits
-/// that info so that canonical ABI validation works on the aliased type.
-fn propagate_type_bounds(
-    component: &mut ParsedComponent,
-    new_idx: u32,
-    bounds: wasmparser::TypeBounds,
-) {
-    if let wasmparser::TypeBounds::Eq(src_idx) = bounds {
-        if let Some(val_type) = component.defined_val_types.get(&src_idx).copied() {
-            component.defined_val_types.insert(new_idx, val_type);
-        }
-    }
-}
-
-/// Record a defined component type for later lookup.
-///
-/// Currently only records variant types (with their case count) so that
-/// the canonical ABI can validate discriminant values at runtime.
-fn record_defined_type(
-    component: &mut ParsedComponent,
-    type_index: u32,
-    def: &wasmparser::ComponentDefinedType,
-) {
-    match def {
-        wasmparser::ComponentDefinedType::Variant(cases) => {
-            component.defined_val_types.insert(
-                type_index,
-                ComponentResultType::Variant {
-                    case_count: cases.len() as u32,
-                },
-            );
-        }
-        wasmparser::ComponentDefinedType::Tuple(fields) => {
-            let alignment = compute_tuple_alignment(component, fields);
-            component
-                .defined_val_types
-                .insert(type_index, ComponentResultType::Compound { alignment });
-        }
-        wasmparser::ComponentDefinedType::Record(fields) => {
-            let field_types: Vec<wasmparser::ComponentValType> =
-                fields.iter().map(|(_, ty)| *ty).collect();
-            let alignment = compute_tuple_alignment(component, &field_types);
-            component
-                .defined_val_types
-                .insert(type_index, ComponentResultType::Compound { alignment });
-        }
-        wasmparser::ComponentDefinedType::List(_) => {
-            component
-                .defined_val_types
-                .insert(type_index, ComponentResultType::Compound { alignment: 4 });
-        }
-        _ => {}
-    }
-}
-
-/// Compute the alignment of a tuple type from its field types.
-///
-/// The alignment of a tuple is the maximum alignment of any of its fields.
-/// Falls back to 4 if any field type is unknown (safe default for i32-based
-/// compound types).
-fn compute_tuple_alignment(
-    component: &ParsedComponent,
-    fields: &[wasmparser::ComponentValType],
-) -> u32 {
-    let mut max_align = 1u32;
-    for field in fields {
-        let align = match field {
-            wasmparser::ComponentValType::Primitive(p) => primitive_alignment(*p),
-            wasmparser::ComponentValType::Type(idx) => {
-                match component.defined_val_types.get(&(*idx as u32)) {
-                    Some(ComponentResultType::Compound { alignment }) => *alignment,
-                    _ => 4,
-                }
-            }
-        };
-        max_align = max_align.max(align);
-    }
-    max_align
-}
-
-/// Return the byte alignment of a primitive component value type.
-fn primitive_alignment(p: wasmparser::PrimitiveValType) -> u32 {
-    match p {
-        wasmparser::PrimitiveValType::Bool
-        | wasmparser::PrimitiveValType::S8
-        | wasmparser::PrimitiveValType::U8 => 1,
-        wasmparser::PrimitiveValType::S16 | wasmparser::PrimitiveValType::U16 => 2,
-        wasmparser::PrimitiveValType::S32
-        | wasmparser::PrimitiveValType::U32
-        | wasmparser::PrimitiveValType::F32
-        | wasmparser::PrimitiveValType::Char => 4,
-        wasmparser::PrimitiveValType::S64
-        | wasmparser::PrimitiveValType::U64
-        | wasmparser::PrimitiveValType::F64 => 8,
-        wasmparser::PrimitiveValType::String => 4,
-        wasmparser::PrimitiveValType::ErrorContext => 4,
-    }
-}
-
-/// Convert a `ComponentValType` to a `ComponentResultType`, looking up
-/// defined types (like variants) when the type is a reference.
-fn convert_val_type(
-    component: &ParsedComponent,
-    ty: &wasmparser::ComponentValType,
-) -> ComponentResultType {
-    match ty {
-        wasmparser::ComponentValType::Primitive(p) => convert_primitive_type(*p),
-        wasmparser::ComponentValType::Type(idx) => component
-            .defined_val_types
-            .get(&(*idx as u32))
-            .copied()
-            .unwrap_or(ComponentResultType::Unknown),
-    }
-}
-
-fn convert_primitive_type(p: wasmparser::PrimitiveValType) -> ComponentResultType {
-    match p {
-        wasmparser::PrimitiveValType::Bool => ComponentResultType::Bool,
-        wasmparser::PrimitiveValType::S8 => ComponentResultType::S8,
-        wasmparser::PrimitiveValType::U8 => ComponentResultType::U8,
-        wasmparser::PrimitiveValType::S16 => ComponentResultType::S16,
-        wasmparser::PrimitiveValType::U16 => ComponentResultType::U16,
-        wasmparser::PrimitiveValType::S32 => ComponentResultType::S32,
-        wasmparser::PrimitiveValType::U32 => ComponentResultType::U32,
-        wasmparser::PrimitiveValType::S64 => ComponentResultType::S64,
-        wasmparser::PrimitiveValType::U64 => ComponentResultType::U64,
-        wasmparser::PrimitiveValType::F32 => ComponentResultType::F32,
-        wasmparser::PrimitiveValType::F64 => ComponentResultType::F64,
-        wasmparser::PrimitiveValType::Char => ComponentResultType::Char,
-        wasmparser::PrimitiveValType::String => ComponentResultType::String,
-        wasmparser::PrimitiveValType::ErrorContext => ComponentResultType::Unknown,
-    }
 }

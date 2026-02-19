@@ -204,13 +204,14 @@ fn resolve_aliased_export(
 pub(super) fn resolve_component_exports(
     core_instances: &[CoreInstance],
     component: &ParsedComponent,
+    types: &wasmparser::types::Types,
 ) -> Result<HashMap<String, ResolvedExport>, String> {
     let mut exports = HashMap::new();
     for export_def in &component.exports {
         if export_def.kind != ComponentExternalKind::Func {
             continue;
         }
-        resolve_single_export(&mut exports, core_instances, component, export_def)?;
+        resolve_single_export(&mut exports, core_instances, component, export_def, types)?;
     }
     Ok(exports)
 }
@@ -225,6 +226,7 @@ fn resolve_single_export(
     core_instances: &[CoreInstance],
     component: &ParsedComponent,
     export_def: &ComponentExportDef,
+    types: &wasmparser::types::Types,
 ) -> Result<(), String> {
     let comp_func = component
         .component_funcs
@@ -244,8 +246,8 @@ fn resolve_single_export(
                 .ok_or_else(|| {
                     format!("core func index {} out of bounds", core_func_index)
                 })?;
-            let param_types = lookup_param_types(component, *type_index);
-            let result_type = lookup_result_type(component, *type_index);
+            let param_types = lookup_param_types(*type_index, types);
+            let result_type = lookup_result_type(*type_index, types);
             let resolved = resolve_core_func_to_resolved(
                 core_instances,
                 component,
@@ -254,6 +256,7 @@ fn resolve_single_export(
                 result_type,
                 *memory_index,
                 *realloc_func_index,
+                types,
             )?;
             exports.insert(export_def.name.clone(), ResolvedExport::Local(resolved));
         }
@@ -289,6 +292,7 @@ pub(super) fn resolve_core_func_to_resolved(
     result_type: ComponentResultType,
     memory_index: Option<u32>,
     realloc_func_index: Option<u32>,
+    types: &wasmparser::types::Types,
 ) -> Result<ResolvedFunc, String> {
     match core_func {
         CoreFuncDef::AliasInstanceExport {
@@ -360,11 +364,11 @@ pub(super) fn resolve_core_func_to_resolved(
                         .core_funcs
                         .get(*core_func_index as usize)
                         .ok_or_else(|| format!("core func index {} out of bounds", core_func_index))?;
-                    let inner_params = lookup_param_types(component, *type_index);
-                    let inner_result = lookup_result_type(component, *type_index);
+                    let inner_params = lookup_param_types(*type_index, types);
+                    let inner_result = lookup_result_type(*type_index, types);
                     resolve_core_func_to_resolved(
                         core_instances, component, inner_core_func,
-                        inner_params, inner_result, *mem_idx, *realloc_idx,
+                        inner_params, inner_result, *mem_idx, *realloc_idx, types,
                     )
                 }
                 None => {
@@ -417,26 +421,139 @@ fn resolve_memory_instance(
 
 /// Look up the result type from a component func type index.
 pub(super) fn lookup_result_type(
-    component: &ParsedComponent,
     type_index: u32,
+    types: &wasmparser::types::Types,
 ) -> ComponentResultType {
-    component
-        .component_types
-        .get(type_index as usize)
-        .and_then(|t| t.as_ref())
-        .map(|t| t.result)
+    resolve_func_type(types, type_index)
+        .map(|ft| match &ft.result {
+            None => ComponentResultType::Unit,
+            Some(ty) => convert_component_val_type(types, ty),
+        })
         .unwrap_or(ComponentResultType::Unknown)
 }
 
 /// Look up the param types from a component func type index.
 pub(super) fn lookup_param_types(
-    component: &ParsedComponent,
     type_index: u32,
+    types: &wasmparser::types::Types,
 ) -> Vec<ComponentResultType> {
-    component
-        .component_types
-        .get(type_index as usize)
-        .and_then(|t| t.as_ref())
-        .map(|t| t.params.clone())
+    resolve_func_type(types, type_index)
+        .map(|ft| {
+            ft.params
+                .iter()
+                .map(|(_name, ty)| convert_component_val_type(types, ty))
+                .collect()
+        })
         .unwrap_or_default()
+}
+
+/// Resolve a component type index to a function type via the `Types` object.
+///
+/// Returns `None` if the type index doesn't refer to a function type.
+fn resolve_func_type<'a>(
+    types: &'a wasmparser::types::Types,
+    type_index: u32,
+) -> Option<&'a wasmparser::component_types::ComponentFuncType> {
+    use wasmparser::component_types::ComponentAnyTypeId;
+    let any_id = types.as_ref().component_any_type_at(type_index);
+    match any_id {
+        ComponentAnyTypeId::Func(id) => types.as_ref().get(id),
+        _ => None,
+    }
+}
+
+/// Convert a wasmparser `ComponentValType` to our `ComponentResultType`.
+fn convert_component_val_type(
+    types: &wasmparser::types::Types,
+    ty: &wasmparser::component_types::ComponentValType,
+) -> ComponentResultType {
+    use wasmparser::component_types::{ComponentDefinedType, ComponentValType};
+    match ty {
+        ComponentValType::Primitive(p) => convert_primitive(*p),
+        ComponentValType::Type(id) => {
+            let defined = types.as_ref().get(*id);
+            match defined {
+                Some(ComponentDefinedType::Primitive(p)) => convert_primitive(*p),
+                Some(ComponentDefinedType::Variant(v)) => ComponentResultType::Variant {
+                    case_count: v.cases.len() as u32,
+                },
+                Some(ComponentDefinedType::Tuple(t)) => {
+                    let alignment = t.types.iter().map(|f| val_type_alignment(types, f)).max().unwrap_or(1);
+                    ComponentResultType::Compound { alignment }
+                }
+                Some(ComponentDefinedType::Record(r)) => {
+                    let alignment = r.fields.iter().map(|(_, f)| val_type_alignment(types, f)).max().unwrap_or(1);
+                    ComponentResultType::Compound { alignment }
+                }
+                Some(ComponentDefinedType::List(_)) => {
+                    ComponentResultType::Compound { alignment: 4 }
+                }
+                _ => ComponentResultType::Unknown,
+            }
+        }
+    }
+}
+
+/// Convert a wasmparser `PrimitiveValType` to our `ComponentResultType`.
+fn convert_primitive(p: wasmparser::PrimitiveValType) -> ComponentResultType {
+    match p {
+        wasmparser::PrimitiveValType::Bool => ComponentResultType::Bool,
+        wasmparser::PrimitiveValType::S8 => ComponentResultType::S8,
+        wasmparser::PrimitiveValType::U8 => ComponentResultType::U8,
+        wasmparser::PrimitiveValType::S16 => ComponentResultType::S16,
+        wasmparser::PrimitiveValType::U16 => ComponentResultType::U16,
+        wasmparser::PrimitiveValType::S32 => ComponentResultType::S32,
+        wasmparser::PrimitiveValType::U32 => ComponentResultType::U32,
+        wasmparser::PrimitiveValType::S64 => ComponentResultType::S64,
+        wasmparser::PrimitiveValType::U64 => ComponentResultType::U64,
+        wasmparser::PrimitiveValType::F32 => ComponentResultType::F32,
+        wasmparser::PrimitiveValType::F64 => ComponentResultType::F64,
+        wasmparser::PrimitiveValType::Char => ComponentResultType::Char,
+        wasmparser::PrimitiveValType::String => ComponentResultType::String,
+        wasmparser::PrimitiveValType::ErrorContext => ComponentResultType::Unknown,
+    }
+}
+
+/// Compute the maximum alignment of a single component value type.
+fn val_type_alignment(
+    types: &wasmparser::types::Types,
+    ty: &wasmparser::component_types::ComponentValType,
+) -> u32 {
+    use wasmparser::component_types::{ComponentDefinedType, ComponentValType};
+    match ty {
+        ComponentValType::Primitive(p) => primitive_byte_alignment(*p),
+        ComponentValType::Type(id) => match types.as_ref().get(*id) {
+            Some(ComponentDefinedType::Tuple(t)) => t
+                .types
+                .iter()
+                .map(|f| val_type_alignment(types, f))
+                .max()
+                .unwrap_or(1),
+            Some(ComponentDefinedType::Record(r)) => r
+                .fields
+                .iter()
+                .map(|(_, f)| val_type_alignment(types, f))
+                .max()
+                .unwrap_or(1),
+            _ => 4,
+        },
+    }
+}
+
+/// Byte alignment for a primitive component value type.
+fn primitive_byte_alignment(p: wasmparser::PrimitiveValType) -> u32 {
+    match p {
+        wasmparser::PrimitiveValType::Bool
+        | wasmparser::PrimitiveValType::S8
+        | wasmparser::PrimitiveValType::U8 => 1,
+        wasmparser::PrimitiveValType::S16 | wasmparser::PrimitiveValType::U16 => 2,
+        wasmparser::PrimitiveValType::S32
+        | wasmparser::PrimitiveValType::U32
+        | wasmparser::PrimitiveValType::F32
+        | wasmparser::PrimitiveValType::Char => 4,
+        wasmparser::PrimitiveValType::S64
+        | wasmparser::PrimitiveValType::U64
+        | wasmparser::PrimitiveValType::F64 => 8,
+        wasmparser::PrimitiveValType::String | wasmparser::PrimitiveValType::ErrorContext => 4,
+    }
 }

@@ -15,4 +15,5 @@ pub use opcode::Op;
 pub use store::{Store, SharedStore, HostFunc, EXTERN_FUNC_BASE};
 pub use exec::ExecError;
 pub use value::Value;
-pub use component::{ParsedComponent, ComponentArg, ComponentImportDef, ComponentImportKind, ComponentInstance, ComponentResultType, ComponentValue, Linker};
+pub use component::{ComponentArg, ComponentImportDef, ComponentImportKind, ComponentInstance, ComponentResultType, ComponentValue};
+pub use crate::engine::Engine;

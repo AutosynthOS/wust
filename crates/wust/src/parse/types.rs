@@ -5,7 +5,6 @@
 //! data that describes what the component contains.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
 use crate::runtime::Value;
 
@@ -37,7 +36,6 @@ pub(crate) enum CoreInstanceArg {
 /// Each entry says "export `name` as the core item of `kind` at `index`
 /// in the component's core index space for that kind."
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) struct CoreInstanceExportDef {
     pub name: String,
     pub kind: wasmparser::ExternalKind,
@@ -176,11 +174,15 @@ pub enum ComponentResultType {
     /// No result (unit function).
     Unit,
     /// A variant type with a known number of cases.
-    Variant { case_count: u32 },
+    Variant {
+        case_count: u32,
+    },
     /// A compound type (tuple, record, list) that uses retptr/argptr
     /// when passed across the ABI boundary. The alignment is the maximum
     /// alignment of the type's fields (e.g. 4 for tuples of u32).
-    Compound { alignment: u32 },
+    Compound {
+        alignment: u32,
+    },
     /// An owned resource handle — transferred across the ABI boundary.
     Own,
     /// A borrowed resource handle — the callee receives the rep value.
@@ -209,15 +211,11 @@ pub(crate) enum ComponentFuncDef {
         realloc_func_index: Option<u32>,
     },
     /// Aliased from a component instance export.
-    AliasInstanceExport {
-        instance_index: u32,
-        name: String,
-    },
+    AliasInstanceExport { instance_index: u32, name: String },
 }
 
 /// How a component instance is created within a component.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) enum ComponentInstanceDef {
     /// Instantiate an inner component with args.
     Instantiate {
@@ -225,15 +223,10 @@ pub(crate) enum ComponentInstanceDef {
         args: Vec<(String, ComponentInstanceArg)>,
     },
     /// Alias a component instance from another component instance's export.
-    AliasInstanceExport {
-        instance_index: u32,
-        name: String,
-    },
+    AliasInstanceExport { instance_index: u32, name: String },
     /// Re-export of an existing component instance (from `export` section).
     /// The index references an earlier component instance.
-    Reexport {
-        source_index: u32,
-    },
+    Reexport { source_index: u32 },
     /// A synthetic component instance built from explicit exports.
     ///
     /// At the component level these typically export types and other
@@ -252,13 +245,12 @@ pub(crate) struct ComponentInstanceExport {
 
 /// An arg to a component instantiation.
 #[derive(Clone)]
-#[allow(dead_code)]
 pub(crate) enum ComponentInstanceArg {
     Instance(u32),
     Module(u32),
     Component(u32),
     Func(u32),
-    Type(u32),
+    Type(()),
 }
 
 /// A component-level export.
@@ -290,13 +282,6 @@ impl From<wasmparser::ComponentExternalKind> for ComponentExternalKind {
             wasmparser::ComponentExternalKind::Type => Self::Type,
         }
     }
-}
-
-/// A parsed component function type (params + result).
-#[derive(Clone)]
-pub(crate) struct ComponentFuncTypeDef {
-    pub params: Vec<ComponentResultType>,
-    pub result: ComponentResultType,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,9 +344,8 @@ pub struct ParsedComponent {
     pub(crate) core_tags: Vec<CoreAliasDef>,
     pub(crate) component_funcs: Vec<ComponentFuncDef>,
     pub(crate) exports: Vec<ComponentExportDef>,
-    /// Component-level types. Only func types are stored; other type
-    /// indices map to `None`.
-    pub(crate) component_types: Vec<Option<ComponentFuncTypeDef>>,
+    /// Number of component-level type entries (for index space tracking).
+    pub(crate) component_type_count: u32,
     /// Tracks core modules that are aliased from component instance exports.
     /// Key is the core module index, value is (component instance index, export name).
     pub(crate) aliased_core_modules: HashMap<u32, (u32, String)>,
@@ -383,31 +367,35 @@ pub struct ParsedComponent {
     /// Outer alias requests that need resolution when the parent context
     /// is available.
     pub(crate) outer_aliases: Vec<OuterAlias>,
-    /// Pre-parsed and resolved inner components, keyed by inner component
-    /// index.  When an inner component's bytes are obtained via outer alias
-    /// resolution, its own outer aliases may reference a parent that is no
-    /// longer in the current ancestor chain.  Storing the resolved Component
-    /// here avoids re-resolution with the wrong ancestors.
-    pub(crate) pre_resolved_inner: HashMap<u32, Box<ParsedComponent>>,
-    /// Defined component-level types that carry runtime validation info.
-    /// Keyed by type index. Currently tracks variant case counts.
-    pub(crate) defined_val_types: HashMap<u32, ComponentResultType>,
 }
 
-/// A component with all static aliases resolved and inner components
-/// recursively parsed.
-///
-/// Produced by the resolve phase. `def` contains the parsed component with
-/// `core_modules` and `inner_components` bytes filled in wherever outer
-/// aliases and self aliases applied. `inner` holds recursively resolved
-/// inner components; `None` entries are placeholders for components that
-/// will be resolved from child instance exports during instantiation.
-#[derive(Clone)]
-pub(crate) struct ResolvedComponent {
-    /// The parsed component with alias bytes applied.
-    pub def: ParsedComponent,
-    /// Recursively resolved inner components. `None` for instance-export
-    /// alias placeholders (resolved during instantiation from child
-    /// instances).
-    pub inner: Vec<Option<Rc<ResolvedComponent>>>,
+impl ParsedComponent {
+    /// The component's import declarations.
+    pub(crate) fn imports(&self) -> &[ComponentImportDef] {
+        &self.imports
+    }
+
+    /// Create an empty component with all fields default-initialized.
+    pub(crate) fn empty() -> Self {
+        ParsedComponent {
+            core_modules: Vec::new(),
+            core_instances: Vec::new(),
+            core_funcs: Vec::new(),
+            core_globals: Vec::new(),
+            core_memories: Vec::new(),
+            core_tables: Vec::new(),
+            core_tags: Vec::new(),
+            component_funcs: Vec::new(),
+            exports: Vec::new(),
+            component_type_count: 0,
+            aliased_core_modules: HashMap::new(),
+            aliased_inner_components: HashMap::new(),
+            inner_components: Vec::new(),
+            component_instances: Vec::new(),
+            instance_import_count: 0,
+            imports: Vec::new(),
+            instance_type_exports: HashMap::new(),
+            outer_aliases: Vec::new(),
+        }
+    }
 }

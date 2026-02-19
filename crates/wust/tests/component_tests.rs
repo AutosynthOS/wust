@@ -2,8 +2,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use wast::component::WastVal;
+use wust::component::Component;
+use wust::engine::Engine;
+use wust::linker::Linker;
 use wust::runtime::{
-    ParsedComponent, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Linker, Value,
+    ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Value,
 };
 
 // ---------------------------------------------------------------------------
@@ -16,6 +19,8 @@ use wust::runtime::{
 /// invoke functions, check results. Tracks named definitions and
 /// instances across directives.
 struct WastRunner {
+    /// Shared engine for parsing and validation.
+    engine: Engine,
     /// Named component binaries (from `component definition`).
     definitions: HashMap<String, Vec<u8>>,
     /// All instantiated component instances.
@@ -31,6 +36,7 @@ struct WastRunner {
 impl WastRunner {
     fn new() -> Self {
         let mut runner = WastRunner {
+            engine: Engine::new(),
             definitions: HashMap::new(),
             instances: Vec::new(),
             named: HashMap::new(),
@@ -54,8 +60,8 @@ impl WastRunner {
     /// Parse WAT, instantiate it, and register under a name.
     fn register_host(&mut self, name: &str, kind: ComponentImportKind, wat: &str) {
         let binary = wat::parse_str(wat).expect("bad host WAT");
-        let component = ParsedComponent::from_bytes(&binary).expect("bad host component");
-        if let Ok(instance) = ComponentInstance::instantiate(&component) {
+        let component = Component::new(&mut self.engine, &binary).expect("bad host component");
+        if let Ok(instance) = component.instantiate() {
             match kind {
                 ComponentImportKind::Instance => self.linker.instance(name, instance.export_view()),
                 ComponentImportKind::Func => self.linker.func(name, instance.export_view()),
@@ -66,7 +72,7 @@ impl WastRunner {
 
     /// Parse + instantiate a component binary, returning its instance index.
     fn instantiate(&mut self, binary: &[u8]) -> Result<usize, String> {
-        let component = ParsedComponent::from_bytes(binary)?;
+        let component = Component::new(&mut self.engine, binary)?;
         // Auto-register host shims for instance imports we can satisfy.
         for import in component.imports() {
             if import.kind == ComponentImportKind::Instance
@@ -323,7 +329,7 @@ fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Res
             ..
         } => match module.encode() {
             Err(_) => Ok(()),
-            Ok(binary) => match ParsedComponent::from_bytes(&binary) {
+            Ok(binary) => match Component::new(&mut runner.engine, &binary) {
                 Err(_) => Ok(()),
                 Ok(_) => Err(format!("assert_invalid: should have rejected ({message})")),
             },
@@ -336,7 +342,7 @@ fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Res
             ..
         } => match module.encode() {
             Err(_) => Ok(()),
-            Ok(binary) => match ParsedComponent::from_bytes(&binary) {
+            Ok(binary) => match Component::new(&mut runner.engine, &binary) {
                 Err(_) => Ok(()),
                 Ok(_) => Err(format!(
                     "assert_malformed: should have rejected ({message})"
@@ -380,9 +386,10 @@ fn run_directive(runner: &mut WastRunner, directive: wast::WastDirective) -> Res
 
 /// Parse WAT and instantiate it in one shot.
 fn instantiate_wat(wat: &str) -> Option<ComponentInstance> {
+    let mut engine = Engine::new();
     let binary = wat::parse_str(wat).ok()?;
-    let component = ParsedComponent::from_bytes(&binary).ok()?;
-    ComponentInstance::instantiate(&component).ok()
+    let component = Component::new(&mut engine, &binary).ok()?;
+    component.instantiate().ok()
 }
 
 /// Extract invoke arguments as WastVal references.

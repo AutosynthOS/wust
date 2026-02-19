@@ -5,12 +5,10 @@
 //! instantiation.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 
-use super::instance::{
-    find_func_import_slot, shift_component_instance_indices, ComponentInstance,
-};
-use crate::parse::types::{ParsedComponent, ComponentFuncDef, ComponentImportKind};
+use crate::component::Component;
+use crate::parse::types::{ComponentFuncDef, ComponentImportKind, ParsedComponent};
+use crate::runtime::component::instance::ComponentInstance;
 
 /// Entry in the linker registry.
 struct LinkerEntry {
@@ -83,7 +81,10 @@ impl Linker {
     /// 6. Resolve and instantiate.
     ///
     /// Returns an error if any import is missing or has a kind mismatch.
-    pub fn instantiate(&self, component: &ParsedComponent) -> Result<ComponentInstance, String> {
+    pub fn instantiate(&self, component: &Component) -> Result<ComponentInstance, String> {
+        let types = &component.types;
+        let features = component.features;
+        let component = &component.parsed;
         let mut import_instances = Vec::new();
         let mut func_patches: Vec<(usize, String, ComponentInstance)> = Vec::new();
 
@@ -93,14 +94,17 @@ impl Linker {
             };
             if import_def.kind != entry.kind {
                 return Err(
-                    format!("expected {:?} found {:?}", import_def.kind, entry.kind)
-                        .to_lowercase(),
+                    format!("expected {:?} found {:?}", import_def.kind, entry.kind).to_lowercase(),
                 );
             }
             match import_def.kind {
                 ComponentImportKind::Instance => {
                     let instance = entry.instance.export_view();
-                    validate_required_exports(&instance, &import_def.name, &import_def.required_exports)?;
+                    validate_required_exports(
+                        &instance,
+                        &import_def.name,
+                        &import_def.required_exports,
+                    )?;
                     import_instances.push(instance);
                 }
                 ComponentImportKind::Func => {
@@ -116,8 +120,7 @@ impl Linker {
         }
 
         if func_patches.is_empty() {
-            let resolved = Rc::new(super::resolve::resolve(component.clone(), &[])?);
-            ComponentInstance::instantiate_from_resolved(&resolved, import_instances)
+            ComponentInstance::instantiate_with_imports(component, import_instances, types, features)
         } else {
             let shift = func_patches.len() as u32;
             let mut patched = component.clone();
@@ -132,8 +135,7 @@ impl Linker {
                 patched_slots.push(slot_idx);
             }
             shift_component_instance_indices(&mut patched, shift, &patched_slots);
-            let resolved = Rc::new(super::resolve::resolve(patched, &[])?);
-            ComponentInstance::instantiate_from_resolved(&resolved, import_instances)
+            ComponentInstance::instantiate_with_imports(&patched, import_instances, types, features)
         }
     }
 }
@@ -145,9 +147,7 @@ fn validate_required_exports(
     required_exports: &[String],
 ) -> Result<(), String> {
     for required in required_exports {
-        let has_export = instance.exports.contains_key(required)
-            || instance.exported_instances.contains_key(required);
-        if !has_export {
+        if !instance.has_export(required) {
             return Err(format!(
                 "import '{}': required export '{}' was not found",
                 import_name, required,
@@ -155,4 +155,38 @@ fn validate_required_exports(
         }
     }
     Ok(())
+}
+
+/// Find the component_funcs slot for a func import placeholder.
+fn find_func_import_slot(funcs: &[ComponentFuncDef], name: &str) -> Option<usize> {
+    funcs.iter().position(|f| {
+        matches!(f, ComponentFuncDef::AliasInstanceExport {
+            instance_index, name: n
+        } if *instance_index == u32::MAX && n == name)
+    })
+}
+
+/// Shift all component instance index references in a component by `shift`.
+fn shift_component_instance_indices(component: &mut ParsedComponent, shift: u32, skip: &[usize]) {
+    component.instance_import_count += shift;
+    for (i, func) in component.component_funcs.iter_mut().enumerate() {
+        if skip.contains(&i) {
+            continue;
+        }
+        if let ComponentFuncDef::AliasInstanceExport { instance_index, .. } = func {
+            if *instance_index != u32::MAX {
+                *instance_index += shift;
+            }
+        }
+    }
+    let mut new_aliased_modules = HashMap::new();
+    for (k, (inst_idx, name)) in &component.aliased_core_modules {
+        new_aliased_modules.insert(*k, (*inst_idx + shift, name.clone()));
+    }
+    component.aliased_core_modules = new_aliased_modules;
+    let mut new_aliased_components = HashMap::new();
+    for (k, (inst_idx, name)) in &component.aliased_inner_components {
+        new_aliased_components.insert(*k, (*inst_idx + shift, name.clone()));
+    }
+    component.aliased_inner_components = new_aliased_components;
 }

@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 wasmparser = "0.245"
 libc = "0.2"
+anyhow = "1"
 
 [dev-dependencies]
 wast = "245"

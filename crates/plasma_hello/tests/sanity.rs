@@ -10,11 +10,11 @@
 //! cargo build -p plasma --target wasm32-unknown-unknown --release
 //! ```
 
-use plasma_hello::{eval_js, load_plasma_module};
+use plasma_hello::load_plasma_wasm;
 
 #[test]
 fn eval_simple_expression() {
-    let module = load_plasma_module();
+    let module = load_plasma_wasm();
     let result = eval_js(&module, r#"console.log("hello from plasma")"#);
 
     assert_eq!(result.return_code, 0, "eval returned error");
