@@ -13,6 +13,10 @@ mod validate;
 mod parse;
 mod resolve;
 mod instance;
+mod trampoline;
+mod alias;
+mod imports;
+mod module_validate;
 
 pub use types::{Component, ComponentArg, ComponentImportDef, ComponentImportKind, ComponentResultType, ComponentValue};
 pub(crate) use types::StringEncoding;

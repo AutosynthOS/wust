@@ -3,6 +3,7 @@ pub mod instruction;
 pub(crate) mod opcode;
 mod store;
 pub mod exec;
+mod frame;
 mod value;
 pub mod component;
 mod canonical_abi;

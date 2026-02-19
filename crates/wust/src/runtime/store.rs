@@ -20,80 +20,6 @@ pub type SharedTable = Rc<RefCell<Vec<Option<u32>>>>;
 
 const PAGE_SIZE: usize = 65536; // 64KB WASM pages
 
-/// Evaluate a const expression to a Value, supporting all WASM types and extended const ops.
-fn eval_const_expr(instrs: &[Instruction], globals: &[Value]) -> Option<Value> {
-    let mut stack: Vec<Value> = Vec::new();
-    for instr in instrs {
-        match instr {
-            Instruction::I32Const(v) => stack.push(Value::I32(*v)),
-            Instruction::I64Const(v) => stack.push(Value::I64(*v)),
-            Instruction::F32Const(v) => stack.push(Value::F32(*v)),
-            Instruction::F64Const(v) => stack.push(Value::F64(*v)),
-            Instruction::RefFunc(idx) => stack.push(Value::FuncRef(Some(*idx))),
-            Instruction::RefNull => stack.push(Value::FuncRef(None)),
-            Instruction::GlobalGet(idx) => {
-                stack.push(*globals.get(*idx as usize)?);
-            }
-            Instruction::I32Add => {
-                let Value::I32(b) = stack.pop()? else { return None };
-                let Value::I32(a) = stack.pop()? else { return None };
-                stack.push(Value::I32(a.wrapping_add(b)));
-            }
-            Instruction::I32Sub => {
-                let Value::I32(b) = stack.pop()? else { return None };
-                let Value::I32(a) = stack.pop()? else { return None };
-                stack.push(Value::I32(a.wrapping_sub(b)));
-            }
-            Instruction::I32Mul => {
-                let Value::I32(b) = stack.pop()? else { return None };
-                let Value::I32(a) = stack.pop()? else { return None };
-                stack.push(Value::I32(a.wrapping_mul(b)));
-            }
-            Instruction::I64Add => {
-                let Value::I64(b) = stack.pop()? else { return None };
-                let Value::I64(a) = stack.pop()? else { return None };
-                stack.push(Value::I64(a.wrapping_add(b)));
-            }
-            Instruction::I64Sub => {
-                let Value::I64(b) = stack.pop()? else { return None };
-                let Value::I64(a) = stack.pop()? else { return None };
-                stack.push(Value::I64(a.wrapping_sub(b)));
-            }
-            Instruction::I64Mul => {
-                let Value::I64(b) = stack.pop()? else { return None };
-                let Value::I64(a) = stack.pop()? else { return None };
-                stack.push(Value::I64(a.wrapping_mul(b)));
-            }
-            _ => return None,
-        }
-    }
-    stack.pop()
-}
-
-/// Resolve an element item to a function index, using globals for deferred expressions.
-fn resolve_elem_item(item: &ElemItem, globals: &[Value]) -> Option<u32> {
-    match item {
-        ElemItem::Func(idx) => Some(*idx),
-        ElemItem::Null => None,
-        ElemItem::Expr(instrs) => {
-            // Evaluate expression — could be global.get for a funcref
-            for instr in instrs {
-                match instr {
-                    Instruction::GlobalGet(idx) => match globals.get(*idx as usize) {
-                        Some(&Value::FuncRef(func_ref)) => return func_ref,
-                        Some(&Value::I32(v)) => return Some(v as u32),
-                        _ => return None,
-                    },
-                    Instruction::RefFunc(idx) => return Some(*idx),
-                    Instruction::RefNull => return None,
-                    _ => {}
-                }
-            }
-            None
-        }
-    }
-}
-
 /// A host-provided function callable by imported WASM functions.
 ///
 /// The second parameter is the module's linear memory (mutable), allowing
@@ -157,8 +83,7 @@ impl Store {
         // (must be done before data segments since offsets may reference globals)
         let mut globals = imported_globals;
         for g in &module.globals {
-            let val = eval_const_expr(&g.init, &globals)
-                .unwrap_or(Value::I32(0));
+            let val = eval_const_expr(&g.init, &globals).unwrap_or(Value::I32(0));
             globals.push(val);
         }
 
@@ -171,7 +96,8 @@ impl Store {
                         _ => None,
                     })
                     .ok_or("unsupported data segment offset expr")?;
-                let end = offset.checked_add(seg.data.len())
+                let end = offset
+                    .checked_add(seg.data.len())
                     .ok_or("out of bounds memory access")?;
                 if end > memory.len() {
                     return Err("out of bounds memory access".into());
@@ -187,13 +113,11 @@ impl Store {
         let mut tables: Vec<SharedTable> = imported_tables;
         for t in module.tables.iter().skip(num_table_imports) {
             let init_val = match &t.init {
-                Some(instrs) => {
-                    match eval_const_expr(instrs, &globals) {
-                        Some(Value::FuncRef(func_ref)) => func_ref,
-                        Some(Value::I32(v)) => Some(v as u32),
-                        _ => None,
-                    }
-                }
+                Some(instrs) => match eval_const_expr(instrs, &globals) {
+                    Some(Value::FuncRef(func_ref)) => func_ref,
+                    Some(Value::I32(v)) => Some(v as u32),
+                    _ => None,
+                },
                 None => None,
             };
             tables.push(Rc::new(RefCell::new(vec![init_val; t.min as usize])));
@@ -208,7 +132,8 @@ impl Store {
                 };
                 if let Some(shared_table) = tables.get(elem.table_idx as usize) {
                     let mut table = shared_table.borrow_mut();
-                    let end = offset.checked_add(elem.items.len())
+                    let end = offset
+                        .checked_add(elem.items.len())
                         .ok_or("out of bounds table access")?;
                     if end > table.len() {
                         return Err("out of bounds table access".into());
@@ -223,7 +148,9 @@ impl Store {
         // Build elem_segments: active segments are implicitly dropped after init.
         let mut elem_segments: Vec<Option<Vec<Option<u32>>>> = Vec::new();
         for elem in &module.elements {
-            let funcs: Vec<Option<u32>> = elem.items.iter()
+            let funcs: Vec<Option<u32>> = elem
+                .items
+                .iter()
                 .map(|item| resolve_elem_item(item, &globals))
                 .collect();
             if elem.active {
@@ -244,13 +171,19 @@ impl Store {
         }
 
         // Store table definitions for grow/size
-        let table_defs: Vec<(u64, Option<u64>)> = module.tables.iter()
-            .map(|t| (t.min, t.max))
-            .collect();
+        let table_defs: Vec<(u64, Option<u64>)> =
+            module.tables.iter().map(|t| (t.min, t.max)).collect();
 
         Ok(Store {
-            memory, memory_max, globals, tables, host_funcs,
-            elem_segments, data_segments, extern_funcs: Vec::new(), table_defs,
+            memory,
+            memory_max,
+            globals,
+            tables,
+            host_funcs,
+            elem_segments,
+            data_segments,
+            extern_funcs: Vec::new(),
+            table_defs,
         })
     }
 
@@ -300,5 +233,103 @@ impl Store {
         let idx = EXTERN_FUNC_BASE + self.extern_funcs.len() as u32;
         self.extern_funcs.push(func);
         idx
+    }
+}
+
+/// Evaluate a const expression to a Value, supporting all WASM types and extended const ops.
+fn eval_const_expr(instrs: &[Instruction], globals: &[Value]) -> Option<Value> {
+    let mut stack: Vec<Value> = Vec::new();
+    for instr in instrs {
+        match instr {
+            Instruction::I32Const(v) => stack.push(Value::I32(*v)),
+            Instruction::I64Const(v) => stack.push(Value::I64(*v)),
+            Instruction::F32Const(v) => stack.push(Value::F32(*v)),
+            Instruction::F64Const(v) => stack.push(Value::F64(*v)),
+            Instruction::RefFunc(idx) => stack.push(Value::FuncRef(Some(*idx))),
+            Instruction::RefNull => stack.push(Value::FuncRef(None)),
+            Instruction::GlobalGet(idx) => {
+                stack.push(*globals.get(*idx as usize)?);
+            }
+            Instruction::I32Add => {
+                let Value::I32(b) = stack.pop()? else {
+                    return None;
+                };
+                let Value::I32(a) = stack.pop()? else {
+                    return None;
+                };
+                stack.push(Value::I32(a.wrapping_add(b)));
+            }
+            Instruction::I32Sub => {
+                let Value::I32(b) = stack.pop()? else {
+                    return None;
+                };
+                let Value::I32(a) = stack.pop()? else {
+                    return None;
+                };
+                stack.push(Value::I32(a.wrapping_sub(b)));
+            }
+            Instruction::I32Mul => {
+                let Value::I32(b) = stack.pop()? else {
+                    return None;
+                };
+                let Value::I32(a) = stack.pop()? else {
+                    return None;
+                };
+                stack.push(Value::I32(a.wrapping_mul(b)));
+            }
+            Instruction::I64Add => {
+                let Value::I64(b) = stack.pop()? else {
+                    return None;
+                };
+                let Value::I64(a) = stack.pop()? else {
+                    return None;
+                };
+                stack.push(Value::I64(a.wrapping_add(b)));
+            }
+            Instruction::I64Sub => {
+                let Value::I64(b) = stack.pop()? else {
+                    return None;
+                };
+                let Value::I64(a) = stack.pop()? else {
+                    return None;
+                };
+                stack.push(Value::I64(a.wrapping_sub(b)));
+            }
+            Instruction::I64Mul => {
+                let Value::I64(b) = stack.pop()? else {
+                    return None;
+                };
+                let Value::I64(a) = stack.pop()? else {
+                    return None;
+                };
+                stack.push(Value::I64(a.wrapping_mul(b)));
+            }
+            _ => return None,
+        }
+    }
+    stack.pop()
+}
+
+/// Resolve an element item to a function index, using globals for deferred expressions.
+fn resolve_elem_item(item: &ElemItem, globals: &[Value]) -> Option<u32> {
+    match item {
+        ElemItem::Func(idx) => Some(*idx),
+        ElemItem::Null => None,
+        ElemItem::Expr(instrs) => {
+            // Evaluate expression — could be global.get for a funcref
+            for instr in instrs {
+                match instr {
+                    Instruction::GlobalGet(idx) => match globals.get(*idx as usize) {
+                        Some(&Value::FuncRef(func_ref)) => return func_ref,
+                        Some(&Value::I32(v)) => return Some(v as u32),
+                        _ => return None,
+                    },
+                    Instruction::RefFunc(idx) => return Some(*idx),
+                    Instruction::RefNull => return None,
+                    _ => {}
+                }
+            }
+            None
+        }
     }
 }

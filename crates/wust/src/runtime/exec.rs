@@ -1,11 +1,11 @@
+use crate::runtime::frame::{
+    do_br, do_return, new_frame, pop_f32, pop_f64, pop_i32, pop_i64, pop_raw,
+    setup_local_call, Frame, Label, MAX_STEPS,
+};
 use crate::runtime::module::Module;
 use crate::runtime::opcode::*;
 use crate::runtime::store::{Store, EXTERN_FUNC_BASE};
 use crate::runtime::value::Value;
-
-// TODO: tune once runtime is stable. Catches infinite loops during testing.
-const MAX_STEPS: u64 = 1_000_000_000;
-const MAX_CALL_DEPTH: usize = 10_000;
 
 #[derive(Debug)]
 pub enum ExecError {
@@ -22,26 +22,6 @@ impl std::fmt::Display for ExecError {
     }
 }
 
-struct Frame<'a> {
-    pc: usize,
-    /// Index into the shared `stack` where this frame's locals begin.
-    locals_start: usize,
-    /// The stack height when this frame was entered (after locals are allocated).
-    stack_height: usize,
-    /// Index into the shared `labels` vec where this frame's labels begin.
-    labels_start: usize,
-    arity: usize,
-    body: &'a [Op],
-    br_tables: &'a [(Vec<u32>, u32)],
-}
-
-struct Label {
-    target: usize,
-    stack_height: usize,
-    arity: usize,
-    is_loop: bool,
-}
-
 pub fn invoke(
     module: &Module,
     store: &mut Store,
@@ -54,73 +34,6 @@ pub fn invoke(
     call(module, store, func_idx, args)
 }
 
-/// Push locals onto the shared stack (params from args, rest zeroed).
-/// Returns the index into `stack` where locals start.
-fn push_locals(stack: &mut Vec<u64>, func: &crate::runtime::module::Func, args: &[Value]) -> usize {
-    let locals_start = stack.len();
-    for (i, &_ty) in func.locals.iter().enumerate() {
-        if i < args.len() {
-            stack.push(args[i].to_bits());
-        } else {
-            stack.push(0u64);
-        }
-    }
-    locals_start
-}
-
-fn new_frame<'a>(
-    module: &'a Module,
-    func_idx: u32,
-    args: &[Value],
-    stack: &mut Vec<u64>,
-    labels: &mut Vec<Label>,
-) -> Result<Frame<'a>, ExecError> {
-    let func = module.get_func(func_idx)
-        .ok_or_else(|| ExecError::NotFound(format!("function {func_idx} not found (import or invalid index)")))?;
-    let func_type = module.types.get(func.type_idx as usize)
-        .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", func.type_idx)))?;
-    let arity = func_type.results().len();
-    let locals_start = push_locals(stack, func, args);
-    let stack_height = stack.len();
-    let labels_start = labels.len();
-    labels.push(Label {
-        target: func.body.len().saturating_sub(1),
-        stack_height,
-        arity,
-        is_loop: false,
-    });
-    Ok(Frame {
-        pc: 0,
-        locals_start,
-        stack_height,
-        labels_start,
-        arity,
-        body: &func.body,
-        br_tables: &func.br_tables,
-    })
-}
-
-
-fn do_return(
-    frame: &Frame<'_>,
-    stack: &mut Vec<u64>,
-    labels: &mut Vec<Label>,
-    call_stack: &mut Vec<Frame<'_>>,
-) -> bool {
-    // Unwind stack to frame's base, preserving return values
-    stack_unwind(stack, frame.stack_height, frame.arity);
-    // Now move results down over the locals area
-    let arity = frame.arity;
-    let results_start = stack.len() - arity;
-    let locals_start = frame.locals_start;
-    if arity > 0 && results_start > locals_start {
-        stack.copy_within(results_start..results_start + arity, locals_start);
-    }
-    stack.truncate(locals_start + arity);
-    // Clean up labels
-    labels.truncate(frame.labels_start);
-    call_stack.is_empty()
-}
 
 /// WASM float min with NaN propagation and signed zero handling.
 fn wasm_min<F: Float>(a: F, b: F) -> F {
@@ -224,33 +137,6 @@ impl Float for f64 {
     fn float_signum(self) -> Self { self.signum() }
 }
 
-// --- Stack helper functions for u64-based stack ---
-// WASM validation guarantees stack is non-empty at every pop site.
-
-#[inline(always)]
-fn pop_raw(stack: &mut Vec<u64>) -> u64 {
-    stack.pop().unwrap()
-}
-
-#[inline(always)]
-fn pop_i32(stack: &mut Vec<u64>) -> i32 {
-    stack.pop().unwrap() as i32
-}
-
-#[inline(always)]
-fn pop_i64(stack: &mut Vec<u64>) -> i64 {
-    stack.pop().unwrap() as i64
-}
-
-#[inline(always)]
-fn pop_f32(stack: &mut Vec<u64>) -> f32 {
-    f32::from_bits(stack.pop().unwrap() as u32)
-}
-
-#[inline(always)]
-fn pop_f64(stack: &mut Vec<u64>) -> f64 {
-    f64::from_bits(stack.pop().unwrap())
-}
 macro_rules! push_i32 {
     ($stack:expr, $v:expr) => { $stack.push($v as u32 as u64) }
 }
@@ -467,46 +353,6 @@ fn call_host_fn(
     Ok(())
 }
 
-/// Set up a local (non-import) call: extend stack with zero locals, push label, swap frame.
-fn setup_local_call<'a>(
-    frame: &mut Frame<'a>,
-    call_stack: &mut Vec<Frame<'a>>,
-    stack: &mut Vec<u64>,
-    labels: &mut Vec<Label>,
-    callee: &'a crate::runtime::module::Func,
-    callee_type: &wasmparser::FuncType,
-) -> Result<(), ExecError> {
-    let param_count = callee_type.params().len();
-    let new_arity = callee_type.results().len();
-    let locals_start = stack.len() - param_count;
-    let extra_locals = callee.locals.len() - param_count;
-    for _ in 0..extra_locals {
-        stack.push(0u64);
-    }
-    let stack_height = stack.len();
-    let labels_start = labels.len();
-    labels.push(Label {
-        target: callee.body.len().saturating_sub(1),
-        stack_height,
-        arity: new_arity,
-        is_loop: false,
-    });
-    let new_f = Frame {
-        pc: 0,
-        locals_start,
-        stack_height,
-        labels_start,
-        arity: new_arity,
-        body: &callee.body,
-        br_tables: &callee.br_tables,
-    };
-    if call_stack.len() >= MAX_CALL_DEPTH {
-        return Err(ExecError::Trap("call stack exhausted".into()));
-    }
-    let old_frame = std::mem::replace(frame, new_f);
-    call_stack.push(old_frame);
-    Ok(())
-}
 
 /// Copy elements from an element segment into a table, with bounds checking.
 fn execute_table_init(
@@ -1361,43 +1207,4 @@ pub fn call(
     }
 }
 
-/// Truncate stack to `height`, preserving the top `arity` values.
-/// Avoids Vec allocation by doing an in-place copy.
-#[inline(always)]
-fn stack_unwind(stack: &mut Vec<u64>, height: usize, arity: usize) {
-    if arity == 0 {
-        stack.truncate(height);
-    } else if stack.len() - arity > height {
-        // Copy results down in-place
-        let src = stack.len() - arity;
-        stack.copy_within(src.., height);
-        stack.truncate(height + arity);
-    }
-    // else: stack is already at the right height, nothing to do
-}
-
-fn do_br(frame: &mut Frame, stack: &mut Vec<u64>, labels: &mut Vec<Label>, depth: u32, steps: &mut u64) -> Result<(), ExecError> {
-    let label_idx = labels.len() - 1 - depth as usize;
-    let label = &labels[label_idx];
-
-    let arity = label.arity;
-    let sh = label.stack_height;
-    let is_loop = label.is_loop;
-    let target = label.target;
-
-    stack_unwind(stack, sh, arity);
-    if is_loop {
-        // Backward branch — check execution limit
-        *steps += 1;
-        if *steps > MAX_STEPS {
-            return Err(ExecError::Trap("execution limit".into()));
-        }
-        labels.truncate(label_idx + 1);
-        frame.pc = target + 1;
-    } else {
-        labels.truncate(label_idx);
-        frame.pc = target + 1;
-    }
-    Ok(())
-}
 
