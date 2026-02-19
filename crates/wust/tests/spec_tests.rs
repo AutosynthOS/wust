@@ -121,17 +121,14 @@ fn build_imports(
                         let reg_store = reg.store.clone();
                         let host_fn: HostFunc = Box::new(move |args, _memory| {
                             let mut store = reg_store.lock().unwrap();
-                            match wust::runtime::exec::call(&reg_module, &mut store, func_idx, args)
-                            {
-                                Ok(results) => results,
-                                Err(_) => Vec::new(),
-                            }
+                            wust::runtime::exec::call(&reg_module, &mut store, func_idx, args)
+                                .map_err(|e| format!("{e}"))
                         });
                         host_funcs.push(host_fn);
                         continue;
                     }
                 }
-                let nop: HostFunc = Box::new(|_args, _memory| Vec::new());
+                let nop: HostFunc = Box::new(|_args, _memory| Ok(Vec::new()));
                 host_funcs.push(nop);
             }
             wust::runtime::module::ImportKind::Global { ty, .. } => {
@@ -197,10 +194,8 @@ fn try_instantiate(
         let reg_store = src_store.clone();
         let wrapper: HostFunc = Box::new(move |args, _memory| {
             let mut s = reg_store.lock().unwrap();
-            match wust::runtime::exec::call(&reg_module, &mut s, src_func_idx, args) {
-                Ok(results) => results,
-                Err(_) => Vec::new(),
-            }
+            wust::runtime::exec::call(&reg_module, &mut s, src_func_idx, args)
+                .map_err(|e| format!("{e}"))
         });
         store.extern_funcs.push(wrapper);
     }

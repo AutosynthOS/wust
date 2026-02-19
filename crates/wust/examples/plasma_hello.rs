@@ -21,7 +21,12 @@ fn main() {
     );
     let module = Module::from_bytes(&wasm_bytes).expect("failed to parse plasma.wasm");
 
-    run_test(&module, "hello world", r#"console.log("hello world")"#, "hello world");
+    run_test(
+        &module,
+        "hello world",
+        r#"console.log("hello world")"#,
+        "hello world",
+    );
 
     run_test(
         &module,
@@ -45,8 +50,8 @@ fn run_test(module: &Module, name: &str, js_source: &str, expected: &str) {
 
     let log_output: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
     let host_funcs = build_host_funcs(module, log_output.clone());
-    let mut store =
-        Store::new_with_imports(module, host_funcs, vec![]).expect("failed to instantiate");
+    let mut store = Store::new_with_imports(module, host_funcs, vec![], None, vec![])
+        .expect("failed to instantiate");
 
     let ptr = call_alloc(module, &mut store, js_source.len());
     store.memory[ptr..ptr + js_source.len()].copy_from_slice(js_source.as_bytes());
@@ -92,7 +97,7 @@ fn build_host_funcs(module: &Module, log_output: Arc<Mutex<String>>) -> Vec<Host
                 }));
             } else if has_result {
                 // wasm-bindgen stub that returns a value — return 0.
-                host_funcs.push(Box::new(|_args, _memory| vec![Value::I32(0)]));
+                host_funcs.push(Box::new(|_args, _memory| Ok(vec![Value::I32(0)])));
             } else {
                 // wasm-bindgen stub — no-op.
                 host_funcs.push(Box::new(|_args, _memory| vec![]));

@@ -1,6 +1,15 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::runtime::instruction::Instruction;
 use crate::runtime::module::{ElemItem, Module};
 use crate::runtime::value::Value;
+
+/// A shared, interior-mutable handle to a `Store`.
+///
+/// Allows multiple references to coexist (e.g. across core instances in
+/// a component) while still permitting mutable access via `borrow_mut()`.
+pub type SharedStore = Rc<RefCell<Store>>;
 
 const PAGE_SIZE: usize = 65536; // 64KB WASM pages
 
@@ -83,7 +92,7 @@ fn resolve_elem_item(item: &ElemItem, globals: &[Value]) -> Option<u32> {
 /// The second parameter is the module's linear memory, allowing
 /// host functions to read data written by WASM code (e.g. strings
 /// passed as pointer+length pairs).
-pub type HostFunc = Box<dyn Fn(&[Value], &[u8]) -> Vec<Value>>;
+pub type HostFunc = Box<dyn Fn(&[Value], &[u8]) -> Result<Vec<Value>, String>>;
 
 /// Function indices >= this are external funcref callbacks stored in Store.extern_funcs.
 pub const EXTERN_FUNC_BASE: u32 = 0x7FFF_0000;

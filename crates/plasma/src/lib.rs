@@ -18,6 +18,7 @@ unsafe extern "Rust" fn __getrandom_v03_custom(
 }
 
 use alloc::alloc::Layout;
+use alloc::string::ToString;
 use boa_engine::native_function::NativeFunction;
 use boa_engine::{Context, JsArgs, JsValue, Source, js_string};
 use core::slice;
@@ -55,7 +56,18 @@ pub extern "C" fn eval(ptr: *const u8, len: usize) -> i32 {
 
     match context.eval(Source::from_bytes(source)) {
         Ok(_) => 0,
-        Err(_) => 1,
+        Err(e) => {
+            log_error(&e);
+            1
+        }
+    }
+}
+
+/// Logs a JS error to the host via `host_log`.
+fn log_error(e: &boa_engine::JsError) {
+    let msg = e.to_string();
+    unsafe {
+        host_log(msg.as_ptr(), msg.len());
     }
 }
 

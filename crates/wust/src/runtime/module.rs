@@ -82,6 +82,7 @@ pub enum ExportKind {
     Memory,
     Global,
     Table,
+    Tag,
 }
 
 #[derive(Debug)]
@@ -99,6 +100,8 @@ pub struct TableDef {
     pub max: Option<u64>,
     /// Init expression for each element (None = ref.null).
     pub init: Option<Vec<Instruction>>,
+    /// The element type of the table (funcref, externref, etc.).
+    pub element_type: wasmparser::RefType,
 }
 
 #[derive(Debug)]
@@ -181,9 +184,9 @@ impl ModuleBuilder {
                 ImportKind::Memory(MemoryType { min: ty.initial, max: ty.maximum })
             }
             wasmparser::TypeRef::Table(ty) => {
-                self.tables.push(TableDef { min: ty.initial, max: ty.maximum, init: None });
+                self.tables.push(TableDef { min: ty.initial, max: ty.maximum, init: None, element_type: ty.element_type });
                 self.num_table_imports += 1;
-                ImportKind::Table(TableDef { min: ty.initial, max: ty.maximum, init: None })
+                ImportKind::Table(TableDef { min: ty.initial, max: ty.maximum, init: None, element_type: ty.element_type })
             }
             _ => return Ok(()),
         };
@@ -421,6 +424,7 @@ fn dispatch_payload(builder: &mut ModuleBuilder, payload: Payload<'_>) -> Result
                     min: table.ty.initial,
                     max: table.ty.maximum,
                     init,
+                    element_type: table.ty.element_type,
                 });
             }
         }

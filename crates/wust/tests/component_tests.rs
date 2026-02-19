@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use wast::WastRet;
 use wast::component::WastVal;
-use wust::runtime::{Component, ComponentArg, ComponentInstance, ComponentValue, Value};
+use wust::runtime::{Component, ComponentArg, ComponentImportKind, ComponentInstance, ComponentValue, Value};
 
 /// Component model test runner.
 ///
@@ -17,16 +17,67 @@ struct ComponentTestRunner {
     definitions: HashMap<String, Vec<u8>>,
     /// Maps instance names to indices in `instances`.
     named_instances: HashMap<String, usize>,
+    /// Tracks the kind of entity registered under each name.
+    named_kinds: HashMap<String, ComponentImportKind>,
 }
 
 impl ComponentTestRunner {
     fn new() -> Self {
+        let mut named_kinds = HashMap::new();
+        // Pre-register host builtins expected by the wasmtime test suite.
+        // "host-return-two" is a func provided by the host environment.
+        named_kinds.insert("host-return-two".to_string(), ComponentImportKind::Func);
         ComponentTestRunner {
             instances: Vec::new(),
             current_instance: None,
             definitions: HashMap::new(),
             named_instances: HashMap::new(),
+            named_kinds,
         }
+    }
+
+    /// Build a map of named imports for a component by looking up each
+    /// import name in the test runner's registered instances.
+    ///
+    /// Returns `Err` if a kind mismatch is detected (e.g. component expects
+    /// a module but a registered instance exists under that name).
+    fn resolve_component_imports(
+        &self,
+        component: &Component,
+    ) -> Result<HashMap<String, ComponentInstance>, String> {
+        let mut map = HashMap::new();
+        for import in component.imports() {
+            if let Some(registered_kind) = self.named_kinds.get(&import.name) {
+                if import.kind != *registered_kind {
+                    let expected = format!("{:?}", import.kind).to_lowercase();
+                    let found = format!("{:?}", registered_kind).to_lowercase();
+                    return Err(format!(
+                        "expected {} found {}",
+                        expected, found,
+                    ));
+                }
+            } else if !matches!(
+                import.kind,
+                ComponentImportKind::Instance
+                    | ComponentImportKind::Type
+                    | ComponentImportKind::Component
+                    | ComponentImportKind::Value
+            ) {
+                // Func and Module imports must be registered in the test
+                // environment. Instance/Type/Component/Value imports get
+                // defaults when not explicitly provided.
+                return Err(format!(
+                    "import `{}` was not found",
+                    import.name,
+                ));
+            }
+            if let Some(idx) = self.named_instances.get(&import.name) {
+                if let Some(instance) = self.instances.get(*idx) {
+                    map.insert(import.name.clone(), instance.export_view());
+                }
+            }
+        }
+        Ok(map)
     }
 
     /// Try to instantiate a component binary, returning the instance index.
@@ -35,8 +86,9 @@ impl ComponentTestRunner {
     /// Panics from unsupported features are caught and converted to errors.
     fn try_instantiate(&mut self, binary: &[u8]) -> Result<usize, String> {
         let component = Component::from_bytes(binary)?;
+        let imports = self.resolve_component_imports(&component)?;
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            ComponentInstance::instantiate(&component)
+            ComponentInstance::instantiate_with_imports(&component, imports)
         })) {
             Ok(Ok(instance)) => {
                 let idx = self.instances.len();
@@ -101,8 +153,10 @@ impl ComponentTestRunner {
 
         let mut passed = 0usize;
         let mut failed = 0usize;
+        let mut directive_idx = 0usize;
 
         for directive in wast.directives {
+            directive_idx += 1;
             match directive {
                 // A bare (component ...) — encode and try to instantiate.
                 wast::WastDirective::Module(mut wat) => {
@@ -116,12 +170,13 @@ impl ComponentTestRunner {
                                 Ok(idx) => {
                                     if let Some(ref n) = name {
                                         self.named_instances.insert(n.clone(), idx);
+                                        self.named_kinds.insert(n.clone(), ComponentImportKind::Instance);
                                     }
                                     passed += 1;
                                 }
                                 Err(e) => {
                                     failed += 1;
-                                    eprintln!("  FAIL component instantiation: {e}");
+                                    eprintln!("  FAIL component instantiation (directive {directive_idx}): {e}");
                                 }
                             }
                         }
@@ -162,7 +217,9 @@ impl ComponentTestRunner {
                         Some(binary) => match self.try_instantiate(&binary) {
                             Ok(idx) => {
                                 if let Some(id) = instance {
-                                    self.named_instances.insert(id.name().to_string(), idx);
+                                    let n = id.name().to_string();
+                                    self.named_kinds.insert(n.clone(), ComponentImportKind::Instance);
+                                    self.named_instances.insert(n, idx);
                                 }
                                 passed += 1;
                             }
@@ -186,6 +243,7 @@ impl ComponentTestRunner {
                     match idx {
                         Some(i) => {
                             self.named_instances.insert(name.to_string(), i);
+                            self.named_kinds.insert(name.to_string(), ComponentImportKind::Instance);
                             passed += 1;
                         }
                         None => {
@@ -646,6 +704,7 @@ component_tests! {
     comp_async_same_component_stream_future => ("async", "same-component-stream-future"),
     comp_async_sync_barges_in => ("async", "sync-barges-in"),
     comp_async_sync_streams => ("async", "sync-streams"),
+    // Ignored: wast v245 doesn't support `thread.yield-to` syntax
     // Ignored: wast v245 doesn't support `thread.yield-to` syntax
     // comp_async_trap_if_block_and_sync => ("async", "trap-if-block-and-sync"),
     comp_async_trap_if_done => ("async", "trap-if-done"),

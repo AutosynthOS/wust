@@ -453,15 +453,17 @@ fn pop_args_as_values(stack: &mut Vec<u64>, param_types: &[wasmparser::ValType])
 /// Call a host function: pop args, invoke, push results.
 fn call_host_fn(
     stack: &mut Vec<u64>,
-    host_fn: &dyn Fn(&[Value], &[u8]) -> Vec<Value>,
+    host_fn: &dyn Fn(&[Value], &[u8]) -> Result<Vec<Value>, String>,
     param_types: &[wasmparser::ValType],
     memory: &[u8],
-) {
+) -> Result<(), ExecError> {
     let args = pop_args_as_values(stack, param_types);
-    let results = host_fn(&args, memory);
+    let results = host_fn(&args, memory)
+        .map_err(|e| ExecError::Trap(format!("trap: {e}")))?;
     for r in results {
         stack.push(r.to_bits());
     }
+    Ok(())
 }
 
 /// Set up a local (non-import) call: extend stack with zero locals, push label, swap frame.
@@ -516,25 +518,29 @@ fn execute_table_init(
 ) -> Result<(), ExecError> {
     let seg = store.elem_segments.get(elem_idx)
         .ok_or_else(|| ExecError::Trap("unknown elem segment".into()))?;
-    match seg {
+    // Clone the relevant slice to avoid holding an immutable borrow on
+    // elem_segments while we mutably borrow tables below.
+    let elems = match seg {
         None => {
             if count > 0 {
                 return Err(ExecError::Trap("out of bounds table access".into()));
             }
+            return Ok(());
         }
         Some(elems) => {
             if src as usize + count as usize > elems.len() {
                 return Err(ExecError::Trap("out of bounds table access".into()));
             }
-            let table = store.tables.get_mut(table_idx)
-                .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
-            if dst as usize + count as usize > table.len() {
-                return Err(ExecError::Trap("out of bounds table access".into()));
-            }
-            for i in 0..count as usize {
-                table[dst as usize + i] = elems[src as usize + i];
-            }
+            elems[src as usize..src as usize + count as usize].to_vec()
         }
+    };
+    let table = store.tables.get_mut(table_idx)
+        .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
+    if dst as usize + count as usize > table.len() {
+        return Err(ExecError::Trap("out of bounds table access".into()));
+    }
+    for (i, elem) in elems.iter().enumerate() {
+        table[dst as usize + i] = *elem;
     }
     Ok(())
 }
@@ -645,7 +651,8 @@ pub fn call(
     // If the target is an imported host function, call it directly
     if module.is_import(func_idx) {
         return if let Some(host_fn) = store.host_funcs.get(func_idx as usize) {
-            Ok(host_fn(args, &store.memory))
+            host_fn(args, &store.memory)
+                .map_err(|e| ExecError::Trap(format!("trap: {e}")))
         } else {
             Err(ExecError::Trap(format!("unresolved import function {func_idx}")))
         };
@@ -781,7 +788,7 @@ pub fn call(
                         .ok_or_else(|| ExecError::Trap(format!("type index {} out of bounds", type_idx)))?;
                     let host_fn = store.host_funcs.get(idx as usize)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved import function {idx}")))?;
-                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params(), &store.memory);
+                    call_host_fn(&mut stack, host_fn.as_ref(), callee_type.params(), &store.memory)?;
                 } else {
                     let callee = module.get_func(idx)
                         .ok_or_else(|| ExecError::Trap(format!("function {idx} not found")))?;
@@ -801,12 +808,12 @@ pub fn call(
                     let extern_idx = (func_idx - EXTERN_FUNC_BASE) as usize;
                     let extern_fn = store.extern_funcs.get(extern_idx)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved extern function {func_idx}")))?;
-                    call_host_fn(&mut stack, extern_fn.as_ref(), ci_type.params(), &store.memory);
+                    call_host_fn(&mut stack, extern_fn.as_ref(), ci_type.params(), &store.memory)?;
                 } else if module.is_import(func_idx) {
                     check_indirect_type(module, func_idx, ci_type)?;
                     let host_fn = store.host_funcs.get(func_idx as usize)
                         .ok_or_else(|| ExecError::Trap(format!("unresolved import function {func_idx}")))?;
-                    call_host_fn(&mut stack, host_fn.as_ref(), ci_type.params(), &store.memory);
+                    call_host_fn(&mut stack, host_fn.as_ref(), ci_type.params(), &store.memory)?;
                 } else {
                     let callee = module.get_func(func_idx)
                         .ok_or_else(|| ExecError::Trap(format!("function {func_idx} not found")))?;
@@ -1285,13 +1292,15 @@ pub fn call(
                 let n = pop_i32(&mut stack) as u32;
                 let init_val = pop_raw(&mut stack);
                 let table_idx = op.imm as usize;
+                // Read table_defs before mutably borrowing tables to
+                // avoid a split-borrow conflict through Deref.
+                let max = store.table_defs.get(table_idx)
+                    .and_then(|(_, max)| *max);
                 let table = store.tables.get_mut(table_idx)
                     .ok_or_else(|| ExecError::Trap("undefined table".into()))?;
                 let old_size = table.len() as u32;
                 let new_size = old_size as u64 + n as u64;
                 // Check max limit
-                let max = store.table_defs.get(table_idx)
-                    .and_then(|(_, max)| *max);
                 if let Some(max) = max {
                     if new_size > max {
                         push_i32!(stack, -1i32);
