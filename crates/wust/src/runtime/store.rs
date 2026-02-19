@@ -236,6 +236,15 @@ impl Store {
     }
 }
 
+/// Pop two values of the same variant, apply a binary op, push the result.
+macro_rules! const_binop {
+    ($stack:expr, $variant:ident, $method:ident) => {{
+        let Value::$variant(b) = $stack.pop()? else { return None; };
+        let Value::$variant(a) = $stack.pop()? else { return None; };
+        $stack.push(Value::$variant(a.$method(b)));
+    }};
+}
+
 /// Evaluate a const expression to a Value, supporting all WASM types and extended const ops.
 fn eval_const_expr(instrs: &[Instruction], globals: &[Value]) -> Option<Value> {
     let mut stack: Vec<Value> = Vec::new();
@@ -250,60 +259,12 @@ fn eval_const_expr(instrs: &[Instruction], globals: &[Value]) -> Option<Value> {
             Instruction::GlobalGet(idx) => {
                 stack.push(*globals.get(*idx as usize)?);
             }
-            Instruction::I32Add => {
-                let Value::I32(b) = stack.pop()? else {
-                    return None;
-                };
-                let Value::I32(a) = stack.pop()? else {
-                    return None;
-                };
-                stack.push(Value::I32(a.wrapping_add(b)));
-            }
-            Instruction::I32Sub => {
-                let Value::I32(b) = stack.pop()? else {
-                    return None;
-                };
-                let Value::I32(a) = stack.pop()? else {
-                    return None;
-                };
-                stack.push(Value::I32(a.wrapping_sub(b)));
-            }
-            Instruction::I32Mul => {
-                let Value::I32(b) = stack.pop()? else {
-                    return None;
-                };
-                let Value::I32(a) = stack.pop()? else {
-                    return None;
-                };
-                stack.push(Value::I32(a.wrapping_mul(b)));
-            }
-            Instruction::I64Add => {
-                let Value::I64(b) = stack.pop()? else {
-                    return None;
-                };
-                let Value::I64(a) = stack.pop()? else {
-                    return None;
-                };
-                stack.push(Value::I64(a.wrapping_add(b)));
-            }
-            Instruction::I64Sub => {
-                let Value::I64(b) = stack.pop()? else {
-                    return None;
-                };
-                let Value::I64(a) = stack.pop()? else {
-                    return None;
-                };
-                stack.push(Value::I64(a.wrapping_sub(b)));
-            }
-            Instruction::I64Mul => {
-                let Value::I64(b) = stack.pop()? else {
-                    return None;
-                };
-                let Value::I64(a) = stack.pop()? else {
-                    return None;
-                };
-                stack.push(Value::I64(a.wrapping_mul(b)));
-            }
+            Instruction::I32Add => const_binop!(stack, I32, wrapping_add),
+            Instruction::I32Sub => const_binop!(stack, I32, wrapping_sub),
+            Instruction::I32Mul => const_binop!(stack, I32, wrapping_mul),
+            Instruction::I64Add => const_binop!(stack, I64, wrapping_add),
+            Instruction::I64Sub => const_binop!(stack, I64, wrapping_sub),
+            Instruction::I64Mul => const_binop!(stack, I64, wrapping_mul),
             _ => return None,
         }
     }

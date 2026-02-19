@@ -455,19 +455,20 @@ impl ComponentInstance {
     /// trampolines. Also carries exported module/component bytes for alias
     /// resolution.
     pub fn export_view(&self) -> ComponentInstance {
+        clone_for_export(self)
+    }
+
+    /// Create a minimal view with only core instances and exports.
+    ///
+    /// Used when wiring func imports — the child only needs access to
+    /// the source's core stores and resolved exports for trampoline
+    /// creation.
+    pub(super) fn core_view(&self) -> ComponentInstance {
         ComponentInstance {
             core_instances: self.core_instances.clone(),
             exports: self.exports.clone(),
-            child_instances: self.child_instances.clone(),
-            resolved_modules: HashMap::new(),
-            resolved_components: HashMap::new(),
-            exported_modules: self.exported_modules.clone(),
-            exported_components: self.exported_components.clone(),
-            exported_pre_resolved: self.exported_pre_resolved.clone(),
-            exported_instances: self.exported_instances.clone(),
-            instantiating: Rc::new(Cell::new(false)),
-            pre_resolved_components: HashMap::new(),
             resource_table: self.resource_table.clone(),
+            ..Default::default()
         }
     }
 
@@ -550,6 +551,34 @@ impl ComponentInstance {
 // Population helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve raw bytes for a module or component by index.
+///
+/// Checks the instance's resolved map first (populated from alias resolution),
+/// then falls back to the component's static index space. Returns `None` if
+/// the bytes are empty or not found in either source.
+fn resolve_item_bytes(
+    inst: &ComponentInstance,
+    component: &Component,
+    kind: ComponentExternalKind,
+    index: u32,
+) -> Option<Vec<u8>> {
+    let idx = index as usize;
+    let bytes = match kind {
+        ComponentExternalKind::Module => inst
+            .resolved_modules
+            .get(&index)
+            .cloned()
+            .or_else(|| component.core_modules.get(idx).cloned()),
+        ComponentExternalKind::Component => inst
+            .resolved_components
+            .get(&index)
+            .cloned()
+            .or_else(|| component.inner_components.get(idx).cloned()),
+        _ => None,
+    };
+    bytes.filter(|b| !b.is_empty())
+}
+
 /// Populate a FromExports component instance's exported items.
 ///
 /// For each export entry, looks up the item bytes in the parent component
@@ -564,29 +593,13 @@ fn populate_from_exports_instance(
     for export in exports {
         match export.kind {
             ComponentExternalKind::Module => {
-                let idx = export.index as usize;
-                let bytes = inst
-                    .resolved_modules
-                    .get(&export.index)
-                    .cloned()
-                    .or_else(|| component.core_modules.get(idx).cloned());
-                if let Some(b) = bytes {
-                    if !b.is_empty() {
-                        child.exported_modules.insert(export.name.clone(), b);
-                    }
+                if let Some(b) = resolve_item_bytes(inst, component, export.kind, export.index) {
+                    child.exported_modules.insert(export.name.clone(), b);
                 }
             }
             ComponentExternalKind::Component => {
-                let idx = export.index as usize;
-                let bytes = inst
-                    .resolved_components
-                    .get(&export.index)
-                    .cloned()
-                    .or_else(|| component.inner_components.get(idx).cloned());
-                if let Some(b) = bytes {
-                    if !b.is_empty() {
-                        child.exported_components.insert(export.name.clone(), b);
-                    }
+                if let Some(b) = resolve_item_bytes(inst, component, export.kind, export.index) {
+                    child.exported_components.insert(export.name.clone(), b);
                 }
             }
             ComponentExternalKind::Instance => {
@@ -596,25 +609,10 @@ fn populate_from_exports_instance(
                 let idx = export.index as usize;
                 if idx < inst.child_instances.len() {
                     let source = &inst.child_instances[idx];
-                    child.exported_modules.extend(
-                        source
-                            .exported_modules
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    child.exported_components.extend(
-                        source
-                            .exported_components
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    child.exported_pre_resolved.extend(
-                        source
-                            .exported_pre_resolved
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone())),
-                    );
-                    let sub = clone_child_instance(source);
+                    child.exported_modules.extend(source.exported_modules.clone());
+                    child.exported_components.extend(source.exported_components.clone());
+                    child.exported_pre_resolved.extend(source.exported_pre_resolved.clone());
+                    let sub = clone_for_export(source);
                     child.exported_instances.insert(export.name.clone(), sub);
                 }
             }
@@ -727,58 +725,41 @@ fn populate_exported_bytes(
     for export in &component.exports {
         match export.kind {
             ComponentExternalKind::Module => {
-                let idx = export.index as usize;
-                // Check resolved_modules first, then component.core_modules.
-                let bytes = inst
-                    .resolved_modules
-                    .get(&export.index)
-                    .cloned()
-                    .or_else(|| component.core_modules.get(idx).cloned());
-                if let Some(b) = bytes {
-                    if !b.is_empty() {
-                        inst.exported_modules.insert(export.name.clone(), b);
-                    }
+                if let Some(b) = resolve_item_bytes(inst, component, export.kind, export.index) {
+                    inst.exported_modules.insert(export.name.clone(), b);
                 }
             }
             ComponentExternalKind::Component => {
-                let idx = export.index as usize;
-                let bytes = inst
-                    .resolved_components
-                    .get(&export.index)
-                    .cloned()
-                    .or_else(|| component.inner_components.get(idx).cloned());
+                let bytes = resolve_item_bytes(inst, component, export.kind, export.index);
                 if let Some(ref b) = bytes {
-                    if !b.is_empty() {
-                        inst.exported_components
-                            .insert(export.name.clone(), b.clone());
-                    }
+                    inst.exported_components
+                        .insert(export.name.clone(), b.clone());
                 }
                 // Also store a pre-resolved Component if the inner component
                 // has outer aliases. This ensures consumers get correctly
                 // resolved module bytes even when re-parsed in a different
                 // ancestor context.
+                let idx = export.index as usize;
                 if let Some(pre) = component.pre_resolved_inner.get(&(idx as u32)) {
                     inst.exported_pre_resolved
                         .insert(export.name.clone(), (**pre).clone());
                 } else if let Some(b) = bytes {
-                    if !b.is_empty() {
-                        if let Ok(mut parsed) = super::Component::from_bytes_no_validate(&b) {
-                            let mut inner_ancestors: Vec<&Component> =
-                                Vec::with_capacity(ancestors.len() + 1);
-                            inner_ancestors.push(component);
-                            inner_ancestors.extend_from_slice(ancestors);
-                            alias::resolve_outer_aliases(&mut parsed, &inner_ancestors);
-                            alias::pre_resolve_inner_components(&mut parsed, &inner_ancestors);
-                            inst.exported_pre_resolved
-                                .insert(export.name.clone(), parsed);
-                        }
+                    if let Ok(mut parsed) = super::Component::from_bytes_no_validate(&b) {
+                        let mut inner_ancestors: Vec<&Component> =
+                            Vec::with_capacity(ancestors.len() + 1);
+                        inner_ancestors.push(component);
+                        inner_ancestors.extend_from_slice(ancestors);
+                        alias::resolve_outer_aliases(&mut parsed, &inner_ancestors);
+                        alias::pre_resolve_inner_components(&mut parsed, &inner_ancestors);
+                        inst.exported_pre_resolved
+                            .insert(export.name.clone(), parsed);
                     }
                 }
             }
             ComponentExternalKind::Instance => {
                 let idx = export.index as usize;
                 if idx < inst.child_instances.len() {
-                    let child_clone = clone_child_instance(&inst.child_instances[idx]);
+                    let child_clone = clone_for_export(&inst.child_instances[idx]);
                     inst.exported_instances
                         .insert(export.name.clone(), child_clone);
                 }
@@ -937,7 +918,7 @@ fn push_aliased_child(inst: &mut ComponentInstance, source_index: u32) -> Result
         ));
     }
     let source = &inst.child_instances[src_idx];
-    let cloned = clone_child_instance(source);
+    let cloned = clone_for_export(source);
     inst.child_instances.push(cloned);
     Ok(())
 }
@@ -963,31 +944,28 @@ fn push_aliased_child_by_name(
     }
     let source = &inst.child_instances[src_idx];
     if let Some(sub_instance) = source.exported_instances.get(name) {
-        let cloned = clone_child_instance(sub_instance);
+        let cloned = clone_for_export(sub_instance);
         inst.child_instances.push(cloned);
     } else {
-        let cloned = clone_child_instance(source);
+        let cloned = clone_for_export(source);
         inst.child_instances.push(cloned);
     }
     Ok(())
 }
 
-/// Clone a ComponentInstance for use as an aliased child, copying all
-/// export-related fields.
-fn clone_child_instance(source: &ComponentInstance) -> ComponentInstance {
+/// Clone a ComponentInstance for aliasing or export, copying all
+/// export-related fields while resetting transient state.
+pub(super) fn clone_for_export(source: &ComponentInstance) -> ComponentInstance {
     ComponentInstance {
         core_instances: source.core_instances.clone(),
         exports: source.exports.clone(),
         child_instances: source.child_instances.clone(),
-        resolved_modules: HashMap::new(),
-        resolved_components: HashMap::new(),
         exported_modules: source.exported_modules.clone(),
         exported_components: source.exported_components.clone(),
         exported_pre_resolved: source.exported_pre_resolved.clone(),
         exported_instances: source.exported_instances.clone(),
-        instantiating: Rc::new(Cell::new(false)),
-        pre_resolved_components: HashMap::new(),
         resource_table: source.resource_table.clone(),
+        ..Default::default()
     }
 }
 
@@ -1056,7 +1034,12 @@ fn instantiate_with_instance_args(
                         .cloned()
                 });
                 if bytes.is_none() {
-                    bytes = resolve_module_arg_from_exports(outer, outer_component, *idx);
+                    bytes = resolve_aliased_arg_from_exports(
+                        outer,
+                        &outer_component.aliased_core_modules,
+                        *idx,
+                        |ci| &ci.exported_modules,
+                    );
                 }
                 if let Some(bytes) = bytes {
                     if next_module_slot < module_import_slot {
@@ -1080,7 +1063,12 @@ fn instantiate_with_instance_args(
                         .cloned()
                 });
                 if bytes.is_none() {
-                    bytes = resolve_component_arg_from_exports(outer, outer_component, *idx);
+                    bytes = resolve_aliased_arg_from_exports(
+                        outer,
+                        &outer_component.aliased_inner_components,
+                        *idx,
+                        |ci| &ci.exported_components,
+                    );
                 }
                 if let Some(ref bytes) = bytes {
                     if next_component_slot < component_import_slot {
@@ -1214,24 +1202,9 @@ fn wire_func_import(
     if src_child_idx >= outer.child_instances.len() {
         return;
     }
-    // Build a copy of the child instance that includes its core instances
-    // (needed by `make_child_instance_trampoline` to create the actual
-    // trampoline closure) plus its exports.
-    let src = &outer.child_instances[src_child_idx];
-    let child_view = ComponentInstance {
-        core_instances: src.core_instances.iter().map(|ci| ci.clone()).collect(),
-        exports: src.exports.clone(),
-        child_instances: Vec::new(),
-        resolved_modules: HashMap::new(),
-        resolved_components: HashMap::new(),
-        exported_modules: HashMap::new(),
-        exported_components: HashMap::new(),
-        exported_pre_resolved: HashMap::new(),
-        exported_instances: HashMap::new(),
-        instantiating: Rc::new(Cell::new(false)),
-        pre_resolved_components: HashMap::new(),
-        resource_table: src.resource_table.clone(),
-    };
+    // Build a minimal copy with core instances and exports — enough for
+    // `make_child_instance_trampoline` to create the trampoline closure.
+    let child_view = outer.child_instances[src_child_idx].core_view();
 
     // Step 4: Add this child as a new import instance for the inner component.
     // The instance import count determines the child instance offset.
@@ -1245,42 +1218,19 @@ fn wire_func_import(
     };
 }
 
-/// Resolve a module arg by looking up aliased_core_modules and then checking
-/// the child instance's exported_modules.
-fn resolve_module_arg_from_exports(
+/// Resolve an aliased arg by looking up the alias map and checking the
+/// child instance's exported bytes.
+///
+/// `alias_map` is either `aliased_core_modules` or `aliased_inner_components`.
+/// `get_exports` selects which export map to check on the child instance.
+fn resolve_aliased_arg_from_exports(
     inst: &ComponentInstance,
-    component: &Component,
-    module_idx: u32,
+    alias_map: &HashMap<u32, (u32, String)>,
+    idx: u32,
+    get_exports: fn(&ComponentInstance) -> &HashMap<String, Vec<u8>>,
 ) -> Option<Vec<u8>> {
-    let (comp_inst_idx, export_name) = component.aliased_core_modules.get(&module_idx)?;
-    let total_idx = *comp_inst_idx as usize;
-    if total_idx < inst.child_instances.len() {
-        let child = &inst.child_instances[total_idx];
-        if let Some(bytes) = child.exported_modules.get(export_name.as_str()) {
-            if !bytes.is_empty() {
-                return Some(bytes.clone());
-            }
-        }
-    }
-    None
-}
-
-/// Resolve a component arg by looking up aliased_inner_components and then
-/// checking the child instance's exported_components.
-fn resolve_component_arg_from_exports(
-    inst: &ComponentInstance,
-    component: &Component,
-    comp_idx: u32,
-) -> Option<Vec<u8>> {
-    let (comp_inst_idx, export_name) = component.aliased_inner_components.get(&comp_idx)?;
-    let total_idx = *comp_inst_idx as usize;
-    if total_idx < inst.child_instances.len() {
-        let child = &inst.child_instances[total_idx];
-        if let Some(bytes) = child.exported_components.get(export_name.as_str()) {
-            if !bytes.is_empty() {
-                return Some(bytes.clone());
-            }
-        }
-    }
-    None
+    let (comp_inst_idx, export_name) = alias_map.get(&idx)?;
+    let child = inst.child_instances.get(*comp_inst_idx as usize)?;
+    let bytes = get_exports(child).get(export_name.as_str())?;
+    if bytes.is_empty() { None } else { Some(bytes.clone()) }
 }

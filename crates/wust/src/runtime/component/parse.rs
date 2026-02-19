@@ -390,26 +390,7 @@ fn parse_component_instance_section(
                 let entries = exports
                     .iter()
                     .map(|e| {
-                        let kind = match e.kind {
-                            wasmparser::ComponentExternalKind::Module => {
-                                ComponentExternalKind::Module
-                            }
-                            wasmparser::ComponentExternalKind::Func => {
-                                ComponentExternalKind::Func
-                            }
-                            wasmparser::ComponentExternalKind::Instance => {
-                                ComponentExternalKind::Instance
-                            }
-                            wasmparser::ComponentExternalKind::Component => {
-                                ComponentExternalKind::Component
-                            }
-                            wasmparser::ComponentExternalKind::Value => {
-                                ComponentExternalKind::Value
-                            }
-                            wasmparser::ComponentExternalKind::Type => {
-                                ComponentExternalKind::Type
-                            }
-                        };
+                        let kind = ComponentExternalKind::from(e.kind);
                         ComponentInstanceExport {
                             name: e.name.0.to_string(),
                             kind,
@@ -566,14 +547,7 @@ fn parse_export_section(
 ) -> Result<(), String> {
     for export in reader {
         let export = export.map_err(|e| format!("export parse error: {e}"))?;
-        let kind = match export.kind {
-            wasmparser::ComponentExternalKind::Func => ComponentExternalKind::Func,
-            wasmparser::ComponentExternalKind::Module => ComponentExternalKind::Module,
-            wasmparser::ComponentExternalKind::Component => ComponentExternalKind::Component,
-            wasmparser::ComponentExternalKind::Instance => ComponentExternalKind::Instance,
-            wasmparser::ComponentExternalKind::Value => ComponentExternalKind::Value,
-            wasmparser::ComponentExternalKind::Type => ComponentExternalKind::Type,
-        };
+        let kind = ComponentExternalKind::from(export.kind);
 
         // Component exports introduce a new item in the corresponding
         // index space. The new item references the original at `export.index`.

@@ -10,27 +10,34 @@ use std::collections::HashMap;
 use super::instance::ComponentInstance;
 use super::types::*;
 
-/// Resolve core modules that are aliased from component instance exports.
+/// Resolve aliased items from component instance exports.
 ///
-/// For each entry in `component.aliased_core_modules`, looks up the
-/// referenced child component instance's exported_modules first, then
-/// falls back to the parsed inner component's core_modules.
-pub(super) fn resolve_aliased_core_modules(
-    inst: &mut ComponentInstance,
+/// Generic helper that both `resolve_aliased_core_modules` and
+/// `resolve_aliased_inner_components` delegate to. The differences
+/// between those callers are parameterized as:
+/// - `aliased_map`: which aliased map to iterate
+/// - `get_child_exports`: extracts the exported map from a child instance
+/// - `find_in_parsed`: finds bytes from a parsed inner component by name
+/// - `resolved_map`: which resolved map to insert into
+fn resolve_aliased_items(
+    child_instances: &[ComponentInstance],
     component: &Component,
     parsed_inner_components: &HashMap<u32, Component>,
+    aliased_map: &HashMap<u32, (u32, String)>,
+    get_child_exports: impl Fn(&ComponentInstance) -> &HashMap<String, Vec<u8>>,
+    find_in_parsed: impl Fn(&Component, &str) -> Option<Vec<u8>>,
+    resolved_map: &mut HashMap<u32, Vec<u8>>,
 ) -> Result<(), String> {
-    for (module_idx, (comp_inst_idx, export_name)) in &component.aliased_core_modules {
+    for (idx, (comp_inst_idx, export_name)) in aliased_map {
         let total_idx = *comp_inst_idx as usize;
 
-        // Check if the child instance already has exported_modules.
-        if total_idx < inst.child_instances.len() {
-            if let Some(bytes) = inst.child_instances[total_idx]
-                .exported_modules
-                .get(export_name.as_str())
+        // Check if the child instance already has the exported item.
+        if total_idx < child_instances.len() {
+            if let Some(bytes) =
+                get_child_exports(&child_instances[total_idx]).get(export_name.as_str())
             {
                 if !bytes.is_empty() {
-                    inst.resolved_modules.insert(*module_idx, bytes.clone());
+                    resolved_map.insert(*idx, bytes.clone());
                     continue;
                 }
             }
@@ -47,20 +54,40 @@ pub(super) fn resolve_aliased_core_modules(
             continue;
         }
 
-        match &component.component_instances[def_idx] {
-            ComponentInstanceDef::Instantiate {
-                component_index, ..
-            } => {
-                if let Some(inner) = parsed_inner_components.get(component_index) {
-                    if let Some(module_bytes) = find_exported_core_module(inner, export_name) {
-                        inst.resolved_modules.insert(*module_idx, module_bytes);
-                    }
+        if let ComponentInstanceDef::Instantiate { component_index, .. } =
+            &component.component_instances[def_idx]
+        {
+            if let Some(inner) = parsed_inner_components.get(component_index) {
+                if let Some(bytes) = find_in_parsed(inner, export_name) {
+                    resolved_map.insert(*idx, bytes);
                 }
             }
-            _ => {}
         }
     }
     Ok(())
+}
+
+/// Resolve core modules that are aliased from component instance exports.
+///
+/// For each entry in `component.aliased_core_modules`, looks up the
+/// referenced child component instance's exported_modules first, then
+/// falls back to the parsed inner component's core_modules.
+pub(super) fn resolve_aliased_core_modules(
+    inst: &mut ComponentInstance,
+    component: &Component,
+    parsed_inner_components: &HashMap<u32, Component>,
+) -> Result<(), String> {
+    resolve_aliased_items(
+        &inst.child_instances,
+        component,
+        parsed_inner_components,
+        &component.aliased_core_modules,
+        |ci| &ci.exported_modules,
+        |inner, name| {
+            find_exported_bytes(inner, name, ComponentExternalKind::Module, &inner.core_modules)
+        },
+        &mut inst.resolved_modules,
+    )
 }
 
 /// Look up inner component bytes by index, checking multiple sources.
@@ -166,19 +193,16 @@ fn resolve_component_alias_on_demand(
     if def_idx >= component.component_instances.len() {
         return Ok(None);
     }
-    match &component.component_instances[def_idx] {
-        ComponentInstanceDef::Instantiate {
-            component_index, ..
-        } => {
-            if let Some(inner) = parsed_inner_components.get(component_index) {
-                if let Some(comp_bytes) = find_exported_inner_component(inner, export_name) {
-                    inst.resolved_components
-                        .insert(comp_idx, comp_bytes.clone());
-                    return Ok(Some(comp_bytes));
-                }
+    if let ComponentInstanceDef::Instantiate { component_index, .. } =
+        &component.component_instances[def_idx]
+    {
+        if let Some(inner) = parsed_inner_components.get(component_index) {
+            if let Some(comp_bytes) = find_exported_bytes(inner, export_name, ComponentExternalKind::Component, &inner.inner_components) {
+                inst.resolved_components
+                    .insert(comp_idx, comp_bytes.clone());
+                return Ok(Some(comp_bytes));
             }
         }
-        _ => {}
     }
     Ok(None)
 }
@@ -217,60 +241,37 @@ pub(super) fn resolve_aliased_inner_components(
     component: &Component,
     parsed_inner_components: &HashMap<u32, Component>,
 ) -> Result<(), String> {
-    for (comp_idx, (comp_inst_idx, export_name)) in &component.aliased_inner_components {
-        let total_idx = *comp_inst_idx as usize;
-
-        // Check if the child instance already has exported_components.
-        if total_idx < inst.child_instances.len() {
-            if let Some(bytes) = inst.child_instances[total_idx]
-                .exported_components
-                .get(export_name.as_str())
-            {
-                if !bytes.is_empty() {
-                    inst.resolved_components.insert(*comp_idx, bytes.clone());
-                    continue;
-                }
-            }
-        }
-
-        // Fall back to parsed inner component lookup.
-        let def_idx = if total_idx >= component.instance_import_count as usize {
-            total_idx - component.instance_import_count as usize
-        } else {
-            continue;
-        };
-
-        if def_idx >= component.component_instances.len() {
-            continue;
-        }
-
-        match &component.component_instances[def_idx] {
-            ComponentInstanceDef::Instantiate {
-                component_index, ..
-            } => {
-                if let Some(inner) = parsed_inner_components.get(component_index) {
-                    if let Some(comp_bytes) = find_exported_inner_component(inner, export_name) {
-                        inst.resolved_components.insert(*comp_idx, comp_bytes);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    Ok(())
+    resolve_aliased_items(
+        &inst.child_instances,
+        component,
+        parsed_inner_components,
+        &component.aliased_inner_components,
+        |ci| &ci.exported_components,
+        |inner, name| {
+            find_exported_bytes(
+                inner,
+                name,
+                ComponentExternalKind::Component,
+                &inner.inner_components,
+            )
+        },
+        &mut inst.resolved_components,
+    )
 }
 
-/// Find inner component bytes for a named export from a parsed component.
-pub(super) fn find_exported_inner_component(
+/// Find bytes for a named export of a given kind from a parsed component.
+///
+/// Scans `component.exports` for an entry matching `export_name` and `kind`,
+/// then indexes into `source_vec` to retrieve the corresponding bytes.
+pub(super) fn find_exported_bytes(
     component: &Component,
     export_name: &str,
+    kind: ComponentExternalKind,
+    source_vec: &[Vec<u8>],
 ) -> Option<Vec<u8>> {
     for export in &component.exports {
-        if export.name == export_name && export.kind == ComponentExternalKind::Component {
-            return component
-                .inner_components
-                .get(export.index as usize)
-                .cloned();
+        if export.name == export_name && export.kind == kind {
+            return source_vec.get(export.index as usize).cloned();
         }
     }
     None
@@ -420,15 +421,3 @@ pub(super) fn resolve_self_aliases(inst: &mut ComponentInstance, component: &Com
     }
 }
 
-/// Find the core module bytes for a named export from a parsed component.
-pub(super) fn find_exported_core_module(
-    component: &Component,
-    export_name: &str,
-) -> Option<Vec<u8>> {
-    for export in &component.exports {
-        if export.name == export_name && export.kind == ComponentExternalKind::Module {
-            return component.core_modules.get(export.index as usize).cloned();
-        }
-    }
-    None
-}

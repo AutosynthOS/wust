@@ -296,6 +296,62 @@ macro_rules! trunc_op_u {
     }};
 }
 
+macro_rules! div_s {
+    ($stack:expr, $pop_fn:ident, $push_macro:ident, $int_ty:ty) => {{
+        let b = $pop_fn(&mut $stack);
+        let a = $pop_fn(&mut $stack);
+        if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
+        if a == <$int_ty>::MIN && b == -1 { return Err(ExecError::Trap("integer overflow".into())); }
+        $push_macro!($stack, a.wrapping_div(b));
+    }};
+}
+
+macro_rules! div_u {
+    ($stack:expr, $pop_fn:ident, $push_macro:ident, $uint_ty:ty, $int_ty:ty) => {{
+        let b = $pop_fn(&mut $stack) as $uint_ty;
+        let a = $pop_fn(&mut $stack) as $uint_ty;
+        if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
+        $push_macro!($stack, (a / b) as $int_ty);
+    }};
+}
+
+macro_rules! rem_s {
+    ($stack:expr, $pop_fn:ident, $push_macro:ident, $int_ty:ty) => {{
+        let b = $pop_fn(&mut $stack);
+        let a = $pop_fn(&mut $stack);
+        if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
+        $push_macro!($stack, if a == <$int_ty>::MIN && b == -1 { 0 } else { a.wrapping_rem(b) });
+    }};
+}
+
+macro_rules! rem_u {
+    ($stack:expr, $pop_fn:ident, $push_macro:ident, $uint_ty:ty, $int_ty:ty) => {{
+        let b = $pop_fn(&mut $stack) as $uint_ty;
+        let a = $pop_fn(&mut $stack) as $uint_ty;
+        if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
+        $push_macro!($stack, (a % b) as $int_ty);
+    }};
+}
+
+macro_rules! trunc_sat_s {
+    ($stack:expr, $pop_fn:ident, $push_macro:ident, $int_ty:ty, $max_bound:expr, $min_bound:expr) => {{
+        let a = $pop_fn(&mut $stack);
+        $push_macro!($stack, if a.is_nan() { 0 as $int_ty }
+            else if a >= $max_bound { <$int_ty>::MAX }
+            else if a < $min_bound { <$int_ty>::MIN }
+            else { a as $int_ty });
+    }};
+}
+
+macro_rules! trunc_sat_u {
+    ($stack:expr, $pop_fn:ident, $push_macro:ident, $uint_ty:ty, $int_ty:ty, $max_bound:expr) => {{
+        let a = $pop_fn(&mut $stack);
+        $push_macro!($stack, if a.is_nan() || a <= -1.0 { 0 as $uint_ty as $int_ty }
+            else if a >= $max_bound { <$uint_ty>::MAX as $int_ty }
+            else { a as $uint_ty as $int_ty });
+    }};
+}
+
 /// Convert raw bits to a Value matching the type of an existing global.
 fn coerce_bits_to_global(bits: u64, existing: &Value) -> Result<Value, ExecError> {
     match existing {
@@ -796,31 +852,10 @@ pub fn call(
             OP_I32_ADD => binop_i32!(stack, |a: i32, b: i32| a.wrapping_add(b)),
             OP_I32_SUB => binop_i32!(stack, |a: i32, b: i32| a.wrapping_sub(b)),
             OP_I32_MUL => binop_i32!(stack, |a: i32, b: i32| a.wrapping_mul(b)),
-            OP_I32_DIV_S => {
-                let b = pop_i32(&mut stack);
-                let a = pop_i32(&mut stack);
-                if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-                if a == i32::MIN && b == -1 { return Err(ExecError::Trap("integer overflow".into())); }
-                push_i32!(stack, a.wrapping_div(b));
-            }
-            OP_I32_DIV_U => {
-                let b = pop_i32(&mut stack) as u32;
-                let a = pop_i32(&mut stack) as u32;
-                if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-                push_i32!(stack, (a / b) as i32);
-            }
-            OP_I32_REM_S => {
-                let b = pop_i32(&mut stack);
-                let a = pop_i32(&mut stack);
-                if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-                push_i32!(stack, if a == i32::MIN && b == -1 { 0 } else { a.wrapping_rem(b) });
-            }
-            OP_I32_REM_U => {
-                let b = pop_i32(&mut stack) as u32;
-                let a = pop_i32(&mut stack) as u32;
-                if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-                push_i32!(stack, (a % b) as i32);
-            }
+            OP_I32_DIV_S => div_s!(stack, pop_i32, push_i32, i32),
+            OP_I32_DIV_U => div_u!(stack, pop_i32, push_i32, u32, i32),
+            OP_I32_REM_S => rem_s!(stack, pop_i32, push_i32, i32),
+            OP_I32_REM_U => rem_u!(stack, pop_i32, push_i32, u32, i32),
             OP_I32_AND => binop_i32!(stack, |a: i32, b: i32| a & b),
             OP_I32_OR => binop_i32!(stack, |a: i32, b: i32| a | b),
             OP_I32_XOR => binop_i32!(stack, |a: i32, b: i32| a ^ b),
@@ -857,31 +892,10 @@ pub fn call(
             OP_I64_ADD => binop_i64!(stack, |a: i64, b: i64| a.wrapping_add(b)),
             OP_I64_SUB => binop_i64!(stack, |a: i64, b: i64| a.wrapping_sub(b)),
             OP_I64_MUL => binop_i64!(stack, |a: i64, b: i64| a.wrapping_mul(b)),
-            OP_I64_DIV_S => {
-                let b = pop_i64(&mut stack);
-                let a = pop_i64(&mut stack);
-                if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-                if a == i64::MIN && b == -1 { return Err(ExecError::Trap("integer overflow".into())); }
-                push_i64!(stack, a.wrapping_div(b));
-            }
-            OP_I64_DIV_U => {
-                let b = pop_i64(&mut stack) as u64;
-                let a = pop_i64(&mut stack) as u64;
-                if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-                push_i64!(stack, (a / b) as i64);
-            }
-            OP_I64_REM_S => {
-                let b = pop_i64(&mut stack);
-                let a = pop_i64(&mut stack);
-                if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-                push_i64!(stack, if a == i64::MIN && b == -1 { 0 } else { a.wrapping_rem(b) });
-            }
-            OP_I64_REM_U => {
-                let b = pop_i64(&mut stack) as u64;
-                let a = pop_i64(&mut stack) as u64;
-                if b == 0 { return Err(ExecError::Trap("integer divide by zero".into())); }
-                push_i64!(stack, (a % b) as i64);
-            }
+            OP_I64_DIV_S => div_s!(stack, pop_i64, push_i64, i64),
+            OP_I64_DIV_U => div_u!(stack, pop_i64, push_i64, u64, i64),
+            OP_I64_REM_S => rem_s!(stack, pop_i64, push_i64, i64),
+            OP_I64_REM_U => rem_u!(stack, pop_i64, push_i64, u64, i64),
             OP_I64_AND => binop_i64!(stack, |a: i64, b: i64| a & b),
             OP_I64_OR => binop_i64!(stack, |a: i64, b: i64| a | b),
             OP_I64_XOR => binop_i64!(stack, |a: i64, b: i64| a ^ b),
@@ -993,58 +1007,14 @@ pub fn call(
             OP_I64_TRUNC_F64_U => trunc_op_u!(stack, pop_f64, push_i64, u64, i64, 18446744073709551616.0_f64),
 
             // --- Saturating truncation ---
-            OP_I32_TRUNC_SAT_F32_S => {
-                let a = pop_f32(&mut stack);
-                push_i32!(stack, if a.is_nan() { 0i32 }
-                    else if a >= 2147483648.0_f32 { i32::MAX }
-                    else if a < -2147483648.0_f32 { i32::MIN }
-                    else { a as i32 });
-            }
-            OP_I32_TRUNC_SAT_F32_U => {
-                let a = pop_f32(&mut stack);
-                push_i32!(stack, if a.is_nan() || a <= -1.0 { 0u32 as i32 }
-                    else if a >= 4294967296.0_f32 { u32::MAX as i32 }
-                    else { a as u32 as i32 });
-            }
-            OP_I32_TRUNC_SAT_F64_S => {
-                let a = pop_f64(&mut stack);
-                push_i32!(stack, if a.is_nan() { 0i32 }
-                    else if a >= 2147483648.0_f64 { i32::MAX }
-                    else if a <= -2147483649.0_f64 { i32::MIN }
-                    else { a as i32 });
-            }
-            OP_I32_TRUNC_SAT_F64_U => {
-                let a = pop_f64(&mut stack);
-                push_i32!(stack, if a.is_nan() || a <= -1.0 { 0u32 as i32 }
-                    else if a >= 4294967296.0_f64 { u32::MAX as i32 }
-                    else { a as u32 as i32 });
-            }
-            OP_I64_TRUNC_SAT_F32_S => {
-                let a = pop_f32(&mut stack);
-                push_i64!(stack, if a.is_nan() { 0i64 }
-                    else if a >= 9223372036854775808.0_f32 { i64::MAX }
-                    else if a < -9223372036854775808.0_f32 { i64::MIN }
-                    else { a as i64 });
-            }
-            OP_I64_TRUNC_SAT_F32_U => {
-                let a = pop_f32(&mut stack);
-                push_i64!(stack, if a.is_nan() || a <= -1.0 { 0u64 as i64 }
-                    else if a >= 18446744073709551616.0_f32 { u64::MAX as i64 }
-                    else { a as u64 as i64 });
-            }
-            OP_I64_TRUNC_SAT_F64_S => {
-                let a = pop_f64(&mut stack);
-                push_i64!(stack, if a.is_nan() { 0i64 }
-                    else if a >= 9223372036854775808.0_f64 { i64::MAX }
-                    else if a < -9223372036854775808.0_f64 { i64::MIN }
-                    else { a as i64 });
-            }
-            OP_I64_TRUNC_SAT_F64_U => {
-                let a = pop_f64(&mut stack);
-                push_i64!(stack, if a.is_nan() || a <= -1.0 { 0u64 as i64 }
-                    else if a >= 18446744073709551616.0_f64 { u64::MAX as i64 }
-                    else { a as u64 as i64 });
-            }
+            OP_I32_TRUNC_SAT_F32_S => trunc_sat_s!(stack, pop_f32, push_i32, i32, 2147483648.0_f32, -2147483648.0_f32),
+            OP_I32_TRUNC_SAT_F32_U => trunc_sat_u!(stack, pop_f32, push_i32, u32, i32, 4294967296.0_f32),
+            OP_I32_TRUNC_SAT_F64_S => trunc_sat_s!(stack, pop_f64, push_i32, i32, 2147483648.0_f64, -2147483648.0_f64),
+            OP_I32_TRUNC_SAT_F64_U => trunc_sat_u!(stack, pop_f64, push_i32, u32, i32, 4294967296.0_f64),
+            OP_I64_TRUNC_SAT_F32_S => trunc_sat_s!(stack, pop_f32, push_i64, i64, 9223372036854775808.0_f32, -9223372036854775808.0_f32),
+            OP_I64_TRUNC_SAT_F32_U => trunc_sat_u!(stack, pop_f32, push_i64, u64, i64, 18446744073709551616.0_f32),
+            OP_I64_TRUNC_SAT_F64_S => trunc_sat_s!(stack, pop_f64, push_i64, i64, 9223372036854775808.0_f64, -9223372036854775808.0_f64),
+            OP_I64_TRUNC_SAT_F64_U => trunc_sat_u!(stack, pop_f64, push_i64, u64, i64, 18446744073709551616.0_f64),
 
             OP_F32_CONVERT_I32_S => { let a = pop_i32(&mut stack); push_f32!(stack, a as f32); }
             OP_F32_CONVERT_I32_U => { let a = pop_i32(&mut stack); push_f32!(stack, (a as u32) as f32); }

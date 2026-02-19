@@ -275,6 +275,19 @@ pub(crate) enum ComponentExternalKind {
     Type,
 }
 
+impl From<wasmparser::ComponentExternalKind> for ComponentExternalKind {
+    fn from(kind: wasmparser::ComponentExternalKind) -> Self {
+        match kind {
+            wasmparser::ComponentExternalKind::Func => Self::Func,
+            wasmparser::ComponentExternalKind::Module => Self::Module,
+            wasmparser::ComponentExternalKind::Component => Self::Component,
+            wasmparser::ComponentExternalKind::Instance => Self::Instance,
+            wasmparser::ComponentExternalKind::Value => Self::Value,
+            wasmparser::ComponentExternalKind::Type => Self::Type,
+        }
+    }
+}
+
 /// A parsed component function type (params + result).
 #[derive(Clone)]
 pub(crate) struct ComponentFuncTypeDef {

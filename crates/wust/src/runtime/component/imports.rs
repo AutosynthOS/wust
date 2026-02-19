@@ -199,6 +199,52 @@ fn provide_default_import(
     }
 }
 
+/// Resolve through synthetic instance chains to find the real instantiated
+/// store and resource index for a given core export kind.
+///
+/// Both globals and tables use the same pattern: for `Instantiated`
+/// instances, the store is directly available; for `Synthetic` instances,
+/// we follow the `CoreExport` chain until we reach a real instance.
+///
+/// `match_export` extracts the `(instance, index)` from a `CoreExport`
+/// if it matches the desired kind (e.g. `Global` or `Table`).
+fn resolve_core_resource<T>(
+    inst: &ComponentInstance,
+    instance_idx: usize,
+    resource_idx: u32,
+    kind_name: &str,
+    match_export: fn(&CoreExport, u32) -> Option<(usize, u32)>,
+    read_from_store: fn(&Store, u32) -> Option<T>,
+) -> Result<T, String> {
+    match inst.core_instances.get(instance_idx) {
+        Some(CoreInstance::Instantiated { store, .. }) => {
+            let store = store.borrow();
+            read_from_store(&store, resource_idx)
+                .ok_or_else(|| format!("{} {} out of bounds", kind_name, resource_idx))
+        }
+        Some(CoreInstance::Synthetic { exports }) => {
+            let real = exports
+                .values()
+                .find_map(|e| match_export(e, resource_idx));
+            match real {
+                Some((real_instance, real_index)) => resolve_core_resource(
+                    inst,
+                    real_instance,
+                    real_index,
+                    kind_name,
+                    match_export,
+                    read_from_store,
+                ),
+                None => Err(format!(
+                    "{} {} not found in synthetic instance {}",
+                    kind_name, resource_idx, instance_idx,
+                )),
+            }
+        }
+        None => Err(format!("instance {} out of bounds", instance_idx)),
+    }
+}
+
 /// Read a global value from a core instance.
 ///
 /// For synthetic instances, follows the `CoreExport::Global` reference
@@ -208,40 +254,17 @@ fn get_global_value(
     instance_idx: usize,
     global_idx: u32,
 ) -> Result<Value, String> {
-    match inst.core_instances.get(instance_idx) {
-        Some(CoreInstance::Instantiated { store, .. }) => {
-            let store = store.borrow();
-            store
-                .globals
-                .get(global_idx as usize)
-                .copied()
-                .ok_or_else(|| format!("global {} out of bounds", global_idx))
-        }
-        Some(CoreInstance::Synthetic { exports }) => {
-            // The global_idx here is from the synthetic export resolution.
-            // We need to find the export that corresponds to this global.
-            // The caller looked up the export by name, got kind=Global + index.
-            // For synthetic instances, we need to follow the CoreExport chain
-            // to the real instance.
-            //
-            // Since resolve_single_import calls resolve_export which returns
-            // (ExportKind::Global, index), and the index comes from the
-            // CoreExport, we need to search by index.
-            let real_export = exports
-                .values()
-                .find(|e| matches!(e, CoreExport::Global { index, .. } if *index == global_idx));
-            match real_export {
-                Some(CoreExport::Global { instance, index }) => {
-                    get_global_value(inst, *instance, *index)
-                }
-                _ => Err(format!(
-                    "global {} not found in synthetic instance {}",
-                    global_idx, instance_idx,
-                )),
-            }
-        }
-        None => Err(format!("instance {} out of bounds", instance_idx)),
-    }
+    resolve_core_resource(
+        inst,
+        instance_idx,
+        global_idx,
+        "global",
+        |export, idx| match export {
+            CoreExport::Global { instance, index } if *index == idx => Some((*instance, *index)),
+            _ => None,
+        },
+        |store, idx| store.globals.get(idx as usize).copied(),
+    )
 }
 
 /// Get a shared table reference from a core instance.
@@ -254,29 +277,15 @@ fn get_shared_table(
     instance_idx: usize,
     table_idx: u32,
 ) -> Result<SharedTable, String> {
-    match inst.core_instances.get(instance_idx) {
-        Some(CoreInstance::Instantiated { store, .. }) => {
-            let store = store.borrow();
-            store
-                .tables
-                .get(table_idx as usize)
-                .cloned()
-                .ok_or_else(|| format!("table {} out of bounds", table_idx))
-        }
-        Some(CoreInstance::Synthetic { exports }) => {
-            let real_export = exports
-                .values()
-                .find(|e| matches!(e, CoreExport::Table { index, .. } if *index == table_idx));
-            match real_export {
-                Some(CoreExport::Table { instance, index }) => {
-                    get_shared_table(inst, *instance, *index)
-                }
-                _ => Err(format!(
-                    "table {} not found in synthetic instance {}",
-                    table_idx, instance_idx,
-                )),
-            }
-        }
-        None => Err(format!("instance {} out of bounds", instance_idx)),
-    }
+    resolve_core_resource(
+        inst,
+        instance_idx,
+        table_idx,
+        "table",
+        |export, idx| match export {
+            CoreExport::Table { instance, index } if *index == idx => Some((*instance, *index)),
+            _ => None,
+        },
+        |store, idx| store.tables.get(idx as usize).cloned(),
+    )
 }
