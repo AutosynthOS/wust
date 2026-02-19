@@ -15,7 +15,7 @@ use crate::runtime::store::SharedStore;
 use crate::runtime::value::Value;
 
 use super::imports;
-use super::types::*;
+use crate::parse::types::*;
 
 // ---------------------------------------------------------------------------
 // Live core instance state
@@ -67,7 +67,7 @@ pub(crate) enum CoreExport {
         export_name: String,
         /// String encoding from the `canon lower` that created this lowered
         /// func. Used by the fused adapter to validate string pointer alignment.
-        string_encoding: super::types::StringEncoding,
+        string_encoding: crate::parse::types::StringEncoding,
     },
     /// A lowered-then-lifted core func (`canon lower` of `canon lift`).
     /// Resolves to a real core func but must trap during instantiation
@@ -583,7 +583,7 @@ fn instantiate_child_components(
     resolved: &Rc<ResolvedComponent>,
     ancestors: &[&ParsedComponent],
 ) -> Result<(), String> {
-    use super::ParsedComponent;
+    use crate::parse::types::ParsedComponent;
 
     let mut inner_ancestors: Vec<&ParsedComponent> = Vec::with_capacity(ancestors.len() + 1);
     inner_ancestors.push(component);

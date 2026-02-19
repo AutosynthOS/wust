@@ -2,7 +2,7 @@
 //!
 //! Extracts component sections from raw bytes into our parsed types.
 
-use crate::runtime::component::types::*;
+use super::types::*;
 
 // ---------------------------------------------------------------------------
 // Section parsing
@@ -166,9 +166,7 @@ fn register_outer_alias(
             component.inner_components.push(Vec::new());
             (OuterAliasKind::Component, idx)
         }
-        wasmparser::ComponentOuterAliasKind::CoreType => {
-            (OuterAliasKind::CoreType, 0)
-        }
+        wasmparser::ComponentOuterAliasKind::CoreType => (OuterAliasKind::CoreType, 0),
         wasmparser::ComponentOuterAliasKind::Type => {
             let idx = component.component_types.len() as u32;
             component.component_types.push(None);
@@ -199,24 +197,28 @@ fn register_core_instance_export(
             });
         }
         wasmparser::ExternalKind::Global => {
-            component
-                .core_globals
-                .push(CoreAliasDef { instance_index, name });
+            component.core_globals.push(CoreAliasDef {
+                instance_index,
+                name,
+            });
         }
         wasmparser::ExternalKind::Memory => {
-            component
-                .core_memories
-                .push(CoreAliasDef { instance_index, name });
+            component.core_memories.push(CoreAliasDef {
+                instance_index,
+                name,
+            });
         }
         wasmparser::ExternalKind::Table => {
-            component
-                .core_tables
-                .push(CoreAliasDef { instance_index, name });
+            component.core_tables.push(CoreAliasDef {
+                instance_index,
+                name,
+            });
         }
         wasmparser::ExternalKind::Tag => {
-            component
-                .core_tags
-                .push(CoreAliasDef { instance_index, name });
+            component.core_tags.push(CoreAliasDef {
+                instance_index,
+                name,
+            });
         }
         // Type aliases are handled separately by wasmparser
         _ => {}
@@ -300,10 +302,12 @@ fn parse_component_import_section(
             }
             wasmparser::ComponentTypeRef::Func(_) => {
                 // Func imports occupy a slot in the component func index space.
-                component.component_funcs.push(ComponentFuncDef::AliasInstanceExport {
-                    instance_index: u32::MAX,
-                    name: import.name.0.to_string(),
-                });
+                component
+                    .component_funcs
+                    .push(ComponentFuncDef::AliasInstanceExport {
+                        instance_index: u32::MAX,
+                        name: import.name.0.to_string(),
+                    });
                 ComponentImportKind::Func
             }
             wasmparser::ComponentTypeRef::Module(_) => {
@@ -416,7 +420,10 @@ fn parse_canonical_section(
             } => {
                 parse_canon_lift(component, core_func_index, type_index, &options);
             }
-            wasmparser::CanonicalFunction::Lower { func_index, options } => {
+            wasmparser::CanonicalFunction::Lower {
+                func_index,
+                options,
+            } => {
                 let string_encoding = parse_string_encoding(&options);
                 let memory_index = options.iter().find_map(|opt| match opt {
                     wasmparser::CanonicalOption::Memory(idx) => Some(*idx),
@@ -429,14 +436,20 @@ fn parse_canonical_section(
                 });
             }
             wasmparser::CanonicalFunction::ResourceNew { resource } => {
-                component.core_funcs.push(CoreFuncDef::ResourceNew { resource });
+                component
+                    .core_funcs
+                    .push(CoreFuncDef::ResourceNew { resource });
             }
             wasmparser::CanonicalFunction::ResourceRep { resource } => {
-                component.core_funcs.push(CoreFuncDef::ResourceRep { resource });
+                component
+                    .core_funcs
+                    .push(CoreFuncDef::ResourceRep { resource });
             }
             wasmparser::CanonicalFunction::ResourceDrop { resource }
             | wasmparser::CanonicalFunction::ResourceDropAsync { resource } => {
-                component.core_funcs.push(CoreFuncDef::ResourceDrop { resource });
+                component
+                    .core_funcs
+                    .push(CoreFuncDef::ResourceDrop { resource });
             }
             // All other canonical builtins (async, threads, etc.) are
             // placeholders — they occupy a core func index slot but we
@@ -566,9 +579,11 @@ fn parse_type_section(
         let type_index = component.component_types.len() as u32;
         match ty {
             wasmparser::ComponentType::Func(func_ty) => {
-                let params: Vec<ComponentResultType> = func_ty.params.iter().map(|(_name, ty)| {
-                    convert_val_type(component, ty)
-                }).collect();
+                let params: Vec<ComponentResultType> = func_ty
+                    .params
+                    .iter()
+                    .map(|(_name, ty)| convert_val_type(component, ty))
+                    .collect();
                 let result = match func_ty.result {
                     None => ComponentResultType::Unit,
                     Some(ref ty) => convert_val_type(component, ty),
@@ -602,15 +617,11 @@ fn parse_type_section(
 /// Extract export names from an instance type declaration.
 ///
 /// Scans the declarations for `Export` entries and collects their names.
-fn extract_instance_type_exports(
-    decls: &[wasmparser::InstanceTypeDeclaration],
-) -> Vec<String> {
+fn extract_instance_type_exports(decls: &[wasmparser::InstanceTypeDeclaration]) -> Vec<String> {
     decls
         .iter()
         .filter_map(|d| match d {
-            wasmparser::InstanceTypeDeclaration::Export { name, .. } => {
-                Some(name.0.to_string())
-            }
+            wasmparser::InstanceTypeDeclaration::Export { name, .. } => Some(name.0.to_string()),
             _ => None,
         })
         .collect()
@@ -649,30 +660,29 @@ fn record_defined_type(
         wasmparser::ComponentDefinedType::Variant(cases) => {
             component.defined_val_types.insert(
                 type_index,
-                ComponentResultType::Variant { case_count: cases.len() as u32 },
+                ComponentResultType::Variant {
+                    case_count: cases.len() as u32,
+                },
             );
         }
         wasmparser::ComponentDefinedType::Tuple(fields) => {
             let alignment = compute_tuple_alignment(component, fields);
-            component.defined_val_types.insert(
-                type_index,
-                ComponentResultType::Compound { alignment },
-            );
+            component
+                .defined_val_types
+                .insert(type_index, ComponentResultType::Compound { alignment });
         }
         wasmparser::ComponentDefinedType::Record(fields) => {
             let field_types: Vec<wasmparser::ComponentValType> =
                 fields.iter().map(|(_, ty)| *ty).collect();
             let alignment = compute_tuple_alignment(component, &field_types);
-            component.defined_val_types.insert(
-                type_index,
-                ComponentResultType::Compound { alignment },
-            );
+            component
+                .defined_val_types
+                .insert(type_index, ComponentResultType::Compound { alignment });
         }
         wasmparser::ComponentDefinedType::List(_) => {
-            component.defined_val_types.insert(
-                type_index,
-                ComponentResultType::Compound { alignment: 4 },
-            );
+            component
+                .defined_val_types
+                .insert(type_index, ComponentResultType::Compound { alignment: 4 });
         }
         _ => {}
     }
@@ -709,8 +719,7 @@ fn primitive_alignment(p: wasmparser::PrimitiveValType) -> u32 {
         wasmparser::PrimitiveValType::Bool
         | wasmparser::PrimitiveValType::S8
         | wasmparser::PrimitiveValType::U8 => 1,
-        wasmparser::PrimitiveValType::S16
-        | wasmparser::PrimitiveValType::U16 => 2,
+        wasmparser::PrimitiveValType::S16 | wasmparser::PrimitiveValType::U16 => 2,
         wasmparser::PrimitiveValType::S32
         | wasmparser::PrimitiveValType::U32
         | wasmparser::PrimitiveValType::F32
@@ -731,13 +740,11 @@ fn convert_val_type(
 ) -> ComponentResultType {
     match ty {
         wasmparser::ComponentValType::Primitive(p) => convert_primitive_type(*p),
-        wasmparser::ComponentValType::Type(idx) => {
-            component
-                .defined_val_types
-                .get(&(*idx as u32))
-                .copied()
-                .unwrap_or(ComponentResultType::Unknown)
-        }
+        wasmparser::ComponentValType::Type(idx) => component
+            .defined_val_types
+            .get(&(*idx as u32))
+            .copied()
+            .unwrap_or(ComponentResultType::Unknown),
     }
 }
 

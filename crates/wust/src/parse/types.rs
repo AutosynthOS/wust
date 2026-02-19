@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use crate::runtime::value::Value;
+use crate::runtime::Value;
 
 // ---------------------------------------------------------------------------
 // Core instance definitions

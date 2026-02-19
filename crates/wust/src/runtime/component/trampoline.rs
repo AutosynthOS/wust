@@ -12,7 +12,7 @@ use crate::runtime::store::{HostFunc, SharedStore};
 use crate::runtime::value::Value;
 
 use super::instance::{ComponentInstance, CoreExport, CoreInstance, ResolvedExport, ResourceEntry};
-use super::types::*;
+use crate::parse::types::*;
 
 /// Create a host function trampoline that returns `result_count` zero values.
 ///
@@ -337,7 +337,7 @@ fn make_child_instance_trampoline(
     child_index: usize,
     export_name: String,
     result_count: usize,
-    caller_string_encoding: super::types::StringEncoding,
+    caller_string_encoding: crate::parse::types::StringEncoding,
 ) -> HostFunc {
     // Resolve the child's export to find the actual core instance and func.
     let Some(child) = inst.child_instances.get(child_index) else {

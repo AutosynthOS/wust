@@ -10,7 +10,7 @@ use std::rc::Rc;
 use super::instance::{
     find_func_import_slot, shift_component_instance_indices, ComponentInstance,
 };
-use super::types::{ParsedComponent, ComponentFuncDef, ComponentImportKind};
+use crate::parse::types::{ParsedComponent, ComponentFuncDef, ComponentImportKind};
 
 /// Entry in the linker registry.
 struct LinkerEntry {

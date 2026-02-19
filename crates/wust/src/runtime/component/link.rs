@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use super::instance::{
     make_core_export, CoreExport, CoreInstance, ResolvedExport, ResolvedFunc,
 };
-use super::types::*;
+use crate::parse::types::*;
 use crate::runtime::module::ExportKind;
 
 // ---------------------------------------------------------------------------

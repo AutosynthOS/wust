@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::rc::Rc;
 
-use super::types::*;
+use crate::parse::types::*;
 
 /// Resolve all static aliases in a component and parse inner components.
 ///

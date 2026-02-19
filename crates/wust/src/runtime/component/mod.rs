@@ -1,16 +1,13 @@
 //! Component model runtime.
 //!
-//! Implements parsing, validation, instantiation, and invocation of
+//! Implements validation, instantiation, and invocation of
 //! WebAssembly components.
 //!
-//! - [`types`] — parsed component definitions (immutable "code" side)
 //! - [`validate`] — wasmparser validation and wasmtime-specific restriction checks
-//! - [`parse`] — binary section parsing
 //! - [`resolve`] — resolve phase: apply static aliases, recursively parse inner components
 //! - [`link`] — alias and export resolution (core func → core instance export)
 //! - [`instance`] — live state, instantiation, and export resolution
 
-pub(crate) mod types;
 mod validate;
 mod link;
 mod resolve;
@@ -19,8 +16,8 @@ mod linker;
 mod trampoline;
 mod imports;
 
-pub use types::{ParsedComponent, ComponentArg, ComponentImportDef, ComponentImportKind, ComponentResultType, ComponentValue};
-pub(crate) use types::StringEncoding;
+pub use crate::parse::types::{ParsedComponent, ComponentArg, ComponentImportDef, ComponentImportKind, ComponentResultType, ComponentValue};
+pub(crate) use crate::parse::types::StringEncoding;
 pub use instance::ComponentInstance;
 pub(crate) use instance::CoreInstance;
 pub use linker::Linker;
@@ -36,7 +33,7 @@ impl ParsedComponent {
         &self.imports
     }
 
-    /// Parse a component binary into a `Component`.
+    /// Parse a component binary into a `ParsedComponent`.
     ///
     /// Validates the binary with component features enabled, then extracts
     /// the sections needed for instantiation and invocation.
@@ -58,7 +55,7 @@ impl ParsedComponent {
         Self::parse_sections(bytes)
     }
 
-    /// Extract sections from a component binary into a `Component`.
+    /// Extract sections from a component binary into a `ParsedComponent`.
     fn parse_sections(bytes: &[u8]) -> Result<Self, String> {
         let mut component = ParsedComponent {
             core_modules: Vec::new(),

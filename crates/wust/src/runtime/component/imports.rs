@@ -14,7 +14,7 @@ use crate::runtime::value::Value;
 
 use super::instance::{ComponentInstance, CoreExport, CoreInstance};
 use super::trampoline::{make_cross_instance_trampoline, make_resource_trampoline, make_trampoline};
-use super::types::*;
+use crate::parse::types::*;
 
 /// Instantiate a core module, wiring up imports from the arg instances.
 ///
