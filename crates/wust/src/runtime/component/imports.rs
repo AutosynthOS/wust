@@ -7,7 +7,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::runtime::exec;
+use crate::runtime::code::program;
 use crate::runtime::module::{ExportKind, ImportKind, Module};
 use crate::runtime::store::{HostFunc, SharedTable, Store};
 use crate::runtime::value::Value;
@@ -42,7 +42,7 @@ pub(super) fn instantiate_core_module(
 
     if let Some(start_idx) = module.start {
         let mut s = store.borrow_mut();
-        exec::call(&module, &mut s, start_idx, &[])
+        program::call(&module, &mut s, start_idx, &[])
             .map_err(|e| format!("start function trap: {e}"))?;
     }
 

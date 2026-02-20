@@ -29,10 +29,10 @@ fn main() {
     let mut store = Store::new(&module).expect("failed to instantiate module");
 
     // Warmup
-    let _ = wust::runtime::exec::call(&module, &mut store, 0, &[Value::I32(10)]);
+    let _ = wust::runtime::code::program::call(&module, &mut store, 0, &[Value::I32(10)]);
 
     let t0 = Instant::now();
-    let result = wust::runtime::exec::call(&module, &mut store, 0, &[Value::I32(n)]);
+    let result = wust::runtime::code::program::call(&module, &mut store, 0, &[Value::I32(n)]);
     let wust_time = t0.elapsed();
     let wust_result = result.expect("wust fib failed")[0].unwrap_i32();
 

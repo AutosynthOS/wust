@@ -640,6 +640,14 @@ fn register_export_index_space(
         ComponentExternalKind::Type => {
             component.component_type_count += 1;
         }
+        ComponentExternalKind::Func => {
+            // Exporting a func creates a new entry in the component func
+            // index space that aliases the original func.
+            if let Some(original) = component.component_funcs.get(index as usize) {
+                let cloned = original.clone();
+                component.component_funcs.push(cloned);
+            }
+        }
         _ => {}
     }
 }

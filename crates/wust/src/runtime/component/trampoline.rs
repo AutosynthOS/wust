@@ -7,7 +7,7 @@
 use std::rc::Rc;
 
 use crate::runtime::canonical_abi;
-use crate::runtime::exec;
+use crate::runtime::code::program;
 use crate::runtime::store::{HostFunc, SharedStore};
 use crate::runtime::value::Value;
 
@@ -90,7 +90,7 @@ pub(super) fn make_resource_trampoline(
 /// Create a host function that calls into a source core instance.
 ///
 /// Captures the source instance's `Rc<Module>` and `SharedStore`, then
-/// on each invocation borrows the store mutably and calls `exec::call`.
+/// on each invocation borrows the store mutably and calls `program::call`.
 /// If the source is a synthetic instance, follows the `CoreExport::Func`
 /// chain to the real instance.
 pub(super) fn make_cross_instance_trampoline(
@@ -109,7 +109,7 @@ pub(super) fn make_cross_instance_trampoline(
                 let Ok(mut s) = store.try_borrow_mut() else {
                     return Ok(vec![Value::I32(0); result_count]);
                 };
-                match exec::call(&module, &mut s, func_index, args) {
+                match program::call(&module, &mut s, func_index, args) {
                     Ok(values) => Ok(values),
                     Err(_) => Ok(vec![Value::I32(0); result_count]),
                 }
@@ -212,7 +212,7 @@ fn make_lowered_core_trampoline(
                 let Ok(mut s) = store.try_borrow_mut() else {
                     return Ok(vec![Value::I32(0); result_count]);
                 };
-                match exec::call(&module, &mut s, func_index, args) {
+                match program::call(&module, &mut s, func_index, args) {
                     Ok(values) => Ok(values),
                     Err(_) => Ok(vec![Value::I32(0); result_count]),
                 }
@@ -290,7 +290,7 @@ fn fused_memory_transfer(
     let callee_args = vec![Value::I32(callee_argptr as i32)];
     let call_results = {
         let mut s = store.borrow_mut();
-        exec::call(module, &mut s, func_idx, &callee_args).map_err(|e| format!("trap: {e}"))?
+        program::call(module, &mut s, func_idx, &callee_args).map_err(|e| format!("trap: {e}"))?
     };
 
     // Step 5: If compound result, read results from callee memory.
@@ -410,7 +410,7 @@ fn make_child_instance_trampoline(
                             let Ok(mut s) = store.try_borrow_mut() else {
                                 return Ok(vec![Value::I32(0); result_count]);
                             };
-                            match exec::call(&module, &mut s, func_idx, &normalized) {
+                            match program::call(&module, &mut s, func_idx, &normalized) {
                                 Ok(values) => {
                                     canonical_abi::validate_fused_results(&values, result_type)?;
                                     canonical_abi::normalize_result(&values, result_type)

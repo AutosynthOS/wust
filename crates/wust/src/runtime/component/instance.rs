@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::runtime::canonical_abi;
-use crate::runtime::exec;
+use crate::runtime::code::program;
 use crate::runtime::module::{ExportKind, Module};
 use crate::runtime::store::SharedStore;
 use crate::runtime::value::Value;
@@ -231,7 +231,14 @@ impl ComponentInstance {
         features: wasmparser::WasmFeatures,
     ) -> Result<Self, String> {
         let component = component.clone();
-        Self::instantiate_inner(component, Vec::new(), Rc::new(RefCell::new(vec![None])), types, features, 0)
+        Self::instantiate_inner(
+            component,
+            Vec::new(),
+            Rc::new(RefCell::new(vec![None])),
+            types,
+            features,
+            0,
+        )
     }
 
     /// Instantiate with positional imports (used by the Linker).
@@ -242,7 +249,14 @@ impl ComponentInstance {
         features: wasmparser::WasmFeatures,
     ) -> Result<Self, String> {
         let component = component.clone();
-        Self::instantiate_inner(component, import_instances, Rc::new(RefCell::new(vec![None])), types, features, 0)
+        Self::instantiate_inner(
+            component,
+            import_instances,
+            Rc::new(RefCell::new(vec![None])),
+            types,
+            features,
+            0,
+        )
     }
 
     /// Inner instantiation with a shared resource table from the parent.
@@ -291,7 +305,8 @@ impl ComponentInstance {
             }
         }
 
-        inst.exports = super::link::resolve_component_exports(&inst.core_instances, &component, types)?;
+        inst.exports =
+            super::link::resolve_component_exports(&inst.core_instances, &component, types)?;
         instantiating.set(false);
         Ok(inst)
     }
@@ -309,6 +324,29 @@ impl ComponentInstance {
     /// Check whether this instance has an export with the given name.
     pub fn has_export(&self, name: &str) -> bool {
         self.exports.contains_key(name)
+    }
+
+    /// Write bytes into a core instance's linear memory at the given offset.
+    ///
+    /// Finds the first `Instantiated` core instance and writes `data`
+    /// into its store's memory starting at `offset`.
+    pub fn write_memory(&mut self, offset: usize, data: &[u8]) -> Result<(), String> {
+        for inst in &self.core_instances {
+            if let CoreInstance::Instantiated { store, .. } = inst {
+                let mut store = store.borrow_mut();
+                let end = offset.checked_add(data.len())
+                    .ok_or("memory write overflow")?;
+                if end > store.memory.len() {
+                    return Err(format!(
+                        "memory write out of bounds: offset={offset} len={} memory_size={}",
+                        data.len(), store.memory.len()
+                    ));
+                }
+                store.memory[offset..end].copy_from_slice(data);
+                return Ok(());
+            }
+        }
+        Err("no instantiated core instance with memory".into())
     }
 
     /// Create a minimal view with only core instances and exports.
@@ -382,7 +420,7 @@ impl ComponentInstance {
                 let values = match instance {
                     CoreInstance::Instantiated { module, store } => {
                         let mut store = store.borrow_mut();
-                        exec::call(module, &mut store, func_idx, &core_args)
+                        program::call(module, &mut store, func_idx, &core_args)
                             .map_err(|e| format!("trap: {e}"))?
                     }
                     CoreInstance::Synthetic { .. } => {
@@ -404,7 +442,6 @@ impl ComponentInstance {
 // Import helpers
 // ---------------------------------------------------------------------------
 
-
 // ---------------------------------------------------------------------------
 // Child component instantiation
 // ---------------------------------------------------------------------------
@@ -422,11 +459,8 @@ fn instantiate_child_components(
                 component_index,
                 args,
             } => {
-                let (mut inner_component, child_types) = resolve_inner_component(
-                    component,
-                    *component_index,
-                    features,
-                )?;
+                let (mut inner_component, child_types) =
+                    resolve_inner_component(component, *component_index, features)?;
 
                 let child = instantiate_child(
                     inst,
@@ -439,8 +473,7 @@ fn instantiate_child_components(
                 )?;
                 inst.child_instances.push(child);
             }
-            ComponentInstanceDef::AliasInstanceExport
-            | ComponentInstanceDef::Reexport => {
+            ComponentInstanceDef::AliasInstanceExport | ComponentInstanceDef::Reexport => {
                 inst.child_instances.push(ComponentInstance::default());
             }
             ComponentInstanceDef::FromExports(_exports) => {
