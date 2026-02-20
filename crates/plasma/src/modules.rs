@@ -4,6 +4,7 @@
 /// Evaluates polyfill JS strings in dependency order so that globals like
 /// `EventEmitter`, `Buffer`, and `process` are available before the
 /// `require()` registry references them.
+use alloc::format;
 use boa_engine::{Context, Source};
 
 use crate::polyfills;
@@ -19,19 +20,26 @@ const POLYFILL_SOURCES: &[fn() -> &'static str] = &[
     polyfills::text_codec,
     polyfills::buffer,
     polyfills::url,
+    polyfills::legacy,
     polyfills::require,
 ];
 
-/// Initialize the boa context with all Node.js polyfills and require().
-///
-/// Evaluates each polyfill JS string in order. If any polyfill fails
-/// to evaluate, logs the error via `host_log` and continues — this
-/// allows partial initialization for debugging.
+/// Names for logging which polyfill is being evaluated.
+const POLYFILL_NAMES: &[&str] = &[
+    "process", "event_emitter", "timers", "text_codec", "buffer", "url", "legacy", "require",
+];
+
 pub fn register_modules(context: &mut Context) {
-    for source_fn in POLYFILL_SOURCES {
+    for (i, source_fn) in POLYFILL_SOURCES.iter().enumerate() {
+        let name = POLYFILL_NAMES.get(i).unwrap_or(&"unknown");
+        crate::log_str(&alloc::format!("[polyfill] loading: {name}"));
         let js = source_fn();
-        if let Err(e) = context.eval(Source::from_bytes(js)) {
-            crate::log_error(&e);
+        match context.eval(Source::from_bytes(js)) {
+            Ok(_) => crate::log_str(&alloc::format!("[polyfill] ok: {name}")),
+            Err(e) => {
+                crate::log_str(&alloc::format!("[polyfill] FAILED: {name}"));
+                crate::log_error(&e);
+            }
         }
     }
 }

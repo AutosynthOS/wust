@@ -114,15 +114,27 @@ pub fn event_emitter() -> &'static str {
 }
 
 /// Defines timer globals: setTimeout, setInterval, clearTimeout, etc.
+///
+/// Returns timer handle objects with `.ref()`, `.unref()`, and
+/// `.hasRef()` methods to match Node.js timer behavior.
 pub fn timers() -> &'static str {
     r#"
 (function() {
     var _nextId = 1;
-    globalThis.setTimeout = function(fn, delay) { return _nextId++; };
+    function TimerHandle(id) {
+        this._id = id;
+        this._ref = true;
+    }
+    TimerHandle.prototype.ref = function() { this._ref = true; return this; };
+    TimerHandle.prototype.unref = function() { this._ref = false; return this; };
+    TimerHandle.prototype.hasRef = function() { return this._ref; };
+    TimerHandle.prototype[Symbol.toPrimitive] = function() { return this._id; };
+
+    globalThis.setTimeout = function(fn, delay) { return new TimerHandle(_nextId++); };
     globalThis.clearTimeout = function(id) {};
-    globalThis.setInterval = function(fn, delay) { return _nextId++; };
+    globalThis.setInterval = function(fn, delay) { return new TimerHandle(_nextId++); };
     globalThis.clearInterval = function(id) {};
-    globalThis.setImmediate = function(fn) { return _nextId++; };
+    globalThis.setImmediate = function(fn) { return new TimerHandle(_nextId++); };
     globalThis.clearImmediate = function(id) {};
     globalThis.queueMicrotask = function(fn) {};
 })();
@@ -302,6 +314,89 @@ pub fn url() -> &'static str {
     URL.prototype.toString = function() { return this.href; };
 
     globalThis.URL = URL;
+})();
+"#
+}
+
+/// Defines legacy `escape()` and `unescape()` globals.
+///
+/// These are deprecated but still used by some libraries (e.g. discord.js
+/// depends on code that calls `escape()`). Boa doesn't provide them by
+/// default.
+pub fn legacy() -> &'static str {
+    r#"
+(function() {
+    if (typeof globalThis.FinalizationRegistry === "undefined") {
+        globalThis.FinalizationRegistry = function FinalizationRegistry(callback) {
+            // No-op: weak ref cleanup callbacks can't fire in a single-run wasm env
+        };
+        globalThis.FinalizationRegistry.prototype.register = function() {};
+        globalThis.FinalizationRegistry.prototype.unregister = function() {};
+    }
+    if (typeof globalThis.AbortController === "undefined") {
+        function AbortSignal() {
+            this.aborted = false;
+            this.reason = undefined;
+            this._listeners = [];
+        }
+        AbortSignal.prototype.addEventListener = function(type, fn) {
+            if (type === "abort") this._listeners.push(fn);
+        };
+        AbortSignal.prototype.removeEventListener = function(type, fn) {
+            if (type === "abort") {
+                this._listeners = this._listeners.filter(function(l) { return l !== fn; });
+            }
+        };
+        AbortSignal.prototype.throwIfAborted = function() {
+            if (this.aborted) throw this.reason;
+        };
+        AbortSignal.abort = function(reason) {
+            var s = new AbortSignal();
+            s.aborted = true;
+            s.reason = reason !== undefined ? reason : new Error("This operation was aborted");
+            return s;
+        };
+        AbortSignal.timeout = function(ms) { return new AbortSignal(); };
+        AbortSignal.any = function(signals) { return new AbortSignal(); };
+
+        function AbortController() {
+            this.signal = new AbortSignal();
+        }
+        AbortController.prototype.abort = function(reason) {
+            if (this.signal.aborted) return;
+            this.signal.aborted = true;
+            this.signal.reason = reason !== undefined ? reason : new Error("This operation was aborted");
+            var listeners = this.signal._listeners.slice();
+            for (var i = 0; i < listeners.length; i++) {
+                listeners[i]({ type: "abort", target: this.signal });
+            }
+        };
+
+        globalThis.AbortController = AbortController;
+        globalThis.AbortSignal = AbortSignal;
+    }
+    if (typeof globalThis.escape === "undefined") {
+        globalThis.escape = function(str) {
+            return String(str).replace(/[^A-Za-z0-9@*_+\-./]/g, function(ch) {
+                var code = ch.charCodeAt(0);
+                if (code < 256) {
+                    return "%" + ("00" + code.toString(16).toUpperCase()).slice(-2);
+                }
+                return "%u" + ("0000" + code.toString(16).toUpperCase()).slice(-4);
+            });
+        };
+    }
+    if (typeof globalThis.unescape === "undefined") {
+        globalThis.unescape = function(str) {
+            return String(str)
+                .replace(/%u([0-9A-Fa-f]{4})/g, function(_, hex) {
+                    return String.fromCharCode(parseInt(hex, 16));
+                })
+                .replace(/%([0-9A-Fa-f]{2})/g, function(_, hex) {
+                    return String.fromCharCode(parseInt(hex, 16));
+                });
+        };
+    }
 })();
 "#
 }
@@ -566,10 +661,14 @@ pub fn require() -> &'static str {
         },
         "net": function() { return _modules["node:net"](); },
         "undici": function() {
+            var notAvailable = function() {
+                return Promise.reject(new Error("undici not available in WASM"));
+            };
             return {
                 fetch: typeof globalThis.fetch === "function"
                     ? globalThis.fetch
-                    : function() { return Promise.reject(new Error("fetch not available")); },
+                    : notAvailable,
+                request: notAvailable,
                 Agent: function() {},
                 Pool: function() {},
                 Client: function() {},

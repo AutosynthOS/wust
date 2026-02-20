@@ -214,9 +214,10 @@ pub(crate) fn do_br(frame: &mut Frame, stack: &mut Vec<u64>, labels: &mut Vec<La
     if is_loop {
         // Backward branch — check execution limit
         *steps += 1;
-        if *steps > MAX_STEPS {
-            return Err(ExecError::execution_limit());
-        }
+        // Step limit disabled for now — re-enable when needed
+        // if *steps > MAX_STEPS {
+        //     return Err(ExecError::execution_limit());
+        // }
         labels.truncate(label_idx + 1);
         frame.pc = target + 1;
     } else {

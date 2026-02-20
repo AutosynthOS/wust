@@ -1,7 +1,7 @@
 
 const result = await Bun.build({
     entrypoints: ["./index.ts"],
-    target: "browser",
+    target: "bun",
     format: "esm",
     minify: false,
 });
