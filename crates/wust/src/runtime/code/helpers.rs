@@ -2,8 +2,8 @@
 //!
 //! These are used by the interpreter loop and also by component code.
 
+use crate::runtime::code::module::Module;
 use crate::runtime::error::ExecError;
-use crate::runtime::module::Module;
 use crate::runtime::store::Store;
 use crate::runtime::value::Value;
 

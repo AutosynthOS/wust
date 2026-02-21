@@ -7,11 +7,9 @@
 
 use std::collections::HashMap;
 
-use super::instance::{
-    make_core_export, CoreExport, CoreInstance, ResolvedExport, ResolvedFunc,
-};
+use super::instance::{CoreExport, CoreInstance, ResolvedExport, ResolvedFunc, make_core_export};
 use crate::parse::types::*;
-use crate::runtime::module::ExportKind;
+use crate::runtime::code::module::ExportKind;
 
 // ---------------------------------------------------------------------------
 // Synthetic instance construction
@@ -79,9 +77,7 @@ fn resolve_alias_to_core_export(
         wasmparser::ExternalKind::Table => {
             get_alias_coords(&component.core_tables, index, "table")?
         }
-        wasmparser::ExternalKind::Tag => {
-            get_alias_coords(&component.core_tags, index, "tag")?
-        }
+        wasmparser::ExternalKind::Tag => get_alias_coords(&component.core_tags, index, "tag")?,
         _ => return Err("unsupported export kind in synthetic instance".to_string()),
     };
     resolve_aliased_export(core_instances, instance_index, name, kind)
@@ -103,15 +99,20 @@ fn resolve_core_func_def_to_export(
         .get(index as usize)
         .ok_or_else(|| format!("core func index {} out of bounds", index))?;
     match func_def {
-        CoreFuncDef::AliasInstanceExport { instance_index, name } => {
-            resolve_aliased_export(
-                core_instances,
-                *instance_index,
-                name,
-                wasmparser::ExternalKind::Func,
-            )
-        }
-        CoreFuncDef::Lower { func_index, string_encoding, .. } => {
+        CoreFuncDef::AliasInstanceExport {
+            instance_index,
+            name,
+        } => resolve_aliased_export(
+            core_instances,
+            *instance_index,
+            name,
+            wasmparser::ExternalKind::Func,
+        ),
+        CoreFuncDef::Lower {
+            func_index,
+            string_encoding,
+            ..
+        } => {
             // canon lower wraps a component func. If the component func is
             // a Lift over a core func, resolve to a LoweredCoreFunc that
             // will trap during instantiation (re-entrance check).
@@ -119,9 +120,13 @@ fn resolve_core_func_def_to_export(
             // LoweredFunc that calls through to the child.
             let comp_func = component.component_funcs.get(*func_index as usize);
             match comp_func {
-                Some(ComponentFuncDef::Lift { core_func_index, .. }) => {
+                Some(ComponentFuncDef::Lift {
+                    core_func_index, ..
+                }) => {
                     let inner = resolve_core_func_def_to_export(
-                        core_instances, component, *core_func_index,
+                        core_instances,
+                        component,
+                        *core_func_index,
                     )?;
                     match inner {
                         CoreExport::Func { instance, index } => {
@@ -141,15 +146,15 @@ fn resolve_core_func_def_to_export(
                 _ => Ok(CoreExport::Trampoline),
             }
         }
-        CoreFuncDef::ResourceNew { resource } => {
-            Ok(CoreExport::ResourceNew { resource_type: *resource })
-        }
-        CoreFuncDef::ResourceRep { resource } => {
-            Ok(CoreExport::ResourceRep { resource_type: *resource })
-        }
-        CoreFuncDef::ResourceDrop { resource } => {
-            Ok(CoreExport::ResourceDrop { resource_type: *resource })
-        }
+        CoreFuncDef::ResourceNew { resource } => Ok(CoreExport::ResourceNew {
+            resource_type: *resource,
+        }),
+        CoreFuncDef::ResourceRep { resource } => Ok(CoreExport::ResourceRep {
+            resource_type: *resource,
+        }),
+        CoreFuncDef::ResourceDrop { resource } => Ok(CoreExport::ResourceDrop {
+            resource_type: *resource,
+        }),
         _ => Ok(CoreExport::Trampoline),
     }
 }
@@ -243,9 +248,7 @@ fn resolve_single_export(
             let core_func = component
                 .core_funcs
                 .get(*core_func_index as usize)
-                .ok_or_else(|| {
-                    format!("core func index {} out of bounds", core_func_index)
-                })?;
+                .ok_or_else(|| format!("core func index {} out of bounds", core_func_index))?;
             let param_types = lookup_param_types(*type_index, types);
             let result_type = lookup_result_type(*type_index, types);
             let resolved = resolve_core_func_to_resolved(
@@ -299,8 +302,7 @@ pub(super) fn resolve_core_func_to_resolved(
             instance_index,
             name,
         } => {
-            let memory_instance =
-                resolve_memory_instance(core_instances, component, memory_index)?;
+            let memory_instance = resolve_memory_instance(core_instances, component, memory_index)?;
             let inst_idx = *instance_index as usize;
             let instance = core_instances
                 .get(inst_idx)
@@ -342,9 +344,7 @@ pub(super) fn resolve_core_func_to_resolved(
             // If the component func is an alias to a child instance export,
             // delegate there. Otherwise, resolve via the first available core
             // instance as a trampoline.
-            let comp_func = component
-                .component_funcs
-                .get(*func_index as usize);
+            let comp_func = component.component_funcs.get(*func_index as usize);
             match comp_func {
                 Some(ComponentFuncDef::AliasInstanceExport { .. }) => {
                     // Lowering an aliased component func → use a dummy
@@ -358,22 +358,33 @@ pub(super) fn resolve_core_func_to_resolved(
                         realloc_func_index: None,
                     })
                 }
-                Some(ComponentFuncDef::Lift { core_func_index, type_index, memory_index: mem_idx, realloc_func_index: realloc_idx }) => {
+                Some(ComponentFuncDef::Lift {
+                    core_func_index,
+                    type_index,
+                    memory_index: mem_idx,
+                    realloc_func_index: realloc_idx,
+                }) => {
                     // Lowering a lifted func → the underlying core func.
                     let inner_core_func = component
                         .core_funcs
                         .get(*core_func_index as usize)
-                        .ok_or_else(|| format!("core func index {} out of bounds", core_func_index))?;
+                        .ok_or_else(|| {
+                            format!("core func index {} out of bounds", core_func_index)
+                        })?;
                     let inner_params = lookup_param_types(*type_index, types);
                     let inner_result = lookup_result_type(*type_index, types);
                     resolve_core_func_to_resolved(
-                        core_instances, component, inner_core_func,
-                        inner_params, inner_result, *mem_idx, *realloc_idx, types,
+                        core_instances,
+                        component,
+                        inner_core_func,
+                        inner_params,
+                        inner_result,
+                        *mem_idx,
+                        *realloc_idx,
+                        types,
                     )
                 }
-                None => {
-                    Err(format!("component func index {} out of bounds", func_index))
-                }
+                None => Err(format!("component func index {} out of bounds", func_index)),
             }
         }
         // Resource operations and async builtins resolve to a dummy
@@ -478,11 +489,21 @@ fn convert_component_val_type(
                     case_count: v.cases.len() as u32,
                 },
                 Some(ComponentDefinedType::Tuple(t)) => {
-                    let alignment = t.types.iter().map(|f| val_type_alignment(types, f)).max().unwrap_or(1);
+                    let alignment = t
+                        .types
+                        .iter()
+                        .map(|f| val_type_alignment(types, f))
+                        .max()
+                        .unwrap_or(1);
                     ComponentResultType::Compound { alignment }
                 }
                 Some(ComponentDefinedType::Record(r)) => {
-                    let alignment = r.fields.iter().map(|(_, f)| val_type_alignment(types, f)).max().unwrap_or(1);
+                    let alignment = r
+                        .fields
+                        .iter()
+                        .map(|(_, f)| val_type_alignment(types, f))
+                        .max()
+                        .unwrap_or(1);
                     ComponentResultType::Compound { alignment }
                 }
                 Some(ComponentDefinedType::List(_)) => {

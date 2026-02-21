@@ -354,7 +354,7 @@ fn is_supported(code: u8) -> bool {
 }
 
 /// Try to compile a function to native aarch64 code.
-pub fn compile_func(func: &Func, module: &Module, func_idx: u32) -> Option<JitCode> {
+pub fn compile_func(func: &FuncDef, module: &Module, func_idx: u32) -> Option<JitCode> {
     for op in &func.body {
         if !is_supported(op.code) {
             return None;

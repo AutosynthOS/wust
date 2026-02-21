@@ -239,7 +239,7 @@ fn fused_memory_transfer(
     caller_mem: &mut [u8],
     param_types: &[ComponentResultType],
     result_type: ComponentResultType,
-    module: &Rc<crate::runtime::module::Module>,
+    module: &Rc<crate::runtime::code::module::Module>,
     store: &SharedStore,
     callee_mem_store: &Option<SharedStore>,
     func_idx: u32,

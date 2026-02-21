@@ -7,13 +7,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::runtime::code::module::{ExportKind, ImportKind, Module};
 use crate::runtime::code::program;
-use crate::runtime::module::{ExportKind, ImportKind, Module};
 use crate::runtime::store::{HostFunc, SharedTable, Store};
 use crate::runtime::value::Value;
 
 use super::instance::{ComponentInstance, CoreExport, CoreInstance};
-use super::trampoline::{make_cross_instance_trampoline, make_resource_trampoline, make_trampoline};
+use super::trampoline::{
+    make_cross_instance_trampoline, make_resource_trampoline, make_trampoline,
+};
 use crate::parse::types::*;
 
 /// Instantiate a core module, wiring up imports from the arg instances.
@@ -128,7 +130,11 @@ fn resolve_single_import(
                 host_funcs.push(resource_func);
             } else {
                 host_funcs.push(make_cross_instance_trampoline(
-                    inst, arg_idx, &import.name, export_index, result_count,
+                    inst,
+                    arg_idx,
+                    &import.name,
+                    export_index,
+                    result_count,
                 ));
             }
         }
@@ -221,9 +227,7 @@ fn resolve_core_resource<T>(
                 .ok_or_else(|| format!("{} {} out of bounds", kind_name, resource_idx))
         }
         Some(CoreInstance::Synthetic { exports }) => {
-            let real = exports
-                .values()
-                .find_map(|e| match_export(e, resource_idx));
+            let real = exports.values().find_map(|e| match_export(e, resource_idx));
             match real {
                 Some((real_instance, real_index)) => resolve_core_resource(
                     inst,

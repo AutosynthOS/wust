@@ -1,5 +1,45 @@
 use wasmparser::{FuncType, Operator};
 
+/// Compile-time metadata for a block/loop/if control structure.
+///
+/// All fields are resolved at compile time — the interpreter just looks them up
+/// by block index, no runtime block frame tracking needed.
+#[derive(Debug, Clone)]
+pub struct BlockDef {
+    pub kind: BlockKind,
+    /// Number of result values produced by this block (preserved on forward br).
+    pub result_arity: u32,
+    /// Number of param values consumed by this block (preserved on backward br to loops).
+    pub param_arity: u32,
+    /// PC to jump to on `br` to this block.
+    /// Blocks/If: end_pc + 1 (past the END). Loops: start_pc + 1 (first op in body).
+    pub br_target: u32,
+    /// PC of the END instruction.
+    pub end_pc: u32,
+    /// PC of the ELSE instruction (0 if no else clause).
+    pub else_pc: u32,
+    /// Operand stack depth (relative to operand_base) at block entry, BELOW
+    /// block params. This is a compile-time constant — WASM validation
+    /// guarantees stack depth is statically known at every instruction.
+    pub entry_depth: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockKind {
+    Block,
+    Loop,
+    If,
+}
+
+/// Out-of-line branch table data for OP_BR_TABLE.
+#[derive(Debug, Clone)]
+pub struct BrTable {
+    /// Target block indices for each table entry.
+    pub targets: Box<[u32]>,
+    /// Default target block index.
+    pub default: u32,
+}
+
 /// Flat instruction for execution — 16 bytes, cache-friendly.
 /// Replaces the ~40-byte Instruction enum for the hot interpreter loop.
 #[derive(Clone, Copy)]
@@ -291,313 +331,103 @@ pub const OP_TABLE_GROW: u16 = 199; // imm = table_idx
 pub const OP_TABLE_SIZE: u16 = 200; // imm = table_idx
 pub const OP_TABLE_COPY: u16 = 201; // imm = (dst_table << 32) | src_table
 pub const OP_TABLE_FILL: u16 = 202; // imm = table_idx
-// 4-byte slot typed variants — the compiler emits these instead of the
-// untyped versions so the interpreter knows the operand width.
-pub const OP_DROP_32: u16 = 203; // drop 4 bytes
-pub const OP_DROP_64: u16 = 204; // drop 8 bytes
-pub const OP_SELECT_32: u16 = 205; // select between two 4-byte values
-pub const OP_SELECT_64: u16 = 206; // select between two 8-byte values
-pub const OP_LOCAL_GET_32: u16 = 207; // imm = byte_offset; push 4 bytes
-pub const OP_LOCAL_GET_64: u16 = 208; // imm = byte_offset; push 8 bytes
-pub const OP_LOCAL_SET_32: u16 = 209; // imm = byte_offset; pop 4 bytes
-pub const OP_LOCAL_SET_64: u16 = 210; // imm = byte_offset; pop 8 bytes
-pub const OP_LOCAL_TEE_32: u16 = 211; // imm = byte_offset; peek 4 bytes
-pub const OP_LOCAL_TEE_64: u16 = 212; // imm = byte_offset; peek 8 bytes
 
-/// Returns the byte size of a value type on the stack (4 for i32/f32, 8 for i64/f64).
-fn val_byte_size(ty: ValType) -> u32 {
-    match ty {
-        ValType::I32 | ValType::F32 | ValType::Ref(_) => 4,
-        ValType::I64 | ValType::F64 => 8,
-        ValType::V128 => 16,
-    }
-}
-
-/// Compute block result arity in bytes from a wasmparser BlockType.
+/// Compute block result arity from a wasmparser BlockType.
 fn block_result_arity(bt: wasmparser::BlockType, types: &[FuncType]) -> u32 {
     match bt {
         wasmparser::BlockType::Empty => 0,
-        wasmparser::BlockType::Type(ty) => val_byte_size(ty),
-        wasmparser::BlockType::FuncType(idx) => types[idx as usize]
-            .results()
-            .iter()
-            .map(|ty| val_byte_size(*ty))
-            .sum(),
+        wasmparser::BlockType::Type(_) => 1,
+        wasmparser::BlockType::FuncType(idx) => types[idx as usize].results().len() as u32,
     }
 }
 
-/// Compute loop arity (param bytes) from a wasmparser BlockType.
-fn loop_arity(bt: wasmparser::BlockType, types: &[FuncType]) -> u32 {
+/// Compute block param arity from a wasmparser BlockType.
+fn block_param_arity(bt: wasmparser::BlockType, types: &[FuncType]) -> u32 {
     match bt {
         wasmparser::BlockType::Empty | wasmparser::BlockType::Type(_) => 0,
-        wasmparser::BlockType::FuncType(idx) => types[idx as usize]
-            .params()
-            .iter()
-            .map(|ty| val_byte_size(*ty))
-            .sum(),
+        wasmparser::BlockType::FuncType(idx) => types[idx as usize].params().len() as u32,
     }
 }
 
-/// Tracks control flow blocks during compilation for type stack management.
-struct ControlBlockInfo {
-    /// Type stack height at block entry.
-    stack_height: usize,
-    /// True for loop blocks.
-    is_loop: bool,
-    /// The block's type signature.
-    block_type: wasmparser::BlockType,
-    /// True if code is unreachable (after br/return/unreachable).
-    unreachable: bool,
-}
-
-/// Pre-computed byte offsets for function locals.
-pub(crate) struct LocalInfo {
-    /// Byte offset of local[i] from locals base.
-    pub offsets: Vec<u32>,
-    /// Byte size of local[i] (4 or 8).
-    pub sizes: Vec<u32>,
-    /// Total bytes for all locals.
-    pub total_bytes: u32,
-}
-
-impl LocalInfo {
-    fn from_locals(locals: &[ValType]) -> Self {
-        let mut offsets = Vec::with_capacity(locals.len());
-        let mut sizes = Vec::with_capacity(locals.len());
-        let mut offset: u32 = 0;
-        for ty in locals {
-            let size = val_byte_size(*ty);
-            offsets.push(offset);
-            sizes.push(size);
-            offset += size;
-        }
-        Self {
-            offsets,
-            sizes,
-            total_bytes: offset,
-        }
-    }
-}
-
-/// Convert a single wasmparser Operator into an Op, or return None for
-/// unsupported operators. Block/If ops are emitted with placeholder targets
-/// that get patched by `resolve_block_targets`.
-///
-/// `type_stack` tracks the value types on the operand stack so we can emit
-/// typed variants of DROP and SELECT. `local_info` provides byte offsets
-/// for typed LOCAL_GET/SET/TEE opcodes.
+/// Convert a single wasmparser Operator into an Op. Block/Loop/If ops create
+/// BlockDef entries. Br ops store relative depth (resolved to block_idx in
+/// pass 2). Returns None for unsupported operators.
 fn decode_operator(
     op: &Operator,
+    pc: u32,
     types: &[FuncType],
     br_tables: &mut Vec<(Vec<u32>, u32)>,
-    local_info: &LocalInfo,
-    type_stack: &mut Vec<ValType>,
-    control_stack: &mut Vec<ControlBlockInfo>,
+    blocks: &mut Vec<BlockDef>,
 ) -> Option<Op> {
     Some(match *op {
-        Operator::Unreachable => {
-            // Mark as unreachable — stop tracking types until next reachable point
-            if let Some(ctrl) = control_stack.last_mut() {
-                ctrl.unreachable = true;
-            }
-            Op::unit(OP_UNREACHABLE)
-        }
+        Operator::Unreachable => Op::unit(OP_UNREACHABLE),
         Operator::Nop => Op::unit(OP_NOP),
         Operator::Block { blockty } => {
-            let arity = block_result_arity(blockty, types);
-            let stack_height = type_stack.len();
-            control_stack.push(ControlBlockInfo {
-                stack_height,
-                is_loop: false,
-                block_type: blockty,
-                unreachable: false,
+            let block_idx = blocks.len() as u32;
+            blocks.push(BlockDef {
+                kind: BlockKind::Block,
+                result_arity: block_result_arity(blockty, types),
+                param_arity: block_param_arity(blockty, types),
+                br_target: 0,
+                end_pc: 0,
+                else_pc: 0,
+                entry_depth: 0,
             });
-            // end_pc placeholder = 0, will be patched
-            Op::pair(OP_BLOCK, 0, arity)
+            Op::new(OP_BLOCK, block_idx as u64)
         }
         Operator::Loop { blockty } => {
-            let arity = loop_arity(blockty, types);
-            let stack_height = type_stack.len();
-            control_stack.push(ControlBlockInfo {
-                stack_height,
-                is_loop: true,
-                block_type: blockty,
-                unreachable: false,
+            let block_idx = blocks.len() as u32;
+            blocks.push(BlockDef {
+                kind: BlockKind::Loop,
+                result_arity: block_result_arity(blockty, types),
+                param_arity: block_param_arity(blockty, types),
+                br_target: 0,
+                end_pc: 0,
+                else_pc: 0,
+                entry_depth: 0,
             });
-            Op::new(OP_LOOP, arity as u64)
+            Op::new(OP_LOOP, block_idx as u64)
         }
         Operator::If { blockty } => {
-            type_stack.pop(); // condition
-            let arity = block_result_arity(blockty, types);
-            let stack_height = type_stack.len();
-            control_stack.push(ControlBlockInfo {
-                stack_height,
-                is_loop: false,
-                block_type: blockty,
-                unreachable: false,
+            let block_idx = blocks.len() as u32;
+            blocks.push(BlockDef {
+                kind: BlockKind::If,
+                result_arity: block_result_arity(blockty, types),
+                param_arity: block_param_arity(blockty, types),
+                br_target: 0,
+                end_pc: 0,
+                else_pc: 0,
+                entry_depth: 0,
             });
-            // end_pc placeholder = 0, will be patched
-            Op::pair(OP_IF, 0, arity)
+            Op::new(OP_IF, block_idx as u64)
         }
-        Operator::Else => {
-            // Reset type stack to block entry height, push block params
-            if let Some(ctrl) = control_stack.last_mut() {
-                type_stack.truncate(ctrl.stack_height);
-                ctrl.unreachable = false;
-                // Push block params for else branch
-                if let wasmparser::BlockType::FuncType(idx) = ctrl.block_type {
-                    for ty in types[idx as usize].params() {
-                        type_stack.push(*ty);
-                    }
-                }
-            }
-            Op::unit(OP_ELSE)
-        }
-        Operator::End => {
-            if let Some(ctrl) = control_stack.pop() {
-                type_stack.truncate(ctrl.stack_height);
-                // Push result types
-                match ctrl.block_type {
-                    wasmparser::BlockType::Empty => {}
-                    wasmparser::BlockType::Type(ty) => type_stack.push(ty),
-                    wasmparser::BlockType::FuncType(idx) => {
-                        for ty in types[idx as usize].results() {
-                            type_stack.push(*ty);
-                        }
-                    }
-                }
-            }
-            Op::unit(OP_END)
-        }
-        Operator::Br { relative_depth } => {
-            if let Some(ctrl) = control_stack.last_mut() {
-                ctrl.unreachable = true;
-            }
-            Op::new(OP_BR, relative_depth as u64)
-        }
-        Operator::BrIf { relative_depth } => {
-            type_stack.pop(); // condition
-            Op::new(OP_BR_IF, relative_depth as u64)
-        }
+        Operator::Else => Op::unit(OP_ELSE),
+        Operator::End => Op::unit(OP_END),
+        // br/br_if store relative depth in pass 1; resolved to block_idx in pass 2
+        Operator::Br { relative_depth } => Op::new(OP_BR, relative_depth as u64),
+        Operator::BrIf { relative_depth } => Op::new(OP_BR_IF, relative_depth as u64),
         Operator::BrTable { ref targets } => {
-            type_stack.pop(); // index
-            if let Some(ctrl) = control_stack.last_mut() {
-                ctrl.unreachable = true;
-            }
             let target_list: Vec<u32> = targets.targets().collect::<Result<Vec<_>, _>>().ok()?;
             let default = targets.default();
             let idx = br_tables.len();
             br_tables.push((target_list, default));
             Op::new(OP_BR_TABLE, idx as u64)
         }
-        Operator::Return => {
-            if let Some(ctrl) = control_stack.last_mut() {
-                ctrl.unreachable = true;
-            }
-            Op::unit(OP_RETURN)
-        }
-        Operator::Call { function_index } => {
-            let type_idx = types.get(function_index as usize); // This is wrong — we need func_types
-            // We can't resolve call types without func_types. Keep untyped and
-            // let the interpreter handle type stack. Pop params, push results.
-            // For now, just clear type tracking after calls (conservative).
-            // TODO: pass func_types to properly track call types
-            Op::new(OP_CALL, function_index as u64)
-        }
+        Operator::Return => Op::unit(OP_RETURN),
+        Operator::Call { function_index } => Op::new(OP_CALL, function_index as u64),
         Operator::CallIndirect {
             type_index,
             table_index,
-        } => {
-            type_stack.pop(); // table index
-            // Pop params, push results based on type_index
-            if let Some(ft) = types.get(type_index as usize) {
-                for _ in ft.params() {
-                    type_stack.pop();
-                }
-                for ty in ft.results() {
-                    type_stack.push(*ty);
-                }
-            }
-            Op::pair(OP_CALL_INDIRECT, type_index as u32, table_index as u32)
-        }
-        Operator::Drop => {
-            let ty = type_stack.pop().unwrap_or(ValType::I32);
-            match val_byte_size(ty) {
-                8 => Op::unit(OP_DROP_64),
-                _ => Op::unit(OP_DROP_32),
-            }
-        }
-        Operator::Select => {
-            type_stack.pop(); // condition (i32)
-            let ty = type_stack.pop().unwrap_or(ValType::I32); // val b
-            type_stack.pop(); // val a
-            type_stack.push(ty);
-            match val_byte_size(ty) {
-                8 => Op::unit(OP_SELECT_64),
-                _ => Op::unit(OP_SELECT_32),
-            }
-        }
-        Operator::TypedSelect { ty } => {
-            type_stack.pop(); // condition
-            type_stack.pop(); // val b
-            type_stack.pop(); // val a
-            type_stack.push(ty);
-            match val_byte_size(ty) {
-                8 => Op::unit(OP_SELECT_64),
-                _ => Op::unit(OP_SELECT_32),
-            }
-        }
+        } => Op::pair(OP_CALL_INDIRECT, type_index as u32, table_index as u32),
+        Operator::Drop => Op::unit(OP_DROP),
+        Operator::Select => Op::unit(OP_SELECT),
+        Operator::TypedSelect { .. } => Op::unit(OP_SELECT),
 
-        Operator::LocalGet { local_index } => {
-            let idx = local_index as usize;
-            let offset = local_info.offsets[idx];
-            let size = local_info.sizes[idx];
-            if idx < local_info.offsets.len() {
-                // Track type on type stack (look up from locals)
-                // We don't have locals Vec here, but we know from size
-                let ty = if size == 8 {
-                    ValType::I64
-                } else {
-                    ValType::I32
-                };
-                type_stack.push(ty);
-            }
-            if size == 8 {
-                Op::new(OP_LOCAL_GET_64, offset as u64)
-            } else {
-                Op::new(OP_LOCAL_GET_32, offset as u64)
-            }
-        }
-        Operator::LocalSet { local_index } => {
-            let idx = local_index as usize;
-            let offset = local_info.offsets[idx];
-            let size = local_info.sizes[idx];
-            type_stack.pop();
-            if size == 8 {
-                Op::new(OP_LOCAL_SET_64, offset as u64)
-            } else {
-                Op::new(OP_LOCAL_SET_32, offset as u64)
-            }
-        }
-        Operator::LocalTee { local_index } => {
-            let idx = local_index as usize;
-            let offset = local_info.offsets[idx];
-            let size = local_info.sizes[idx];
-            // tee doesn't change type stack (value stays)
-            if size == 8 {
-                Op::new(OP_LOCAL_TEE_64, offset as u64)
-            } else {
-                Op::new(OP_LOCAL_TEE_32, offset as u64)
-            }
-        }
-        Operator::GlobalGet { global_index } => {
-            // TODO: track global types on type stack
-            Op::new(OP_GLOBAL_GET, global_index as u64)
-        }
-        Operator::GlobalSet { global_index } => {
-            type_stack.pop();
-            Op::new(OP_GLOBAL_SET, global_index as u64)
-        }
+        Operator::LocalGet { local_index } => Op::new(OP_LOCAL_GET, local_index as u64),
+        Operator::LocalSet { local_index } => Op::new(OP_LOCAL_SET, local_index as u64),
+        Operator::LocalTee { local_index } => Op::new(OP_LOCAL_TEE, local_index as u64),
+        Operator::GlobalGet { global_index } => Op::new(OP_GLOBAL_GET, global_index as u64),
+        Operator::GlobalSet { global_index } => Op::new(OP_GLOBAL_SET, global_index as u64),
 
         Operator::I32Load { memarg } => Op::new(OP_I32_LOAD, memarg.offset),
         Operator::I64Load { memarg } => Op::new(OP_I64_LOAD, memarg.offset),
@@ -801,85 +631,330 @@ fn decode_operator(
     })
 }
 
-/// Second pass: patch Block, If, and IfElse ops with resolved end_pc and else_pc.
+/// Net stack effect of an opcode (positive = pushes, negative = pops).
+/// Control flow and call ops are handled separately by the resolve pass.
+fn stack_delta(code: u16) -> i32 {
+    match code {
+        // No effect
+        OP_NOP | OP_UNREACHABLE | OP_BLOCK | OP_LOOP | OP_END | OP_ELSE
+        | OP_BR | OP_BR_IF | OP_BR_TABLE | OP_RETURN => 0,
+
+        // Push 1
+        OP_I32_CONST | OP_I64_CONST | OP_F32_CONST | OP_F64_CONST
+        | OP_LOCAL_GET | OP_GLOBAL_GET | OP_MEMORY_SIZE
+        | OP_REF_FUNC | OP_REF_NULL | OP_TABLE_SIZE => 1,
+
+        // Pop 1
+        OP_DROP | OP_LOCAL_SET | OP_GLOBAL_SET => -1,
+
+        // Pop 1, push 1 (net 0): unary ops, conversions, loads
+        OP_LOCAL_TEE | OP_MEMORY_GROW | OP_REF_IS_NULL
+        | OP_I32_EQZ | OP_I64_EQZ
+        | OP_I32_CLZ | OP_I32_CTZ | OP_I32_POPCNT
+        | OP_I64_CLZ | OP_I64_CTZ | OP_I64_POPCNT
+        | OP_F32_ABS | OP_F32_NEG | OP_F32_CEIL | OP_F32_FLOOR
+        | OP_F32_TRUNC | OP_F32_NEAREST | OP_F32_SQRT
+        | OP_F64_ABS | OP_F64_NEG | OP_F64_CEIL | OP_F64_FLOOR
+        | OP_F64_TRUNC | OP_F64_NEAREST | OP_F64_SQRT
+        | OP_I32_WRAP_I64 | OP_I64_EXTEND_I32_S | OP_I64_EXTEND_I32_U
+        | OP_I32_EXTEND8_S | OP_I32_EXTEND16_S
+        | OP_I64_EXTEND8_S | OP_I64_EXTEND16_S | OP_I64_EXTEND32_S
+        | OP_I32_REINTERPRET_F32 | OP_I64_REINTERPRET_F64
+        | OP_F32_REINTERPRET_I32 | OP_F64_REINTERPRET_I64
+        | OP_I32_TRUNC_F32_S | OP_I32_TRUNC_F32_U
+        | OP_I32_TRUNC_F64_S | OP_I32_TRUNC_F64_U
+        | OP_I64_TRUNC_F32_S | OP_I64_TRUNC_F32_U
+        | OP_I64_TRUNC_F64_S | OP_I64_TRUNC_F64_U
+        | OP_I32_TRUNC_SAT_F32_S | OP_I32_TRUNC_SAT_F32_U
+        | OP_I32_TRUNC_SAT_F64_S | OP_I32_TRUNC_SAT_F64_U
+        | OP_I64_TRUNC_SAT_F32_S | OP_I64_TRUNC_SAT_F32_U
+        | OP_I64_TRUNC_SAT_F64_S | OP_I64_TRUNC_SAT_F64_U
+        | OP_F32_CONVERT_I32_S | OP_F32_CONVERT_I32_U
+        | OP_F32_CONVERT_I64_S | OP_F32_CONVERT_I64_U
+        | OP_F32_DEMOTE_F64
+        | OP_F64_CONVERT_I32_S | OP_F64_CONVERT_I32_U
+        | OP_F64_CONVERT_I64_S | OP_F64_CONVERT_I64_U
+        | OP_F64_PROMOTE_F32
+        | OP_I32_LOAD | OP_I64_LOAD | OP_F32_LOAD | OP_F64_LOAD
+        | OP_I32_LOAD8_S | OP_I32_LOAD8_U | OP_I32_LOAD16_S | OP_I32_LOAD16_U
+        | OP_I64_LOAD8_S | OP_I64_LOAD8_U | OP_I64_LOAD16_S | OP_I64_LOAD16_U
+        | OP_I64_LOAD32_S | OP_I64_LOAD32_U
+        | OP_TABLE_GET => 0,
+
+        // Pop 2, push 1 (net -1): binary ops, comparisons, table.grow
+        OP_I32_ADD | OP_I32_SUB | OP_I32_MUL | OP_I32_DIV_S | OP_I32_DIV_U
+        | OP_I32_REM_S | OP_I32_REM_U
+        | OP_I32_AND | OP_I32_OR | OP_I32_XOR
+        | OP_I32_SHL | OP_I32_SHR_S | OP_I32_SHR_U | OP_I32_ROTL | OP_I32_ROTR
+        | OP_I64_ADD | OP_I64_SUB | OP_I64_MUL | OP_I64_DIV_S | OP_I64_DIV_U
+        | OP_I64_REM_S | OP_I64_REM_U
+        | OP_I64_AND | OP_I64_OR | OP_I64_XOR
+        | OP_I64_SHL | OP_I64_SHR_S | OP_I64_SHR_U | OP_I64_ROTL | OP_I64_ROTR
+        | OP_I32_EQ | OP_I32_NE | OP_I32_LT_S | OP_I32_LT_U
+        | OP_I32_GT_S | OP_I32_GT_U | OP_I32_LE_S | OP_I32_LE_U
+        | OP_I32_GE_S | OP_I32_GE_U
+        | OP_I64_EQ | OP_I64_NE | OP_I64_LT_S | OP_I64_LT_U
+        | OP_I64_GT_S | OP_I64_GT_U | OP_I64_LE_S | OP_I64_LE_U
+        | OP_I64_GE_S | OP_I64_GE_U
+        | OP_F32_ADD | OP_F32_SUB | OP_F32_MUL | OP_F32_DIV
+        | OP_F32_MIN | OP_F32_MAX | OP_F32_COPYSIGN
+        | OP_F64_ADD | OP_F64_SUB | OP_F64_MUL | OP_F64_DIV
+        | OP_F64_MIN | OP_F64_MAX | OP_F64_COPYSIGN
+        | OP_F32_EQ | OP_F32_NE | OP_F32_LT | OP_F32_GT | OP_F32_LE | OP_F32_GE
+        | OP_F64_EQ | OP_F64_NE | OP_F64_LT | OP_F64_GT | OP_F64_LE | OP_F64_GE
+        | OP_TABLE_GROW => -1,
+
+        // Pop 2 (net -2): stores, table.set
+        OP_I32_STORE | OP_I64_STORE | OP_F32_STORE | OP_F64_STORE
+        | OP_I32_STORE8 | OP_I32_STORE16
+        | OP_I64_STORE8 | OP_I64_STORE16 | OP_I64_STORE32
+        | OP_TABLE_SET => -2,
+
+        // Pop 3, push 1 (net -2): select
+        OP_SELECT => -2,
+
+        // Pop 3 (net -3): bulk memory/table ops
+        OP_MEMORY_COPY | OP_MEMORY_FILL
+        | OP_TABLE_COPY | OP_TABLE_FILL
+        | OP_TABLE_INIT | OP_MEMORY_INIT => -3,
+
+        // No stack effect
+        OP_ELEM_DROP | OP_DATA_DROP => 0,
+
+        // Superinstructions
+        OP_LOCAL_GET_I32_CONST => 2,
+        OP_LOCAL_GET_LOCAL_GET => 2,
+
+        // Call/call_indirect handled separately
+        OP_CALL | OP_CALL_INDIRECT | OP_IF | OP_IF_ELSE => 0,
+
+        _ => 0,
+    }
+}
+
+/// Second pass: resolve block targets, br depths, and stack depths.
 ///
-/// Walks the ops array, maintaining a stack of block-start positions.
-/// When an OP_END is encountered, it pops the stack and patches the
-/// corresponding block/if op with the correct target addresses.
-fn resolve_block_targets(ops: &mut [Op]) {
-    // Stack entries: (start_pc, is_if)
-    let mut stack: Vec<(usize, bool)> = Vec::new();
-    // Records (if_pc, else_pc) for if blocks that have an else branch
+/// 1. Patches end_pc, else_pc, br_target on each BlockDef
+/// 2. Rewrites OP_IF to OP_IF_ELSE when an else branch exists
+/// 3. Resolves OP_BR/OP_BR_IF relative depths to block indices
+/// 4. Resolves br_table entries from relative depths to block indices
+/// 5. Tracks operand stack depth to set entry_depth on each BlockDef
+fn resolve_pass(
+    ops: &mut [Op],
+    blocks: &mut [BlockDef],
+    br_tables: &mut [(Vec<u32>, u32)],
+    types: &[FuncType],
+    func_types: &[u32],
+) {
+    // Block stack: entries are block indices. Block 0 (function-level) is always
+    // at the bottom. Used to resolve relative br depths to block indices.
+    let mut block_stack: Vec<u32> = vec![0];
+
+    // Stack depth tracking (operand stack depth relative to operand_base).
+    let mut depth: i32 = 0;
+    let mut unreachable = false;
+
+    // Else map: (if_start_pc, else_pc) for if blocks with else branches.
     let mut else_map: Vec<(usize, usize)> = Vec::new();
 
     for i in 0..ops.len() {
-        match ops[i].code {
-            OP_BLOCK => stack.push((i, false)),
-            OP_LOOP => stack.push((i, false)),
-            OP_IF => stack.push((i, true)),
+        let code = ops[i].code;
+
+        match code {
+            OP_BLOCK | OP_LOOP => {
+                let block_idx = ops[i].imm as u32;
+                let block = &mut blocks[block_idx as usize];
+                // entry_depth = depth below block params
+                block.entry_depth = (depth - block.param_arity as i32) as u32;
+                block_stack.push(block_idx);
+            }
+            OP_IF => {
+                if !unreachable { depth -= 1; } // pop condition
+                let block_idx = ops[i].imm as u32;
+                let block = &mut blocks[block_idx as usize];
+                block.entry_depth = (depth - block.param_arity as i32) as u32;
+                block_stack.push(block_idx);
+            }
             OP_ELSE => {
-                if let Some(&(if_pc, true)) = stack.last() {
-                    else_map.push((if_pc, i));
+                if let Some(&block_idx) = block_stack.last() {
+                    let block = &blocks[block_idx as usize];
+                    let start_pc = block_stack.iter().rev()
+                        .position(|&b| b == block_idx)
+                        .map(|_| {
+                            // Find the OP_IF instruction for this block
+                            ops.iter().position(|op| {
+                                (op.code == OP_IF || op.code == OP_IF_ELSE) && op.imm as u32 == block_idx
+                            }).unwrap_or(0)
+                        })
+                        .unwrap_or(0);
+                    else_map.push((start_pc, i));
+                    // Reset depth to entry_depth + param_arity for else branch
+                    depth = block.entry_depth as i32 + block.param_arity as i32;
+                    unreachable = false;
                 }
             }
             OP_END => {
-                if let Some((start_pc, is_if)) = stack.pop() {
-                    let start_code = ops[start_pc].code;
-                    match start_code {
-                        OP_BLOCK => {
-                            let arity = ops[start_pc].imm_lo();
-                            ops[start_pc] = Op::pair(OP_BLOCK, i as u32, arity);
-                        }
-                        OP_IF => {
-                            let arity = ops[start_pc].imm_lo();
-                            let else_pc = if is_if {
-                                else_map
-                                    .iter()
-                                    .rev()
-                                    .find(|(ip, _)| *ip == start_pc)
-                                    .map(|(_, ep)| *ep)
-                            } else {
-                                None
-                            };
-                            match else_pc {
-                                None => {
-                                    ops[start_pc] = Op::pair(OP_IF, i as u32, arity);
-                                }
-                                Some(ep) => {
-                                    let imm = (arity as u64) << 56 | (i as u64) << 28 | ep as u64;
-                                    ops[start_pc] = Op::new(OP_IF_ELSE, imm);
+                if let Some(block_idx) = block_stack.pop() {
+                    let block = &mut blocks[block_idx as usize];
+                    block.end_pc = i as u32;
+
+                    // Compute br_target
+                    match block.kind {
+                        BlockKind::Loop => {
+                            // br to loop = jump to first op in loop body
+                            block.br_target = block.end_pc; // placeholder
+                            // Find the OP_LOOP instruction position
+                            for j in 0..ops.len() {
+                                if ops[j].code == OP_LOOP && ops[j].imm as u32 == block_idx {
+                                    block.br_target = j as u32 + 1;
+                                    break;
                                 }
                             }
                         }
-                        _ => {} // OP_LOOP doesn't need patching
+                        _ => {
+                            // br to block/if = jump past the END
+                            block.br_target = i as u32 + 1;
+                        }
+                    }
+
+                    // Handle else for if blocks
+                    if block.kind == BlockKind::If {
+                        if let Some(&(_, ep)) = else_map.iter().rev()
+                            .find(|(sp, _)| {
+                                ops.get(*sp).map(|o| o.imm as u32 == block_idx).unwrap_or(false)
+                            })
+                        {
+                            block.else_pc = ep as u32;
+                            // Rewrite OP_IF to OP_IF_ELSE
+                            for j in 0..ops.len() {
+                                if ops[j].code == OP_IF && ops[j].imm as u32 == block_idx {
+                                    ops[j].code = OP_IF_ELSE;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Restore depth after block
+                    depth = block.entry_depth as i32 + block.result_arity as i32;
+                    unreachable = false;
+                }
+            }
+            OP_BR => {
+                // Resolve relative depth to block_idx
+                let rel_depth = ops[i].imm as u32;
+                let target_idx = block_stack[block_stack.len() - 1 - rel_depth as usize];
+                ops[i].imm = target_idx as u64;
+                unreachable = true;
+            }
+            OP_BR_IF => {
+                if !unreachable { depth -= 1; } // pop condition
+                let rel_depth = ops[i].imm as u32;
+                let target_idx = block_stack[block_stack.len() - 1 - rel_depth as usize];
+                ops[i].imm = target_idx as u64;
+            }
+            OP_BR_TABLE => {
+                if !unreachable { depth -= 1; } // pop index
+                let table_idx = ops[i].imm as usize;
+                let (ref mut targets, ref mut default) = br_tables[table_idx];
+                // Resolve each target depth to block_idx
+                for t in targets.iter_mut() {
+                    *t = block_stack[block_stack.len() - 1 - *t as usize];
+                }
+                *default = block_stack[block_stack.len() - 1 - *default as usize];
+                unreachable = true;
+            }
+            OP_RETURN | OP_UNREACHABLE => {
+                unreachable = true;
+            }
+            OP_CALL => {
+                if !unreachable {
+                    let func_idx = ops[i].imm as usize;
+                    if func_idx < func_types.len() {
+                        let type_idx = func_types[func_idx] as usize;
+                        if type_idx < types.len() {
+                            let ft = &types[type_idx];
+                            depth -= ft.params().len() as i32;
+                            depth += ft.results().len() as i32;
+                        }
                     }
                 }
             }
-            _ => {}
+            OP_CALL_INDIRECT => {
+                if !unreachable {
+                    depth -= 1; // pop table index
+                    let type_idx = ops[i].imm_hi() as usize;
+                    if type_idx < types.len() {
+                        let ft = &types[type_idx];
+                        depth -= ft.params().len() as i32;
+                        depth += ft.results().len() as i32;
+                    }
+                }
+            }
+            _ => {
+                if !unreachable {
+                    depth += stack_delta(code);
+                }
+            }
         }
     }
 }
 
-/// Compile wasmparser operators directly into flat Op bytecode with resolved
-/// block targets. This is the single-pass replacement for the old
-/// decode_op -> Instruction -> compile_instruction pipeline.
+/// Compile wasmparser operators into flat Op bytecode with fully resolved
+/// block targets and branch indices.
 ///
-/// Returns (ops, br_tables) where br_tables stores BrTable target data
-/// out-of-line, indexed by the imm field of OP_BR_TABLE ops.
+/// Returns the compiled FuncDef components:
+/// - `body`: flat instruction array
+/// - `blocks`: pre-computed metadata for each block/loop/if (block 0 = function-level)
+/// - `br_tables`: out-of-line branch table data with resolved block indices
+///
+/// All branch targets are resolved to block indices. All entry_depth values
+/// are set. The interpreter can execute this without any runtime block tracking.
 pub fn compile_body(
     ops_reader: wasmparser::OperatorsReader<'_>,
     types: &[FuncType],
-) -> Result<(Vec<Op>, Vec<(Vec<u32>, u32)>), String> {
+    func_types: &[u32],
+    result_arity: u32,
+) -> Result<(Box<[Op]>, Box<[BlockDef]>, Box<[BrTable]>), String> {
     let mut ops = Vec::new();
-    let mut br_tables = Vec::new();
+    let mut br_tables_raw: Vec<(Vec<u32>, u32)> = Vec::new();
+
+    // Block 0: implicit function-level block.
+    let mut blocks = vec![BlockDef {
+        kind: BlockKind::Block,
+        result_arity,
+        param_arity: 0,
+        br_target: 0,
+        end_pc: 0,
+        else_pc: 0,
+        entry_depth: 0,
+    }];
 
     for op_result in ops_reader {
         let op = op_result.map_err(|e| format!("op error: {e}"))?;
-        if let Some(compiled) = decode_operator(&op, types, &mut br_tables) {
+        let pc = ops.len() as u32;
+        if let Some(compiled) = decode_operator(&op, pc, types, &mut br_tables_raw, &mut blocks) {
             ops.push(compiled);
         }
     }
 
-    resolve_block_targets(&mut ops);
-    Ok((ops, br_tables))
+    // Resolve everything in a second pass
+    resolve_pass(&mut ops, &mut blocks, &mut br_tables_raw, types, func_types);
+
+    // Block 0's end_pc and br_target: the final END is at ops.len()-1.
+    // br to block 0 = return, target past the END = exits the loop.
+    if !ops.is_empty() {
+        blocks[0].end_pc = (ops.len() - 1) as u32;
+        blocks[0].br_target = ops.len() as u32;
+    }
+
+    // Convert br_tables to BrTable structs
+    let br_tables: Vec<BrTable> = br_tables_raw.into_iter()
+        .map(|(targets, default)| BrTable {
+            targets: targets.into_boxed_slice(),
+            default,
+        })
+        .collect();
+
+    Ok((ops.into_boxed_slice(), blocks.into_boxed_slice(), br_tables.into_boxed_slice()))
 }

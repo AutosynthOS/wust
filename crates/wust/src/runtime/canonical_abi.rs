@@ -9,11 +9,11 @@
 
 use std::rc::Rc;
 
+use crate::runtime::code::module::Module;
+use crate::runtime::code::program;
 use crate::runtime::component::{
     ComponentArg, ComponentResultType, ComponentValue, CoreInstance, StringEncoding,
 };
-use crate::runtime::code::program;
-use crate::runtime::module::Module;
 use crate::runtime::store::SharedStore;
 use crate::runtime::value::Value;
 
@@ -625,7 +625,8 @@ pub(crate) fn callee_realloc(
     ];
     let results = {
         let mut s = store.borrow_mut();
-        program::call(module, &mut s, realloc_idx, &realloc_args).map_err(|e| format!("trap: {e}"))?
+        program::call(module, &mut s, realloc_idx, &realloc_args)
+            .map_err(|e| format!("trap: {e}"))?
     };
     match results.first() {
         Some(Value::I32(p)) => Ok(*p as u32),

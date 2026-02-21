@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::runtime::module::{ConstOp, ElemItem, Module};
+use crate::runtime::code::module::{ConstOp, ElemItem, Module};
 use crate::runtime::value::Value;
 
 /// A shared, interior-mutable handle to a `Store`.
@@ -238,8 +238,12 @@ impl Store {
 /// Pop two values of the same variant, apply a binary op, push the result.
 macro_rules! const_binop {
     ($stack:expr, $variant:ident, $method:ident) => {{
-        let Value::$variant(b) = $stack.pop()? else { return None; };
-        let Value::$variant(a) = $stack.pop()? else { return None; };
+        let Value::$variant(b) = $stack.pop()? else {
+            return None;
+        };
+        let Value::$variant(a) = $stack.pop()? else {
+            return None;
+        };
         $stack.push(Value::$variant(a.$method(b)));
     }};
 }

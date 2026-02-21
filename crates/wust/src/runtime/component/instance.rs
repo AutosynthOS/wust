@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::runtime::canonical_abi;
+use crate::runtime::code::module::{ExportKind, Module};
 use crate::runtime::code::program;
-use crate::runtime::module::{ExportKind, Module};
 use crate::runtime::store::SharedStore;
 use crate::runtime::value::Value;
 
@@ -334,12 +334,14 @@ impl ComponentInstance {
         for inst in &self.core_instances {
             if let CoreInstance::Instantiated { store, .. } = inst {
                 let mut store = store.borrow_mut();
-                let end = offset.checked_add(data.len())
+                let end = offset
+                    .checked_add(data.len())
                     .ok_or("memory write overflow")?;
                 if end > store.memory.len() {
                     return Err(format!(
                         "memory write out of bounds: offset={offset} len={} memory_size={}",
-                        data.len(), store.memory.len()
+                        data.len(),
+                        store.memory.len()
                     ));
                 }
                 store.memory[offset..end].copy_from_slice(data);

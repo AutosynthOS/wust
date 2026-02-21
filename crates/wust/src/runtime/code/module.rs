@@ -2,7 +2,7 @@ use wasmparser::{
     FuncType, Operator, Parser, Payload, ValType,
 };
 
-use crate::runtime::opcode::{Op, compile_body};
+use crate::runtime::opcode::{BlockDef, BrTable, Op, compile_body};
 
 /// Small instruction enum used only for const expressions (global inits,
 /// data segment offsets, table inits, element items). These only need a
@@ -50,7 +50,7 @@ fn decode_const_op(op: &Operator) -> Option<ConstOp> {
 #[derive(Debug)]
 pub struct Module {
     pub types: Vec<FuncType>,
-    pub funcs: Vec<Func>,
+    pub funcs: Vec<FuncDef>,
     pub memories: Vec<MemoryType>,
     pub globals: Vec<GlobalDef>,
     pub exports: Vec<Export>,
@@ -85,13 +85,19 @@ pub enum ImportKind {
     Table(TableDef),
 }
 
+/// Pre-compiled function definition ready for execution.
 #[derive(Debug)]
-pub struct Func {
+pub struct FuncDef {
     pub type_idx: u32,
+    pub param_count: u32,
+    pub local_count: u32,
+    pub result_count: u32,
     pub locals: Vec<ValType>,
-    pub body: Vec<Op>,
-    /// Out-of-line BrTable data: (targets, default) indexed by Op.imm for OP_BR_TABLE.
-    pub br_tables: Vec<(Vec<u32>, u32)>,
+    pub body: Box<[Op]>,
+    /// Block metadata table indexed by block_idx. Block 0 = function-level.
+    pub blocks: Box<[BlockDef]>,
+    /// Out-of-line branch table data with resolved block indices.
+    pub br_tables: Box<[BrTable]>,
 }
 
 #[derive(Debug, Clone)]
@@ -191,8 +197,8 @@ struct ModuleBuilder {
     num_global_imports: u32,
     num_memory_imports: u32,
     num_table_imports: u32,
-    /// Pre-compiled function bodies: (locals, compiled ops, br_tables).
-    func_bodies: Vec<(Vec<ValType>, Vec<Op>, Vec<(Vec<u32>, u32)>)>,
+    /// Pre-compiled function definitions.
+    func_defs: Vec<FuncDef>,
     code_idx: u32,
 }
 
@@ -213,7 +219,7 @@ impl ModuleBuilder {
             num_global_imports: 0,
             num_memory_imports: 0,
             num_table_imports: 0,
-            func_bodies: Vec::new(),
+            func_defs: Vec::new(),
             code_idx: 0,
         }
     }
@@ -315,13 +321,31 @@ impl ModuleBuilder {
         Ok(())
     }
 
-    /// Decode a single code section entry, compiling directly to Op bytecode.
+    /// Decode a single code section entry, compiling directly to a FuncDef.
     fn parse_code_entry(&mut self, body: wasmparser::FunctionBody<'_>) -> Result<(), String> {
         let locals = self.collect_locals(&body)?;
+        let type_idx = self.func_types[self.num_func_imports as usize + self.code_idx as usize];
+        let func_type = &self.types[type_idx as usize];
+        let param_count = func_type.params().len() as u32;
+        let result_count = func_type.results().len() as u32;
         let ops_reader = body.get_operators_reader()
             .map_err(|e| format!("ops error: {e}"))?;
-        let (compiled, br_tables) = compile_body(ops_reader, &self.types)?;
-        self.func_bodies.push((locals, compiled, br_tables));
+        let (body_ops, blocks, br_tables) = compile_body(
+            ops_reader,
+            &self.types,
+            &self.func_types,
+            result_count,
+        )?;
+        self.func_defs.push(FuncDef {
+            type_idx,
+            param_count,
+            local_count: locals.len() as u32,
+            result_count,
+            locals,
+            body: body_ops,
+            blocks,
+            br_tables,
+        });
         self.code_idx += 1;
         Ok(())
     }
@@ -343,22 +367,9 @@ impl ModuleBuilder {
         Ok(locals)
     }
 
-    /// Build Func entries from pre-compiled bodies.
-    fn build_funcs(&self) -> Vec<Func> {
-        self.func_bodies.iter().enumerate().map(|(i, (locals, compiled, br_tables))| {
-            let type_idx = self.func_types[self.num_func_imports as usize + i];
-            Func {
-                type_idx,
-                locals: locals.clone(),
-                body: compiled.clone(),
-                br_tables: br_tables.clone(),
-            }
-        }).collect()
-    }
-
     /// Consume the builder and produce the final Module.
     fn build(self) -> Module {
-        let funcs = self.build_funcs();
+        let funcs = self.func_defs;
         Module {
             types: self.types,
             funcs,
@@ -404,7 +415,7 @@ impl Module {
     }
 
     /// Get a local function by global index (accounting for imports).
-    pub fn get_func(&self, idx: u32) -> Option<&Func> {
+    pub fn get_func(&self, idx: u32) -> Option<&FuncDef> {
         if idx < self.num_func_imports {
             None // imported function — not in self.funcs
         } else {
