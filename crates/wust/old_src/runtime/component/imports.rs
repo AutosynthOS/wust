@@ -95,7 +95,7 @@ fn resolve_imports(
 /// is looked up in the source instance and wired in.
 #[allow(clippy::too_many_arguments)]
 fn resolve_single_import(
-    import: &crate::runtime::module::Import,
+    import: &crate::runtime::code::module::Import,
     args: &[(String, CoreInstanceArg)],
     inst: &ComponentInstance,
     module: &Module,
@@ -187,7 +187,7 @@ fn func_result_count(module: &Module, func_import_idx: usize) -> usize {
 
 /// Provide default values for an import that has no matching arg instance.
 fn provide_default_import(
-    import: &crate::runtime::module::Import,
+    import: &crate::runtime::code::module::Import,
     result_count: usize,
     host_funcs: &mut Vec<HostFunc>,
     imported_globals: &mut Vec<Value>,

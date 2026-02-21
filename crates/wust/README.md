@@ -4,14 +4,14 @@ A WebAssembly runtime with a managed execution stack. WUST decodes WASM bytecode
 
 ## Modules
 
-| Module | Purpose |
-|---|---|
-| `runtime::module` | Parsed WASM module — holds function signatures, type definitions, memory/table/global declarations, exports, and imports. Immutable after construction. |
-| `runtime::instruction` | Custom instruction enum decoded from WASM bytecode at parse time. Covers control flow, memory ops, arithmetic, and more. |
-| `runtime::store` | Mutable runtime state — memory pages, globals, tables, and constant expression evaluation. |
-| `runtime::exec` | Core interpreter. Drives instruction execution on the managed stack with explicit frames and labeled branch targets. |
-| `runtime::value` | WASM value enum (`I32`, `I64`, `F32`, `F64`, `V128`, `FuncRef`) with typed accessors. |
-| `runtime::jit` | (Disabled) Experimental JIT compiler for aarch64/Apple Silicon. |
+| Module                 | Purpose                                                                                                                                                 |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `runtime::module`      | Parsed WASM module — holds function signatures, type definitions, memory/table/global declarations, exports, and imports. Immutable after construction. |
+| `runtime::instruction` | Custom instruction enum decoded from WASM bytecode at parse time. Covers control flow, memory ops, arithmetic, and more.                                |
+| `runtime::store`       | Mutable runtime state — memory pages, globals, tables, and constant expression evaluation.                                                              |
+| `runtime::exec`        | Core interpreter. Drives instruction execution on the managed stack with explicit frames and labeled branch targets.                                    |
+| `runtime::value`       | WASM value enum (`I32`, `I64`, `F32`, `F64`, `V128`, `FuncRef`) with typed accessors.                                                                   |
+| `runtime::jit`         | (Disabled) Experimental JIT compiler for aarch64/Apple Silicon.                                                                                         |
 
 ## Common Commands
 
@@ -32,3 +32,24 @@ cargo build -p wust --release
 ## Tests
 
 `tests/spec_tests.rs` runs the official WebAssembly spec test suite via `.wast` files. Currently 84 tests pass with 13 ignored (GC/type-recursion proposals not yet implemented).
+
+
+
+----
+
+
+Branchless instruction check:
+
+Bit 0 = 0 -> inline instruction
+Bit 0 = 1 -> indirect instruction load (address to load from)
+
+bytes = [...] -> contains instruction codes
+
+pcs = Vec<u32> -> either inline instruction codes or indirect instruction addresses
+
+
+let instruction_code = if ops[pc] first bit = 1 () {
+    ops[pc]
+} else {
+    bytes[ops[pc]]
+}

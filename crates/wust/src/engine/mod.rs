@@ -1,28 +1,24 @@
-//! Shared configuration for wasm feature flags.
-//!
-//! The [`Engine`] holds feature flags that control parsing and validation.
+use wasmparser::{Validator, WasmFeatures};
 
-/// Shared configuration context for wasm feature flags.
-///
-/// # Examples
-///
-/// ```ignore
-/// let engine = Engine::new();
-/// let component = Component::new(&engine, bytes)?;
-/// let instance = component.instantiate()?;
-/// ```
+/// Shared compilation configuration.
 pub struct Engine {
-    pub(crate) features: wasmparser::WasmFeatures,
+    features: WasmFeatures,
 }
 
 impl Engine {
-    /// Create an engine with default component model features enabled.
-    pub fn new() -> Self {
-        let mut features = wasmparser::WasmFeatures::default();
-        features.set(wasmparser::WasmFeatures::COMPONENT_MODEL, true);
-        features.set(wasmparser::WasmFeatures::CM_ASYNC, true);
-        features.set(wasmparser::WasmFeatures::CM_ASYNC_STACKFUL, true);
-        features.set(wasmparser::WasmFeatures::CM_ASYNC_BUILTINS, true);
-        Engine { features }
+    /// Create a new validator with the engine's features.
+    pub fn new_validator(&self) -> Validator {
+        Validator::new_with_features(self.features)
+    }
+}
+
+impl Default for Engine {
+    fn default() -> Self {
+        let mut features = WasmFeatures::default();
+        features.set(WasmFeatures::COMPONENT_MODEL, true);
+        features.set(WasmFeatures::CM_ASYNC, true);
+        features.set(WasmFeatures::CM_ASYNC_STACKFUL, true);
+        features.set(WasmFeatures::CM_ASYNC_BUILTINS, true);
+        Self { features }
     }
 }
