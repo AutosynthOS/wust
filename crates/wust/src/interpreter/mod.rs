@@ -3,7 +3,8 @@ use wasmparser::ValType;
 use crate::stack::Stack;
 use crate::{Instance, Val, parse::func::FuncIdx};
 
-mod exec;
+mod exec_recursive;
+mod exec_stack;
 
 pub(crate) fn call(
     instance: &mut Instance,
@@ -16,48 +17,46 @@ pub(crate) fn call(
         .get_func(func_idx)
         .ok_or_else(|| anyhow::anyhow!("function {func_idx:?} not found"))?;
 
+    let return_sp = stack.sp();
+
+    // Push args onto the operand stack.
     for arg in args {
         stack.push_val(arg);
     }
 
-    exec::execute(func, stack)?;
+    // call_function expects args already on stack.
+    let mut fuel: i64 = i64::MAX;
+    exec_recursive::call_function(module, stack, func, &mut fuel)?;
 
-    // Pop result values off the stack (in reverse, then reverse back).
-    let results = pop_results(stack, &func.results);
+    // Results are now at return_sp.
+    let results = read_results(stack, return_sp, &func.results);
 
     Ok(results)
 }
 
-/// Pop `result_types.len()` values from the stack, returning them in order.
-///
-/// Results are on top of the stack in order (first result deepest),
-/// so we pop in reverse then flip.
-fn pop_results(stack: &mut Stack, result_types: &[ValType]) -> Vec<Val> {
-    let mut results: Vec<Val> = result_types
+/// Read result values starting at `base` offset, using type info to
+/// interpret the raw u64 bits.
+fn read_results(stack: &Stack, base: usize, result_types: &[ValType]) -> Vec<Val> {
+    result_types
         .iter()
-        .rev()
-        .map(|ty| pop_typed(stack, ty))
-        .collect();
-    results.reverse();
-    results
+        .enumerate()
+        .map(|(i, ty)| read_typed(stack, base + i * 8, ty))
+        .collect()
 }
 
-/// Pop a single value from the stack, interpreting the raw u64 bits
-/// according to the given ValType.
-fn pop_typed(stack: &mut Stack, ty: &ValType) -> Val {
+/// Read a single value at a byte offset, interpreting raw bits by ValType.
+fn read_typed(stack: &Stack, offset: usize, ty: &ValType) -> Val {
+    let raw = stack.read_u64_at(offset);
     match ty {
-        ValType::I32 => Val::I32(stack.pop_i32()),
-        ValType::I64 => Val::I64(stack.pop_i64()),
-        ValType::F32 => Val::F32(stack.pop_f32()),
-        ValType::F64 => Val::F64(stack.pop_f64()),
+        ValType::I32 => Val::I32(raw as i32),
+        ValType::I64 => Val::I64(raw as i64),
+        ValType::F32 => Val::F32(f32::from_bits(raw as u32)),
+        ValType::F64 => Val::F64(f64::from_bits(raw)),
         ValType::V128 => {
-            let hi = stack.pop_u64();
-            let lo = stack.pop_u64();
-            Val::V128((hi as u128) << 64 | lo as u128)
+            let lo = raw as u128;
+            let hi = stack.read_u64_at(offset + 8) as u128;
+            Val::V128(hi << 64 | lo)
         }
-        ValType::Ref(ref_ty) => {
-            stack.pop_u64();
-            Val::Ref(*ref_ty)
-        }
+        ValType::Ref(ref_ty) => Val::Ref(*ref_ty),
     }
 }

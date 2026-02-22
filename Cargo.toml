@@ -5,3 +5,9 @@ members = [
     "crates/plasma",
     "crates/plasma_hello",
 ]
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+debug = true

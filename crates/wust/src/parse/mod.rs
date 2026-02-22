@@ -10,6 +10,7 @@ use func::ParsedFunction;
 use wasmparser::Export;
 use wasmparser::ExportSectionReader;
 use wasmparser::FunctionBody;
+use wasmparser::ValType;
 use wasmparser::types::Types;
 use wasmparser::{Parser, Payload};
 
@@ -34,8 +35,8 @@ pub(crate) fn parse(engine: &Engine, bytes: &[u8]) -> Result<ParsedModule, anyho
 
 #[derive(Default)]
 struct ModuleBuilder {
-    /// Parsed function bodies for each defined (non-import) function.
-    bodies: Vec<ParsedBody>,
+    /// Parsed function bodies with their declared locals.
+    bodies: Vec<(ParsedBody, Vec<ValType>)>,
     /// Function exports: name → function index.
     exports: HashMap<String, FuncIdx>,
 }
@@ -65,10 +66,19 @@ impl ModuleBuilder {
     }
 
     fn parse_body(&mut self, body: FunctionBody) -> Result<(), anyhow::Error> {
-        Ok(self.bodies.push(ParsedBody::parse(&body)?))
+        let mut body_locals = Vec::new();
+        for local in body.get_locals_reader()? {
+            let (count, val_type) = local?;
+            for _ in 0..count {
+                body_locals.push(val_type);
+            }
+        }
+        let parsed = ParsedBody::parse(&body)?;
+        self.bodies.push((parsed, body_locals));
+        Ok(())
     }
 
-    fn build(self, types: Types) -> ParsedModule {
+    fn build(mut self, types: Types) -> ParsedModule {
         let total = types.as_ref().function_count();
         let num_imported = total - self.bodies.len() as u32;
         let types_ref = types.as_ref();
@@ -77,16 +87,29 @@ impl ModuleBuilder {
             .map(|idx| {
                 let core_type_id = types_ref.core_function_at(idx);
                 let func_type = types_ref[core_type_id].unwrap_func();
+                let params = func_type.params();
+                let param_count = params.len();
 
-                let body = if idx < num_imported {
-                    ParsedBody::empty()
+                let (body, body_locals) = if idx < num_imported {
+                    (ParsedBody::empty(), vec![])
                 } else {
-                    self.bodies[(idx - num_imported) as usize].clone()
+                    // Take to avoid cloning.
+                    std::mem::take(&mut self.bodies[(idx - num_imported) as usize])
                 };
 
+                // locals = params ++ body-declared locals
+                let mut locals: Vec<ValType> = params.into();
+                locals.extend(body_locals);
+
+                let results: Box<[ValType]> = func_type.results().into();
+                let local_count = locals.len();
                 ParsedFunction {
-                    locals: func_type.params().into(),
-                    results: func_type.results().into(),
+                    result_count: results.len() as u32,
+                    arg_byte_count: param_count * 8,
+                    extra_local_bytes: (local_count - param_count) * 8,
+                    locals: locals.into(),
+                    results,
+                    param_count,
                     body,
                 }
             })

@@ -100,6 +100,7 @@ fn execute(
             }
 
             // --- Block control flow ---
+
             OpCode::Block | OpCode::Loop => {}
 
             OpCode::If => {
@@ -137,6 +138,7 @@ fn execute(
             }
 
             // --- Call ---
+
             OpCode::Call => {
                 let callee_idx = imm as usize;
                 let callee = module
@@ -169,6 +171,7 @@ fn execute(
             }
 
             // --- Stack operations ---
+
             OpCode::I32Const => {
                 let val = (imm as i32) << 8 >> 8;
                 stack.push_i32(val);

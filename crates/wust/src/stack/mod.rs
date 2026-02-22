@@ -16,6 +16,24 @@ const GUARD_PAGES: usize = 1;
 ///
 /// Accessing a guard page triggers SIGSEGV — zero-cost overflow
 /// and underflow detection.
+///
+/// # Safety: guard page limitations
+///
+/// Guard pages only protect against **sequential** push/pop overflow
+/// and underflow (SP ± 8 stepping into a guard region). They do NOT
+/// protect against computed offsets like `sp - N` or `locals_sp + i * 8`:
+///
+/// - A usize underflow (`0 - 8`) panics in debug or wraps in release,
+///   pointing far above the allocation — never hitting the lower guard.
+/// - An out-of-bounds local index could read/write arbitrary memory
+///   relative to `base`.
+///
+/// Correctness of computed offsets relies on **wasm validation**
+/// (wasmparser validates by default). Validation guarantees operand
+/// stack balance and local index bounds, making these cases impossible
+/// for well-formed modules. If we ever accept unvalidated bytecode,
+/// explicit bounds checks must be added to `read_u64_at`, `write_u64_at`,
+/// and any `sp - N` arithmetic.
 pub(crate) struct Stack {
     mmap_base: *mut u8,
     mmap_size: usize,
@@ -65,17 +83,20 @@ impl Stack {
     }
 
     /// Current stack pointer offset from base, in bytes.
+    #[inline(always)]
     pub(crate) fn sp(&self) -> usize {
         self.sp
     }
 
     /// Reset stack pointer to a given byte offset.
+    #[inline(always)]
     pub(crate) fn set_sp(&mut self, offset: usize) {
         self.sp = offset;
     }
 
     // --- Push/pop: all values stored as 8-byte (u64) slots ---
 
+    #[inline(always)]
     pub(crate) fn push_u64(&mut self, val: u64) {
         unsafe {
             let dst = self.base.add(self.sp) as *mut u64;
@@ -84,6 +105,7 @@ impl Stack {
         self.sp += 8;
     }
 
+    #[inline(always)]
     pub(crate) fn pop_u64(&mut self) -> u64 {
         self.sp -= 8;
         unsafe {
@@ -92,40 +114,61 @@ impl Stack {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn push_i32(&mut self, val: i32) {
         self.push_u64(val as u64);
     }
 
+    #[inline(always)]
     pub(crate) fn pop_i32(&mut self) -> i32 {
         self.pop_u64() as i32
     }
 
+    #[inline(always)]
     pub(crate) fn push_i64(&mut self, val: i64) {
         self.push_u64(val as u64);
     }
 
+    #[inline(always)]
     pub(crate) fn pop_i64(&mut self) -> i64 {
         self.pop_u64() as i64
     }
 
+    #[inline(always)]
     pub(crate) fn push_f32(&mut self, val: f32) {
         self.push_u64(val.to_bits() as u64);
     }
 
+    #[inline(always)]
     pub(crate) fn pop_f32(&mut self) -> f32 {
         f32::from_bits(self.pop_u64() as u32)
     }
 
+    #[inline(always)]
     pub(crate) fn push_f64(&mut self, val: f64) {
         self.push_u64(val.to_bits());
     }
 
+    #[inline(always)]
     pub(crate) fn pop_f64(&mut self) -> f64 {
         f64::from_bits(self.pop_u64())
     }
 
+    /// Base pointer of the usable stack region.
+    #[inline(always)]
+    pub(crate) fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    /// Raw mutable pointer at a byte offset from base.
+    #[inline(always)]
+    pub(crate) fn ptr_at_mut(&mut self, offset: usize) -> *mut u8 {
+        unsafe { self.base.add(offset) }
+    }
+
     // --- Random access by byte offset (for locals, result slots) ---
 
+    #[inline(always)]
     pub(crate) fn read_u64_at(&self, offset: usize) -> u64 {
         unsafe {
             let src = self.base.add(offset) as *const u64;
@@ -133,6 +176,7 @@ impl Stack {
         }
     }
 
+    #[inline(always)]
     pub(crate) fn write_u64_at(&mut self, offset: usize, val: u64) {
         unsafe {
             let dst = self.base.add(offset) as *mut u64;
@@ -141,6 +185,7 @@ impl Stack {
     }
 
     /// Push a Val onto the stack.
+    #[inline(always)]
     pub(crate) fn push_val(&mut self, val: &Val) {
         match val {
             Val::I32(v) => self.push_i32(*v),
