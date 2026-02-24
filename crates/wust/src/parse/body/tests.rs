@@ -58,7 +58,7 @@ fn call_function_index() {
 
 #[test]
 fn large_const_spills_to_data() {
-    let mut body = ParsedBody::empty();
+    let mut body = ParsedBody::default();
     let big: i64 = 1 << 24;
     body.emit_signed(OpCode::I32Const, big, &(big as i32).to_le_bytes());
     let (opcode, offset) = decode(body.ops[0]);
@@ -119,7 +119,7 @@ fn superinstruction_packing_roundtrips() {
 
 #[test]
 fn fuse_local_get_return() {
-    let mut body = ParsedBody::empty();
+    let mut body = ParsedBody::default();
     body.ops.push(pack_imm_u(OpCode::LocalGet, 2));
     body.ops.push(pack(OpCode::Return));
     body.fuse();
@@ -130,7 +130,7 @@ fn fuse_local_get_return() {
 
 #[test]
 fn fuse_local_get_const_sub() {
-    let mut body = ParsedBody::empty();
+    let mut body = ParsedBody::default();
     body.ops.push(pack_imm_u(OpCode::LocalGet, 0));
     body.ops.push(pack_imm(OpCode::I32Const, 1));
     body.ops.push(pack(OpCode::I32Sub));
@@ -143,7 +143,7 @@ fn fuse_local_get_const_sub() {
 
 #[test]
 fn fuse_call_local_set() {
-    let mut body = ParsedBody::empty();
+    let mut body = ParsedBody::default();
     body.ops.push(pack_imm_u(OpCode::Call, 42));
     body.ops.push(pack_imm_u(OpCode::LocalSet, 3));
     body.fuse();
@@ -155,7 +155,7 @@ fn fuse_call_local_set() {
 
 #[test]
 fn fuse_local_get_local_get_add() {
-    let mut body = ParsedBody::empty();
+    let mut body = ParsedBody::default();
     body.ops.push(pack_imm_u(OpCode::LocalGet, 1));
     body.ops.push(pack_imm_u(OpCode::LocalGet, 2));
     body.ops.push(pack(OpCode::I32Add));
@@ -170,7 +170,7 @@ fn fuse_local_get_local_get_add() {
 /// reduces 21 ops down to the expected fused sequence.
 #[test]
 fn fuse_fib_sequence() {
-    let mut body = ParsedBody::empty();
+    let mut body = ParsedBody::default();
 
     // Block 0: implicit function block (added by parser normally).
     // Block 1: the if block.

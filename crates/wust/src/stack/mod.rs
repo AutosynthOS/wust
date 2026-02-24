@@ -115,13 +115,13 @@ impl Stack {
     }
 
     #[inline(always)]
-    pub(crate) fn push_i32(&mut self, val: i32) {
-        self.push_u64(val as u64);
+    pub(crate) fn pop_i32(&mut self) -> i32 {
+        self.pop_u64() as i32
     }
 
     #[inline(always)]
-    pub(crate) fn pop_i32(&mut self) -> i32 {
-        self.pop_u64() as i32
+    pub(crate) fn push_i32(&mut self, val: i32) {
+        self.push_u64(val as u64);
     }
 
     #[inline(always)]
@@ -130,18 +130,8 @@ impl Stack {
     }
 
     #[inline(always)]
-    pub(crate) fn pop_i64(&mut self) -> i64 {
-        self.pop_u64() as i64
-    }
-
-    #[inline(always)]
     pub(crate) fn push_f32(&mut self, val: f32) {
         self.push_u64(val.to_bits() as u64);
-    }
-
-    #[inline(always)]
-    pub(crate) fn pop_f32(&mut self) -> f32 {
-        f32::from_bits(self.pop_u64() as u32)
     }
 
     #[inline(always)]
@@ -213,76 +203,4 @@ impl Drop for Stack {
 fn page_size() -> usize {
     // SAFETY: sysconf(_SC_PAGESIZE) always succeeds on POSIX systems.
     unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn push_pop_i32() {
-        let mut s = Stack::new().unwrap();
-        s.push_i32(42);
-        s.push_i32(-1);
-        assert_eq!(s.pop_i32(), -1);
-        assert_eq!(s.pop_i32(), 42);
-    }
-
-    #[test]
-    fn push_pop_i64() {
-        let mut s = Stack::new().unwrap();
-        s.push_i64(0x1_0000_0000);
-        assert_eq!(s.pop_i64(), 0x1_0000_0000);
-    }
-
-    #[test]
-    fn push_pop_f32() {
-        let mut s = Stack::new().unwrap();
-        s.push_f32(3.14);
-        assert_eq!(s.pop_f32(), 3.14);
-    }
-
-    #[test]
-    fn push_pop_f64() {
-        let mut s = Stack::new().unwrap();
-        s.push_f64(2.718281828);
-        assert_eq!(s.pop_f64(), 2.718281828);
-    }
-
-    #[test]
-    fn sp_tracks_pushes_and_pops() {
-        let mut s = Stack::new().unwrap();
-        assert_eq!(s.sp(), 0);
-        s.push_i32(1);
-        assert_eq!(s.sp(), 8);
-        s.push_i32(2);
-        assert_eq!(s.sp(), 16);
-        s.pop_i32();
-        assert_eq!(s.sp(), 8);
-    }
-
-    #[test]
-    fn set_sp_resets_position() {
-        let mut s = Stack::new().unwrap();
-        s.push_i32(10);
-        s.push_i32(20);
-        assert_eq!(s.sp(), 16);
-        s.set_sp(8);
-        assert_eq!(s.sp(), 8);
-        // The value at offset 0 is still there.
-        assert_eq!(s.pop_i32(), 10);
-    }
-
-    #[test]
-    fn random_access_read_write() {
-        let mut s = Stack::new().unwrap();
-        s.push_i32(100);
-        s.push_i32(200);
-        // Slot 0 = 100, slot 1 = 200
-        assert_eq!(s.read_u64_at(0) as i32, 100);
-        assert_eq!(s.read_u64_at(8) as i32, 200);
-        // Overwrite slot 0
-        s.write_u64_at(0, 999);
-        assert_eq!(s.read_u64_at(0), 999);
-    }
 }

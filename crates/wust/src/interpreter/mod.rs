@@ -26,12 +26,19 @@ pub(crate) fn call(
 
     // call_function expects args already on stack.
     let mut fuel: i64 = i64::MAX;
-    exec_recursive::call_function(module, stack, func, &mut fuel)?;
-
-    // Results are now at return_sp.
-    let results = read_results(stack, return_sp, &func.results);
-
-    Ok(results)
+    let mut depth: u32 = 0;
+    match exec_recursive::call_function(module, stack, func, &mut fuel, &mut depth) {
+        Ok(()) => {
+            // Results are now at return_sp.
+            let results = read_results(stack, return_sp, &func.results);
+            Ok(results)
+        }
+        Err(trap) => {
+            // Reset SP so the instance stays usable after a trap.
+            stack.set_sp(return_sp);
+            Err(trap.into())
+        }
+    }
 }
 
 /// Read result values starting at `base` offset, using type info to

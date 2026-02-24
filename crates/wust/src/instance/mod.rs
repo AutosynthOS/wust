@@ -53,7 +53,7 @@ impl Instance {
             .ok_or_else(|| anyhow::anyhow!("func index {} out of bounds", idx.0))
     }
 
-    fn resolve_export_func_idx(&self, name: &str) -> Result<FuncIdx, anyhow::Error> {
+    pub(crate) fn resolve_export_func_idx(&self, name: &str) -> Result<FuncIdx, anyhow::Error> {
         self.module
             .exports
             .get(name)

@@ -1,5 +1,4 @@
-// Hand-compiled fib for aarch64 — simulates JIT output.
-// Four variants: no fuel, fuel at calls, fuel at every op, tail-call.
+// Hand-written fib for aarch64 — reference implementations for benchmarking.
 //
 // All follow C calling convention: w0 = n, returns i32 in w0.
 // Fuel variants: x1 = initial fuel count (or pointer for calls-only).
@@ -8,10 +7,10 @@
 .align 4
 
 // ============================================================
-// Variant 1: No fuel check
+// No fuel check — pure recursive, no overhead.
 // ============================================================
-.global _fib_jit_no_fuel
-_fib_jit_no_fuel:
+.global _fib_asm_no_fuel
+_fib_asm_no_fuel:
     cmp     w0, #1
     b.le    0f
     stp     x29, x30, [sp, #-32]!
@@ -19,10 +18,10 @@ _fib_jit_no_fuel:
     stp     x19, x20, [sp, #16]
     mov     w19, w0
     sub     w0, w0, #1
-    bl      _fib_jit_no_fuel
+    bl      _fib_asm_no_fuel
     mov     w20, w0
     sub     w0, w19, #2
-    bl      _fib_jit_no_fuel
+    bl      _fib_asm_no_fuel
     add     w0, w0, w20
     ldp     x19, x20, [sp, #16]
     ldp     x29, x30, [sp], #32
@@ -30,11 +29,11 @@ _fib_jit_no_fuel:
     ret
 
 // ============================================================
-// Variant 2: Fuel check at call sites only
-// x1 = *fuel (preserved in x21 across calls)
+// Fuel check at call sites only.
+// x1 = *fuel (preserved in x21 across calls).
 // ============================================================
-.global _fib_jit_fuel_calls
-_fib_jit_fuel_calls:
+.global _fib_asm_fuel_calls
+_fib_asm_fuel_calls:
     cmp     w0, #1
     b.le    0f
     stp     x29, x30, [sp, #-48]!
@@ -52,7 +51,7 @@ _fib_jit_fuel_calls:
 
     sub     w0, w19, #1
     mov     x1, x21
-    bl      _fib_jit_fuel_calls
+    bl      _fib_asm_fuel_calls
     mov     w20, w0
 
     // fuel check before call 2
@@ -63,7 +62,7 @@ _fib_jit_fuel_calls:
 
     sub     w0, w19, #2
     mov     x1, x21
-    bl      _fib_jit_fuel_calls
+    bl      _fib_asm_fuel_calls
     add     w0, w0, w20
 
     ldr     x21, [sp, #32]
@@ -79,14 +78,13 @@ _fib_jit_fuel_calls:
     ret
 
 // ============================================================
-// Variant 3: Fuel check at every real wasm instruction boundary
+// Fuel check at every wasm instruction boundary.
 // x24 = pinned fuel register (pure register, no memory traffic).
-// Based on actual Cranelift-style output.
 // ============================================================
-.global _fib_jit_fuel_all
-.global _fib_jit_fuel_all_entry
+.global _fib_asm_fuel_all
+.global _fib_asm_fuel_all_entry
 
-_fib_jit_fuel_all:
+_fib_asm_fuel_all:
     stp     x29, x30, [sp, #-0x10]!
     stp     x21, x22, [sp, #-0x10]!
     mov     x29, sp
@@ -106,7 +104,7 @@ _fib_jit_fuel_all:
     // wasm: call $fib
     subs    x24, x24, #1
     b.le    2f
-    bl      _fib_jit_fuel_all
+    bl      _fib_asm_fuel_all
     mov     w21, w0                    // save fib(n-1)
 
     // wasm: local.get 0 / i32.const 2 / i32.sub
@@ -117,7 +115,7 @@ _fib_jit_fuel_all:
     // wasm: call $fib
     subs    x24, x24, #1
     b.le    2f
-    bl      _fib_jit_fuel_all          // w0 = fib(n-2)
+    bl      _fib_asm_fuel_all          // w0 = fib(n-2)
 
     // wasm: local.get 1 / local.get 2 / i32.add
     subs    x24, x24, #1
@@ -147,244 +145,28 @@ _fib_jit_fuel_all:
     ldp     x29, x30, [sp], #0x10
     ret
 
-// C-callable wrapper: x1 = initial fuel value → pinned into x24.
+// C-callable wrapper: x1 = initial fuel value -> pinned into x24.
 .align 4
-_fib_jit_fuel_all_entry:
+_fib_asm_fuel_all_entry:
     stp     x29, x30, [sp, #-0x10]!
     str     x24, [sp, #-0x10]!
     mov     x29, sp
     mov     x24, x1
-    bl      _fib_jit_fuel_all
+    bl      _fib_asm_fuel_all
     ldr     x24, [sp], #0x10
     ldp     x29, x30, [sp], #0x10
     ret
 
 // ============================================================
-// Variant 5: Fuel@op + EAGER stores (worst case)
-// x24 = pinned fuel, x23 = locals base pointer.
-// After every op, stores live registers back to locals memory.
-// This simulates "always clean state" — maximum store overhead.
-// ============================================================
-.global _fib_jit_fuel_eager
-.global _fib_jit_fuel_eager_entry
-
-_fib_jit_fuel_eager:
-    stp     x29, x30, [sp, #-0x10]!
-    stp     x21, x22, [sp, #-0x10]!
-    str     x23, [sp, #-0x10]!
-    // Allocate locals area on stack: 3 locals * 4 bytes = 12, padded to 16
-    sub     sp, sp, #16
-    mov     x29, sp
-    mov     x23, sp                    // x23 = locals base
-    mov     w22, w0
-    str     w22, [x23, #0]            // locals[0] = n
-
-    // wasm: local.get 0 / i32.const 1 / i32.le_s / if
-    subs    x24, x24, #1
-    b.le    12f
-    cmp     w22, #1
-    b.le    13f
-
-    // wasm: local.get 0 / i32.const 1 / i32.sub
-    subs    x24, x24, #1
-    b.le    12f
-    sub     w0, w22, #1
-
-    // wasm: call $fib
-    subs    x24, x24, #1
-    b.le    12f
-    bl      _fib_jit_fuel_eager
-    mov     w21, w0
-    str     w21, [x23, #4]            // eager store: locals[1] = fib(n-1)
-
-    // wasm: local.get 0 / i32.const 2 / i32.sub
-    subs    x24, x24, #1
-    b.le    12f
-    sub     w0, w22, #2
-
-    // wasm: call $fib
-    subs    x24, x24, #1
-    b.le    12f
-    bl      _fib_jit_fuel_eager
-    str     w0, [x23, #8]             // eager store: locals[2] = fib(n-2)
-
-    // wasm: local.get 1 / local.get 2 / i32.add
-    subs    x24, x24, #1
-    b.le    12f
-    ldr     w21, [x23, #4]            // eager load: must re-read from memory
-    ldr     w2, [x23, #8]             // eager load
-    add     w0, w21, w2
-
-    // wasm: end
-    subs    x24, x24, #1
-    b.le    12f
-
-    add     sp, sp, #16
-    ldr     x23, [sp], #0x10
-    ldp     x21, x22, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-13: // base case
-    subs    x24, x24, #1
-    b.le    12f
-    mov     w0, w22
-
-    add     sp, sp, #16
-    ldr     x23, [sp], #0x10
-    ldp     x21, x22, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-12: // out of fuel
-    mov     w0, #-1
-    add     sp, sp, #16
-    ldr     x23, [sp], #0x10
-    ldp     x21, x22, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-.align 4
-_fib_jit_fuel_eager_entry:
-    stp     x29, x30, [sp, #-0x10]!
-    stp     x23, x24, [sp, #-0x10]!
-    mov     x29, sp
-    mov     x24, x1
-    bl      _fib_jit_fuel_eager
-    ldp     x23, x24, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-// ============================================================
-// Variant 6: Fuel@op + LAZY stores (realistic JIT)
-// x24 = pinned fuel, x23 = locals base pointer.
-// Stores only happen in the out-of-fuel path (cold, never taken).
-// Hot path is pure registers — identical to variant 3.
-// ============================================================
-.global _fib_jit_fuel_lazy
-.global _fib_jit_fuel_lazy_entry
-
-_fib_jit_fuel_lazy:
-    stp     x29, x30, [sp, #-0x10]!
-    stp     x21, x22, [sp, #-0x10]!
-    str     x23, [sp, #-0x10]!
-    // Allocate locals area: 3 * 4 = 12 bytes, padded to 16
-    sub     sp, sp, #16
-    mov     x29, sp
-    mov     x23, sp                    // x23 = locals base
-    mov     w22, w0
-
-    // wasm: local.get 0 / i32.const 1 / i32.le_s / if
-    subs    x24, x24, #1
-    b.le    22f                        // suspend point 0: locals[0]=w22
-    cmp     w22, #1
-    b.le    23f
-
-    // wasm: local.get 0 / i32.const 1 / i32.sub
-    subs    x24, x24, #1
-    b.le    22f                        // suspend point 1: locals[0]=w22
-    sub     w0, w22, #1
-
-    // wasm: call $fib
-    subs    x24, x24, #1
-    b.le    22f                        // suspend point 2: locals[0]=w22
-    bl      _fib_jit_fuel_lazy
-    mov     w21, w0
-
-    // wasm: local.get 0 / i32.const 2 / i32.sub
-    subs    x24, x24, #1
-    b.le    24f                        // suspend point 3: locals[0]=w22, locals[1]=w21
-    sub     w0, w22, #2
-
-    // wasm: call $fib
-    subs    x24, x24, #1
-    b.le    24f                        // suspend point 4: locals[0]=w22, locals[1]=w21
-    bl      _fib_jit_fuel_lazy
-
-    // wasm: local.get 1 / local.get 2 / i32.add
-    subs    x24, x24, #1
-    b.le    25f                        // suspend point 5: all three live
-    add     w0, w21, w0
-
-    // wasm: end
-    subs    x24, x24, #1
-    b.le    22f
-
-    add     sp, sp, #16
-    ldr     x23, [sp], #0x10
-    ldp     x21, x22, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-23: // base case
-    subs    x24, x24, #1
-    b.le    22f
-    mov     w0, w22
-
-    add     sp, sp, #16
-    ldr     x23, [sp], #0x10
-    ldp     x21, x22, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-// --- Cold paths: lazy spill only on suspend ---
-22: // suspend: only local 0 live
-    str     w22, [x23, #0]
-    mov     w0, #-1
-    add     sp, sp, #16
-    ldr     x23, [sp], #0x10
-    ldp     x21, x22, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-24: // suspend: locals 0 and 1 live
-    stp     w22, w21, [x23, #0]
-    mov     w0, #-1
-    add     sp, sp, #16
-    ldr     x23, [sp], #0x10
-    ldp     x21, x22, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-25: // suspend: locals 0, 1, 2 live (w0 = local 2)
-    str     w22, [x23, #0]
-    stp     w21, w0, [x23, #4]
-    mov     w0, #-1
-    add     sp, sp, #16
-    ldr     x23, [sp], #0x10
-    ldp     x21, x22, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-.align 4
-_fib_jit_fuel_lazy_entry:
-    stp     x29, x30, [sp, #-0x10]!
-    stp     x24, xzr, [sp, #-0x10]!
-    mov     x29, sp
-    mov     x24, x1
-    bl      _fib_jit_fuel_lazy
-    ldp     x24, xzr, [sp], #0x10
-    ldp     x29, x30, [sp], #0x10
-    ret
-
-// ============================================================
-// Variant 8: Custom calling convention — wasm-managed stack
+// Custom calling convention — wasm-managed stack.
 //
 // x23 = wasm stack pointer (caller-managed, flat array)
 // x24 = pinned fuel register
-//
-// Convention:
-//   - Caller pushes its live locals to [x23], bumps x23
-//   - Caller pushes arg (n) to [x23]
-//   - Callee reads arg from [x23 - 4], works in registers
-//   - Callee writes i32 result to [x23 - 4] (overwrites arg)
-//   - Caller restores x23, reads result
-//   - Only x30 saved on native stack (for ret)
 // ============================================================
-.global _fib_jit_wasm_stack
-.global _fib_jit_wasm_stack_entry
+.global _fib_asm_wasm_stack
+.global _fib_asm_wasm_stack_entry
 
-_fib_jit_wasm_stack:
+_fib_asm_wasm_stack:
     // On entry: arg n is at [x23 - 4], as i32
     ldr     w9, [x23, #-4]            // w9 = n
 
@@ -400,8 +182,6 @@ _fib_jit_wasm_stack:
     str     x30, [sp, #-0x10]!
 
     // Caller saves local 0 (n) to wasm stack, pushes arg (n-1)
-    //   [x23 + 0] = n  (caller's live local)
-    //   [x23 + 4] = n-1 (arg for callee)
     subs    x24, x24, #1
     b.le    34f
     sub     w10, w9, #1
@@ -410,12 +190,9 @@ _fib_jit_wasm_stack:
     // call fib(n-1)
     subs    x24, x24, #1
     b.le    34f
-    bl      _fib_jit_wasm_stack
+    bl      _fib_asm_wasm_stack
 
-    // Result is at [x23 - 4]. Read it, store as local 1.
-    // Now wasm stack: [x23-8]=saved_n, [x23-4]=fib(n-1)
-    // We need saved_n to compute n-2, and fib(n-1) for the final add.
-    // Push arg (n-2) on top:
+    // Result is at [x23 - 4]. Push arg (n-2) on top.
     subs    x24, x24, #1
     b.le    34f
     ldr     w9, [x23, #-8]            // reload n from wasm stack
@@ -425,19 +202,17 @@ _fib_jit_wasm_stack:
     // call fib(n-2)
     subs    x24, x24, #1
     b.le    34f
-    bl      _fib_jit_wasm_stack
+    bl      _fib_asm_wasm_stack
 
     // Result at [x23 - 4] = fib(n-2)
-    // [x23-12]=saved_n, [x23-8]=fib(n-1), [x23-4]=fib(n-2)
     subs    x24, x24, #1
     b.le    34f
     ldp     w11, w12, [x23, #-8]      // w11 = fib(n-1), w12 = fib(n-2)
     add     w0, w11, w12
 
-    // Pop wasm stack: we pushed 12 bytes (8 + 4), go back to caller's frame
-    // Caller had arg at [original_x23 - 4], we write result there
+    // Pop wasm stack, write result to caller's arg slot
     sub     x23, x23, #12
-    str     w0, [x23, #-4]            // overwrite caller's arg slot with result
+    str     w0, [x23, #-4]
 
     // Restore return address
     ldr     x30, [sp], #0x10
@@ -460,9 +235,100 @@ _fib_jit_wasm_stack:
     ldr     x30, [sp], #0x10
     ret
 
+// ============================================================
+// Fuel + jump table trampoline for calls.
+//
+// Instead of loading a function pointer from memory and doing
+// `blr` (indirect call), callers do `bl <trampoline>` (direct).
+// The trampoline is a single `b <target>` instruction.
+//
+// Call overhead: 1 extra `b` hop vs 2 `ldr` + `blr`.
+// x24 = pinned fuel register.
+// ============================================================
+.global _fib_asm_jumptable
+.global _fib_asm_jumptable_entry
+
+// Jump table — one `b` per function. For fib we have one function.
+.align 4
+_fib_jumptable:
+    b       _fib_asm_jumptable          // func 0: fib
+
+_fib_asm_jumptable:
+    stp     x29, x30, [sp, #-0x10]!
+    stp     x21, x22, [sp, #-0x10]!
+    mov     x29, sp
+    mov     w22, w0                     // n in callee-saved
+
+    // wasm: local.get 0 / i32.const 1 / i32.le_s / if
+    subs    x24, x24, #1
+    b.le    42f
+    cmp     w22, #1
+    b.le    43f
+
+    // wasm: local.get 0 / i32.const 1 / i32.sub
+    subs    x24, x24, #1
+    b.le    42f
+    sub     w0, w22, #1
+
+    // wasm: call $fib — via jump table trampoline
+    subs    x24, x24, #1
+    b.le    42f
+    bl      _fib_jumptable              // bl to trampoline (direct), which does b to target
+    mov     w21, w0                     // save fib(n-1)
+
+    // wasm: local.get 0 / i32.const 2 / i32.sub
+    subs    x24, x24, #1
+    b.le    42f
+    sub     w0, w22, #2
+
+    // wasm: call $fib — via jump table trampoline
+    subs    x24, x24, #1
+    b.le    42f
+    bl      _fib_jumptable              // w0 = fib(n-2)
+
+    // wasm: local.get 1 / local.get 2 / i32.add
+    subs    x24, x24, #1
+    b.le    42f
+    add     w0, w21, w0
+
+    // wasm: end (function return)
+    subs    x24, x24, #1
+    b.le    42f
+
+    ldp     x21, x22, [sp], #0x10
+    ldp     x29, x30, [sp], #0x10
+    ret
+
+43: // base case: local.get $n / return
+    subs    x24, x24, #1
+    b.le    42f
+    mov     w0, w22
+
+    ldp     x21, x22, [sp], #0x10
+    ldp     x29, x30, [sp], #0x10
+    ret
+
+42: // out of fuel
+    mov     w0, #-1
+    ldp     x21, x22, [sp], #0x10
+    ldp     x29, x30, [sp], #0x10
+    ret
+
+// C-callable wrapper: x1 = initial fuel value -> pinned into x24.
+.align 4
+_fib_asm_jumptable_entry:
+    stp     x29, x30, [sp, #-0x10]!
+    str     x24, [sp, #-0x10]!
+    mov     x29, sp
+    mov     x24, x1
+    bl      _fib_jumptable              // enter via trampoline
+    ldr     x24, [sp], #0x10
+    ldp     x29, x30, [sp], #0x10
+    ret
+
 // C-callable entry: w0 = n, x1 = fuel, x2 = wasm stack base
 .align 4
-_fib_jit_wasm_stack_entry:
+_fib_asm_wasm_stack_entry:
     stp     x29, x30, [sp, #-0x10]!
     stp     x23, x24, [sp, #-0x10]!
     mov     x29, sp
@@ -470,32 +336,9 @@ _fib_jit_wasm_stack_entry:
     mov     x24, x1                    // fuel
     // Push arg onto wasm stack
     str     w0, [x23], #4             // push n, x23 += 4
-    bl      _fib_jit_wasm_stack
+    bl      _fib_asm_wasm_stack
     // Result at [x23 - 4]
     ldr     w0, [x23, #-4]
     ldp     x23, x24, [sp], #0x10
     ldp     x29, x30, [sp], #0x10
-    ret
-
-// ============================================================
-// Variant 7: Tail-call optimized (iterative accumulator)
-//
-// fib(n) = fib_iter(n, 0, 1)
-// fib_iter(n, a, b) = if n == 0 then a else fib_iter(n-1, b, a+b)
-//
-// No stack frames, no calls — pure register loop.
-// ============================================================
-.global _fib_jit_tailcall
-_fib_jit_tailcall:
-    mov     w1, #0              // a = 0
-    mov     w2, #1              // b = 1
-0:
-    cbz     w0, 1f              // if n == 0, return a
-    add     w3, w1, w2          // tmp = a + b
-    mov     w1, w2              // a = b
-    mov     w2, w3              // b = tmp
-    sub     w0, w0, #1          // n--
-    b       0b
-1:
-    mov     w0, w1              // return a
     ret

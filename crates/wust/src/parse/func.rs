@@ -28,14 +28,3 @@ impl ParsedFunction {
         self.param_count
     }
 }
-
-fn get_size_of_value(value: &ValType) -> usize {
-    match value {
-        ValType::I32 => 4,
-        ValType::I64 => 8,
-        ValType::F32 => 4,
-        ValType::F64 => 8,
-        ValType::V128 => 16,
-        ValType::Ref(..) => 8,
-    }
-}

@@ -1,6 +1,7 @@
 mod engine;
 mod instance;
 mod interpreter;
+mod jit;
 mod linker;
 mod module;
 mod parse;
@@ -10,6 +11,8 @@ mod value;
 
 pub use engine::Engine;
 pub use instance::Instance;
+pub use jit::codegen::Codegen;
+pub use jit::{FiberResult, JitCompiler, JitFiber, JitModule};
 pub use linker::Linker;
 pub use module::Module;
 pub use store::Store;

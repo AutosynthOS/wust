@@ -1,5 +1,5 @@
 use crate::Module;
-use crate::parse::body::OpCode;
+use crate::parse::body::{Block, BlockKind, OpCode};
 use crate::parse::func::ParsedFunction;
 use crate::stack::Stack;
 
@@ -9,13 +9,20 @@ use crate::stack::Stack;
 pub(crate) enum Trap {
     Unreachable,
     OutOfFuel,
+    CallStackExhausted,
+    Unimplemented(OpCode),
 }
+
+/// Maximum call depth before trapping with `CallStackExhausted`.
+const MAX_CALL_DEPTH: u32 = 1000;
 
 impl std::fmt::Display for Trap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Trap::Unreachable => write!(f, "unreachable executed"),
             Trap::OutOfFuel => write!(f, "out of fuel"),
+            Trap::CallStackExhausted => write!(f, "call stack exhausted"),
+            Trap::Unimplemented(op) => write!(f, "unimplemented opcode: {op:?}"),
         }
     }
 }
@@ -39,7 +46,14 @@ pub(crate) fn call_function(
     stack: &mut Stack,
     func: &ParsedFunction,
     fuel: &mut i64,
+    depth: &mut u32,
 ) -> Result<(), Trap> {
+    *depth += 1;
+    if *depth > MAX_CALL_DEPTH {
+        *depth -= 1;
+        return Err(Trap::CallStackExhausted);
+    }
+
     let base = stack.base();
     let sp = stack.sp();
 
@@ -58,7 +72,9 @@ pub(crate) fn call_function(
         result_count: func.result_count,
     };
 
-    execute(module, func, stack, &frame, fuel)
+    let result = execute(module, func, stack, &frame, fuel, depth);
+    *depth -= 1;
+    result
 }
 
 fn execute(
@@ -67,6 +83,7 @@ fn execute(
     stack: &mut Stack,
     frame: &Frame,
     fuel: &mut i64,
+    depth: &mut u32,
 ) -> Result<(), Trap> {
     let ops = func.body.ops.as_ptr();
     let blocks = func.body.blocks.as_ptr();
@@ -122,10 +139,24 @@ fn execute(
                 }
             }
 
+            OpCode::Br => {
+                let block = unsafe { &*blocks.add(imm as usize) };
+                pc = branch_target(block);
+            }
+
+            OpCode::BrIf => {
+                sp = unsafe { sp.sub(8) };
+                let condition = unsafe { *(sp as *const i32) };
+                if condition != 0 {
+                    let block = unsafe { &*blocks.add(imm as usize) };
+                    pc = branch_target(block);
+                }
+            }
+
             OpCode::Call => {
                 stack.set_sp(unsafe { sp.offset_from(base) as usize });
                 let callee = unsafe { module.funcs.get_unchecked(imm as usize) };
-                call_function(module, stack, callee, fuel)?;
+                call_function(module, stack, callee, fuel, depth)?;
                 sp = unsafe { base.add(stack.sp()) };
             }
 
@@ -214,7 +245,7 @@ fn execute(
                 let local_idx = entry.imm_u8_c() as usize;
                 stack.set_sp(unsafe { sp.offset_from(base) as usize });
                 let callee = unsafe { module.funcs.get_unchecked(func_idx) };
-                call_function(module, stack, callee, fuel)?;
+                call_function(module, stack, callee, fuel, depth)?;
                 sp = unsafe { base.add(stack.sp()) };
                 // Pop result into local.
                 sp = unsafe { sp.sub(8) };
@@ -257,7 +288,10 @@ fn execute(
                 }
             }
 
-            _ => {}
+            _ => {
+                stack.set_sp(unsafe { sp.offset_from(base) as usize });
+                return Err(Trap::Unimplemented(opcode));
+            }
         }
     }
 
@@ -273,10 +307,23 @@ fn execute(
             *(dst as *mut u64) = val;
         },
         _ => unsafe {
-            std::ptr::copy_nonoverlapping(src, dst, byte_count);
+            // Use `copy` instead of `copy_nonoverlapping`: when a
+            // function has zero args, src and dst can be the same address.
+            std::ptr::copy(src, dst, byte_count);
         },
     }
     stack.set_sp(unsafe { dst.add(byte_count).offset_from(base) as usize });
 
     Ok(())
+}
+
+/// Resolve a branch target PC from a block.
+/// Loop: back-edge to first instruction inside the loop (start_pc + 1).
+/// Block/If/Function: forward to instruction after End (end_pc + 1).
+fn branch_target(block: &Block) -> usize {
+    if block.kind == BlockKind::Loop {
+        block.start_pc as usize + 1
+    } else {
+        block.end_pc as usize + 1
+    }
 }

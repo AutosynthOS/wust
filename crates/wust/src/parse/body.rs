@@ -192,20 +192,12 @@ fn pack_imm_u(opcode: OpCode, imm: u32) -> InlineOp {
 
 /// Pack opcode + u8 in bits[8..16] + i16 in bits[16..32].
 fn pack_u8_i16(opcode: OpCode, a: u8, val: i16) -> InlineOp {
-    InlineOp(
-        (opcode as u64)
-            | ((a as u64) << 8)
-            | (((val as u16) as u64) << 16),
-    )
+    InlineOp((opcode as u64) | ((a as u64) << 8) | (((val as u16) as u64) << 16))
 }
 
 /// Pack opcode + u16 in bits[8..24] + u8 in bits[24..32].
 fn pack_u16_u8(opcode: OpCode, a: u16, b: u8) -> InlineOp {
-    InlineOp(
-        (opcode as u64)
-            | ((a as u64) << 8)
-            | ((b as u64) << 24),
-    )
+    InlineOp((opcode as u64) | ((a as u64) << 8) | ((b as u64) << 24))
 }
 
 /// Pack opcode + u8 in bits[8..16] + u8 in bits[16..24].
@@ -215,12 +207,7 @@ fn pack_two_u8(opcode: OpCode, a: u8, b: u8) -> InlineOp {
 
 /// Pack opcode + three u8 fields in bits[8..16], [16..24], [24..32].
 fn pack_three_u8(opcode: OpCode, a: u8, b: u8, c: u8) -> InlineOp {
-    InlineOp(
-        (opcode as u64)
-            | ((a as u64) << 8)
-            | ((b as u64) << 16)
-            | ((c as u64) << 24),
-    )
+    InlineOp((opcode as u64) | ((a as u64) << 8) | ((b as u64) << 16) | ((c as u64) << 24))
 }
 
 fn fits_imm24(val: i64) -> bool {
@@ -234,7 +221,7 @@ fn fits_imm24_unsigned(val: u64) -> bool {
 impl ParsedBody {
     /// Parse raw wasm function body bytes into a pre-decoded body.
     pub(crate) fn parse(reader: &FunctionBody) -> Result<Self, anyhow::Error> {
-        let mut body = Self::empty();
+        let mut body = Self::default();
 
         // Implicit function-level block (index 0).
         let func_block_idx = body.open_block(BlockKind::Function);
@@ -262,11 +249,7 @@ impl ParsedBody {
         idx
     }
 
-    fn parse_op(
-        &mut self,
-        op: Operator,
-        block_stack: &mut Vec<u32>,
-    ) -> Result<(), anyhow::Error> {
+    fn parse_op(&mut self, op: Operator, block_stack: &mut Vec<u32>) -> Result<(), anyhow::Error> {
         match op {
             // No-immediate ops
             Operator::Nop => self.ops.push(pack(OpCode::Nop)),
@@ -290,12 +273,16 @@ impl ParsedBody {
                 self.ops.push(pack_imm_u(OpCode::If, idx));
             }
             Operator::Else => {
-                let &idx = block_stack.last().expect("else without open block");
+                let &idx = block_stack
+                    .last()
+                    .ok_or_else(|| anyhow::anyhow!("else without open block"))?;
                 self.blocks[idx as usize].else_pc = self.ops.len() as u32;
                 self.ops.push(pack_imm_u(OpCode::Else, idx));
             }
             Operator::End => {
-                let idx = block_stack.pop().expect("end without open block");
+                let idx = block_stack
+                    .pop()
+                    .ok_or_else(|| anyhow::anyhow!("end without open block"))?;
                 self.blocks[idx as usize].end_pc = self.ops.len() as u32;
                 self.ops.push(pack_imm_u(OpCode::End, idx));
             }
@@ -325,6 +312,9 @@ impl ParsedBody {
             Operator::LocalSet { local_index } => {
                 self.emit_unsigned(OpCode::LocalSet, local_index);
             }
+            Operator::LocalTee { local_index } => {
+                self.emit_unsigned(OpCode::LocalTee, local_index);
+            }
 
             // Globals
             Operator::GlobalGet { global_index } => {
@@ -334,12 +324,24 @@ impl ParsedBody {
                 self.emit_unsigned(OpCode::GlobalSet, global_index);
             }
 
+            // Branches — resolve relative depth to block index.
+            Operator::Br { relative_depth, .. } => {
+                let block_idx = block_stack[block_stack.len() - 1 - relative_depth as usize];
+                self.emit_unsigned(OpCode::Br, block_idx);
+            }
+            Operator::BrIf { relative_depth, .. } => {
+                let block_idx = block_stack[block_stack.len() - 1 - relative_depth as usize];
+                self.emit_unsigned(OpCode::BrIf, block_idx);
+            }
+
             // Call
             Operator::Call { function_index } => {
                 self.emit_unsigned(OpCode::Call, function_index);
             }
 
-            _ => {} // Unknown ops skipped for now.
+            // Unimplemented opcodes emit Unreachable so the interpreter
+            // traps cleanly instead of silently corrupting the stack.
+            _ => self.ops.push(pack(OpCode::Unreachable)),
         }
         Ok(())
     }
@@ -512,10 +514,7 @@ impl ParsedBody {
             if o0.opcode() == OpCode::LocalGet && o1.opcode() == OpCode::Return {
                 let local = o0.immediate_u32();
                 if local < 256 {
-                    return Some((
-                        pack_imm_u(OpCode::LocalGetReturn, local),
-                        2,
-                    ));
+                    return Some((pack_imm_u(OpCode::LocalGetReturn, local), 2));
                 }
             }
         }
@@ -536,8 +535,10 @@ impl ParsedBody {
 
     /// An empty body (for imported functions).
     pub(crate) fn empty() -> Self {
+        // Emit Unreachable so that calling an imported (unlinked) function
+        // produces a clean trap instead of reading from an empty ops slice.
         ParsedBody {
-            ops: Vec::new(),
+            ops: vec![pack(OpCode::Unreachable)],
             data: Vec::new(),
             blocks: Vec::new(),
         }
