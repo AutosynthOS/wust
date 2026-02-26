@@ -284,6 +284,9 @@ pub(crate) fn lower(ir: &IrFunction) -> Result<CompiledFunction, anyhow::Error> 
 
     // ---- Prologue ----
     e.mark();
+    // TODO: pointer authentication (pacibz / autibz) — disabled for now.
+    // e.code.push(0xD503235F); // pacibz
+
     // Save return address (x29 is the wasm frame pointer, managed by caller).
     e.str_x_pre(Reg::X30, Reg::SP, -16);
 
@@ -829,6 +832,8 @@ pub(crate) fn lower_into(
     let mut fuel_sites: Vec<FuelCheckSite> = Vec::new();
 
     // ---- Prologue ----
+    // TODO: pointer authentication (pacibz / autibz) — disabled for now.
+    // e.code.push(0xD503235F); // pacibz
     // Save return address (x29 is the wasm frame pointer, managed by caller).
     e.str_x_pre(Reg::X30, Reg::SP, -16);
 
@@ -909,8 +914,9 @@ fn emit_ir_return(e: &mut Emitter, ra: &RegAlloc, results: &[VReg], result_count
     // result_count == 0: nothing to move.
     // result_count > 1: not yet supported (would need multi-reg return).
 
-    // Epilogue: restore return address and return.
+    // Epilogue: restore return address, verify pointer auth, return.
     e.ldr_x_post(Reg::X30, Reg::SP, 16);
+    // e.code.push(0xD50323DF); // autibz
     e.ret();
 }
 
