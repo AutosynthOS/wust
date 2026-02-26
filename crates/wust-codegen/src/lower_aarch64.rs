@@ -1,46 +1,47 @@
-use crate::jit::code_buffer::CodeBuffer;
-use crate::jit::emit::{Cond, Emitter, PatchPoint, Reg};
-use crate::jit::ir::{IrCond, IrFunction, IrInst, Label, VReg};
+use crate::code_buffer::CodeBuffer;
+use crate::context::JitContext;
+use crate::emit::{Cond, Emitter, PatchPoint, Reg};
+use crate::ir::{IrCond, IrFunction, IrInst, Label, VReg};
 
 /// Compiled JIT code for a single function (standalone mode).
-pub(crate) struct CompiledFunction {
-    pub(crate) buffer: CodeBuffer,
+pub struct CompiledFunction {
+    pub buffer: CodeBuffer,
     /// Instruction words (snapshot from emitter, readable after finalize).
-    pub(crate) code: Vec<u32>,
+    pub code: Vec<u32>,
     /// Byte offset of the completion handler within the code buffer.
-    pub(crate) completion_offset: usize,
+    pub completion_offset: usize,
     /// Word offsets marking boundaries between logical regions.
     /// Marker 0 = prologue, markers 1..N+1 = IR instructions 0..N,
     /// then yield handler, completion handler.
-    pub(crate) markers: Vec<usize>,
+    pub markers: Vec<usize>,
 }
 
 impl CompiledFunction {
     /// Entry point to the compiled code.
-    pub(crate) fn entry(&self) -> *const u8 {
+    pub fn entry(&self) -> *const u8 {
         self.buffer.entry()
     }
 
     /// Address of the completion handler (used as lr for fiber entry).
-    pub(crate) fn completion_handler(&self) -> *const u8 {
+    pub fn completion_handler(&self) -> *const u8 {
         unsafe { self.buffer.entry().add(self.completion_offset) }
     }
 }
 
 /// Word offsets of shared handlers within a shared code buffer.
-pub(crate) struct SharedHandlerOffsets {
+pub struct SharedHandlerOffsets {
     /// Yield handler — called when fuel is exhausted.
-    pub(crate) yield_handler: usize,
+    pub yield_handler: usize,
     /// Completion handler — called when a fiber-mode function returns.
-    pub(crate) completion: usize,
+    pub completion: usize,
     /// Interpret-exit handler — stub target for uncompiled functions.
-    pub(crate) interpret_exit: usize,
+    pub interpret_exit: usize,
 }
 
 /// Layout info for a single compiled function within the shared buffer.
-pub(crate) struct FunctionLayout {
+pub struct FunctionLayout {
     /// Byte offset of the function body start.
-    pub(crate) body_offset: usize,
+    pub body_offset: usize,
 }
 
 /// How calls are emitted — differs between standalone and shared-buffer modes.
@@ -49,7 +50,12 @@ enum CallMode<'a> {
     /// Standalone mode: indirect call via func_table in context.
     Indirect,
     /// Shared-buffer mode: PC-relative call through jump table.
-    PcRelative { shared: &'a SharedHandlerOffsets },
+    PcRelative {
+        shared: &'a SharedHandlerOffsets,
+        /// For each func_idx, `Some(word_offset)` if its body has been
+        /// compiled already (enables direct BL instead of jump table hop).
+        body_offsets: &'a [Option<usize>],
+    },
 }
 
 /// Physical register pool for virtual register allocation.
@@ -177,6 +183,50 @@ impl VRegConsts {
     }
 }
 
+/// Tracks which physical registers currently hold local values.
+///
+/// Avoids redundant loads from the frame when a register already
+/// contains the local's current value — e.g., after a prologue store
+/// or a `LocalSet`, the subsequent `LocalGet` can reuse the register.
+struct LocalCache {
+    /// For each local index, the physical register holding its value.
+    entries: Vec<Option<Reg>>,
+}
+
+impl LocalCache {
+    fn new(total_locals: usize) -> Self {
+        LocalCache {
+            entries: vec![None; total_locals],
+        }
+    }
+
+    /// Record that `reg` holds the current value of `local_idx`.
+    fn set(&mut self, local_idx: usize, reg: Reg) {
+        if local_idx < self.entries.len() {
+            self.entries[local_idx] = Some(reg);
+        }
+    }
+
+    /// Get the cached register for a local, if any.
+    fn get(&self, local_idx: usize) -> Option<Reg> {
+        self.entries.get(local_idx).copied().flatten()
+    }
+
+    /// Invalidate all entries (e.g., after a call or at a label).
+    fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
+    /// Invalidate any entry pointing to `reg` (called when a register is freed).
+    fn invalidate_reg(&mut self, reg: Reg) {
+        for entry in &mut self.entries {
+            if *entry == Some(reg) {
+                *entry = None;
+            }
+        }
+    }
+}
+
 /// Ensure a VReg has a physical register, materializing a constant if needed.
 ///
 /// If the VReg was defined by IConst and hasn't been allocated yet, this
@@ -193,6 +243,22 @@ fn materialize(e: &mut Emitter, ra: &mut RegAlloc, consts: &VRegConsts, vreg: VR
     let phys = ra.alloc(vreg);
     emit_i64_const(e, phys, val);
     phys
+}
+
+/// Free a VReg if it's at its last use, and invalidate any local cache
+/// entries pointing to the freed register.
+fn maybe_free_with_cache(
+    ra: &mut RegAlloc,
+    local_cache: &mut LocalCache,
+    vreg: VReg,
+    inst_idx: usize,
+) {
+    if ra.last_use[vreg.0 as usize] == inst_idx {
+        if let Some(phys) = ra.try_get(vreg) {
+            local_cache.invalidate_reg(phys);
+        }
+        ra.maybe_free(vreg, inst_idx);
+    }
 }
 
 /// Compute last-use position for each VReg by scanning instructions backward.
@@ -245,8 +311,6 @@ fn for_each_use(inst: &IrInst, mut f: impl FnMut(VReg)) {
     }
 }
 
-use crate::jit::JitContext;
-
 const CTX_FUNC_TABLE: u16 = std::mem::offset_of!(JitContext, func_table) as u16;
 const CTX_IS_FIBER: u16 = std::mem::offset_of!(JitContext, is_fiber) as u16;
 const CTX_RESUME_LR: u16 = std::mem::offset_of!(JitContext, resume_lr) as u16;
@@ -268,7 +332,7 @@ const CTX_SCRATCH: u16 = std::mem::offset_of!(JitContext, scratch) as u16;
 /// - x30: link register
 /// - x9–x15: allocatable scratch registers for virtual regs
 /// - x0: temp for yield handler (outside VReg pool)
-pub(crate) fn lower(ir: &IrFunction) -> Result<CompiledFunction, anyhow::Error> {
+pub fn lower(ir: &IrFunction) -> Result<CompiledFunction, anyhow::Error> {
     let mut e = Emitter::new();
     let mut fuel_sites: Vec<FuelCheckSite> = Vec::new();
 
@@ -303,6 +367,12 @@ pub(crate) fn lower(ir: &IrFunction) -> Result<CompiledFunction, anyhow::Error> 
         e.str_x_uoff(Reg::XZR, Reg::X29, offset);
     }
 
+    // Seed local cache: params are in registers after prologue stores.
+    let mut local_cache = LocalCache::new(ir.total_local_count as usize);
+    for i in 0..ir.param_count {
+        local_cache.set(i as usize, Reg(9 + i as u8));
+    }
+
     // ---- Lower each IR instruction ----
     lower_body(
         &mut e,
@@ -312,6 +382,7 @@ pub(crate) fn lower(ir: &IrFunction) -> Result<CompiledFunction, anyhow::Error> 
         &mut label_offsets,
         &mut label_patches,
         &CallMode::Indirect,
+        &mut local_cache,
         true, // emit markers
     );
 
@@ -401,7 +472,7 @@ fn lower_body(
     label_offsets: &mut [Option<usize>],
     label_patches: &mut Vec<(Label, PatchPoint)>,
     call_mode: &CallMode,
-
+    local_cache: &mut LocalCache,
     emit_markers: bool,
 ) {
     let result_count = ir.result_count as usize;
@@ -427,31 +498,43 @@ fn lower_body(
             }
 
             IrInst::LocalGet { dst, idx } => {
-                let phys = ra.alloc(*dst);
-                let offset = (*idx as u16) * 8;
-                e.ldr_x_uoff(phys, Reg::X29, offset);
+                if let Some(cached_reg) = local_cache.get(*idx as usize) {
+                    // Cache hit: the register still holds the local's value.
+                    let phys = ra.alloc(*dst);
+                    if phys != cached_reg {
+                        e.mov_x(phys, cached_reg);
+                    }
+                    local_cache.set(*idx as usize, phys);
+                } else {
+                    // Cache miss: load from frame.
+                    let phys = ra.alloc(*dst);
+                    let offset = (*idx as u16) * 8;
+                    e.ldr_x_uoff(phys, Reg::X29, offset);
+                    local_cache.set(*idx as usize, phys);
+                }
             }
 
             IrInst::LocalSet { idx, src } => {
                 let phys_src = materialize(e, ra, &consts, *src);
                 let offset = (*idx as u16) * 8;
                 e.str_x_uoff(phys_src, Reg::X29, offset);
-                ra.maybe_free(*src, inst_idx);
+                local_cache.set(*idx as usize, phys_src);
+                maybe_free_with_cache(ra, local_cache, *src, inst_idx);
             }
 
             IrInst::Add { dst, lhs, rhs } => {
                 // Try immediate folding: add wd, wn, #imm
                 if let Some(imm) = consts.as_u12(*rhs) {
                     let phys_lhs = materialize(e, ra, &consts, *lhs);
-                    ra.maybe_free(*lhs, inst_idx);
-                    ra.maybe_free(*rhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *lhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *rhs, inst_idx);
                     let phys_dst = ra.alloc(*dst);
                     e.add_w_imm(phys_dst, phys_lhs, imm);
                 } else {
                     let phys_lhs = materialize(e, ra, &consts, *lhs);
                     let phys_rhs = materialize(e, ra, &consts, *rhs);
-                    ra.maybe_free(*lhs, inst_idx);
-                    ra.maybe_free(*rhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *lhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *rhs, inst_idx);
                     let phys_dst = ra.alloc(*dst);
                     e.add_w(phys_dst, phys_lhs, phys_rhs);
                 }
@@ -461,15 +544,15 @@ fn lower_body(
                 // Try immediate folding: sub wd, wn, #imm
                 if let Some(imm) = consts.as_u12(*rhs) {
                     let phys_lhs = materialize(e, ra, &consts, *lhs);
-                    ra.maybe_free(*lhs, inst_idx);
-                    ra.maybe_free(*rhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *lhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *rhs, inst_idx);
                     let phys_dst = ra.alloc(*dst);
                     e.sub_w_imm(phys_dst, phys_lhs, imm);
                 } else {
                     let phys_lhs = materialize(e, ra, &consts, *lhs);
                     let phys_rhs = materialize(e, ra, &consts, *rhs);
-                    ra.maybe_free(*lhs, inst_idx);
-                    ra.maybe_free(*rhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *lhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *rhs, inst_idx);
                     let phys_dst = ra.alloc(*dst);
                     e.sub_w(phys_dst, phys_lhs, phys_rhs);
                 }
@@ -488,14 +571,14 @@ fn lower_body(
                 // Emit cmp (immediate or register).
                 if let Some(imm) = consts.as_u12(*rhs) {
                     let phys_lhs = materialize(e, ra, &consts, *lhs);
-                    ra.maybe_free(*lhs, inst_idx);
-                    ra.maybe_free(*rhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *lhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *rhs, inst_idx);
                     e.cmp_w_imm(phys_lhs, imm);
                 } else {
                     let phys_lhs = materialize(e, ra, &consts, *lhs);
                     let phys_rhs = materialize(e, ra, &consts, *rhs);
-                    ra.maybe_free(*lhs, inst_idx);
-                    ra.maybe_free(*rhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *lhs, inst_idx);
+                    maybe_free_with_cache(ra, local_cache, *rhs, inst_idx);
                     e.cmp_w_reg(phys_lhs, phys_rhs);
                 }
 
@@ -523,6 +606,8 @@ fn lower_body(
 
             IrInst::DefLabel { label } => {
                 label_offsets[label.0 as usize] = Some(e.offset());
+                // Conservative: clear cache at merge points.
+                local_cache.clear();
             }
 
             IrInst::Br { label } => {
@@ -538,20 +623,24 @@ fn lower_body(
 
             IrInst::BrIfZero { cond, label } => {
                 let phys = materialize(e, ra, &consts, *cond);
-                ra.maybe_free(*cond, inst_idx);
+                maybe_free_with_cache(ra, local_cache, *cond, inst_idx);
                 emit_cbz_w(e, phys, *label, label_offsets, label_patches);
             }
 
             IrInst::BrIfNonZero { cond, label } => {
                 let phys = materialize(e, ra, &consts, *cond);
-                ra.maybe_free(*cond, inst_idx);
+                maybe_free_with_cache(ra, local_cache, *cond, inst_idx);
                 emit_cbnz_w(e, phys, *label, label_offsets, label_patches);
             }
 
             IrInst::FrameStore { slot, src } => {
                 let phys = materialize(e, ra, &consts, *src);
-                ra.maybe_free(*src, inst_idx);
+                maybe_free_with_cache(ra, local_cache, *src, inst_idx);
                 e.str_x_uoff(phys, Reg::X29, (*slot as u16) * 8);
+                // Update local cache if this slot corresponds to a local.
+                if (*slot as usize) < ir.total_local_count as usize {
+                    local_cache.set(*slot as usize, phys);
+                }
             }
 
             IrInst::FrameLoad { dst, slot } => {
@@ -579,6 +668,8 @@ fn lower_body(
                 }
                 // Free all scratch registers (they're clobbered by the call).
                 ra.free_all();
+                // All cached locals are invalid — registers are clobbered.
+                local_cache.clear();
 
                 // Advance frame base to callee's frame.
                 let frame_sz = ir.frame_size() as u16;
@@ -592,10 +683,18 @@ fn lower_body(
                         e.ldr_x_uoff(Reg::X0, Reg::X0, table_offset);
                         e.blr(Reg::X0);
                     }
-                    CallMode::PcRelative { .. } => {
-                        let current = e.offset();
-                        let target = *func_idx as i32 - current as i32;
-                        e.bl_offset(target);
+                    CallMode::PcRelative { body_offsets, .. } => {
+                        // Direct BL to body if target is already compiled.
+                        if let Some(body_word) = body_offsets[*func_idx as usize] {
+                            let current = e.offset();
+                            let target = body_word as i32 - current as i32;
+                            e.bl_offset(target);
+                        } else {
+                            // Fall back to jump table hop.
+                            let current = e.offset();
+                            let target = *func_idx as i32 - current as i32;
+                            e.bl_offset(target);
+                        }
                     }
                 }
 
@@ -754,7 +853,7 @@ fn emit_cbnz_w(
 ///
 /// Returns the handler offsets. The jump table starts at word offset 0
 /// and has one `b <stub>` instruction per function.
-pub(crate) fn emit_shared_preamble(e: &mut Emitter, func_count: usize) -> SharedHandlerOffsets {
+pub fn emit_shared_preamble(e: &mut Emitter, func_count: usize) -> SharedHandlerOffsets {
     // ---- Jump table: one `b <stub>` per function ----
     // We emit placeholders, then patch each to its interpret stub.
     let jump_table_pps: Vec<PatchPoint> = (0..func_count).map(|_| e.b()).collect();
@@ -812,13 +911,18 @@ pub(crate) fn emit_shared_preamble(e: &mut Emitter, func_count: usize) -> Shared
 /// The emitter must already contain the shared preamble (jump table +
 /// stubs + handlers). This function appends the function body and
 /// returns the body's byte offset within the emitter.
-pub(crate) fn lower_into(
+pub fn lower_into(
     e: &mut Emitter,
     ir: &IrFunction,
-    _func_idx: u32,
+    func_idx: u32,
     shared: &SharedHandlerOffsets,
+    body_offsets: &mut [Option<usize>],
 ) -> FunctionLayout {
     let body_start = e.offset();
+
+    // Record this function's body offset so self-recursive calls
+    // (and later functions calling us) can use direct BL.
+    body_offsets[func_idx as usize] = Some(body_start);
 
     let vreg_count = count_vregs(&ir.insts);
     let last_use = compute_last_use(&ir.insts, vreg_count);
@@ -850,6 +954,12 @@ pub(crate) fn lower_into(
         e.str_x_uoff(Reg::XZR, Reg::X29, offset);
     }
 
+    // Seed local cache: params are in registers after prologue stores.
+    let mut local_cache = LocalCache::new(ir.total_local_count as usize);
+    for i in 0..ir.param_count {
+        local_cache.set(i as usize, Reg(9 + i as u8));
+    }
+
     // ---- Lower each IR instruction ----
     lower_body(
         e,
@@ -858,7 +968,11 @@ pub(crate) fn lower_into(
         &mut fuel_sites,
         &mut label_offsets,
         &mut label_patches,
-        &CallMode::PcRelative { shared },
+        &CallMode::PcRelative {
+            shared,
+            body_offsets,
+        },
+        &mut local_cache,
         false, // no markers in shared mode
     );
 
@@ -893,7 +1007,7 @@ pub(crate) fn lower_into(
 ///
 /// The jump table starts at word offset 0. Entry `func_idx` is at
 /// word offset `func_idx`.
-pub(crate) fn patch_jump_table(e: &mut Emitter, func_idx: u32, target_word: usize) {
+pub fn patch_jump_table(e: &mut Emitter, func_idx: u32, target_word: usize) {
     let source = func_idx as usize;
     let word_offset = target_word as i32 - source as i32;
     let imm26 = (word_offset as u32) & 0x03FF_FFFF;
@@ -929,10 +1043,12 @@ struct FuelCheckSite {
     resume_offset: usize,
 }
 
-/// Emit a fuel check: `subs x21, x21, #1; b.le <cold_stub>`.
+/// Emit a fuel check: `subs x21, x21, #1; bc.le <cold_stub>`.
 ///
-/// The cold stub (emitted later) does `bl yield_handler; b .resume`
-/// so the hot path is only 2 instructions.
+/// Uses BC.cond (FEAT_HBC) to hint that this branch is consistent —
+/// almost always not-taken (fuel > 0). The cold stub (emitted later)
+/// does `bl yield_handler; b .resume` so the hot path is only 2
+/// instructions.
 fn emit_fuel_check(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>) {
     e.subs_x_imm(Reg::X21, Reg::X21, 1);
     let b_le_patch = e.b_cond(Cond::LE);
@@ -1069,341 +1185,3 @@ fn for_each_def(inst: &IrInst, mut f: impl FnMut(VReg)) {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::jit::compiler::compile_with;
-    use crate::stack::Stack;
-
-    /// Parse WAT, compile to IR, lower to aarch64.
-    fn compile_wat(wat: &str) -> CompiledFunction {
-        let wasm_bytes = wat::parse_str(wat).expect("failed to parse WAT");
-        let engine = crate::Engine::default();
-        let module =
-            crate::Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-        let ir = compile_with(&module.funcs[0], &module.funcs, true);
-        lower(&ir).expect("lowering failed")
-    }
-
-    /// Parse WAT, compile all functions, return (compiled_funcs, func_table).
-    fn compile_all_wat(wat: &str) -> (Vec<CompiledFunction>, Vec<*const u8>) {
-        let wasm_bytes = wat::parse_str(wat).expect("failed to parse WAT");
-        let engine = crate::Engine::default();
-        let module =
-            crate::Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-        let mut compiled = Vec::new();
-        for func in &module.funcs {
-            let ir = compile_with(func, &module.funcs, true);
-            compiled.push(lower(&ir).expect("lowering failed"));
-        }
-        let func_table: Vec<*const u8> = compiled.iter().map(|c| c.entry()).collect();
-        (compiled, func_table)
-    }
-
-    /// Call JIT code with a wasm stack, return the result as i32.
-    ///
-    /// New calling convention: x29 = frame base (stack base), args in
-    /// x9/x10/... registers, result returned in x9.
-    unsafe fn call_jit_full(
-        code_ptr: *const u8,
-        stack: &mut Stack,
-        func_table: &[*const u8],
-    ) -> i32 {
-        use crate::jit::JitContext;
-
-        let base = stack.base();
-        let fuel: i64 = i64::MAX;
-
-        let mut ctx = JitContext::new();
-        ctx.func_table = func_table.as_ptr() as u64;
-        ctx.stack_base = base as u64;
-
-        let ctx_ptr = &mut ctx as *mut JitContext;
-
-        // Load up to 7 args from the wasm stack into an array.
-        // The callee expects args in x9, x10, ...
-        let num_args = stack.sp() / 8;
-        let mut args = [0u64; 7];
-        for i in 0..num_args.min(7) {
-            args[i] = stack.read_u64_at(i * 8);
-        }
-
-        let result: i64;
-        unsafe {
-            std::arch::asm!(
-                // Save host x29 and set up JIT frame pointer.
-                "stp x29, x30, [sp, #-16]!",
-                "mov x20, x0",          // ctx
-                "mov x21, x1",          // fuel
-                "mov x29, x2",          // frame_base
-                "mov x3, x8",          // save code_ptr (x8) to x3
-                // x9-x15 are already set by in() constraints.
-                "blr x3",
-                "mov x0, x9",          // capture result
-                // Restore host x29/x30.
-                "ldp x29, x30, [sp], #16",
-                in("x0") ctx_ptr as u64,
-                in("x1") fuel as u64,
-                in("x2") base as u64,
-                in("x8") code_ptr as u64,
-                in("x9") args[0],
-                in("x10") args[1],
-                in("x11") args[2],
-                in("x12") args[3],
-                in("x13") args[4],
-                in("x14") args[5],
-                in("x15") args[6],
-                lateout("x0") result,
-                lateout("x1") _, lateout("x2") _, lateout("x3") _,
-                lateout("x8") _,
-                lateout("x9") _, lateout("x10") _,
-                lateout("x11") _, lateout("x12") _,
-                lateout("x13") _, lateout("x14") _,
-                lateout("x15") _,
-                out("x20") _, out("x21") _,
-                out("x30") _,
-            );
-        }
-
-        result as i32
-    }
-
-    /// Simplified call for single-function tests.
-    unsafe fn call_jit(compiled: &CompiledFunction, stack: &mut Stack) -> i32 {
-        let dummy_table: Vec<*const u8> = vec![compiled.entry()];
-        unsafe { call_jit_full(compiled.entry(), stack, &dummy_table) }
-    }
-
-    #[test]
-    fn compile_identity() {
-        let wat = r#"(module (func (param i32) (result i32) (local.get 0)))"#;
-        let compiled = compile_wat(wat);
-        let mut stack = Stack::new().unwrap();
-        for &input in &[42, -1, 0] {
-            stack.set_sp(0);
-            stack.push_i32(input);
-            assert_eq!(unsafe { call_jit(&compiled, &mut stack) }, input);
-        }
-    }
-
-    #[test]
-    fn compile_const() {
-        let wat = r#"(module (func (result i32) (i32.const 99)))"#;
-        let compiled = compile_wat(wat);
-        let mut stack = Stack::new().unwrap();
-        assert_eq!(unsafe { call_jit(&compiled, &mut stack) }, 99);
-    }
-
-    #[test]
-    fn compile_add() {
-        let wat = r#"(module (func (param i32 i32) (result i32)
-            (i32.add (local.get 0) (local.get 1))))"#;
-        let compiled = compile_wat(wat);
-        let mut stack = Stack::new().unwrap();
-        stack.push_i32(3);
-        stack.push_i32(5);
-        assert_eq!(unsafe { call_jit(&compiled, &mut stack) }, 8);
-    }
-
-    #[test]
-    fn compile_sub() {
-        let wat = r#"(module (func (param i32 i32) (result i32)
-            (i32.sub (local.get 0) (local.get 1))))"#;
-        let compiled = compile_wat(wat);
-        let mut stack = Stack::new().unwrap();
-        stack.push_i32(10);
-        stack.push_i32(3);
-        assert_eq!(unsafe { call_jit(&compiled, &mut stack) }, 7);
-    }
-
-    #[test]
-    fn compile_if_else() {
-        let wat = r#"(module (func (param i32) (result i32)
-            (if (result i32) (i32.le_s (local.get 0) (i32.const 1))
-                (then (i32.const 42))
-                (else (i32.const 99))
-            )))"#;
-        let compiled = compile_wat(wat);
-        let mut stack = Stack::new().unwrap();
-        for &(input, expected) in &[(0, 42), (1, 42), (2, 99), (-5, 42)] {
-            stack.set_sp(0);
-            stack.push_i32(input);
-            assert_eq!(unsafe { call_jit(&compiled, &mut stack) }, expected);
-        }
-    }
-
-    #[test]
-    fn compile_loop_countdown() {
-        let wat = r#"(module (func (param i32) (result i32)
-            (local i32)
-            (local.set 1 (i32.const 0))
-            (block $break (loop $continue
-                (br_if $break (i32.le_s (local.get 0) (i32.const 0)))
-                (local.set 1 (i32.add (local.get 1) (local.get 0)))
-                (local.set 0 (i32.sub (local.get 0) (i32.const 1)))
-                (br $continue)
-            ))
-            (local.get 1)
-        ))"#;
-        let compiled = compile_wat(wat);
-        let mut stack = Stack::new().unwrap();
-        for &(input, expected) in &[(5, 15), (10, 55), (0, 0), (1, 1)] {
-            stack.set_sp(0);
-            stack.push_i32(input);
-            assert_eq!(unsafe { call_jit(&compiled, &mut stack) }, expected);
-        }
-    }
-
-    #[test]
-    fn compile_iterative_fib() {
-        let wat = r#"(module (func (param i32) (result i32)
-            (local i32 i32 i32 i32)
-            (local.set 1 (i32.const 0))
-            (local.set 2 (i32.const 1))
-            (local.set 3 (i32.const 0))
-            (block $break (loop $continue
-                (br_if $break (i32.le_s (local.get 0) (local.get 3)))
-                (local.set 4 (i32.add (local.get 1) (local.get 2)))
-                (local.set 1 (local.get 2))
-                (local.set 2 (local.get 4))
-                (local.set 3 (i32.add (local.get 3) (i32.const 1)))
-                (br $continue)
-            ))
-            (local.get 1)
-        ))"#;
-        let compiled = compile_wat(wat);
-        let mut stack = Stack::new().unwrap();
-        for &(input, expected) in &[
-            (0, 0),
-            (1, 1),
-            (2, 1),
-            (5, 5),
-            (10, 55),
-            (20, 6765),
-            (30, 832040),
-        ] {
-            stack.set_sp(0);
-            stack.push_i32(input);
-            assert_eq!(
-                unsafe { call_jit(&compiled, &mut stack) },
-                expected,
-                "fib({input})"
-            );
-        }
-    }
-
-    #[test]
-    fn compile_recursive_fib() {
-        let wat = r#"(module
-            (func $fib (param i32) (result i32)
-                (if (result i32) (i32.le_s (local.get 0) (i32.const 1))
-                    (then (local.get 0))
-                    (else
-                        (i32.add
-                            (call $fib (i32.sub (local.get 0) (i32.const 1)))
-                            (call $fib (i32.sub (local.get 0) (i32.const 2)))
-                        )
-                    )
-                )
-            )
-        )"#;
-        let (_compiled, func_table) = compile_all_wat(wat);
-        let mut stack = Stack::new().unwrap();
-        for &(input, expected) in &[(0, 0), (1, 1), (2, 1), (5, 5), (10, 55), (20, 6765)] {
-            stack.set_sp(0);
-            stack.push_i32(input);
-            assert_eq!(
-                unsafe { call_jit_full(func_table[0], &mut stack, &func_table) },
-                expected,
-                "fib({input})"
-            );
-        }
-    }
-
-    #[test]
-    fn fiber_suspend_resume_fib() {
-        use crate::jit::{FiberResult, JitModule};
-
-        let wat = r#"(module
-            (func $fib (export "fib") (param i32) (result i32)
-                (if (result i32) (i32.le_s (local.get 0) (i32.const 1))
-                    (then (local.get 0))
-                    (else
-                        (i32.add
-                            (call $fib (i32.sub (local.get 0) (i32.const 1)))
-                            (call $fib (i32.sub (local.get 0) (i32.const 2)))
-                        )
-                    )
-                )
-            )
-        )"#;
-        let wasm_bytes = wat::parse_str(wat).expect("failed to parse WAT");
-        let engine = crate::Engine::default();
-        let module =
-            crate::Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-        let jit_module = JitModule::compile(&module).expect("JIT compile failed");
-        let linker = crate::Linker::new(&engine);
-        let mut store = crate::Store::new(&engine, ());
-        let mut instance = linker
-            .instantiate(&mut store, &module)
-            .expect("instantiate failed");
-
-        let mut fiber = jit_module
-            .fiber(&mut instance, "fib", (20i32,))
-            .expect("fiber creation failed");
-        let mut resumes = 0u32;
-        let result = loop {
-            match fiber.resume(100) {
-                FiberResult::Complete(val) => break val,
-                FiberResult::Suspended => resumes += 1,
-            }
-        };
-        assert_eq!(result, 6765, "fib(20) should be 6765");
-        assert!(
-            resumes > 0,
-            "should have suspended at least once (got {resumes} resumes)"
-        );
-        eprintln!("fiber_suspend_resume_fib: fib(20) = {result}, {resumes} resumes");
-    }
-
-    /// Compile without fuel checks, verify recursive fib still works.
-    #[test]
-    fn compile_recursive_fib_no_fuel() {
-        let wat = r#"(module
-            (func $fib (param i32) (result i32)
-                (if (result i32) (i32.le_s (local.get 0) (i32.const 1))
-                    (then (local.get 0))
-                    (else
-                        (i32.add
-                            (call $fib (i32.sub (local.get 0) (i32.const 1)))
-                            (call $fib (i32.sub (local.get 0) (i32.const 2)))
-                        )
-                    )
-                )
-            )
-        )"#;
-        let wasm_bytes = wat::parse_str(wat).expect("failed to parse WAT");
-        let engine = crate::Engine::default();
-        let module =
-            crate::Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-
-        // Compile without fuel.
-        let mut compiled = Vec::new();
-        for func in &module.funcs {
-            let ir = compile_with(func, &module.funcs, false);
-            compiled.push(lower(&ir).expect("lowering failed"));
-        }
-        let func_table: Vec<*const u8> = compiled.iter().map(|c| c.entry()).collect();
-
-        let mut stack = Stack::new().unwrap();
-        for &(input, expected) in &[(0, 0), (1, 1), (2, 1), (5, 5), (10, 55), (20, 6765)] {
-            stack.set_sp(0);
-            stack.push_i32(input);
-            assert_eq!(
-                unsafe { call_jit_full(func_table[0], &mut stack, &func_table) },
-                expected,
-                "fib({input}) no-fuel"
-            );
-        }
-    }
-}

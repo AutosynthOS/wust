@@ -1,4 +1,4 @@
-use crate::jit::emit::{Cond, Emitter, Reg};
+use wust_codegen::emit::{Cond, Emitter, Reg};
 
 #[test]
 fn encode_ret() {
@@ -164,7 +164,7 @@ fn patch_cbz_forward() {
 
 #[test]
 fn encode_and_execute_add() {
-    use crate::jit::code_buffer::CodeBuffer;
+    use wust_codegen::code_buffer::CodeBuffer;
 
     let mut e = Emitter::new();
     // fn(a: i32, b: i32) -> i32 { a + b }
@@ -186,7 +186,7 @@ fn encode_and_execute_add() {
 
 #[test]
 fn encode_and_execute_branch() {
-    use crate::jit::code_buffer::CodeBuffer;
+    use wust_codegen::code_buffer::CodeBuffer;
 
     let mut e = Emitter::new();
     // fn(n: i32) -> i32 { if n <= 1 { return 42; } else { return 99; } }

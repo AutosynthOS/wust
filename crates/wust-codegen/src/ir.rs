@@ -1,20 +1,20 @@
 /// Virtual register index — represents an SSA value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct VReg(pub u32);
+pub struct VReg(pub u32);
 
 /// Branch target label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Label(pub u32);
+pub struct Label(pub u32);
 
 /// Comparison condition for `IrInst::Cmp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum IrCond {
+pub enum IrCond {
     LeS,
 }
 
 /// A single IR instruction using virtual registers.
 #[derive(Debug, Clone)]
-pub(crate) enum IrInst {
+pub enum IrInst {
     /// Load a constant into a virtual register.
     IConst { dst: VReg, val: i64 },
     /// Load a local variable into a virtual register.
@@ -60,17 +60,17 @@ pub(crate) enum IrInst {
 }
 
 /// A compiled IR function — the output of the wasm-to-IR compiler.
-pub(crate) struct IrFunction {
+pub struct IrFunction {
     /// The IR instruction sequence.
-    pub(crate) insts: Vec<IrInst>,
+    pub insts: Vec<IrInst>,
     /// Number of function parameters.
-    pub(crate) param_count: u32,
+    pub param_count: u32,
     /// Total number of locals (params + declared locals).
-    pub(crate) total_local_count: u32,
+    pub total_local_count: u32,
     /// Maximum operand stack depth during execution.
-    pub(crate) max_operand_depth: u32,
+    pub max_operand_depth: u32,
     /// Number of result values.
-    pub(crate) result_count: u32,
+    pub result_count: u32,
 }
 
 impl IrFunction {
@@ -79,7 +79,7 @@ impl IrFunction {
     /// Layout: [locals][operand stack slots][ret_info]
     /// Each slot is 8 bytes. The ret_info slot (8 bytes) holds
     /// `{func_idx: u32, op_offset: u32}` for suspend/serialize.
-    pub(crate) fn frame_size(&self) -> u32 {
+    pub fn frame_size(&self) -> u32 {
         (self.total_local_count + self.max_operand_depth) * 8 + 8
     }
 }

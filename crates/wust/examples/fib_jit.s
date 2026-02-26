@@ -326,6 +326,173 @@ _fib_asm_jumptable_entry:
     ldp     x29, x30, [sp], #0x10
     ret
 
+// ============================================================
+// JIT-style with frame locals + fuel, mimics our actual JIT output.
+// x21 = pinned fuel register.
+// x29 = locals frame pointer.
+// x20 = context (unused here, just reserved).
+// x9-x15 = scratch (caller-saved).
+// Args in x9, result in x9.
+//
+// "reload" variant: reloads local.n from frame even when x9
+// still holds it (matches current JIT codegen).
+// ============================================================
+.global _fib_jit_reload
+.global _fib_jit_reload_entry
+
+_fib_jit_reload:
+    str     x30, [sp, #-16]!           // save lr
+    str     x9, [x29, #0]              // stack[fp+0] = local.n
+    str     xzr, [x29, #8]             // stack[fp+1] = local.a = 0
+    str     xzr, [x29, #16]            // stack[fp+2] = local.b = 0
+
+    // --- cmp + branch (reload from frame) ---
+    ldr     x9, [x29, #0]              // reload local.n  ← UNNECESSARY
+    cmp     w9, #1
+    b.gt    50f
+
+    // base case
+    subs    x21, x21, #1
+    b.le    59f
+    ldr     x9, [x29, #0]              // reload local.n  ← UNNECESSARY
+    ldr     x30, [sp], #16
+    ret
+
+50: // recursive case
+    ldr     x10, [x29, #0]             // reload local.n  ← UNNECESSARY
+    sub     w10, w10, #1               // x10 = n - 1
+    subs    x21, x21, #1
+    b.le    59f
+    subs    x21, x21, #1
+    b.le    59f
+
+    mov     x9, x10                    // arg = n-1
+    add     x29, x29, #48              // advance fp
+    bl      _fib_jit_reload
+    sub     x29, x29, #48              // restore fp
+    str     x9, [x29, #8]              // local.a = result
+
+    ldr     x9, [x29, #0]              // reload local.n (clobbered by call)
+    sub     w9, w9, #2                 // x9 = n - 2
+    subs    x21, x21, #1
+    b.le    59f
+    subs    x21, x21, #1
+    b.le    59f
+
+    add     x29, x29, #48
+    bl      _fib_jit_reload
+    sub     x29, x29, #48
+    str     x9, [x29, #16]             // local.b = result
+
+    ldr     x9, [x29, #8]              // reload local.a
+    ldr     x10, [x29, #16]            // reload local.b
+    add     w9, w9, w10                // x9 = a + b
+    subs    x21, x21, #1
+    b.le    59f
+
+    ldr     x30, [sp], #16
+    ret
+
+59: // out of fuel
+    mov     w9, #-1
+    ldr     x30, [sp], #16
+    ret
+
+// ============================================================
+// Same as above but avoids unnecessary reloads.
+// x9 is kept live from the param store — no reload before cmp
+// or first sub.
+// ============================================================
+.global _fib_jit_norld
+.global _fib_jit_norld_entry
+
+_fib_jit_norld:
+    str     x30, [sp, #-16]!           // save lr
+    str     x9, [x29, #0]              // stack[fp+0] = local.n
+    str     xzr, [x29, #8]             // stack[fp+1] = local.a = 0
+    str     xzr, [x29, #16]            // stack[fp+2] = local.b = 0
+
+    // --- cmp + branch (x9 still has n!) ---
+    cmp     w9, #1                      // no reload needed
+    b.gt    60f
+
+    // base case: x9 = n, just return it
+    subs    x21, x21, #1
+    b.le    69f
+    ldr     x30, [sp], #16
+    ret
+
+60: // recursive case
+    sub     w10, w9, #1                 // x10 = n - 1 (x9 still live!)
+    subs    x21, x21, #1
+    b.le    69f
+    subs    x21, x21, #1
+    b.le    69f
+
+    mov     x9, x10                    // arg = n-1
+    add     x29, x29, #48
+    bl      _fib_jit_norld
+    sub     x29, x29, #48
+    str     x9, [x29, #8]              // local.a = result
+
+    ldr     x9, [x29, #0]              // reload local.n (clobbered by call — necessary!)
+    sub     w9, w9, #2                 // x9 = n - 2
+    subs    x21, x21, #1
+    b.le    69f
+    subs    x21, x21, #1
+    b.le    69f
+
+    add     x29, x29, #48
+    bl      _fib_jit_norld
+    sub     x29, x29, #48
+    str     x9, [x29, #16]             // local.b = result
+
+    ldr     x9, [x29, #8]              // reload local.a
+    ldr     x10, [x29, #16]            // reload local.b
+    add     w9, w9, w10                // x9 = a + b
+    subs    x21, x21, #1
+    b.le    69f
+
+    ldr     x30, [sp], #16
+    ret
+
+69: // out of fuel
+    mov     w9, #-1
+    ldr     x30, [sp], #16
+    ret
+
+// C-callable wrappers
+.align 4
+_fib_jit_reload_entry:
+    stp     x29, x30, [sp, #-16]!
+    stp     x20, x21, [sp, #-16]!
+    // allocate frame space (48 bytes per frame × ~30 depth = ~1440, use 64K)
+    sub     sp, sp, #0x10000
+    add     x29, sp, #0                 // fp = base of frame area
+    mov     x21, x1                     // fuel
+    mov     w9, w0                      // arg in x9
+    bl      _fib_jit_reload
+    mov     w0, w9                      // result to w0
+    add     sp, sp, #0x10000
+    ldp     x20, x21, [sp], #16
+    ldp     x29, x30, [sp], #16
+    ret
+
+.align 4
+_fib_jit_norld_entry:
+    stp     x29, x30, [sp, #-16]!
+    stp     x20, x21, [sp, #-16]!
+    sub     sp, sp, #0x10000
+    add     x29, sp, #0
+    mov     x21, x1
+    mov     w9, w0
+    bl      _fib_jit_norld
+    mov     w0, w9
+    add     sp, sp, #0x10000
+    ldp     x20, x21, [sp], #16
+    ldp     x29, x30, [sp], #16
+    ret
+
 // C-callable entry: w0 = n, x1 = fuel, x2 = wasm stack base
 .align 4
 _fib_asm_wasm_stack_entry:

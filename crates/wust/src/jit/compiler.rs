@@ -1,4 +1,4 @@
-use crate::jit::ir::{IrCond, IrFunction, IrInst, Label, VReg};
+use wust_codegen::ir::{IrCond, IrFunction, IrInst, Label, VReg};
 use crate::parse::body::{BlockKind, OpCode};
 use crate::parse::func::ParsedFunction;
 

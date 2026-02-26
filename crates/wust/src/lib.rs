@@ -13,6 +13,7 @@ pub use engine::Engine;
 pub use instance::Instance;
 pub use jit::codegen::Codegen;
 pub use jit::{FiberResult, JitCompiler, JitFiber, JitModule};
+pub use wust_codegen::disasm::{CodegenOutput, FunctionOutput};
 pub use linker::Linker;
 pub use module::Module;
 pub use store::Store;

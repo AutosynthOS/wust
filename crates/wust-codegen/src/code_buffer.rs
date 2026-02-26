@@ -21,7 +21,7 @@ const INITIAL_COMMIT: usize = 64 * 1024;
 ///
 /// A guard page at the end of the reserved region catches overflows.
 /// The buffer is unmapped on drop.
-pub(crate) struct CodeBuffer {
+pub struct CodeBuffer {
     base: *mut u8,
     /// Total mmap'd size (reserved + guard page).
     reserved: usize,
@@ -43,7 +43,7 @@ impl CodeBuffer {
     /// Reserves 128MB of virtual address space (costs no physical memory),
     /// then commits enough pages to hold `min_size` bytes. A guard page
     /// (PROT_NONE) sits at the end of the reserved region.
-    pub(crate) fn new(min_size: usize) -> Result<Self, anyhow::Error> {
+    pub fn new(min_size: usize) -> Result<Self, anyhow::Error> {
         let page_size = page_size();
         let initial_commit = align_up(min_size.max(INITIAL_COMMIT), page_size);
         let reserve = align_up(DEFAULT_RESERVE.max(initial_commit), page_size);
@@ -83,7 +83,7 @@ impl CodeBuffer {
     /// Append a 32-bit instruction word.
     ///
     /// Automatically commits more pages if needed.
-    pub(crate) fn emit_u32(&mut self, word: u32) {
+    pub fn emit_u32(&mut self, word: u32) {
         debug_assert!(!self.finalized, "cannot emit after finalize");
         self.ensure_capacity(4);
         unsafe {
@@ -94,7 +94,7 @@ impl CodeBuffer {
     }
 
     /// Patch a previously emitted instruction at byte offset `offset`.
-    pub(crate) fn patch_u32(&mut self, offset: usize, word: u32) {
+    pub fn patch_u32(&mut self, offset: usize, word: u32) {
         debug_assert!(!self.finalized, "cannot patch after finalize");
         debug_assert!(offset + 4 <= self.len, "patch offset out of bounds");
         unsafe {
@@ -106,7 +106,7 @@ impl CodeBuffer {
     /// Read a previously emitted instruction at byte offset `offset`.
     ///
     /// Only valid before `finalize()` — finalized pages are execute-only.
-    pub(crate) fn read_u32(&self, offset: usize) -> u32 {
+    pub fn read_u32(&self, offset: usize) -> u32 {
         debug_assert!(!self.finalized, "cannot read after finalize (execute-only)");
         debug_assert!(offset + 4 <= self.len, "read offset out of bounds");
         unsafe {
@@ -119,7 +119,7 @@ impl CodeBuffer {
     ///
     /// Pages become PROT_EXEC without PROT_READ — prevents code scanning
     /// for ROP gadgets.
-    pub(crate) fn finalize(&mut self) -> Result<(), anyhow::Error> {
+    pub fn finalize(&mut self) -> Result<(), anyhow::Error> {
         debug_assert!(!self.finalized, "already finalized");
 
         let ret = unsafe {
@@ -140,7 +140,7 @@ impl CodeBuffer {
     }
 
     /// Flip a finalized buffer back to read+write for appending more code.
-    pub(crate) fn reopen(&mut self) -> Result<(), anyhow::Error> {
+    pub fn reopen(&mut self) -> Result<(), anyhow::Error> {
         debug_assert!(self.finalized, "buffer is not finalized");
 
         let ret = unsafe {
@@ -157,13 +157,13 @@ impl CodeBuffer {
     }
 
     /// Pointer to the start of emitted code. Only valid after `finalize()`.
-    pub(crate) fn entry(&self) -> *const u8 {
+    pub fn entry(&self) -> *const u8 {
         debug_assert!(self.finalized, "must finalize before calling entry()");
         self.base as *const u8
     }
 
     /// Number of bytes emitted so far.
-    pub(crate) fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.len
     }
 

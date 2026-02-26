@@ -25,6 +25,8 @@ unsafe extern "C" {
     fn fib_asm_fuel_all_entry(n: i32, fuel: i64) -> i32;
     fn fib_asm_jumptable_entry(n: i32, fuel: i64) -> i32;
     fn fib_asm_wasm_stack_entry(n: i32, fuel: i64, wasm_stack: *mut u8) -> i32;
+    fn fib_jit_reload_entry(n: i32, fuel: i64) -> i32;
+    fn fib_jit_norld_entry(n: i32, fuel: i64) -> i32;
 }
 
 const RUNS: usize = 5;
@@ -229,6 +231,18 @@ fn main() {
                     i64::MAX,
                     wasm_stack.as_mut_ptr(),
                 )
+            }),
+        ),
+        run(
+            "jit-style+reload",
+            Box::new(|| unsafe {
+                fib_jit_reload_entry(std::hint::black_box(n), i64::MAX)
+            }),
+        ),
+        run(
+            "jit-style+norld",
+            Box::new(|| unsafe {
+                fib_jit_norld_entry(std::hint::black_box(n), i64::MAX)
             }),
         ),
     ];

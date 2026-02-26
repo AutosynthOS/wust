@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/wust",
+    "crates/wust-codegen",
     "crates/plasma",
     "crates/plasma_hello",
 ]

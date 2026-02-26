@@ -1,9 +1,5 @@
-pub(crate) mod code_buffer;
 pub mod codegen;
 pub(crate) mod compiler;
-pub(crate) mod emit;
-pub(crate) mod ir;
-pub(crate) mod lower_aarch64;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -12,8 +8,11 @@ use crate::Module;
 use crate::stack::Stack;
 use crate::value::WasmArgs;
 
-use code_buffer::CodeBuffer;
-use lower_aarch64::SharedHandlerOffsets;
+use wust_codegen::code_buffer::CodeBuffer;
+use wust_codegen::context::JitContext;
+use wust_codegen::emit;
+use wust_codegen::lower_aarch64;
+use wust_codegen::lower_aarch64::SharedHandlerOffsets;
 
 /// A JIT-compiled module with a shared code buffer.
 ///
@@ -79,10 +78,14 @@ impl<'a> JitCompiler<'a> {
         // Emit shared preamble: jump table, interpret stubs, handlers.
         let shared = lower_aarch64::emit_shared_preamble(&mut e, func_count);
 
+        // Track body offsets for direct BL optimization.
+        let mut body_offsets: Vec<Option<usize>> = vec![None; func_count];
+
         // Compile and append each function body.
         for (i, func) in self.module.funcs.iter().enumerate() {
             let ir = compiler::compile_with(func, &self.module.funcs, self.emit_fuel);
-            let layout = lower_aarch64::lower_into(&mut e, &ir, i as u32, &shared);
+            let layout =
+                lower_aarch64::lower_into(&mut e, &ir, i as u32, &shared, &mut body_offsets);
             // Patch jump table entry to point at the compiled body.
             let body_word = layout.body_offset / 4;
             lower_aarch64::patch_jump_table(&mut e, i as u32, body_word);
@@ -266,34 +269,6 @@ enum FiberStatus {
     Complete,
 }
 
-/// Unified context for JIT execution — used in both fiber and non-fiber modes.
-///
-/// Field offsets must match the CTX_* constants in lower_aarch64.rs.
-#[repr(C)]
-pub(crate) struct JitContext {
-    pub(crate) func_table: u64,   //   0: unused (kept for offset stability)
-    pub(crate) wasm_sp: u64,      //   8: wasm stack pointer
-    pub(crate) stack_base: u64,   //  16: wasm stack base
-    pub(crate) is_fiber: u64,     //  24: 0 = non-fiber, nonzero = fiber
-    pub(crate) resume_lr: u64,    //  32: resume point (fiber only)
-    pub(crate) jit_sp: u64,       //  40: JIT native SP (fiber only)
-    pub(crate) saved_fuel: u64,   //  48: x21 (fuel)
-    pub(crate) saved_fp: u64,     //  56: x29 (locals base)
-    pub(crate) host_sp: u64,      //  64: host SP
-    pub(crate) host_fp: u64,      //  72: host x29
-    pub(crate) host_lr: u64,      //  80: host x30
-    pub(crate) host_ctx: u64,     //  88: host x20
-    pub(crate) wasm_sp_off: u64,  //  96: result offset (completion)
-    pub(crate) scratch: [u64; 7], // 104: x9-x15 (56 bytes)
-}
-// Total: 160 bytes
-
-impl JitContext {
-    pub(crate) fn new() -> Self {
-        // Safety: all-zeros is a valid initial state (unused until entry).
-        unsafe { std::mem::zeroed() }
-    }
-}
 
 /// A separate native stack for JIT code execution.
 ///
