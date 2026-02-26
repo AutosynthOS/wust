@@ -9,6 +9,7 @@ pub struct Label(pub u32);
 /// Comparison condition for `IrInst::Cmp`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrCond {
+    Eq,
     LeS,
 }
 
@@ -46,15 +47,21 @@ pub enum IrInst {
     ///
     /// Arguments are passed in x9, x10, ... (scratch registers).
     /// A single result (if any) is returned in x9.
+    ///
+    /// `frame_advance` is the byte offset to advance x29 before the
+    /// call: `(2 + total_local_count + spill_count) * 8`. This is a
+    /// per-call-site constant — different call sites may have
+    /// different operand stack depths.
     Call {
         func_idx: u32,
         args: Vec<VReg>,
         result: Option<VReg>,
+        frame_advance: u32,
     },
     /// Return from the function with the given result values.
     Return { results: Vec<VReg> },
-    /// Decrement fuel counter; yield if exhausted.
-    FuelCheck,
+    /// Decrement fuel counter by `cost`; yield if exhausted.
+    FuelCheck { cost: u32 },
     /// Trap (unreachable instruction).
     Trap,
 }
@@ -74,19 +81,19 @@ pub struct IrFunction {
 }
 
 impl IrFunction {
-    /// Total frame size in bytes.
+    /// Maximum frame size in bytes (for stack bounds checking).
     ///
-    /// Layout: [locals][operand stack slots][ret_info]
-    /// Each slot is 8 bytes. The ret_info slot (8 bytes) holds
-    /// `{func_idx: u32, op_offset: u32}` for suspend/serialize.
+    /// Layout: [prev_fp][header][locals][operand stack spills]
+    /// Each slot is 8 bytes. prev_fp and header are 2 slots (16 bytes).
     pub fn frame_size(&self) -> u32 {
-        (self.total_local_count + self.max_operand_depth) * 8 + 8
+        (2 + self.total_local_count + self.max_operand_depth) * 8
     }
 }
 
 impl std::fmt::Display for IrCond {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            IrCond::Eq => write!(f, "i32.eq"),
             IrCond::LeS => write!(f, "i32.le_s"),
         }
     }
@@ -127,6 +134,7 @@ impl std::fmt::Display for IrInst {
                 func_idx,
                 args,
                 result,
+                ..
             } => {
                 if let Some(r) = result {
                     write!(f, "  {r} = call {func_idx}")?;
@@ -156,7 +164,7 @@ impl std::fmt::Display for IrInst {
                 }
                 Ok(())
             }
-            IrInst::FuelCheck => write!(f, "  fuel_check"),
+            IrInst::FuelCheck { cost } => write!(f, "  fuel_check {cost}"),
             IrInst::Trap => write!(f, "  trap"),
         }
     }

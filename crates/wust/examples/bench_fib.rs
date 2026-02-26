@@ -20,13 +20,11 @@ const FIB_WAT: &str = r#"
 std::arch::global_asm!(include_str!("fib_jit.s"));
 
 unsafe extern "C" {
-    fn fib_asm_no_fuel(n: i32) -> i32;
-    fn fib_asm_fuel_calls(n: i32, fuel: *mut i64) -> i32;
-    fn fib_asm_fuel_all_entry(n: i32, fuel: i64) -> i32;
-    fn fib_asm_jumptable_entry(n: i32, fuel: i64) -> i32;
-    fn fib_asm_wasm_stack_entry(n: i32, fuel: i64, wasm_stack: *mut u8) -> i32;
-    fn fib_jit_reload_entry(n: i32, fuel: i64) -> i32;
-    fn fib_jit_norld_entry(n: i32, fuel: i64) -> i32;
+    fn fib_asm(n: i32) -> i32;
+    fn fib_asm_fuel_entry(n: i32, fuel: i64) -> i32;
+    fn fib_asm_jit_entry(n: i32, fuel: i64) -> i32;
+    fn fib_asm_jit_frame16_entry(n: i32, fuel: i64) -> i32;
+    fn fib_asm_jit_frame16_hdr_entry(n: i32, fuel: i64) -> i32;
 }
 
 const RUNS: usize = 5;
@@ -201,48 +199,30 @@ fn main() {
         run("native", Box::new(|| fib_native(std::hint::black_box(n)))),
         run(
             "asm",
-            Box::new(|| unsafe { fib_asm_no_fuel(std::hint::black_box(n)) }),
+            Box::new(|| unsafe { fib_asm(std::hint::black_box(n)) }),
         ),
         run(
-            "asm+fuel@call",
+            "asm+fuel",
             Box::new(|| unsafe {
-                let mut fuel: i64 = i64::MAX;
-                fib_asm_fuel_calls(std::hint::black_box(n), &mut fuel)
+                fib_asm_fuel_entry(std::hint::black_box(n), i64::MAX)
             }),
         ),
         run(
-            "asm+fuel@op",
+            "asm+jit",
             Box::new(|| unsafe {
-                fib_asm_fuel_all_entry(std::hint::black_box(n), i64::MAX)
+                fib_asm_jit_entry(std::hint::black_box(n), i64::MAX)
             }),
         ),
         run(
-            "asm+fuel+jmptbl",
+            "asm+jit+frame16",
             Box::new(|| unsafe {
-                fib_asm_jumptable_entry(std::hint::black_box(n), i64::MAX)
+                fib_asm_jit_frame16_entry(std::hint::black_box(n), i64::MAX)
             }),
         ),
         run(
-            "asm+wasmstk",
+            "asm+jit+frame16+hdr",
             Box::new(|| unsafe {
-                let mut wasm_stack = vec![0u8; 1024 * 1024];
-                fib_asm_wasm_stack_entry(
-                    std::hint::black_box(n),
-                    i64::MAX,
-                    wasm_stack.as_mut_ptr(),
-                )
-            }),
-        ),
-        run(
-            "jit-style+reload",
-            Box::new(|| unsafe {
-                fib_jit_reload_entry(std::hint::black_box(n), i64::MAX)
-            }),
-        ),
-        run(
-            "jit-style+norld",
-            Box::new(|| unsafe {
-                fib_jit_norld_entry(std::hint::black_box(n), i64::MAX)
+                fib_asm_jit_frame16_hdr_entry(std::hint::black_box(n), i64::MAX)
             }),
         ),
     ];

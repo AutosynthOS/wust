@@ -85,7 +85,7 @@ impl<'a> JitCompiler<'a> {
         for (i, func) in self.module.funcs.iter().enumerate() {
             let ir = compiler::compile_with(func, &self.module.funcs, self.emit_fuel);
             let layout =
-                lower_aarch64::lower_into(&mut e, &ir, i as u32, &shared, &mut body_offsets);
+                lower_aarch64::lower_into(&mut e, &ir, i as u32, &shared, &mut body_offsets, false);
             // Patch jump table entry to point at the compiled body.
             let body_word = layout.body_offset / 4;
             lower_aarch64::patch_jump_table(&mut e, i as u32, body_word);
@@ -218,6 +218,8 @@ impl JitModule {
                 "mov x20, x0",
                 "mov x21, x1",
                 "mov x29, x2",
+                // Write prev_fp sentinel at [x29, #0] for the outermost frame.
+                "str x29, [x29, #0]",
                 "mov x3, x8",
                 "blr x3",
                 "mov x0, x9",
@@ -399,6 +401,8 @@ impl JitFiber {
                 "mov x20, x0",
                 "mov x21, x2",
                 "mov x29, x5",
+                // Write prev_fp sentinel at [x29, #0] for the outermost frame.
+                "str x29, [x29, #0]",
 
                 // Set lr = completion handler, then enter JIT.
                 // x9-x15 already hold the args from in() constraints.

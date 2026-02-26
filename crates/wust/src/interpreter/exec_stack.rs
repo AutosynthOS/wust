@@ -189,6 +189,11 @@ fn execute(
                 stack.push_i32(a.wrapping_sub(b));
             }
 
+            OpCode::I32Eqz => {
+                let a = stack.pop_i32();
+                stack.push_i32((a == 0) as i32);
+            }
+
             OpCode::I32LeS => {
                 let b = stack.pop_i32();
                 let a = stack.pop_i32();

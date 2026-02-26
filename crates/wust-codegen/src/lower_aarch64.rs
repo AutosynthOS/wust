@@ -1,32 +1,6 @@
-use crate::code_buffer::CodeBuffer;
 use crate::context::JitContext;
 use crate::emit::{Cond, Emitter, PatchPoint, Reg};
 use crate::ir::{IrCond, IrFunction, IrInst, Label, VReg};
-
-/// Compiled JIT code for a single function (standalone mode).
-pub struct CompiledFunction {
-    pub buffer: CodeBuffer,
-    /// Instruction words (snapshot from emitter, readable after finalize).
-    pub code: Vec<u32>,
-    /// Byte offset of the completion handler within the code buffer.
-    pub completion_offset: usize,
-    /// Word offsets marking boundaries between logical regions.
-    /// Marker 0 = prologue, markers 1..N+1 = IR instructions 0..N,
-    /// then yield handler, completion handler.
-    pub markers: Vec<usize>,
-}
-
-impl CompiledFunction {
-    /// Entry point to the compiled code.
-    pub fn entry(&self) -> *const u8 {
-        self.buffer.entry()
-    }
-
-    /// Address of the completion handler (used as lr for fiber entry).
-    pub fn completion_handler(&self) -> *const u8 {
-        unsafe { self.buffer.entry().add(self.completion_offset) }
-    }
-}
 
 /// Word offsets of shared handlers within a shared code buffer.
 pub struct SharedHandlerOffsets {
@@ -44,18 +18,12 @@ pub struct FunctionLayout {
     pub body_offset: usize,
 }
 
-/// How calls are emitted — differs between standalone and shared-buffer modes.
-#[allow(dead_code)]
-enum CallMode<'a> {
-    /// Standalone mode: indirect call via func_table in context.
-    Indirect,
-    /// Shared-buffer mode: PC-relative call through jump table.
-    PcRelative {
-        shared: &'a SharedHandlerOffsets,
-        /// For each func_idx, `Some(word_offset)` if its body has been
-        /// compiled already (enables direct BL instead of jump table hop).
-        body_offsets: &'a [Option<usize>],
-    },
+/// Call context for PC-relative call emission in the shared code buffer.
+struct CallContext<'a> {
+    shared: &'a SharedHandlerOffsets,
+    /// For each func_idx, `Some(word_offset)` if its body has been
+    /// compiled already (enables direct BL instead of jump table hop).
+    body_offsets: &'a [Option<usize>],
 }
 
 /// Physical register pool for virtual register allocation.
@@ -306,12 +274,15 @@ fn for_each_use(inst: &IrInst, mut f: impl FnMut(VReg)) {
                 f(*r);
             }
         }
-        IrInst::FuelCheck => {}
+        IrInst::FuelCheck { .. } => {}
         IrInst::Trap => {}
     }
 }
 
-const CTX_FUNC_TABLE: u16 = std::mem::offset_of!(JitContext, func_table) as u16;
+/// Byte offset of the first local in the wasm frame.
+/// Layout: [prev_fp (8)][header (8)][locals...], so locals start at +16.
+const FRAME_HEADER_SIZE: u16 = 16;
+
 const CTX_IS_FIBER: u16 = std::mem::offset_of!(JitContext, is_fiber) as u16;
 const CTX_RESUME_LR: u16 = std::mem::offset_of!(JitContext, resume_lr) as u16;
 const CTX_JIT_SP: u16 = std::mem::offset_of!(JitContext, jit_sp) as u16;
@@ -323,147 +294,12 @@ const CTX_HOST_CTX: u16 = std::mem::offset_of!(JitContext, host_ctx) as u16;
 const CTX_WASM_SP_OFF: u16 = std::mem::offset_of!(JitContext, wasm_sp_off) as u16;
 const CTX_SCRATCH: u16 = std::mem::offset_of!(JitContext, scratch) as u16;
 
-/// Lower an IR function to native aarch64 machine code.
-///
-/// Register convention:
-/// - x20: context pointer (→ JitContext)
-/// - x21: fuel counter
-/// - x29: locals base pointer (wasm frame pointer)
-/// - x30: link register
-/// - x9–x15: allocatable scratch registers for virtual regs
-/// - x0: temp for yield handler (outside VReg pool)
-pub fn lower(ir: &IrFunction) -> Result<CompiledFunction, anyhow::Error> {
-    let mut e = Emitter::new();
-    let mut fuel_sites: Vec<FuelCheckSite> = Vec::new();
-
-    // Count VRegs for register allocation.
-    let vreg_count = count_vregs(&ir.insts);
-    let last_use = compute_last_use(&ir.insts, vreg_count);
-    let mut ra = RegAlloc::new(vreg_count, last_use);
-
-    // Track label positions and pending patches.
-    let max_label = count_labels(&ir.insts);
-    let mut label_offsets: Vec<Option<usize>> = vec![None; max_label as usize];
-    let mut label_patches: Vec<(Label, PatchPoint)> = Vec::new();
-
-    // ---- Prologue ----
-    e.mark();
-    // TODO: pointer authentication (pacibz / autibz) — disabled for now.
-    // e.code.push(0xD503235F); // pacibz
-
-    // Save return address (x29 is the wasm frame pointer, managed by caller).
-    e.str_x_pre(Reg::X30, Reg::SP, -16);
-
-    // Copy params from registers (x9, x10, ...) to local slots.
-    for i in 0..ir.param_count {
-        let src = Reg(9 + i as u8);
-        e.str_x_uoff(src, Reg::X29, (i as u16) * 8);
-    }
-
-    // Zero-initialize extra locals (beyond params).
-    let extra_locals = ir.total_local_count - ir.param_count;
-    for i in 0..extra_locals {
-        let offset = ((ir.param_count + i) as u16) * 8;
-        e.str_x_uoff(Reg::XZR, Reg::X29, offset);
-    }
-
-    // Seed local cache: params are in registers after prologue stores.
-    let mut local_cache = LocalCache::new(ir.total_local_count as usize);
-    for i in 0..ir.param_count {
-        local_cache.set(i as usize, Reg(9 + i as u8));
-    }
-
-    // ---- Lower each IR instruction ----
-    lower_body(
-        &mut e,
-        ir,
-        &mut ra,
-        &mut fuel_sites,
-        &mut label_offsets,
-        &mut label_patches,
-        &CallMode::Indirect,
-        &mut local_cache,
-        true, // emit markers
-    );
-
-    // ---- Cold fuel-check stubs ----
-    //
-    // Each fuel check in the hot path is just `subs; b.le`. When fuel
-    // runs out, it branches here. The stub does `bl yield_handler`
-    // (which sets x30 = resume point for fiber mode) then jumps back.
-    e.mark();
-    let mut yield_bl_patches: Vec<PatchPoint> = Vec::new();
-    for site in &fuel_sites {
-        e.patch(site.b_le_patch);
-        let bl_pp = e.bl(); // bl yield_handler (sets x30 for fiber resume)
-        yield_bl_patches.push(bl_pp);
-        // Branch back to resume point (instruction after the b.le).
-        let current = e.offset();
-        let offset = site.resume_offset as i32 - current as i32;
-        e.b_offset(offset);
-    }
-
-    // ---- Yield handler (cold path) ----
-    e.mark();
-    let yield_target = e.offset();
-
-    // Check is_fiber flag in context (use x0 as temp, outside VReg pool).
-    e.ldr_x_uoff(Reg::X0, Reg::X20, CTX_IS_FIBER);
-    let fiber_branch = e.cbnz_x(Reg::X0);
-
-    // Non-fiber path: simple unwind.
-    emit_i32_const_reg(&mut e, Reg::W0, -1);
-    e.ldr_x_post(Reg::X30, Reg::SP, 16);
-    e.ret();
-
-    // Fiber yield path.
-    e.patch(fiber_branch);
-    emit_fiber_yield(&mut e);
-
-    // ---- Completion handler (fiber mode only) ----
-    e.mark();
-    let completion_offset = e.offset();
-    emit_fiber_complete(&mut e);
-
-    // Patch cold-stub BLs to yield handler.
-    for pp in yield_bl_patches {
-        e.patch_to(pp, yield_target);
-    }
-
-    // Patch forward label branches.
-    for (label, pp) in label_patches {
-        let target = label_offsets[label.0 as usize]
-            .unwrap_or_else(|| panic!("unresolved label L{}", label.0));
-        e.patch_to(pp, target);
-    }
-
-    // ---- Finalize ----
-    let completion_byte_offset = completion_offset * 4;
-    let code = e.code().to_vec();
-    let mut buffer = CodeBuffer::new(code.len() * 4 + 64)?;
-    for &word in &code {
-        buffer.emit_u32(word);
-    }
-    buffer.finalize()?;
-
-    Ok(CompiledFunction {
-        buffer,
-        code,
-        completion_offset: completion_byte_offset,
-        markers: e.markers,
-    })
-}
-
 /// Shared lowering loop for IR instructions.
 ///
 /// Handles all IR instructions with peephole optimizations:
 /// - Lazy constant materialization (IConst values tracked, folded into immediates)
 /// - Immediate folding for Add, Sub, Cmp when RHS is a small constant (0..4095)
 /// - Fused compare-and-branch (Cmp + BrIfZero/BrIfNonZero → cmp + b.cond)
-///
-/// The `call_mode` parameter controls how function calls are emitted:
-/// - `Indirect`: loads target from func_table in context (standalone mode)
-/// - `PcRelative`: emits bl to jump table entry (shared buffer mode)
 fn lower_body(
     e: &mut Emitter,
     ir: &IrFunction,
@@ -471,7 +307,7 @@ fn lower_body(
     fuel_sites: &mut Vec<FuelCheckSite>,
     label_offsets: &mut [Option<usize>],
     label_patches: &mut Vec<(Label, PatchPoint)>,
-    call_mode: &CallMode,
+    call_ctx: &CallContext,
     local_cache: &mut LocalCache,
     emit_markers: bool,
 ) {
@@ -508,7 +344,7 @@ fn lower_body(
                 } else {
                     // Cache miss: load from frame.
                     let phys = ra.alloc(*dst);
-                    let offset = (*idx as u16) * 8;
+                    let offset = (*idx as u16) * 8 + FRAME_HEADER_SIZE;
                     e.ldr_x_uoff(phys, Reg::X29, offset);
                     local_cache.set(*idx as usize, phys);
                 }
@@ -516,7 +352,7 @@ fn lower_body(
 
             IrInst::LocalSet { idx, src } => {
                 let phys_src = materialize(e, ra, &consts, *src);
-                let offset = (*idx as u16) * 8;
+                let offset = (*idx as u16) * 8 + FRAME_HEADER_SIZE;
                 e.str_x_uoff(phys_src, Reg::X29, offset);
                 local_cache.set(*idx as usize, phys_src);
                 maybe_free_with_cache(ra, local_cache, *src, inst_idx);
@@ -565,6 +401,7 @@ fn lower_body(
                 cond,
             } => {
                 let arm_cond = match cond {
+                    IrCond::Eq => Cond::EQ,
                     IrCond::LeS => Cond::LE,
                 };
 
@@ -636,7 +473,7 @@ fn lower_body(
             IrInst::FrameStore { slot, src } => {
                 let phys = materialize(e, ra, &consts, *src);
                 maybe_free_with_cache(ra, local_cache, *src, inst_idx);
-                e.str_x_uoff(phys, Reg::X29, (*slot as u16) * 8);
+                e.str_x_uoff(phys, Reg::X29, (*slot as u16) * 8 + FRAME_HEADER_SIZE);
                 // Update local cache if this slot corresponds to a local.
                 if (*slot as usize) < ir.total_local_count as usize {
                     local_cache.set(*slot as usize, phys);
@@ -645,25 +482,63 @@ fn lower_body(
 
             IrInst::FrameLoad { dst, slot } => {
                 let phys = ra.alloc(*dst);
-                e.ldr_x_uoff(phys, Reg::X29, (*slot as u16) * 8);
+                e.ldr_x_uoff(phys, Reg::X29, (*slot as u16) * 8 + FRAME_HEADER_SIZE);
             }
 
             IrInst::Call {
                 func_idx,
                 args,
                 result,
+                frame_advance,
             } => {
-                // Move args into x9, x10, ... (scratch registers).
-                // We need to be careful about conflicts — if an arg VReg
-                // is already in the target register, skip the move.
-                let arg_regs: Vec<Reg> = (0..args.len())
-                    .map(|i| Reg(9 + i as u8))
+                // Materialize all args, then move into position (x9, x10, ...).
+                //
+                // Two-phase to avoid clobbering: if arg1 lives in x9 and
+                // we move arg0 → x9 first, arg1's value is destroyed.
+                //
+                // Phase 1: materialize into whatever regs the allocator picks.
+                let phys_args: Vec<Reg> = args
+                    .iter()
+                    .map(|&arg_vreg| materialize(e, ra, &consts, arg_vreg))
                     .collect();
-                for (i, &arg_vreg) in args.iter().enumerate() {
-                    let src = materialize(e, ra, &consts, arg_vreg);
-                    let dst = arg_regs[i];
-                    if src != dst {
-                        e.mov_x(dst, src);
+                // Phase 2: move into target positions, handling conflicts.
+                // First pass: move args that don't conflict (src != any other's target).
+                // Second pass: remaining args use x15 as temp to break cycles.
+                let arg_count = phys_args.len();
+                let mut done = vec![false; arg_count];
+                // Pass 1: move non-conflicting args.
+                for i in 0..arg_count {
+                    let dst = Reg(9 + i as u8);
+                    if phys_args[i] == dst {
+                        done[i] = true;
+                        continue;
+                    }
+                    // Check if dst is a source for any undone arg.
+                    let conflicts = (0..arg_count).any(|j| j != i && !done[j] && phys_args[j] == dst);
+                    if !conflicts {
+                        e.mov_x(dst, phys_args[i]);
+                        done[i] = true;
+                    }
+                }
+                // Pass 2: break remaining conflicts via x15 temp.
+                for i in 0..arg_count {
+                    if done[i] {
+                        continue;
+                    }
+                    let dst = Reg(9 + i as u8);
+                    // Save dst (which some other arg needs) to temp.
+                    e.mov_x(Reg(15), dst);
+                    e.mov_x(dst, phys_args[i]);
+                    done[i] = true;
+                    // Fix up any arg that was sourcing from dst.
+                    for j in 0..arg_count {
+                        if !done[j] && phys_args[j] == dst {
+                            // This arg's source was just saved to x15.
+                            let dst_j = Reg(9 + j as u8);
+                            e.mov_x(dst_j, Reg(15));
+                            done[j] = true;
+                            break; // Only one arg can source from dst.
+                        }
                     }
                 }
                 // Free all scratch registers (they're clobbered by the call).
@@ -671,35 +546,29 @@ fn lower_body(
                 // All cached locals are invalid — registers are clobbered.
                 local_cache.clear();
 
-                // Advance frame base to callee's frame.
-                let frame_sz = ir.frame_size() as u16;
-                e.add_x_imm(Reg::X29, Reg::X29, frame_sz);
+                let advance = *frame_advance as u16;
 
-                // Emit the call.
-                match call_mode {
-                    CallMode::Indirect => {
-                        let table_offset = (*func_idx as usize * 8) as u16;
-                        e.ldr_x_uoff(Reg::X0, Reg::X20, CTX_FUNC_TABLE);
-                        e.ldr_x_uoff(Reg::X0, Reg::X0, table_offset);
-                        e.blr(Reg::X0);
-                    }
-                    CallMode::PcRelative { body_offsets, .. } => {
-                        // Direct BL to body if target is already compiled.
-                        if let Some(body_word) = body_offsets[*func_idx as usize] {
-                            let current = e.offset();
-                            let target = body_word as i32 - current as i32;
-                            e.bl_offset(target);
-                        } else {
-                            // Fall back to jump table hop.
-                            let current = e.offset();
-                            let target = *func_idx as i32 - current as i32;
-                            e.bl_offset(target);
-                        }
-                    }
+                // prev_fp write deferred to cold suspend path (same as header).
+                // Writing it here costs ~0.4ms on fib(30) for one extra str × 2.7M calls.
+                // e.str_x_uoff(Reg::X29, Reg::X29, advance);
+                e.add_x_imm(Reg::X29, Reg::X29, advance);
+
+                // Emit PC-relative call: direct BL if target is compiled,
+                // otherwise fall back to jump table hop.
+                if let Some(body_word) = call_ctx.body_offsets[*func_idx as usize] {
+                    let current = e.offset();
+                    let target = body_word as i32 - current as i32;
+                    e.bl_offset(target);
+                } else {
+                    let current = e.offset();
+                    let target = *func_idx as i32 - current as i32;
+                    e.bl_offset(target);
                 }
 
-                // Restore frame base.
-                e.sub_x_imm(Reg::X29, Reg::X29, frame_sz);
+                // Caller restores x29 — the callee doesn't touch it.
+                // This is a 1-cycle ALU op vs the ~4-cycle load that
+                // callee-restores-fp would need (ldr x29, [x29, #0]).
+                e.sub_x_imm(Reg::X29, Reg::X29, advance);
 
                 // Move result from x9 to the result VReg's register.
                 if let Some(r) = result {
@@ -718,8 +587,8 @@ fn lower_body(
                 emit_ir_return(e, ra, results, result_count);
             }
 
-            IrInst::FuelCheck => {
-                emit_fuel_check(e, fuel_sites);
+            IrInst::FuelCheck { cost } => {
+                emit_fuel_check(e, fuel_sites, *cost);
             }
 
             IrInst::Trap => {
@@ -917,6 +786,7 @@ pub fn lower_into(
     func_idx: u32,
     shared: &SharedHandlerOffsets,
     body_offsets: &mut [Option<usize>],
+    emit_markers: bool,
 ) -> FunctionLayout {
     let body_start = e.offset();
 
@@ -936,21 +806,28 @@ pub fn lower_into(
     let mut fuel_sites: Vec<FuelCheckSite> = Vec::new();
 
     // ---- Prologue ----
-    // TODO: pointer authentication (pacibz / autibz) — disabled for now.
-    // e.code.push(0xD503235F); // pacibz
-    // Save return address (x29 is the wasm frame pointer, managed by caller).
+    if emit_markers {
+        e.mark();
+    }
+
+    // Save return address on native stack.
     e.str_x_pre(Reg::X30, Reg::SP, -16);
 
-    // Copy params from registers (x9, x10, ...) to local slots.
+    // Frame header write (func_idx | wasm_pc) is deferred to the cold
+    // suspend path. Writing it here in every prologue costs ~1ms on
+    // fib(30) due to 2 extra instructions (movz + str) × 2.7M calls.
+    // It will be emitted by SuspendPoint IR instructions instead.
+
+    // Copy params from registers (x9, x10, ...) to local slots (+16 offset).
     for i in 0..ir.param_count {
         let src = Reg(9 + i as u8);
-        e.str_x_uoff(src, Reg::X29, (i as u16) * 8);
+        e.str_x_uoff(src, Reg::X29, (i as u16) * 8 + 16);
     }
 
     // Zero-initialize extra locals (beyond params).
     let extra_locals = ir.total_local_count - ir.param_count;
     for i in 0..extra_locals {
-        let offset = ((ir.param_count + i) as u16) * 8;
+        let offset = ((ir.param_count + i) as u16) * 8 + 16;
         e.str_x_uoff(Reg::XZR, Reg::X29, offset);
     }
 
@@ -968,12 +845,12 @@ pub fn lower_into(
         &mut fuel_sites,
         &mut label_offsets,
         &mut label_patches,
-        &CallMode::PcRelative {
+        &CallContext {
             shared,
             body_offsets,
         },
         &mut local_cache,
-        false, // no markers in shared mode
+        emit_markers,
     );
 
     // ---- Cold fuel-check stubs ----
@@ -1016,8 +893,10 @@ pub fn patch_jump_table(e: &mut Emitter, func_idx: u32, target_word: usize) {
 
 /// Emit the return sequence for IR results.
 ///
-/// Moves result to x9 (register-passing convention), restores x30,
-/// and returns. The caller reads the result from x9.
+/// Moves result to x9 (register-passing convention), restores x30
+/// from the native stack, and returns. The caller is responsible for
+/// restoring x29 via `sub x29, x29, #advance` after the call — this
+/// avoids the ~4-cycle load latency of `ldr x29, [x29, #0]`.
 fn emit_ir_return(e: &mut Emitter, ra: &RegAlloc, results: &[VReg], result_count: usize) {
     if result_count == 1 {
         let phys = ra.get(results[0]);
@@ -1028,9 +907,9 @@ fn emit_ir_return(e: &mut Emitter, ra: &RegAlloc, results: &[VReg], result_count
     // result_count == 0: nothing to move.
     // result_count > 1: not yet supported (would need multi-reg return).
 
-    // Epilogue: restore return address, verify pointer auth, return.
+    // Epilogue: restore return address and ret.
+    // x29 is NOT restored here — the caller does `sub x29, x29, #advance`.
     e.ldr_x_post(Reg::X30, Reg::SP, 16);
-    // e.code.push(0xD50323DF); // autibz
     e.ret();
 }
 
@@ -1043,14 +922,14 @@ struct FuelCheckSite {
     resume_offset: usize,
 }
 
-/// Emit a fuel check: `subs x21, x21, #1; bc.le <cold_stub>`.
+/// Emit a fuel check: `subs x21, x21, #cost; bc.le <cold_stub>`.
 ///
 /// Uses BC.cond (FEAT_HBC) to hint that this branch is consistent —
 /// almost always not-taken (fuel > 0). The cold stub (emitted later)
 /// does `bl yield_handler; b .resume` so the hot path is only 2
 /// instructions.
-fn emit_fuel_check(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>) {
-    e.subs_x_imm(Reg::X21, Reg::X21, 1);
+fn emit_fuel_check(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>, cost: u32) {
+    e.subs_x_imm(Reg::X21, Reg::X21, cost as u16);
     let b_le_patch = e.b_cond(Cond::LE);
     let resume_offset = e.offset();
     fuel_sites.push(FuelCheckSite {
@@ -1180,7 +1059,7 @@ fn for_each_def(inst: &IrInst, mut f: impl FnMut(VReg)) {
             }
         }
         IrInst::Return { .. } => {}
-        IrInst::FuelCheck => {}
+        IrInst::FuelCheck { .. } => {}
         IrInst::Trap => {}
     }
 }

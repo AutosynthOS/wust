@@ -184,6 +184,13 @@ fn execute(
                 }
             }
 
+            OpCode::I32Eqz => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a == 0) as u64;
+                }
+            }
+
             OpCode::I32LeS => {
                 sp = unsafe { sp.sub(8) };
                 unsafe {
@@ -279,6 +286,23 @@ fn execute(
                     // Condition true: fall through into if-body.
                 } else {
                     // Condition false: jump to else or end.
+                    let block = unsafe { &*blocks.add(block_idx) };
+                    if block.else_pc != 0 {
+                        pc = block.else_pc as usize + 1;
+                    } else {
+                        pc = block.end_pc as usize + 1;
+                    }
+                }
+            }
+
+            OpCode::LocalGetI32EqzIf => {
+                let local_idx = entry.imm_u8_a() as usize;
+                let block_idx = entry.imm_u8_b() as usize;
+                let val = unsafe { *(locals.add(local_idx * 8) as *const i32) };
+                if val == 0 {
+                    // eqz is true: fall through into if-body.
+                } else {
+                    // eqz is false: jump to else or end.
                     let block = unsafe { &*blocks.add(block_idx) };
                     if block.else_pc != 0 {
                         pc = block.else_pc as usize + 1;

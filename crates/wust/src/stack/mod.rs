@@ -2,7 +2,7 @@ use std::ptr;
 
 use crate::Val;
 
-const DEFAULT_STACK_PAGES: usize = 16;
+const DEFAULT_STACK_PAGES: usize = 64;
 const GUARD_PAGES: usize = 1;
 
 /// Mmap'd operand stack with guard pages on both ends.

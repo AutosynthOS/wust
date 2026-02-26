@@ -112,7 +112,8 @@ pub(crate) enum OpCode {
     I32Add,
     I32Sub,
 
-    // --- i32 comparison (no immediate) ---
+    // --- i32 comparison / test (no immediate) ---
+    I32Eqz,
     I32LeS,
 
     // --- Reference operations ---
@@ -146,6 +147,36 @@ pub(crate) enum OpCode {
     LocalGetLocalGetAdd,   // localA(8) + localB(8)
     LocalGetReturn,        // local(8)
     LocalGetI32ConstLeSIf, // local(8) + const_i8(8) + block(8)
+    LocalGetI32EqzIf,      // local(8) + block(8)
+}
+
+impl OpCode {
+    /// Fuel cost for this opcode. Zero means no fuel check is emitted
+    /// after this opcode's IR group.
+    ///
+    /// Comparisons (I32Eqz, I32LeS) cost 0 because their IR (Cmp)
+    /// must stay adjacent to the following branch (BrIfZero) for
+    /// fusion. The branch opcode (If, BrIf) charges for both.
+    pub(crate) fn fuel_cost(self) -> u32 {
+        match self {
+            // Structural — no work.
+            OpCode::Nop | OpCode::Block | OpCode::Loop | OpCode::Else | OpCode::End => 0,
+            // Comparisons — cost folded into the following branch.
+            OpCode::I32Eqz | OpCode::I32LeS => 0,
+            // Branches charge for the preceding comparison too.
+            OpCode::If | OpCode::BrIf => 2,
+            // Superinstructions cost the number of fused wasm opcodes.
+            OpCode::LocalGetI32ConstSub
+            | OpCode::LocalGetI32ConstAdd
+            | OpCode::LocalGetLocalGetAdd => 3,
+            OpCode::CallLocalSet => 2,
+            OpCode::LocalGetReturn => 2,
+            OpCode::LocalGetI32ConstLeSIf => 4,
+            OpCode::LocalGetI32EqzIf => 3,
+            // Everything else: 1 fuel per wasm opcode.
+            _ => 1,
+        }
+    }
 }
 
 /// Metadata for a block/loop/if/function, resolved at parse time.
@@ -291,7 +322,8 @@ impl ParsedBody {
             Operator::I32Add => self.ops.push(pack(OpCode::I32Add)),
             Operator::I32Sub => self.ops.push(pack(OpCode::I32Sub)),
 
-            // i32 comparison
+            // i32 comparison / test
+            Operator::I32Eqz => self.ops.push(pack(OpCode::I32Eqz)),
             Operator::I32LeS => self.ops.push(pack(OpCode::I32LeS)),
 
             // References
@@ -473,6 +505,21 @@ impl ParsedBody {
                 if local < 256 && konst >= i16::MIN as i32 && konst <= i16::MAX as i32 {
                     return Some((
                         pack_u8_i16(OpCode::LocalGetI32ConstAdd, local as u8, konst as i16),
+                        3,
+                    ));
+                }
+            }
+
+            // LocalGet + I32Eqz + If
+            if o0.opcode() == OpCode::LocalGet
+                && o1.opcode() == OpCode::I32Eqz
+                && o2.opcode() == OpCode::If
+            {
+                let local = o0.immediate_u32();
+                let block = o2.immediate_u32();
+                if local < 256 && block < 256 {
+                    return Some((
+                        pack_two_u8(OpCode::LocalGetI32EqzIf, local as u8, block as u8),
                         3,
                     ));
                 }

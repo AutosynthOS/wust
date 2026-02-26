@@ -19,12 +19,7 @@ fn main() -> anyhow::Result<()> {
     let engine = Engine::default();
     let module = Module::new(&engine, FIB_WAT)?;
 
-    println!("=== WITH FUEL ===\n");
     let output = Codegen::new(&module).inspect().compile()?;
-    print!("{}", output.render_inspect());
-
-    println!("\n=== WITHOUT FUEL ===\n");
-    let output = Codegen::new(&module).inspect().fuel(false).compile()?;
     print!("{}", output.render_inspect());
 
     Ok(())

@@ -28,8 +28,6 @@ struct IrCompiler {
     next_label: u32,
     /// Block stack for branch resolution.
     block_stack: Vec<OpenBlock>,
-    /// Whether to emit fuel check instructions.
-    emit_fuel: bool,
     /// Maximum vstack depth seen during compilation.
     max_vstack_depth: usize,
     /// Total number of locals (params + declared). Used to compute
@@ -38,14 +36,13 @@ struct IrCompiler {
 }
 
 impl IrCompiler {
-    fn new(emit_fuel: bool, total_local_count: u32) -> Self {
+    fn new(total_local_count: u32) -> Self {
         IrCompiler {
             insts: Vec::new(),
             vstack: Vec::new(),
             next_vreg: 0,
             next_label: 0,
             block_stack: Vec::new(),
-            emit_fuel,
             max_vstack_depth: 0,
             total_local_count,
         }
@@ -81,12 +78,6 @@ impl IrCompiler {
 
     fn emit(&mut self, inst: IrInst) {
         self.insts.push(inst);
-    }
-
-    fn fuel_check(&mut self) {
-        if self.emit_fuel {
-            self.emit(IrInst::FuelCheck);
-        }
     }
 
     fn emit_i32_const(&mut self, val: i32) {
@@ -169,15 +160,16 @@ impl IrCompiler {
 /// virtual registers and are only materialized to the physical wasm
 /// stack at call boundaries and control flow merge points.
 ///
-/// When `emit_fuel` is true, fuel check instructions are inserted
-/// after most wasm operations, enabling suspension and bounded
-/// execution. When false, no fuel checks are emitted.
+/// Each wasm opcode emits a group of IR instructions, followed by a
+/// single `FuelCheck` (when `emit_fuel` is true). This keeps fused
+/// operations (e.g. Cmp+BrIfZero from i32.eqz+if) adjacent — the
+/// fuel check always comes after the whole group.
 pub(crate) fn compile_with(
     func: &ParsedFunction,
     all_funcs: &[ParsedFunction],
     emit_fuel: bool,
 ) -> IrFunction {
-    let mut c = IrCompiler::new(emit_fuel, func.locals.len() as u32);
+    let mut c = IrCompiler::new(func.locals.len() as u32);
 
     let result_count = func.result_count as usize;
     let ops = &func.body.ops;
@@ -195,14 +187,12 @@ pub(crate) fn compile_with(
             }
 
             OpCode::Return => {
-                c.fuel_check();
                 c.emit_return(result_count);
             }
 
             OpCode::I32Const => {
                 let val = ((imm as i32) << 8 >> 8) as i32;
                 c.emit_i32_const(val);
-                c.fuel_check();
             }
 
             OpCode::I64Const => {
@@ -210,42 +200,35 @@ pub(crate) fn compile_with(
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::IConst { dst, val });
                 c.vpush(dst);
-                c.fuel_check();
             }
 
             OpCode::LocalGet => {
                 c.emit_local_get(imm);
-                c.fuel_check();
             }
 
             OpCode::LocalSet => {
                 c.emit_local_set(imm);
-                c.fuel_check();
             }
 
             OpCode::LocalTee => {
                 let src = c.vpeek();
                 c.emit(IrInst::LocalSet { idx: imm, src });
-                c.fuel_check();
             }
 
             OpCode::GlobalGet => {
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::IConst { dst, val: 0 });
                 c.vpush(dst);
-                c.fuel_check();
             }
 
             OpCode::GlobalSet => {
                 c.vpop();
-                c.fuel_check();
             }
 
             OpCode::RefNull => {
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::IConst { dst, val: 0 });
                 c.vpush(dst);
-                c.fuel_check();
             }
 
             OpCode::I32Add => {
@@ -254,7 +237,6 @@ pub(crate) fn compile_with(
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::Add { dst, lhs, rhs });
                 c.vpush(dst);
-                c.fuel_check();
             }
 
             OpCode::I32Sub => {
@@ -263,7 +245,20 @@ pub(crate) fn compile_with(
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::Sub { dst, lhs, rhs });
                 c.vpush(dst);
-                c.fuel_check();
+            }
+
+            OpCode::I32Eqz => {
+                let val = c.vpop();
+                let zero = c.fresh_vreg();
+                c.emit(IrInst::IConst { dst: zero, val: 0 });
+                let dst = c.fresh_vreg();
+                c.emit(IrInst::Cmp {
+                    dst,
+                    lhs: val,
+                    rhs: zero,
+                    cond: IrCond::Eq,
+                });
+                c.vpush(dst);
             }
 
             OpCode::I32LeS => {
@@ -277,7 +272,6 @@ pub(crate) fn compile_with(
                     cond: IrCond::LeS,
                 });
                 c.vpush(dst);
-                c.fuel_check();
             }
 
             OpCode::Block => {
@@ -308,13 +302,14 @@ pub(crate) fn compile_with(
                     cond: cond_vreg,
                     label,
                 });
+                // Flush AFTER BrIfZero so Cmp+BrIfZero stay adjacent
+                // for fusion in the lowerer.
                 c.block_stack.push(OpenBlock {
                     block_idx: imm,
                     kind: blocks[imm as usize].kind,
                     label,
                     vstack_depth: c.vstack.len(),
                 });
-                c.fuel_check();
             }
 
             OpCode::Else => {
@@ -334,8 +329,6 @@ pub(crate) fn compile_with(
 
             OpCode::End => {
                 if imm == 0 {
-                    // Function-level end — no fuel check needed, we're
-                    // just leaving the function.
                     c.emit_return(result_count);
                 } else if let Some(block) = c.block_stack.pop() {
                     if block.kind == BlockKind::If {
@@ -355,7 +348,6 @@ pub(crate) fn compile_with(
             }
 
             OpCode::Br => {
-                c.fuel_check();
                 c.emit_br(imm);
             }
 
@@ -366,7 +358,6 @@ pub(crate) fn compile_with(
                     cond: cond_vreg,
                     label: skip_label,
                 });
-                c.fuel_check();
                 c.emit_br(imm);
                 c.emit(IrInst::DefLabel { label: skip_label });
             }
@@ -385,16 +376,17 @@ pub(crate) fn compile_with(
                 // survive the call (scratch registers are clobbered).
                 let spill_count = c.vstack.len();
                 c.flush_vstack_above(0);
-                c.fuel_check();
                 let result = if has_result {
                     Some(c.fresh_vreg())
                 } else {
                     None
                 };
+                let frame_advance = (2 + c.total_local_count + spill_count as u32) * 8;
                 c.emit(IrInst::Call {
                     func_idx: imm,
                     args,
                     result,
+                    frame_advance,
                 });
                 // Reload spilled values back onto vstack.
                 if spill_count > 0 {
@@ -416,7 +408,6 @@ pub(crate) fn compile_with(
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::Add { dst, lhs, rhs });
                 c.vpush(dst);
-                c.fuel_check();
             }
 
             OpCode::LocalGetI32ConstSub => {
@@ -429,7 +420,6 @@ pub(crate) fn compile_with(
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::Sub { dst, lhs, rhs });
                 c.vpush(dst);
-                c.fuel_check();
             }
 
             OpCode::LocalGetI32ConstAdd => {
@@ -442,7 +432,6 @@ pub(crate) fn compile_with(
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::Add { dst, lhs, rhs });
                 c.vpush(dst);
-                c.fuel_check();
             }
 
             OpCode::LocalGetReturn => {
@@ -473,13 +462,13 @@ pub(crate) fn compile_with(
                     cond: cmp_dst,
                     label,
                 });
+                // Flush AFTER BrIfZero so Cmp+BrIfZero stay adjacent.
                 c.block_stack.push(OpenBlock {
                     block_idx,
                     kind: blocks[block_idx as usize].kind,
                     label,
                     vstack_depth: c.vstack.len(),
                 });
-                c.fuel_check();
             }
 
             OpCode::CallLocalSet => {
@@ -496,16 +485,17 @@ pub(crate) fn compile_with(
                 // Spill remaining vstack values across the call.
                 let spill_count = c.vstack.len();
                 c.flush_vstack_above(0);
-                c.fuel_check();
                 let result = if has_result {
                     Some(c.fresh_vreg())
                 } else {
                     None
                 };
+                let frame_advance = (2 + c.total_local_count + spill_count as u32) * 8;
                 c.emit(IrInst::Call {
                     func_idx,
                     args,
                     result,
+                    frame_advance,
                 });
                 // Reload spilled values back onto vstack.
                 if spill_count > 0 {
@@ -519,8 +509,44 @@ pub(crate) fn compile_with(
                 }
             }
 
+            OpCode::LocalGetI32EqzIf => {
+                let local_idx = op.imm_u8_a() as u32;
+                let block_idx = op.imm_u8_b() as u32;
+
+                c.emit_local_get(local_idx);
+                let val = c.vpop();
+                let zero = c.fresh_vreg();
+                c.emit(IrInst::IConst { dst: zero, val: 0 });
+                let cmp_dst = c.fresh_vreg();
+                c.emit(IrInst::Cmp {
+                    dst: cmp_dst,
+                    lhs: val,
+                    rhs: zero,
+                    cond: IrCond::Eq,
+                });
+
+                let label = c.fresh_label();
+                c.emit(IrInst::BrIfZero {
+                    cond: cmp_dst,
+                    label,
+                });
+                c.block_stack.push(OpenBlock {
+                    block_idx,
+                    kind: blocks[block_idx as usize].kind,
+                    label,
+                    vstack_depth: c.vstack.len(),
+                });
+            }
+
             _ => {
                 c.emit(IrInst::Trap);
+            }
+        }
+
+        if emit_fuel {
+            let cost = opcode.fuel_cost();
+            if cost > 0 {
+                c.emit(IrInst::FuelCheck { cost });
             }
         }
     }
@@ -538,7 +564,7 @@ pub(crate) fn compile_with(
 mod tests {
     use super::*;
 
-    /// Compile a parsed wasm function into IR with fuel checks enabled.
+    /// Compile a parsed wasm function into IR with fuel checks.
     pub(crate) fn compile(func: &ParsedFunction, all_funcs: &[ParsedFunction]) -> IrFunction {
         compile_with(func, all_funcs, true)
     }
@@ -550,6 +576,35 @@ mod tests {
         let module =
             crate::Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
         compile(&module.funcs[0], &module.funcs)
+    }
+
+    #[test]
+    fn ir_ackermann() {
+        let ir = compile_wat_ir(
+            r#"(module
+                (func $ack (export "ack") (param $m i32) (param $n i32) (result i32)
+                  (if (result i32) (i32.eqz (local.get $m))
+                    (then
+                      (i32.add (local.get $n) (i32.const 1))
+                    )
+                    (else
+                      (if (result i32) (i32.eqz (local.get $n))
+                        (then
+                          (call $ack (i32.sub (local.get $m) (i32.const 1)) (i32.const 1))
+                        )
+                        (else
+                          (call $ack
+                            (i32.sub (local.get $m) (i32.const 1))
+                            (call $ack (local.get $m) (i32.sub (local.get $n) (i32.const 1)))
+                          )
+                        )
+                      )
+                    )
+                  )
+                )
+              )"#,
+        );
+        eprintln!("{ir}");
     }
 
     #[test]
