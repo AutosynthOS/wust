@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 anyhow = "1"
 libc = "0.2"
+regalloc2 = "0.13"

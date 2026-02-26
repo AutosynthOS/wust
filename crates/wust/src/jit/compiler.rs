@@ -545,7 +545,11 @@ pub(crate) fn compile_with(
 
         if emit_fuel {
             let cost = opcode.fuel_cost();
-            if cost > 0 {
+            let last_is_terminator = c
+                .insts
+                .last()
+                .is_some_and(|i| matches!(i, IrInst::Return { .. } | IrInst::Trap));
+            if cost > 0 && !last_is_terminator {
                 c.emit(IrInst::FuelCheck { cost });
             }
         }
