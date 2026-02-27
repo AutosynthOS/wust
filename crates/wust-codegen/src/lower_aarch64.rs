@@ -535,24 +535,13 @@ pub fn lower_into(
     let mut fuel_sites: Vec<FuelCheckSite> = Vec::new();
 
     // ---- Prologue ----
+    // Only save LR. Param stores and local zero-init are handled by
+    // the IR compiler via FrameStore instructions (deferred to first
+    // flush_dirty_locals at the first suspend point).
     if emit_markers {
         e.mark();
     }
     e.str_x_pre(Reg::X30, Reg::SP, -16);
-
-    for i in 0..ir.param_count {
-        let src = Reg(9 + i as u8);
-        e.str_x_uoff(src, Reg::X29, frame_slot_offset(i));
-    }
-
-    let skip_zero_init = compute_skip_zero_init(ir);
-    let extra_locals = ir.total_local_count - ir.param_count;
-    for i in 0..extra_locals {
-        let local_idx = ir.param_count + i;
-        if !skip_zero_init[local_idx as usize] {
-            e.str_x_uoff(Reg::XZR, Reg::X29, frame_slot_offset(local_idx));
-        }
-    }
 
     // ---- Lower body ----
     lower_body_ra2(

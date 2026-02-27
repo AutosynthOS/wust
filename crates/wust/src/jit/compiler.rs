@@ -421,11 +421,11 @@ pub(crate) fn compile_with(
             }
 
             OpCode::If => {
-                // Don't flush fuel here — FuelCheck before a conditional
-                // branch would break Cmp+BrIfZero fusion. The accumulated
-                // cost carries into whichever branch is taken and gets
-                // flushed at the next unconditional boundary.
                 let cond_vreg = c.vpop();
+                // Flush dirty locals before the conditional branch —
+                // the taken path (else/end) arrives at a DefLabel where
+                // locals are invalidated, so frame must be consistent.
+                c.flush_dirty_locals();
                 let label = c.fresh_label();
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
@@ -440,18 +440,16 @@ pub(crate) fn compile_with(
             }
 
             OpCode::Else => {
-                // At Else, the then-branch has produced values on the
-                // vstack. Flush them to the physical wasm stack so the
-                // merge point (End) can reload them uniformly.
                 let (depth, if_label) = {
                     let block = c.block_stack.last().expect("Else without If");
                     (block.vstack_depth, block.label)
                 };
                 c.flush_vstack_above(depth);
-                // No fuel flush — forward branch, not a suspend point.
+                c.flush_dirty_locals();
                 let end_label = c.fresh_label();
                 c.emit(IrInst::Br { label: end_label });
                 c.emit(IrInst::DefLabel { label: if_label });
+                c.invalidate_locals();
                 c.block_stack.last_mut().unwrap().label = end_label;
             }
 
@@ -481,7 +479,34 @@ pub(crate) fn compile_with(
             }
 
             OpCode::Br => {
-                // Only flush fuel (consume+check) for loop back-edges.
+                let stack_idx = c
+                    .block_stack
+                    .iter()
+                    .rposition(|b| b.block_idx == imm)
+                    .expect("branch target not on block stack");
+                if c.block_stack[stack_idx].kind == BlockKind::Loop {
+                    // Loop back-edge: consume fuel + check + flush locals.
+                    c.flush_fuel();
+                } else {
+                    // Forward branch to block end — flush dirty locals
+                    // because the DefLabel at End invalidates tracking.
+                    c.flush_dirty_locals();
+                }
+                c.emit_br(imm);
+            }
+
+            OpCode::BrIf => {
+                let cond_vreg = c.vpop();
+                let skip_label = c.fresh_label();
+                // Flush dirty locals before the conditional branch —
+                // the taken path may reach a DefLabel with invalidation.
+                c.flush_dirty_locals();
+                c.emit(IrInst::BrIfZero {
+                    cond: cond_vreg,
+                    label: skip_label,
+                });
+                // Taken path: if targeting a loop, consume+check fuel.
+                // Dirty locals already flushed above.
                 let stack_idx = c
                     .block_stack
                     .iter()
@@ -491,22 +516,6 @@ pub(crate) fn compile_with(
                     c.flush_fuel();
                 }
                 c.emit_br(imm);
-            }
-
-            OpCode::BrIf => {
-                let cond_vreg = c.vpop();
-                // Don't flush fuel here — FuelCheck before a conditional
-                // branch would break Cmp+BrIfZero fusion. The accumulated
-                // cost carries into whichever branch is taken and gets
-                // flushed at the next unconditional boundary.
-                let skip_label = c.fresh_label();
-                c.emit(IrInst::BrIfZero {
-                    cond: cond_vreg,
-                    label: skip_label,
-                });
-                c.emit_br(imm);
-                // Skip label has one incoming edge — the fall-through
-                // where BrIfZero didn't branch. Cache is still valid.
                 c.emit(IrInst::DefLabel { label: skip_label });
             }
 
@@ -603,6 +612,10 @@ pub(crate) fn compile_with(
 
                 c.emit_local_get(local_idx);
                 let lhs = c.vpop();
+                // Flush dirty locals before the compare+branch sequence —
+                // the else path arrives at a DefLabel with invalidation.
+                // Flushing here (before CmpImm) preserves Cmp+BrIfZero fusion.
+                c.flush_dirty_locals();
                 let cmp_dst = c.fresh_vreg();
                 if konst >= 0 && konst < 4096 {
                     c.emit(IrInst::CmpImm {
@@ -622,7 +635,6 @@ pub(crate) fn compile_with(
                     });
                 }
 
-                // Don't flush fuel before conditional branch — same reason as If/BrIf.
                 let label = c.fresh_label();
                 c.emit(IrInst::BrIfZero {
                     cond: cmp_dst,
@@ -680,6 +692,9 @@ pub(crate) fn compile_with(
 
                 c.emit_local_get(local_idx);
                 let val = c.vpop();
+                // Flush dirty locals before the conditional branch —
+                // the else path arrives at a DefLabel with invalidation.
+                c.flush_dirty_locals();
 
                 // eqz(val) is 1 when val==0, 0 when val!=0.
                 // BrIfZero on eqz(val) branches when val!=0.
