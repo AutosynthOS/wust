@@ -14,7 +14,9 @@ pub(crate) enum Trap {
 }
 
 /// Maximum call depth before trapping with `CallStackExhausted`.
-const MAX_CALL_DEPTH: u32 = 10_000;
+/// Kept at 1000 to avoid native Rust stack overflow in debug builds
+/// (the recursive interpreter uses one Rust frame per wasm call).
+const MAX_CALL_DEPTH: u32 = 1_000;
 
 impl std::fmt::Display for Trap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -166,6 +168,12 @@ fn execute(
                 sp = unsafe { sp.add(8) };
             }
 
+            OpCode::I64Const => {
+                let val = ((imm as i32) << 8 >> 8) as i64;
+                unsafe { *(sp as *mut u64) = val as u64 };
+                sp = unsafe { sp.add(8) };
+            }
+
             OpCode::I32Add => {
                 sp = unsafe { sp.sub(8) };
                 unsafe {
@@ -198,6 +206,590 @@ fn execute(
                     let a = *(sp.sub(8) as *const i32);
                     *(sp.sub(8) as *mut u64) = (a <= b) as u64;
                 }
+            }
+
+            OpCode::I32Mul => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_mul(b) as u64;
+                }
+            }
+
+            OpCode::I32DivS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    if b == 0 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    if a == i32::MIN && b == -1 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    *(sp.sub(8) as *mut u64) = a.wrapping_div(b) as u64;
+                }
+            }
+
+            OpCode::I32DivU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    if b == 0 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    *(sp.sub(8) as *mut u64) = (a / b) as u64;
+                }
+            }
+
+            OpCode::I32RemS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    if b == 0 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    // i32::MIN % -1 = 0 in wasm (no trap)
+                    let result = if a == i32::MIN && b == -1 { 0 } else { a.wrapping_rem(b) };
+                    *(sp.sub(8) as *mut u64) = result as u64;
+                }
+            }
+
+            OpCode::I32RemU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    if b == 0 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    *(sp.sub(8) as *mut u64) = (a % b) as u64;
+                }
+            }
+
+            OpCode::I32And => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a & b) as u64;
+                }
+            }
+
+            OpCode::I32Or => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a | b) as u64;
+                }
+            }
+
+            OpCode::I32Xor => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a ^ b) as u64;
+                }
+            }
+
+            OpCode::I32Shl => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_shl(b & 31) as u64;
+                }
+            }
+
+            OpCode::I32ShrS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_shr(b & 31) as u64;
+                }
+            }
+
+            OpCode::I32ShrU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_shr(b & 31) as u64;
+                }
+            }
+
+            OpCode::I32Rotl => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = a.rotate_left(b & 31) as u64;
+                }
+            }
+
+            OpCode::I32Rotr => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = a.rotate_right(b & 31) as u64;
+                }
+            }
+
+            OpCode::I32Eq => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a == b) as u64;
+                }
+            }
+
+            OpCode::I32Ne => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a != b) as u64;
+                }
+            }
+
+            OpCode::I32LtS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a < b) as u64;
+                }
+            }
+
+            OpCode::I32LtU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = (a < b) as u64;
+                }
+            }
+
+            OpCode::I32GtS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a > b) as u64;
+                }
+            }
+
+            OpCode::I32GtU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = (a > b) as u64;
+                }
+            }
+
+            OpCode::I32LeU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = (a <= b) as u64;
+                }
+            }
+
+            OpCode::I32GeS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i32);
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a >= b) as u64;
+                }
+            }
+
+            OpCode::I32GeU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u32);
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = (a >= b) as u64;
+                }
+            }
+
+            OpCode::I32Clz => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = a.leading_zeros() as u64;
+                }
+            }
+
+            OpCode::I32Ctz => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = a.trailing_zeros() as u64;
+                }
+            }
+
+            OpCode::I32Popcnt => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = a.count_ones() as u64;
+                }
+            }
+
+            OpCode::I32WrapI64 => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a as i32) as u64;
+                }
+            }
+
+            OpCode::I32Extend8S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a as i8 as i32) as u64;
+                }
+            }
+
+            OpCode::I32Extend16S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a as i16 as i32) as u64;
+                }
+            }
+
+            OpCode::I64Add => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_add(b) as u64;
+                }
+            }
+
+            OpCode::I64Sub => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_sub(b) as u64;
+                }
+            }
+
+            OpCode::I64Mul => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_mul(b) as u64;
+                }
+            }
+
+            OpCode::I64DivS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    if b == 0 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    if a == i64::MIN && b == -1 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    *(sp.sub(8) as *mut u64) = a.wrapping_div(b) as u64;
+                }
+            }
+
+            OpCode::I64DivU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    if b == 0 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    *(sp.sub(8) as *mut u64) = a / b;
+                }
+            }
+
+            OpCode::I64RemS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    if b == 0 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    let result = if a == i64::MIN && b == -1 { 0 } else { a.wrapping_rem(b) };
+                    *(sp.sub(8) as *mut u64) = result as u64;
+                }
+            }
+
+            OpCode::I64RemU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    if b == 0 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::Unreachable);
+                    }
+                    *(sp.sub(8) as *mut u64) = a % b;
+                }
+            }
+
+            OpCode::I64And => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a & b;
+                }
+            }
+
+            OpCode::I64Or => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a | b;
+                }
+            }
+
+            OpCode::I64Xor => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a ^ b;
+                }
+            }
+
+            OpCode::I64Shl => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_shl((b & 63) as u32) as u64;
+                }
+            }
+
+            OpCode::I64ShrS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_shr((b & 63) as u32) as u64;
+                }
+            }
+
+            OpCode::I64ShrU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a.wrapping_shr((b & 63) as u32);
+                }
+            }
+
+            OpCode::I64Rotl => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a.rotate_left((b & 63) as u32);
+                }
+            }
+
+            OpCode::I64Rotr => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a.rotate_right((b & 63) as u32);
+                }
+            }
+
+            OpCode::I64Eqz => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a == 0) as u64;
+                }
+            }
+
+            OpCode::I64Eq => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a == b) as u64;
+                }
+            }
+
+            OpCode::I64Ne => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a != b) as u64;
+                }
+            }
+
+            OpCode::I64LtS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a < b) as u64;
+                }
+            }
+
+            OpCode::I64LtU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = (a < b) as u64;
+                }
+            }
+
+            OpCode::I64GtS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a > b) as u64;
+                }
+            }
+
+            OpCode::I64GtU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = (a > b) as u64;
+                }
+            }
+
+            OpCode::I64LeS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a <= b) as u64;
+                }
+            }
+
+            OpCode::I64LeU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = (a <= b) as u64;
+                }
+            }
+
+            OpCode::I64GeS => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const i64);
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a >= b) as u64;
+                }
+            }
+
+            OpCode::I64GeU => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = *(sp as *const u64);
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = (a >= b) as u64;
+                }
+            }
+
+            OpCode::I64Clz => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a.leading_zeros() as u64;
+                }
+            }
+
+            OpCode::I64Ctz => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a.trailing_zeros() as u64;
+                }
+            }
+
+            OpCode::I64Popcnt => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = a.count_ones() as u64;
+                }
+            }
+
+            OpCode::I64ExtendI32S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a as i64) as u64;
+                }
+            }
+
+            OpCode::I64ExtendI32U => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = a as u64;
+                }
+            }
+
+            OpCode::I64Extend8S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a as i8 as i64) as u64;
+                }
+            }
+
+            OpCode::I64Extend16S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a as i16 as i64) as u64;
+                }
+            }
+
+            OpCode::I64Extend32S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a as i32 as i64) as u64;
+                }
+            }
+
+            OpCode::Drop => {
+                sp = unsafe { sp.sub(8) };
+            }
+
+            OpCode::Select => {
+                sp = unsafe { sp.sub(8) };
+                let cond = unsafe { *(sp as *const i32) };
+                sp = unsafe { sp.sub(8) };
+                let val2 = unsafe { *(sp as *const u64) };
+                let val1 = unsafe { *(sp.sub(8) as *const u64) };
+                unsafe { *(sp.sub(8) as *mut u64) = if cond != 0 { val1 } else { val2 } };
             }
 
             OpCode::RefNull => {
@@ -308,6 +900,73 @@ fn execute(
                         pc = block.else_pc as usize + 1;
                     } else {
                         pc = block.end_pc as usize + 1;
+                    }
+                }
+            }
+
+            OpCode::DataStream => {
+                let data = func.body.data.as_slice();
+                let off = imm as usize;
+                let real_opcode: OpCode = unsafe { std::mem::transmute(data[off]) };
+                match real_opcode {
+                    OpCode::I32Const => {
+                        let val = i32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
+                        unsafe { *(sp as *mut u64) = val as u64 };
+                        sp = unsafe { sp.add(8) };
+                    }
+                    OpCode::I64Const => {
+                        let val = i64::from_le_bytes(data[off+1..off+9].try_into().unwrap());
+                        unsafe { *(sp as *mut u64) = val as u64 };
+                        sp = unsafe { sp.add(8) };
+                    }
+                    OpCode::LocalGet => {
+                        let idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
+                        let val = unsafe { *(locals.add((idx as usize) * 8) as *const u64) };
+                        unsafe { *(sp as *mut u64) = val };
+                        sp = unsafe { sp.add(8) };
+                    }
+                    OpCode::LocalSet => {
+                        sp = unsafe { sp.sub(8) };
+                        let val = unsafe { *(sp as *const u64) };
+                        let idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
+                        unsafe { *(locals.add((idx as usize) * 8) as *mut u64) = val };
+                    }
+                    OpCode::LocalTee => {
+                        let val = unsafe { *(sp.sub(8) as *const u64) };
+                        let idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
+                        unsafe { *(locals.add((idx as usize) * 8) as *mut u64) = val };
+                    }
+                    OpCode::GlobalGet => {
+                        unsafe { *(sp as *mut u64) = 0 };
+                        sp = unsafe { sp.add(8) };
+                    }
+                    OpCode::GlobalSet => {
+                        sp = unsafe { sp.sub(8) };
+                    }
+                    OpCode::Call => {
+                        let func_idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
+                        stack.set_sp(unsafe { sp.offset_from(base) as usize });
+                        let callee = unsafe { module.funcs.get_unchecked(func_idx as usize) };
+                        call_function(module, stack, callee, fuel, depth)?;
+                        sp = unsafe { base.add(stack.sp()) };
+                    }
+                    OpCode::Br => {
+                        let block_idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
+                        let block = unsafe { &*blocks.add(block_idx as usize) };
+                        pc = branch_target(block);
+                    }
+                    OpCode::BrIf => {
+                        let block_idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
+                        sp = unsafe { sp.sub(8) };
+                        let condition = unsafe { *(sp as *const i32) };
+                        if condition != 0 {
+                            let block = unsafe { &*blocks.add(block_idx as usize) };
+                            pc = branch_target(block);
+                        }
+                    }
+                    _ => {
+                        stack.set_sp(unsafe { sp.offset_from(base) as usize });
+                        return Err(Trap::Unimplemented(real_opcode));
                     }
                 }
             }

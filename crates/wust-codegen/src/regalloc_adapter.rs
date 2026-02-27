@@ -164,42 +164,21 @@ fn classify_inst(
 
         IrInst::LocalSet { src, .. } => (vec![Operand::reg_use(to_ra2_vreg(*src))], empty_clob, false, false),
 
-        IrInst::Add { dst, lhs, rhs } | IrInst::Sub { dst, lhs, rhs } => (
-            vec![
+        IrInst::Alu { dst, lhs, rhs, .. } => {
+            let mut ops = vec![
                 Operand::reg_def(to_ra2_vreg(*dst)),
                 Operand::reg_use(to_ra2_vreg(*lhs)),
-                Operand::reg_use(to_ra2_vreg(*rhs)),
-            ],
-            empty_clob,
-            false,
-            false,
-        ),
+            ];
+            if let crate::ir::Operand::Reg(r) = rhs {
+                ops.push(Operand::reg_use(to_ra2_vreg(*r)));
+            }
+            (ops, empty_clob, false, false)
+        }
 
-        IrInst::AddImm { dst, lhs, .. } | IrInst::SubImm { dst, lhs, .. } => (
+        IrInst::Unary { dst, src, .. } => (
             vec![
                 Operand::reg_def(to_ra2_vreg(*dst)),
-                Operand::reg_use(to_ra2_vreg(*lhs)),
-            ],
-            empty_clob,
-            false,
-            false,
-        ),
-
-        IrInst::Cmp { dst, lhs, rhs, .. } => (
-            vec![
-                Operand::reg_def(to_ra2_vreg(*dst)),
-                Operand::reg_use(to_ra2_vreg(*lhs)),
-                Operand::reg_use(to_ra2_vreg(*rhs)),
-            ],
-            empty_clob,
-            false,
-            false,
-        ),
-
-        IrInst::CmpImm { dst, lhs, .. } => (
-            vec![
-                Operand::reg_def(to_ra2_vreg(*dst)),
-                Operand::reg_use(to_ra2_vreg(*lhs)),
+                Operand::reg_use(to_ra2_vreg(*src)),
             ],
             empty_clob,
             false,
@@ -453,11 +432,11 @@ mod tests {
                 // Load param, compare with 0
                 IrInst::LocalGet { dst: v(0), idx: 0 },
                 IrInst::IConst { dst: v(1), val: 0 },
-                IrInst::Cmp {
+                IrInst::Alu {
+                    op: crate::ir::AluOp::I32Eq,
                     dst: v(2),
                     lhs: v(0),
-                    rhs: v(1),
-                    cond: crate::ir::IrCond::Eq,
+                    rhs: crate::ir::Operand::Reg(v(1)),
                 },
                 IrInst::BrIfZero {
                     cond: v(2),
@@ -537,11 +516,11 @@ mod tests {
                 // Block 0: compare + conditional branch
                 IrInst::LocalGet { dst: v(0), idx: 0 },
                 IrInst::IConst { dst: v(1), val: 1 },
-                IrInst::Cmp {
+                IrInst::Alu {
+                    op: crate::ir::AluOp::I32LeS,
                     dst: v(2),
                     lhs: v(0),
-                    rhs: v(1),
-                    cond: crate::ir::IrCond::LeS,
+                    rhs: crate::ir::Operand::Reg(v(1)),
                 },
                 IrInst::BrIfZero {
                     cond: v(2),
@@ -557,10 +536,11 @@ mod tests {
                 IrInst::DefLabel { label: l(0), params: vec![] },
                 IrInst::LocalGet { dst: v(4), idx: 0 },
                 IrInst::IConst { dst: v(5), val: 1 },
-                IrInst::Sub {
+                IrInst::Alu {
+                    op: crate::ir::AluOp::I32Sub,
                     dst: v(6),
                     lhs: v(4),
-                    rhs: v(5),
+                    rhs: crate::ir::Operand::Reg(v(5)),
                 },
                 IrInst::FuelConsume { cost: 3 }, IrInst::FuelCheck { live_state: vec![] },
                 IrInst::Call {

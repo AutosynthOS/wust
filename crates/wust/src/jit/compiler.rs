@@ -1,4 +1,4 @@
-use wust_codegen::ir::{IrCond, IrFunction, IrInst, Label, VReg};
+use wust_codegen::ir::{AluOp, IrFunction, IrInst, Label, Operand, UnaryOp, VReg};
 use crate::parse::body::{BlockKind, OpCode};
 use crate::parse::func::ParsedFunction;
 
@@ -389,44 +389,71 @@ pub(crate) fn compile_with(
                 c.vpush(dst);
             }
 
-            OpCode::I32Add => {
+            OpCode::I32Add | OpCode::I32Sub
+            | OpCode::I32Mul | OpCode::I32DivS | OpCode::I32DivU
+            | OpCode::I32RemS | OpCode::I32RemU
+            | OpCode::I32And | OpCode::I32Or | OpCode::I32Xor
+            | OpCode::I32Shl | OpCode::I32ShrS | OpCode::I32ShrU
+            | OpCode::I32Rotl | OpCode::I32Rotr
+            | OpCode::I32Eq | OpCode::I32Ne
+            | OpCode::I32LtS | OpCode::I32LtU | OpCode::I32GtS | OpCode::I32GtU
+            | OpCode::I32LeS | OpCode::I32LeU | OpCode::I32GeS | OpCode::I32GeU
+            | OpCode::I64Add | OpCode::I64Sub | OpCode::I64Mul
+            | OpCode::I64DivS | OpCode::I64DivU | OpCode::I64RemS | OpCode::I64RemU
+            | OpCode::I64And | OpCode::I64Or | OpCode::I64Xor
+            | OpCode::I64Shl | OpCode::I64ShrS | OpCode::I64ShrU
+            | OpCode::I64Rotl | OpCode::I64Rotr
+            | OpCode::I64Eq | OpCode::I64Ne
+            | OpCode::I64LtS | OpCode::I64LtU | OpCode::I64GtS | OpCode::I64GtU
+            | OpCode::I64LeS | OpCode::I64LeU | OpCode::I64GeS | OpCode::I64GeU => {
+                let alu_op = opcode_to_alu_op(opcode);
                 let rhs = c.vpop();
                 let lhs = c.vpop();
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Add { dst, lhs, rhs });
+                c.emit(IrInst::Alu { op: alu_op, dst, lhs, rhs: Operand::Reg(rhs) });
                 c.vpush(dst);
             }
 
-            OpCode::I32Sub => {
-                let rhs = c.vpop();
-                let lhs = c.vpop();
+            OpCode::I32Eqz | OpCode::I32Clz | OpCode::I32Ctz | OpCode::I32Popcnt
+            | OpCode::I32WrapI64 | OpCode::I32Extend8S | OpCode::I32Extend16S
+            | OpCode::I64Clz | OpCode::I64Ctz | OpCode::I64Popcnt
+            | OpCode::I64Eqz
+            | OpCode::I64ExtendI32S | OpCode::I64ExtendI32U
+            | OpCode::I64Extend8S | OpCode::I64Extend16S | OpCode::I64Extend32S => {
+                let unary_op = opcode_to_unary_op(opcode);
+                let src = c.vpop();
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Sub { dst, lhs, rhs });
+                c.emit(IrInst::Unary { op: unary_op, dst, src });
                 c.vpush(dst);
             }
 
-            OpCode::I32Eqz => {
-                let val = c.vpop();
-                let dst = c.fresh_vreg();
-                c.emit(IrInst::CmpImm {
-                    dst,
-                    lhs: val,
-                    imm: 0,
-                    cond: IrCond::Eq,
-                });
-                c.vpush(dst);
+            OpCode::Drop => {
+                c.vpop();
             }
 
-            OpCode::I32LeS => {
-                let rhs = c.vpop();
-                let lhs = c.vpop();
+            OpCode::Select => {
+                let cond = c.vpop();
+                let val2 = c.vpop();
+                let val1 = c.vpop();
+                let else_label = c.fresh_label();
+                let end_label = c.fresh_label();
+                let args = c.collect_local_args();
+                let slot = c.total_local_count + c.vstack.len() as u32;
+                c.emit(IrInst::BrIfZero { cond, label: else_label, args: args.clone() });
+                c.emit(IrInst::FrameStore { slot, src: val1 });
+                let args2 = c.collect_local_args();
+                c.emit(IrInst::Br { label: end_label, args: args2 });
+                let params = c.allocate_local_params();
+                c.emit(IrInst::DefLabel { label: else_label, params: params.clone() });
+                c.apply_local_params(&params);
+                c.emit(IrInst::FrameStore { slot, src: val2 });
+                let args3 = c.collect_local_args();
+                c.emit(IrInst::Br { label: end_label, args: args3 });
+                let params2 = c.allocate_local_params();
+                c.emit(IrInst::DefLabel { label: end_label, params: params2.clone() });
+                c.apply_local_params(&params2);
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Cmp {
-                    dst,
-                    lhs,
-                    rhs,
-                    cond: IrCond::LeS,
-                });
+                c.emit(IrInst::FrameLoad { dst, slot });
                 c.vpush(dst);
             }
 
@@ -593,7 +620,7 @@ pub(crate) fn compile_with(
                 let rhs = c.vpop();
                 let lhs = c.vpop();
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Add { dst, lhs, rhs });
+                c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Reg(rhs) });
                 c.vpush(dst);
             }
 
@@ -604,11 +631,11 @@ pub(crate) fn compile_with(
                 let lhs = c.vpop();
                 let dst = c.fresh_vreg();
                 if konst >= 0 && konst < 4096 {
-                    c.emit(IrInst::SubImm { dst, lhs, imm: konst as u16 });
+                    c.emit(IrInst::Alu { op: AluOp::I32Sub, dst, lhs, rhs: Operand::Imm(konst as i64) });
                 } else {
                     c.emit_i32_const(konst);
                     let rhs = c.vpop();
-                    c.emit(IrInst::Sub { dst, lhs, rhs });
+                    c.emit(IrInst::Alu { op: AluOp::I32Sub, dst, lhs, rhs: Operand::Reg(rhs) });
                 }
                 c.vpush(dst);
             }
@@ -620,11 +647,11 @@ pub(crate) fn compile_with(
                 let lhs = c.vpop();
                 let dst = c.fresh_vreg();
                 if konst >= 0 && konst < 4096 {
-                    c.emit(IrInst::AddImm { dst, lhs, imm: konst as u16 });
+                    c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Imm(konst as i64) });
                 } else {
                     c.emit_i32_const(konst);
                     let rhs = c.vpop();
-                    c.emit(IrInst::Add { dst, lhs, rhs });
+                    c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Reg(rhs) });
                 }
                 c.vpush(dst);
             }
@@ -645,24 +672,24 @@ pub(crate) fn compile_with(
                 let lhs = c.vpop();
                 // Collect local args before the compare+branch sequence —
                 // collect_local_args may emit LocalGet, so placing it before
-                // CmpImm preserves Cmp+BrIfZero fusion.
+                // Alu cmp preserves Cmp+BrIfZero fusion.
                 let args = c.collect_local_args();
                 let cmp_dst = c.fresh_vreg();
                 if konst >= 0 && konst < 4096 {
-                    c.emit(IrInst::CmpImm {
+                    c.emit(IrInst::Alu {
+                        op: AluOp::I32LeS,
                         dst: cmp_dst,
                         lhs,
-                        imm: konst as u16,
-                        cond: IrCond::LeS,
+                        rhs: Operand::Imm(konst as i64),
                     });
                 } else {
                     c.emit_i32_const(konst);
                     let rhs = c.vpop();
-                    c.emit(IrInst::Cmp {
+                    c.emit(IrInst::Alu {
+                        op: AluOp::I32LeS,
                         dst: cmp_dst,
                         lhs,
-                        rhs,
-                        cond: IrCond::LeS,
+                        rhs: Operand::Reg(rhs),
                     });
                 }
 
@@ -802,6 +829,56 @@ fn eliminate_dead_load_store_pairs(ir: &mut IrFunction) {
         }
         ir.insts = new_insts;
         ir.source_ops = new_source_ops;
+    }
+}
+
+fn opcode_to_alu_op(op: OpCode) -> AluOp {
+    match op {
+        OpCode::I32Add => AluOp::I32Add, OpCode::I32Sub => AluOp::I32Sub,
+        OpCode::I32Mul => AluOp::I32Mul, OpCode::I32DivS => AluOp::I32DivS,
+        OpCode::I32DivU => AluOp::I32DivU, OpCode::I32RemS => AluOp::I32RemS,
+        OpCode::I32RemU => AluOp::I32RemU,
+        OpCode::I32And => AluOp::I32And, OpCode::I32Or => AluOp::I32Or,
+        OpCode::I32Xor => AluOp::I32Xor, OpCode::I32Shl => AluOp::I32Shl,
+        OpCode::I32ShrS => AluOp::I32ShrS, OpCode::I32ShrU => AluOp::I32ShrU,
+        OpCode::I32Rotl => AluOp::I32Rotl, OpCode::I32Rotr => AluOp::I32Rotr,
+        OpCode::I32Eq => AluOp::I32Eq, OpCode::I32Ne => AluOp::I32Ne,
+        OpCode::I32LtS => AluOp::I32LtS, OpCode::I32LtU => AluOp::I32LtU,
+        OpCode::I32GtS => AluOp::I32GtS, OpCode::I32GtU => AluOp::I32GtU,
+        OpCode::I32LeS => AluOp::I32LeS, OpCode::I32LeU => AluOp::I32LeU,
+        OpCode::I32GeS => AluOp::I32GeS, OpCode::I32GeU => AluOp::I32GeU,
+        OpCode::I64Add => AluOp::I64Add, OpCode::I64Sub => AluOp::I64Sub,
+        OpCode::I64Mul => AluOp::I64Mul, OpCode::I64DivS => AluOp::I64DivS,
+        OpCode::I64DivU => AluOp::I64DivU, OpCode::I64RemS => AluOp::I64RemS,
+        OpCode::I64RemU => AluOp::I64RemU,
+        OpCode::I64And => AluOp::I64And, OpCode::I64Or => AluOp::I64Or,
+        OpCode::I64Xor => AluOp::I64Xor, OpCode::I64Shl => AluOp::I64Shl,
+        OpCode::I64ShrS => AluOp::I64ShrS, OpCode::I64ShrU => AluOp::I64ShrU,
+        OpCode::I64Rotl => AluOp::I64Rotl, OpCode::I64Rotr => AluOp::I64Rotr,
+        OpCode::I64Eq => AluOp::I64Eq, OpCode::I64Ne => AluOp::I64Ne,
+        OpCode::I64LtS => AluOp::I64LtS, OpCode::I64LtU => AluOp::I64LtU,
+        OpCode::I64GtS => AluOp::I64GtS, OpCode::I64GtU => AluOp::I64GtU,
+        OpCode::I64LeS => AluOp::I64LeS, OpCode::I64LeU => AluOp::I64LeU,
+        OpCode::I64GeS => AluOp::I64GeS, OpCode::I64GeU => AluOp::I64GeU,
+        _ => unreachable!("not a binary alu opcode: {op:?}"),
+    }
+}
+
+fn opcode_to_unary_op(op: OpCode) -> UnaryOp {
+    match op {
+        OpCode::I32Clz => UnaryOp::I32Clz, OpCode::I32Ctz => UnaryOp::I32Ctz,
+        OpCode::I32Popcnt => UnaryOp::I32Popcnt, OpCode::I32Eqz => UnaryOp::I32Eqz,
+        OpCode::I64Clz => UnaryOp::I64Clz, OpCode::I64Ctz => UnaryOp::I64Ctz,
+        OpCode::I64Popcnt => UnaryOp::I64Popcnt, OpCode::I64Eqz => UnaryOp::I64Eqz,
+        OpCode::I32WrapI64 => UnaryOp::I32WrapI64,
+        OpCode::I64ExtendI32S => UnaryOp::I64ExtendI32S,
+        OpCode::I64ExtendI32U => UnaryOp::I64ExtendI32U,
+        OpCode::I32Extend8S => UnaryOp::I32Extend8S,
+        OpCode::I32Extend16S => UnaryOp::I32Extend16S,
+        OpCode::I64Extend8S => UnaryOp::I64Extend8S,
+        OpCode::I64Extend16S => UnaryOp::I64Extend16S,
+        OpCode::I64Extend32S => UnaryOp::I64Extend32S,
+        _ => unreachable!("not a unary opcode: {op:?}"),
     }
 }
 

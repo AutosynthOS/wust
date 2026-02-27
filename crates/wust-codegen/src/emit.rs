@@ -122,6 +122,268 @@ impl Emitter {
         self.code.push(inst);
     }
 
+    /// `ADD Xd, Xn, Xm` — 64-bit register add.
+    pub fn add_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x8B000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `SUB Xd, Xn, Xm` — 64-bit register sub.
+    pub fn sub_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0xCB000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    // ---- Multiply ----
+
+    /// `MUL Wd, Wn, Wm` — 32-bit multiply (alias: MADD Wd, Wn, Wm, WZR).
+    pub fn mul_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x1B000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (31u32 << 10) // Ra = WZR
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `MUL Xd, Xn, Xm` — 64-bit multiply (alias: MADD Xd, Xn, Xm, XZR).
+    pub fn mul_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x9B000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (31u32 << 10) // Ra = XZR
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    // ---- Division ----
+
+    /// `SDIV Wd, Wn, Wm` — 32-bit signed divide.
+    pub fn sdiv_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x1AC00C00
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `UDIV Wd, Wn, Wm` — 32-bit unsigned divide.
+    pub fn udiv_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x1AC00800
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `SDIV Xd, Xn, Xm` — 64-bit signed divide.
+    pub fn sdiv_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x9AC00C00
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `UDIV Xd, Xn, Xm` — 64-bit unsigned divide.
+    pub fn udiv_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x9AC00800
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `MSUB Wd, Wn, Wm, Wa` — 32-bit multiply-subtract: Wa - Wn*Wm.
+    pub fn msub_w(&mut self, rd: Reg, rn: Reg, rm: Reg, ra: Reg) {
+        let inst = 0x1B008000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (ra.0 as u32 & 0x1F) << 10
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `MSUB Xd, Xn, Xm, Xa` — 64-bit multiply-subtract: Xa - Xn*Xm.
+    pub fn msub_x(&mut self, rd: Reg, rn: Reg, rm: Reg, ra: Reg) {
+        let inst = 0x9B008000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (ra.0 as u32 & 0x1F) << 10
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    // ---- Bitwise logic ----
+
+    /// `AND Wd, Wn, Wm` — 32-bit bitwise AND.
+    pub fn and_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x0A000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `ORR Wd, Wn, Wm` — 32-bit bitwise OR.
+    pub fn orr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x2A000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `EOR Wd, Wn, Wm` — 32-bit bitwise exclusive OR.
+    pub fn eor_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x4A000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `AND Xd, Xn, Xm` — 64-bit bitwise AND.
+    pub fn and_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x8A000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `ORR Xd, Xn, Xm` — 64-bit bitwise OR.
+    pub fn orr_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0xAA000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `EOR Xd, Xn, Xm` — 64-bit bitwise exclusive OR.
+    pub fn eor_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0xCA000000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    // ---- Shifts ----
+
+    /// `LSL Wd, Wn, Wm` — 32-bit logical shift left (alias: LSLV).
+    pub fn lsl_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x1AC02000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `LSR Wd, Wn, Wm` — 32-bit logical shift right (alias: LSRV).
+    pub fn lsr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x1AC02400
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `ASR Wd, Wn, Wm` — 32-bit arithmetic shift right (alias: ASRV).
+    pub fn asr_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x1AC02800
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `ROR Wd, Wn, Wm` — 32-bit rotate right (alias: RORV).
+    pub fn ror_w(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x1AC02C00
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `LSL Xd, Xn, Xm` — 64-bit logical shift left (alias: LSLV).
+    pub fn lsl_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x9AC02000
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `LSR Xd, Xn, Xm` — 64-bit logical shift right (alias: LSRV).
+    pub fn lsr_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x9AC02400
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `ASR Xd, Xn, Xm` — 64-bit arithmetic shift right (alias: ASRV).
+    pub fn asr_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x9AC02800
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `ROR Xd, Xn, Xm` — 64-bit rotate right (alias: RORV).
+    pub fn ror_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
+        let inst = 0x9AC02C00
+            | (rm.0 as u32 & 0x1F) << 16
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    // ---- Bit manipulation ----
+
+    /// `CLZ Wd, Wn` — 32-bit count leading zeros.
+    pub fn clz_w(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x5AC01000
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `CLZ Xd, Xn` — 64-bit count leading zeros.
+    pub fn clz_x(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0xDAC01000
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `RBIT Wd, Wn` — 32-bit reverse bits.
+    pub fn rbit_w(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x5AC00000
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `RBIT Xd, Xn` — 64-bit reverse bits.
+    pub fn rbit_x(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0xDAC00000
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
     // ---- Arithmetic (immediate) ----
 
     /// `ADD Xd, Xn, #imm12` — 64-bit immediate add.
@@ -208,6 +470,80 @@ impl Emitter {
             | (31u32 << 5) // Rn = WZR
             | (rd.0 as u32 & 0x1F);
         self.code.push(inst);
+    }
+
+    /// `CMP Xn, Xm` — alias for `SUBS XZR, Xn, Xm`.
+    pub fn cmp_x_reg(&mut self, rn: Reg, rm: Reg) {
+        let inst = 0xEB000000
+            | ((rm.0 as u32) & 0x1F) << 16
+            | ((rn.0 as u32) & 0x1F) << 5
+            | 31; // Rd = XZR
+        self.code.push(inst);
+    }
+
+    /// `CSET Xd, cond` — alias for `CSINC Xd, XZR, XZR, invert(cond)`.
+    pub fn cset_x(&mut self, rd: Reg, cond: Cond) {
+        let inv_cond = (cond as u32) ^ 1;
+        let inst = 0x9A800400
+            | (31u32 << 16) // Rm = XZR
+            | (inv_cond << 12)
+            | (31u32 << 5) // Rn = XZR
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    // ---- Sign/zero extension ----
+
+    /// `SXTW Xd, Wn` — sign-extend 32-bit to 64-bit (alias: SBFM Xd, Xn, #0, #31).
+    pub fn sxtw(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x93407C00
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `UXTW Xd, Wn` — zero-extend 32-bit to 64-bit (alias: MOV Wd, Wn which zeroes high 32 bits).
+    /// Actually encoded as `MOV Wd, Wn` (ORR Wd, WZR, Wn) since writing Wd zeroes bits [63:32].
+    pub fn uxtw(&mut self, rd: Reg, rn: Reg) {
+        self.mov_w(rd, rn);
+    }
+
+    /// `SXTB Wd, Wn` — sign-extend byte to 32-bit (alias: SBFM Wd, Wn, #0, #7).
+    pub fn sxtb_w(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x13001C00
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `SXTH Wd, Wn` — sign-extend halfword to 32-bit (alias: SBFM Wd, Wn, #0, #15).
+    pub fn sxth_w(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x13003C00
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `SXTB Xd, Xn` — sign-extend byte to 64-bit (alias: SBFM Xd, Xn, #0, #7).
+    pub fn sxtb_x(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x93401C00
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `SXTH Xd, Xn` — sign-extend halfword to 64-bit (alias: SBFM Xd, Xn, #0, #15).
+    pub fn sxth_x(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x93403C00
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `SXTW Xd, Wn` — sign-extend word to 64-bit (alias: SBFM Xd, Xn, #0, #31).
+    /// Same as sxtw, kept as alias for clarity.
+    pub fn sxtw_x(&mut self, rd: Reg, rn: Reg) {
+        self.sxtw(rd, rn);
     }
 
     // ---- Moves ----
@@ -347,6 +683,48 @@ impl Emitter {
     pub fn ldr_x_post(&mut self, rt: Reg, rn: Reg, offset: i16) {
         let imm9 = (offset as u32) & 0x1FF;
         let inst = 0xF8400400 | imm9 << 12 | (rn.0 as u32 & 0x1F) << 5 | (rt.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    // ---- Population count helpers (SIMD) ----
+
+    /// `FMOV Dd, Xn` — move general register to SIMD/FP register.
+    pub fn fmov_d_from_x(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x9E670000
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `FMOV Xd, Dn` — move SIMD/FP register to general register.
+    pub fn fmov_x_from_d(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x9E660000
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `CNT Vd.8B, Vn.8B` — count set bits per byte in SIMD register.
+    pub fn cnt_8b(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x0E205800
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `ADDV Bd, Vn.8B` — unsigned sum of 8B vector elements into scalar.
+    pub fn addv_8b(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x0E31B800
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `UMOV Wd, Vn.B[0]` — extract byte 0 from SIMD register to GP register.
+    pub fn umov_w_b0(&mut self, rd: Reg, rn: Reg) {
+        let inst = 0x0E023C00
+            | (rn.0 as u32 & 0x1F) << 5
+            | (rd.0 as u32 & 0x1F);
         self.code.push(inst);
     }
 

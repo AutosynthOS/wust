@@ -81,7 +81,7 @@ impl SpecRunner {
                 Ok(()) => passed += 1,
                 Err(e) => {
                     failed += 1;
-                    // eprintln!("  FAIL {e}");
+                    eprintln!("  FAIL {e}");
                 }
             }
         }

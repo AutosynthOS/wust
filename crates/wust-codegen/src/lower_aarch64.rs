@@ -1,7 +1,7 @@
 use crate::cfg::{self, CfgInfo};
 use crate::context::JitContext;
 use crate::emit::{Cond, Emitter, PatchPoint, Reg};
-use crate::ir::{IrCond, IrFunction, IrInst, Label};
+use crate::ir::{AluOp, IrFunction, IrInst, Label, Operand, UnaryOp};
 use crate::regalloc_adapter::{self, RegAllocAdapter};
 use regalloc2::{self, Allocation, Edit, InstOrEdit, Output};
 
@@ -216,67 +216,24 @@ fn lower_body_ra2(
                             e.str_x_uoff(src, Reg::X29, frame_slot_offset(*idx));
                         }
 
-                        IrInst::Add { .. } => {
-                            let (dst, lhs, rhs) = (
-                                alloc_to_reg(allocs[0]),
-                                alloc_to_reg(allocs[1]),
-                                alloc_to_reg(allocs[2]),
-                            );
-                            e.add_w(dst, lhs, rhs);
-                        }
-
-                        IrInst::Sub { .. } => {
-                            let (dst, lhs, rhs) = (
-                                alloc_to_reg(allocs[0]),
-                                alloc_to_reg(allocs[1]),
-                                alloc_to_reg(allocs[2]),
-                            );
-                            e.sub_w(dst, lhs, rhs);
-                        }
-
-                        IrInst::AddImm { imm, .. } => {
-                            let (dst, lhs) = (
-                                alloc_to_reg(allocs[0]),
-                                alloc_to_reg(allocs[1]),
-                            );
-                            e.add_w_imm(dst, lhs, *imm);
-                        }
-
-                        IrInst::SubImm { imm, .. } => {
-                            let (dst, lhs) = (
-                                alloc_to_reg(allocs[0]),
-                                alloc_to_reg(allocs[1]),
-                            );
-                            e.sub_w_imm(dst, lhs, *imm);
-                        }
-
-                        IrInst::Cmp { cond, .. } => {
+                        IrInst::Alu { op, rhs, .. } => {
                             let dst = alloc_to_reg(allocs[0]);
                             let lhs = alloc_to_reg(allocs[1]);
-                            let rhs = alloc_to_reg(allocs[2]);
-                            let arm_cond = match cond {
-                                IrCond::Eq => Cond::EQ,
-                                IrCond::LeS => Cond::LE,
-                            };
-                            e.cmp_w_reg(lhs, rhs);
-                            pending_cmp = Some(PendingCmp {
-                                arm_cond,
-                                dst_reg: dst,
-                            });
+                            match rhs {
+                                Operand::Reg(_) => {
+                                    let rhs_reg = alloc_to_reg(allocs[2]);
+                                    lower_alu_reg(e, *op, dst, lhs, rhs_reg, &mut pending_cmp);
+                                }
+                                Operand::Imm(imm) => {
+                                    lower_alu_imm(e, *op, dst, lhs, *imm, &mut pending_cmp);
+                                }
+                            }
                         }
 
-                        IrInst::CmpImm { cond, imm, .. } => {
+                        IrInst::Unary { op, .. } => {
                             let dst = alloc_to_reg(allocs[0]);
-                            let lhs = alloc_to_reg(allocs[1]);
-                            let arm_cond = match cond {
-                                IrCond::Eq => Cond::EQ,
-                                IrCond::LeS => Cond::LE,
-                            };
-                            e.cmp_w_imm(lhs, *imm);
-                            pending_cmp = Some(PendingCmp {
-                                arm_cond,
-                                dst_reg: dst,
-                            });
+                            let src = alloc_to_reg(allocs[1]);
+                            lower_unary(e, *op, dst, src);
                         }
 
                         IrInst::DefLabel { .. } => {
@@ -664,6 +621,183 @@ fn emit_i64_const(e: &mut Emitter, rd: Reg, val: i64) {
         e.movz_x(rd, val as u16);
     } else {
         emit_i32_const_reg(e, rd, val as i32);
+    }
+}
+
+/// Lower an ALU operation with register operand.
+fn lower_alu_reg(
+    e: &mut Emitter,
+    op: AluOp,
+    dst: Reg,
+    lhs: Reg,
+    rhs: Reg,
+    pending_cmp: &mut Option<PendingCmp>,
+) {
+    match op {
+        // i32 arithmetic
+        AluOp::I32Add => e.add_w(dst, lhs, rhs),
+        AluOp::I32Sub => e.sub_w(dst, lhs, rhs),
+        AluOp::I32Mul => e.mul_w(dst, lhs, rhs),
+        AluOp::I32DivS => e.sdiv_w(dst, lhs, rhs),
+        AluOp::I32DivU => e.udiv_w(dst, lhs, rhs),
+        AluOp::I32RemS => {
+            e.sdiv_w(dst, lhs, rhs);
+            e.msub_w(dst, dst, rhs, lhs);
+        }
+        AluOp::I32RemU => {
+            e.udiv_w(dst, lhs, rhs);
+            e.msub_w(dst, dst, rhs, lhs);
+        }
+        // i32 bitwise
+        AluOp::I32And => e.and_w(dst, lhs, rhs),
+        AluOp::I32Or => e.orr_w(dst, lhs, rhs),
+        AluOp::I32Xor => e.eor_w(dst, lhs, rhs),
+        AluOp::I32Shl => e.lsl_w(dst, lhs, rhs),
+        AluOp::I32ShrS => e.asr_w(dst, lhs, rhs),
+        AluOp::I32ShrU => e.lsr_w(dst, lhs, rhs),
+        AluOp::I32Rotl => e.ror_w(dst, lhs, rhs), // TODO: rotl needs neg
+        AluOp::I32Rotr => e.ror_w(dst, lhs, rhs),
+        // i32 comparison
+        AluOp::I32Eq | AluOp::I32Ne | AluOp::I32LtS | AluOp::I32LtU
+        | AluOp::I32GtS | AluOp::I32GtU | AluOp::I32LeS | AluOp::I32LeU
+        | AluOp::I32GeS | AluOp::I32GeU => {
+            e.cmp_w_reg(lhs, rhs);
+            let arm_cond = alu_op_to_cond(op);
+            *pending_cmp = Some(PendingCmp { arm_cond, dst_reg: dst });
+        }
+        // i64 arithmetic
+        AluOp::I64Add => e.add_x(dst, lhs, rhs),
+        AluOp::I64Sub => e.sub_x(dst, lhs, rhs),
+        AluOp::I64Mul => e.mul_x(dst, lhs, rhs),
+        AluOp::I64DivS => e.sdiv_x(dst, lhs, rhs),
+        AluOp::I64DivU => e.udiv_x(dst, lhs, rhs),
+        AluOp::I64RemS => {
+            e.sdiv_x(dst, lhs, rhs);
+            e.msub_x(dst, dst, rhs, lhs);
+        }
+        AluOp::I64RemU => {
+            e.udiv_x(dst, lhs, rhs);
+            e.msub_x(dst, dst, rhs, lhs);
+        }
+        // i64 bitwise
+        AluOp::I64And => e.and_x(dst, lhs, rhs),
+        AluOp::I64Or => e.orr_x(dst, lhs, rhs),
+        AluOp::I64Xor => e.eor_x(dst, lhs, rhs),
+        AluOp::I64Shl => e.lsl_x(dst, lhs, rhs),
+        AluOp::I64ShrS => e.asr_x(dst, lhs, rhs),
+        AluOp::I64ShrU => e.lsr_x(dst, lhs, rhs),
+        AluOp::I64Rotl => e.ror_x(dst, lhs, rhs), // TODO: rotl needs neg
+        AluOp::I64Rotr => e.ror_x(dst, lhs, rhs),
+        // i64 comparison
+        AluOp::I64Eq | AluOp::I64Ne | AluOp::I64LtS | AluOp::I64LtU
+        | AluOp::I64GtS | AluOp::I64GtU | AluOp::I64LeS | AluOp::I64LeU
+        | AluOp::I64GeS | AluOp::I64GeU => {
+            e.cmp_x_reg(lhs, rhs);
+            let arm_cond = alu_op_to_cond(op);
+            *pending_cmp = Some(PendingCmp { arm_cond, dst_reg: dst });
+        }
+    }
+}
+
+/// Lower an ALU operation with immediate operand.
+fn lower_alu_imm(
+    e: &mut Emitter,
+    op: AluOp,
+    dst: Reg,
+    lhs: Reg,
+    imm: i64,
+    pending_cmp: &mut Option<PendingCmp>,
+) {
+    let is_cmp = matches!(op,
+        AluOp::I32Eq | AluOp::I32Ne | AluOp::I32LtS | AluOp::I32LtU
+        | AluOp::I32GtS | AluOp::I32GtU | AluOp::I32LeS | AluOp::I32LeU
+        | AluOp::I32GeS | AluOp::I32GeU
+        | AluOp::I64Eq | AluOp::I64Ne | AluOp::I64LtS | AluOp::I64LtU
+        | AluOp::I64GtS | AluOp::I64GtU | AluOp::I64LeS | AluOp::I64LeU
+        | AluOp::I64GeS | AluOp::I64GeU
+    );
+    if is_cmp {
+        let is_64 = matches!(op,
+            AluOp::I64Eq | AluOp::I64Ne | AluOp::I64LtS | AluOp::I64LtU
+            | AluOp::I64GtS | AluOp::I64GtU | AluOp::I64LeS | AluOp::I64LeU
+            | AluOp::I64GeS | AluOp::I64GeU
+        );
+        if is_64 {
+            e.cmp_x_imm(lhs, imm as u16);
+        } else {
+            e.cmp_w_imm(lhs, imm as u16);
+        }
+        let arm_cond = alu_op_to_cond(op);
+        *pending_cmp = Some(PendingCmp { arm_cond, dst_reg: dst });
+        return;
+    }
+
+    match op {
+        AluOp::I32Add => e.add_w_imm(dst, lhs, imm as u16),
+        AluOp::I32Sub => e.sub_w_imm(dst, lhs, imm as u16),
+        AluOp::I64Add => e.add_x_imm(dst, lhs, imm as u16),
+        AluOp::I64Sub => e.sub_x_imm(dst, lhs, imm as u16),
+        _ => e.brk(1),
+    }
+}
+
+/// Map an ALU comparison op to an AArch64 condition code.
+fn alu_op_to_cond(op: AluOp) -> Cond {
+    match op {
+        AluOp::I32Eq | AluOp::I64Eq => Cond::EQ,
+        AluOp::I32Ne | AluOp::I64Ne => Cond::NE,
+        AluOp::I32LtS | AluOp::I64LtS => Cond::LT,
+        AluOp::I32LtU | AluOp::I64LtU => Cond::CC,
+        AluOp::I32GtS | AluOp::I64GtS => Cond::GT,
+        AluOp::I32GtU | AluOp::I64GtU => Cond::HI,
+        AluOp::I32LeS | AluOp::I64LeS => Cond::LE,
+        AluOp::I32LeU | AluOp::I64LeU => Cond::LS,
+        AluOp::I32GeS | AluOp::I64GeS => Cond::GE,
+        AluOp::I32GeU | AluOp::I64GeU => Cond::CS,
+        _ => unreachable!("not a comparison op: {op}"),
+    }
+}
+
+/// Lower a unary operation.
+fn lower_unary(e: &mut Emitter, op: UnaryOp, dst: Reg, src: Reg) {
+    match op {
+        UnaryOp::I32Eqz => {
+            e.cmp_w_imm(src, 0);
+            e.cset_w(dst, Cond::EQ);
+        }
+        UnaryOp::I64Eqz => {
+            e.cmp_x_imm(src, 0);
+            e.cset_w(dst, Cond::EQ);
+        }
+        UnaryOp::I32Clz => e.clz_w(dst, src),
+        UnaryOp::I64Clz => e.clz_x(dst, src),
+        UnaryOp::I32Ctz => {
+            e.rbit_w(dst, src);
+            e.clz_w(dst, dst);
+        }
+        UnaryOp::I64Ctz => {
+            e.rbit_x(dst, src);
+            e.clz_x(dst, dst);
+        }
+        UnaryOp::I32Popcnt | UnaryOp::I64Popcnt => {
+            let v0 = Reg(0);
+            e.fmov_d_from_x(v0, src);
+            e.cnt_8b(v0, v0);
+            e.addv_8b(v0, v0);
+            e.umov_w_b0(dst, v0);
+        }
+        UnaryOp::I32WrapI64 => {
+            if dst != src {
+                e.mov_w(dst, src);
+            }
+        }
+        UnaryOp::I64ExtendI32S => e.sxtw(dst, src),
+        UnaryOp::I64ExtendI32U => e.uxtw(dst, src),
+        UnaryOp::I32Extend8S => e.sxtb_w(dst, src),
+        UnaryOp::I32Extend16S => e.sxth_w(dst, src),
+        UnaryOp::I64Extend8S => e.sxtb_x(dst, src),
+        UnaryOp::I64Extend16S => e.sxth_x(dst, src),
+        UnaryOp::I64Extend32S => e.sxtw(dst, src),
     }
 }
 

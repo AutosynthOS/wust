@@ -6,11 +6,37 @@ pub struct VReg(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Label(pub u32);
 
-/// Comparison condition for `IrInst::Cmp`.
+/// Operand for ALU instructions — either a virtual register or an immediate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IrCond {
-    Eq,
-    LeS,
+pub enum Operand {
+    Reg(VReg),
+    Imm(i64),
+}
+
+/// Binary ALU operation type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AluOp {
+    // i32 arithmetic
+    I32Add, I32Sub, I32Mul, I32DivS, I32DivU, I32RemS, I32RemU,
+    // i32 bitwise
+    I32And, I32Or, I32Xor, I32Shl, I32ShrS, I32ShrU, I32Rotl, I32Rotr,
+    // i32 comparison (result is 0 or 1)
+    I32Eq, I32Ne, I32LtS, I32LtU, I32GtS, I32GtU, I32LeS, I32LeU, I32GeS, I32GeU,
+    // i64 arithmetic
+    I64Add, I64Sub, I64Mul, I64DivS, I64DivU, I64RemS, I64RemU,
+    // i64 bitwise
+    I64And, I64Or, I64Xor, I64Shl, I64ShrS, I64ShrU, I64Rotl, I64Rotr,
+    // i64 comparison (result is 0 or 1)
+    I64Eq, I64Ne, I64LtS, I64LtU, I64GtS, I64GtU, I64LeS, I64LeU, I64GeS, I64GeU,
+}
+
+/// Unary operation type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnaryOp {
+    I32Clz, I32Ctz, I32Popcnt, I32Eqz,
+    I64Clz, I64Ctz, I64Popcnt, I64Eqz,
+    I32WrapI64, I64ExtendI32S, I64ExtendI32U,
+    I32Extend8S, I32Extend16S, I64Extend8S, I64Extend16S, I64Extend32S,
 }
 
 /// A single IR instruction using virtual registers.
@@ -26,18 +52,10 @@ pub enum IrInst {
     LocalGet { dst: VReg, idx: u32 },
     /// Store a virtual register into a local variable.
     LocalSet { idx: u32, src: VReg },
-    /// 32-bit integer addition.
-    Add { dst: VReg, lhs: VReg, rhs: VReg },
-    /// 32-bit integer subtraction.
-    Sub { dst: VReg, lhs: VReg, rhs: VReg },
-    /// 32-bit add with 12-bit unsigned immediate (0..4095).
-    AddImm { dst: VReg, lhs: VReg, imm: u16 },
-    /// 32-bit sub with 12-bit unsigned immediate (0..4095).
-    SubImm { dst: VReg, lhs: VReg, imm: u16 },
-    /// Compare two values, store boolean result (0 or 1).
-    Cmp { dst: VReg, lhs: VReg, rhs: VReg, cond: IrCond },
-    /// Compare a value with a 12-bit unsigned immediate (0..4095).
-    CmpImm { dst: VReg, lhs: VReg, imm: u16, cond: IrCond },
+    /// Binary ALU operation.
+    Alu { op: AluOp, dst: VReg, lhs: VReg, rhs: Operand },
+    /// Unary operation.
+    Unary { op: UnaryOp, dst: VReg, src: VReg },
     /// Define a branch target label with block parameters.
     /// Each param is a fresh VReg defined at block entry.
     DefLabel { label: Label, params: Vec<VReg> },
@@ -97,12 +115,8 @@ impl IrInst {
             IrInst::IConst { dst, .. }
             | IrInst::ParamDef { dst, .. }
             | IrInst::LocalGet { dst, .. }
-            | IrInst::Add { dst, .. }
-            | IrInst::Sub { dst, .. }
-            | IrInst::AddImm { dst, .. }
-            | IrInst::SubImm { dst, .. }
-            | IrInst::Cmp { dst, .. }
-            | IrInst::CmpImm { dst, .. }
+            | IrInst::Alu { dst, .. }
+            | IrInst::Unary { dst, .. }
             | IrInst::FrameLoad { dst, .. } => f(*dst),
             IrInst::Call { result, .. } => {
                 if let Some(r) = result {
@@ -121,15 +135,13 @@ impl IrInst {
     /// Call `f` for every VReg that is *read* by this instruction.
     pub fn for_each_use(&self, mut f: impl FnMut(VReg)) {
         match self {
-            IrInst::Add { lhs, rhs, .. }
-            | IrInst::Sub { lhs, rhs, .. }
-            | IrInst::Cmp { lhs, rhs, .. } => {
+            IrInst::Alu { lhs, rhs, .. } => {
                 f(*lhs);
-                f(*rhs);
+                if let Operand::Reg(r) = rhs {
+                    f(*r);
+                }
             }
-            IrInst::AddImm { lhs, .. }
-            | IrInst::SubImm { lhs, .. }
-            | IrInst::CmpImm { lhs, .. } => f(*lhs),
+            IrInst::Unary { src, .. } => f(*src),
             IrInst::LocalSet { src, .. } | IrInst::FrameStore { src, .. } => f(*src),
             IrInst::BrIfZero { cond, args, .. } | IrInst::BrIfNonZero { cond, args, .. } => {
                 f(*cond);
@@ -190,12 +202,57 @@ impl IrFunction {
     }
 }
 
-impl std::fmt::Display for IrCond {
+impl std::fmt::Display for AluOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            IrCond::Eq => write!(f, "i32.eq"),
-            IrCond::LeS => write!(f, "i32.le_s"),
-        }
+        let name = match self {
+            AluOp::I32Add => "i32.add", AluOp::I32Sub => "i32.sub",
+            AluOp::I32Mul => "i32.mul", AluOp::I32DivS => "i32.div_s",
+            AluOp::I32DivU => "i32.div_u", AluOp::I32RemS => "i32.rem_s",
+            AluOp::I32RemU => "i32.rem_u",
+            AluOp::I32And => "i32.and", AluOp::I32Or => "i32.or",
+            AluOp::I32Xor => "i32.xor", AluOp::I32Shl => "i32.shl",
+            AluOp::I32ShrS => "i32.shr_s", AluOp::I32ShrU => "i32.shr_u",
+            AluOp::I32Rotl => "i32.rotl", AluOp::I32Rotr => "i32.rotr",
+            AluOp::I32Eq => "i32.eq", AluOp::I32Ne => "i32.ne",
+            AluOp::I32LtS => "i32.lt_s", AluOp::I32LtU => "i32.lt_u",
+            AluOp::I32GtS => "i32.gt_s", AluOp::I32GtU => "i32.gt_u",
+            AluOp::I32LeS => "i32.le_s", AluOp::I32LeU => "i32.le_u",
+            AluOp::I32GeS => "i32.ge_s", AluOp::I32GeU => "i32.ge_u",
+            AluOp::I64Add => "i64.add", AluOp::I64Sub => "i64.sub",
+            AluOp::I64Mul => "i64.mul", AluOp::I64DivS => "i64.div_s",
+            AluOp::I64DivU => "i64.div_u", AluOp::I64RemS => "i64.rem_s",
+            AluOp::I64RemU => "i64.rem_u",
+            AluOp::I64And => "i64.and", AluOp::I64Or => "i64.or",
+            AluOp::I64Xor => "i64.xor", AluOp::I64Shl => "i64.shl",
+            AluOp::I64ShrS => "i64.shr_s", AluOp::I64ShrU => "i64.shr_u",
+            AluOp::I64Rotl => "i64.rotl", AluOp::I64Rotr => "i64.rotr",
+            AluOp::I64Eq => "i64.eq", AluOp::I64Ne => "i64.ne",
+            AluOp::I64LtS => "i64.lt_s", AluOp::I64LtU => "i64.lt_u",
+            AluOp::I64GtS => "i64.gt_s", AluOp::I64GtU => "i64.gt_u",
+            AluOp::I64LeS => "i64.le_s", AluOp::I64LeU => "i64.le_u",
+            AluOp::I64GeS => "i64.ge_s", AluOp::I64GeU => "i64.ge_u",
+        };
+        write!(f, "{name}")
+    }
+}
+
+impl std::fmt::Display for UnaryOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            UnaryOp::I32Clz => "i32.clz", UnaryOp::I32Ctz => "i32.ctz",
+            UnaryOp::I32Popcnt => "i32.popcnt", UnaryOp::I32Eqz => "i32.eqz",
+            UnaryOp::I64Clz => "i64.clz", UnaryOp::I64Ctz => "i64.ctz",
+            UnaryOp::I64Popcnt => "i64.popcnt", UnaryOp::I64Eqz => "i64.eqz",
+            UnaryOp::I32WrapI64 => "i32.wrap_i64",
+            UnaryOp::I64ExtendI32S => "i64.extend_i32_s",
+            UnaryOp::I64ExtendI32U => "i64.extend_i32_u",
+            UnaryOp::I32Extend8S => "i32.extend8_s",
+            UnaryOp::I32Extend16S => "i32.extend16_s",
+            UnaryOp::I64Extend8S => "i64.extend8_s",
+            UnaryOp::I64Extend16S => "i64.extend16_s",
+            UnaryOp::I64Extend32S => "i64.extend32_s",
+        };
+        write!(f, "{name}")
     }
 }
 
@@ -231,16 +288,13 @@ impl std::fmt::Display for IrInst {
             IrInst::ParamDef { dst, idx } => write!(f, "  {dst} = param {idx}"),
             IrInst::LocalGet { dst, idx } => write!(f, "  {dst} = local.get {idx}"),
             IrInst::LocalSet { idx, src } => write!(f, "  local.set {idx}, {src}"),
-            IrInst::Add { dst, lhs, rhs } => write!(f, "  {dst} = i32.add {lhs}, {rhs}"),
-            IrInst::Sub { dst, lhs, rhs } => write!(f, "  {dst} = i32.sub {lhs}, {rhs}"),
-            IrInst::AddImm { dst, lhs, imm } => write!(f, "  {dst} = i32.add {lhs}, #{imm}"),
-            IrInst::SubImm { dst, lhs, imm } => write!(f, "  {dst} = i32.sub {lhs}, #{imm}"),
-            IrInst::Cmp { dst, lhs, rhs, cond } => {
-                write!(f, "  {dst} = {cond} {lhs}, {rhs}")
+            IrInst::Alu { op, dst, lhs, rhs } => {
+                match rhs {
+                    Operand::Reg(r) => write!(f, "  {dst} = {op} {lhs}, {r}"),
+                    Operand::Imm(i) => write!(f, "  {dst} = {op} {lhs}, #{i}"),
+                }
             }
-            IrInst::CmpImm { dst, lhs, imm, cond } => {
-                write!(f, "  {dst} = {cond} {lhs}, #{imm}")
-            }
+            IrInst::Unary { op, dst, src } => write!(f, "  {dst} = {op} {src}"),
             IrInst::DefLabel { label, params } => {
                 write!(f, "{label}:")?;
                 if !params.is_empty() {
