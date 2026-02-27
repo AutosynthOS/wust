@@ -30,6 +30,11 @@ pub struct RegAllocAdapter {
     is_branch_flags: Vec<bool>,
     /// Which instructions are returns.
     is_ret_flags: Vec<bool>,
+
+    /// Per-block parameters (VRegs defined at block entry via DefLabel).
+    block_params_storage: Vec<Vec<VReg>>,
+    /// Per-block, per-successor branch arguments (VRegs passed to target).
+    branch_params_storage: Vec<Vec<Vec<VReg>>>,
 }
 
 /// Convert our IR VReg to a regalloc2 VReg (all integer class).
@@ -90,6 +95,36 @@ impl RegAllocAdapter {
             is_ret_flags.push(is_rt);
         }
 
+        // Pre-compute block parameters from DefLabel params.
+        let mut block_params_storage = Vec::with_capacity(num_blocks);
+        for block in &cfg.blocks {
+            let first = &cfg.insts[block.inst_start as usize];
+            let params = match first {
+                IrInst::DefLabel { params, .. } if !params.is_empty() => {
+                    params.iter().map(|p| to_ra2_vreg(*p)).collect()
+                }
+                _ => vec![],
+            };
+            block_params_storage.push(params);
+        }
+
+        // Pre-compute per-successor branch arguments from terminators.
+        let mut branch_params_storage = Vec::with_capacity(num_blocks);
+        for block in &cfg.blocks {
+            let last = &cfg.insts[block.inst_end as usize - 1];
+            let succ_args = match last {
+                IrInst::Br { args, .. } => {
+                    vec![args.iter().map(|a| to_ra2_vreg(*a)).collect()]
+                }
+                IrInst::BrIfZero { args, .. } | IrInst::BrIfNonZero { args, .. } => {
+                    // Successor 0 = fallthrough (no args), successor 1 = taken (gets args).
+                    vec![vec![], args.iter().map(|a| to_ra2_vreg(*a)).collect()]
+                }
+                _ => vec![vec![]; block.succs.len()],
+            };
+            branch_params_storage.push(succ_args);
+        }
+
         RegAllocAdapter {
             num_insts,
             num_vregs,
@@ -100,6 +135,8 @@ impl RegAllocAdapter {
             clobbers,
             is_branch_flags,
             is_ret_flags,
+            block_params_storage,
+            branch_params_storage,
         }
     }
 }
@@ -265,10 +302,8 @@ impl regalloc2::Function for RegAllocAdapter {
         &self.block_preds[block.index()]
     }
 
-    fn block_params(&self, _block: Block) -> &[VReg] {
-        // No block parameters yet — merge values go through
-        // FrameStore/FrameLoad in memory.
-        &[]
+    fn block_params(&self, block: Block) -> &[VReg] {
+        &self.block_params_storage[block.index()]
     }
 
     fn is_ret(&self, insn: Inst) -> bool {
@@ -279,9 +314,8 @@ impl regalloc2::Function for RegAllocAdapter {
         self.is_branch_flags[insn.index()]
     }
 
-    fn branch_blockparams(&self, _block: Block, _insn: Inst, _succ_idx: usize) -> &[VReg] {
-        // No block parameters yet.
-        &[]
+    fn branch_blockparams(&self, block: Block, _insn: Inst, succ_idx: usize) -> &[VReg] {
+        &self.branch_params_storage[block.index()][succ_idx]
     }
 
     fn inst_operands(&self, insn: Inst) -> &[Operand] {

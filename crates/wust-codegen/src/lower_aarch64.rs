@@ -5,6 +5,14 @@ use crate::ir::{IrCond, IrFunction, IrInst, Label};
 use crate::regalloc_adapter::{self, RegAllocAdapter};
 use regalloc2::{self, Allocation, Edit, InstOrEdit, Output};
 
+/// Result of lowering a single function.
+pub struct LowerResult {
+    /// Word offset where the function's code starts.
+    pub body_start: usize,
+    /// Label index → word offset relative to `body_start`.
+    pub label_offsets: Vec<Option<usize>>,
+}
+
 /// Word offsets of shared handlers within a shared code buffer.
 pub struct SharedHandlerOffsets {
     /// Yield handler — called when fuel is exhausted.
@@ -150,6 +158,14 @@ fn lower_body_ra2(
         let mut pending_cmp: Option<PendingCmp> = None;
         let mut pending_fuel: Option<u32> = None;
 
+        // Record label offset at the start of the block, before any
+        // regalloc2 entry edits. Branch targets must land before the
+        // block-param moves so that incoming edges execute them.
+        let first_inst = cfg.blocks[block_idx].inst_start as usize;
+        if let IrInst::DefLabel { label, .. } = &cfg.insts[first_inst] {
+            label_offsets[label.0 as usize] = Some(e.offset());
+        }
+
         for item in output.block_insts_and_edits(adapter, block) {
             match item {
                 InstOrEdit::Edit(edit) => {
@@ -263,8 +279,9 @@ fn lower_body_ra2(
                             });
                         }
 
-                        IrInst::DefLabel { label, .. } => {
-                            label_offsets[label.0 as usize] = Some(e.offset());
+                        IrInst::DefLabel { .. } => {
+                            // Label offset already recorded at block start
+                            // (before entry edits) — see above.
                         }
 
                         IrInst::Br { label, .. } => {
@@ -467,7 +484,7 @@ pub fn lower_into(
     shared: &SharedHandlerOffsets,
     body_offsets: &mut [Option<usize>],
     emit_markers: bool,
-) -> usize {
+) -> LowerResult {
     let body_start = e.offset();
     body_offsets[func_idx as usize] = Some(body_start);
 
@@ -475,7 +492,7 @@ pub fn lower_into(
     let cfg = cfg::build_cfg(&ir.insts);
     let adapter = RegAllocAdapter::new(&cfg);
     let env = regalloc_adapter::build_machine_env();
-    let opts = regalloc2::RegallocOptions::default();
+    let opts = regalloc2::RegallocOptions { validate_ssa: true, ..Default::default() };
     let output = regalloc2::run(&adapter, &env, &opts).expect("regalloc2 failed");
 
     // regalloc2 spill slots go after locals + IR merge-point slots.
@@ -545,7 +562,16 @@ pub fn lower_into(
         e.patch_to(pp, target);
     }
 
-    body_start
+    // Convert label offsets to be relative to body_start.
+    let relative_label_offsets: Vec<Option<usize>> = label_offsets
+        .iter()
+        .map(|off| off.map(|o| o - body_start))
+        .collect();
+
+    LowerResult {
+        body_start,
+        label_offsets: relative_label_offsets,
+    }
 }
 
 /// Patch a jump table entry to point to a new target (word offset).

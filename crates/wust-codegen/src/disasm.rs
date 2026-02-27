@@ -17,6 +17,14 @@ pub struct FunctionOutput {
     /// op index). Superinstructions show as expressions like
     /// `sub(local.get 0, 1)`.
     pub op_labels: Vec<String>,
+    /// Ground-truth label offsets from the lowerer: label index → word
+    /// offset relative to the function's code start. Used for branch
+    /// target resolution instead of reconstructing from markers.
+    pub label_offsets: Vec<Option<usize>>,
+    /// Number of function parameters.
+    pub param_count: usize,
+    /// Number of function results.
+    pub result_count: usize,
 }
 
 /// Output of the codegen pipeline for a module.
@@ -65,7 +73,7 @@ fn render_function(out: &mut String, func: &FunctionOutput) {
     let ir_lines: Vec<&str> = func.ir.lines().collect();
 
     // Build a map from word offset → label name for branch target resolution.
-    let label_at = build_label_map(&ir_lines, markers, func.ir_inst_count);
+    let label_at = build_label_map(&func.label_offsets, total_words);
 
     for region_idx in 0..markers.len() {
         let start = markers[region_idx];
@@ -114,35 +122,18 @@ fn decode_instruction(word: u32) -> String {
     }
 }
 
-/// Build a map from word offset → label string (e.g. "L0") for all DefLabel
-/// IR instructions. Used to annotate branch targets.
+/// Build a map from word offset → label string (e.g. "L0") for all
+/// labels. Uses the ground-truth `label_offsets` from the lowerer.
 fn build_label_map(
-    ir_lines: &[&str],
-    markers: &[usize],
-    ir_inst_count: usize,
+    label_offsets: &[Option<usize>],
+    total_words: usize,
 ) -> Vec<Option<String>> {
-    // Find the maximum word offset we need to cover.
-    let max_offset = markers.last().copied().unwrap_or(0) + 1;
-    let mut map: Vec<Option<String>> = vec![None; max_offset + 256];
+    let mut map: Vec<Option<String>> = vec![None; total_words + 1];
 
-    for region_idx in 0..markers.len() {
-        let ir_idx = region_idx.wrapping_sub(1);
-        if region_idx == 0 || ir_idx >= ir_inst_count {
-            continue;
-        }
-
-        let line_idx = ir_idx + 1;
-        if line_idx >= ir_lines.len() {
-            continue;
-        }
-
-        let line = ir_lines[line_idx].trim();
-        // DefLabel lines look like "L0:" or "L1:"
-        if line.ends_with(':') && line.starts_with('L') {
-            let word_offset = markers[region_idx];
-            if word_offset < map.len() {
-                let label_name = &line[..line.len() - 1]; // strip ':'
-                map[word_offset] = Some(label_name.to_string());
+    for (label_idx, offset) in label_offsets.iter().enumerate() {
+        if let Some(word_offset) = offset {
+            if *word_offset < map.len() {
+                map[*word_offset] = Some(format!("L{label_idx}"));
             }
         }
     }
@@ -224,10 +215,9 @@ fn region_label<'a>(region_idx: usize, ir_inst_count: usize, ir_lines: &[&'a str
 // ============================================================
 
 /// A non-empty region of machine code corresponding to one IR region.
-struct Region<'a> {
+struct Region {
     start: usize,
     end: usize,
-    label: &'a str,
     /// Original marker index this region came from. Used to map back
     /// to IR instruction indices (ir_idx = marker_idx - 1 for
     /// non-prologue regions).
@@ -239,7 +229,7 @@ struct TreeCtx<'a> {
     func: &'a FunctionOutput,
     /// Function name (for resolving self-calls).
     func_name: &'a str,
-    regions: Vec<Region<'a>>,
+    regions: Vec<Region>,
     /// (source_ri, target_ri) for each forward conditional branch.
     branches: Vec<(usize, usize)>,
     label_at: Vec<Option<String>>,
@@ -253,18 +243,15 @@ struct TreeCtx<'a> {
 
 impl<'a> TreeCtx<'a> {
     fn build(func: &'a FunctionOutput, func_name: &'a str) -> Self {
-        let ir_lines: Vec<&str> = func.ir.lines().collect();
         let total_words = func.code.len();
         let max_regions = func.ir_inst_count + 1;
         let regions = collect_regions(
             &func.markers,
             total_words,
-            func.ir_inst_count,
-            &ir_lines,
             max_regions,
         );
 
-        let label_at = build_label_map(&ir_lines, &func.markers, func.ir_inst_count);
+        let label_at = build_label_map(&func.label_offsets, total_words);
         let branches = find_forward_branches(&regions, &func.code);
 
         let ir_at = build_source_op_annotations(func, &regions);
@@ -305,14 +292,12 @@ impl<'a> TreeCtx<'a> {
 /// Conditional branches (wasm if/else) and fuel checks are shown as
 /// indented sub-blocks, mirroring the structure of a high-level program.
 fn render_blocks_function(out: &mut String, name: &str, func: &FunctionOutput) {
-    let ir_lines: Vec<&str> = func.ir.lines().collect();
     let ctx = TreeCtx::build(func, name);
     if ctx.regions.is_empty() {
         return;
     }
 
-    let sig = ir_lines.first().copied().unwrap_or("");
-    writeln!(out, "     func {name}{}", format_signature(sig)).unwrap();
+    writeln!(out, "     func {name}{}", format_signature(func.param_count, func.result_count)).unwrap();
     emit_separator(out, 0);
 
     render_tree(out, &ctx, 0, ctx.regions.len(), 0);
@@ -346,11 +331,11 @@ fn render_tree(
             let branch_word = ctx.func.code[branch_word_idx];
             let raw_asm = normalize_asm(&decode_instruction(branch_word));
 
-            // Resolve branch target label and rewrite the hex offset.
-            let target_label = ctx
-                .label_at
-                .get(ctx.regions[target].start)
-                .and_then(|l| l.as_deref())
+            // Resolve branch target label — search within the target region
+            // since regalloc edits may shift the label away from region.start.
+            let target_region = &ctx.regions[target];
+            let target_label = (target_region.start..target_region.end)
+                .find_map(|w| ctx.label_at.get(w).and_then(|l| l.as_deref()))
                 .unwrap_or("?");
             let asm = rewrite_branch_target(&raw_asm, target_label);
             let ir_note = ctx.ir_at.get(branch_word_idx).and_then(|n| n.as_deref());
@@ -651,7 +636,6 @@ fn build_source_op_annotations(func: &FunctionOutput, regions: &[Region]) -> Vec
         let source_op = func.source_ops[ir_idx];
 
         // Find the extent of this group.
-        let group_start = i;
         let mut group_end = i + 1;
         while group_end < body_regions.len() {
             let idx = body_regions[group_end].marker_idx - 1;
@@ -686,13 +670,11 @@ fn build_source_op_annotations(func: &FunctionOutput, regions: &[Region]) -> Vec
 // ---- Data collection helpers ----
 
 /// Collect non-empty regions from markers, up to `max_regions` region indices.
-fn collect_regions<'a>(
+fn collect_regions(
     markers: &[usize],
     total_words: usize,
-    ir_inst_count: usize,
-    ir_lines: &[&'a str],
     max_regions: usize,
-) -> Vec<Region<'a>> {
+) -> Vec<Region> {
     let count = markers.len().min(max_regions);
     let mut regions = Vec::new();
     for region_idx in 0..count {
@@ -705,11 +687,9 @@ fn collect_regions<'a>(
         if start == end {
             continue;
         }
-        let label = region_label(region_idx, ir_inst_count, ir_lines);
         regions.push(Region {
             start,
             end,
-            label,
             marker_idx: region_idx,
         });
     }
@@ -732,7 +712,7 @@ fn find_forward_branches(regions: &[Region], code: &[u32]) -> Vec<(usize, usize)
             None => continue,
         };
         let target_word = (region.end as i64 - 1 + offset as i64) as usize;
-        if let Some(target_ri) = regions.iter().position(|r| r.start == target_word) {
+        if let Some(target_ri) = regions.iter().position(|r| r.start <= target_word && target_word < r.end) {
             if target_ri > ri {
                 branches.push((ri, target_ri));
             }
@@ -842,25 +822,21 @@ fn pad_to(s: &mut String, target_col: usize, fill: char) {
     }
 }
 
-/// Extract a display-friendly signature from the IR header line.
+/// Format a display-friendly signature with register names.
 ///
-/// The header looks like: `fn(params=1, locals=3, max_depth=2, results=1, frame=56B):`
-/// We extract params and results to produce `(i32) -> i32` style.
-fn format_signature(header: &str) -> String {
-    // Parse params count.
-    let params = extract_field(header, "params=").unwrap_or(0);
-    let results = extract_field(header, "results=").unwrap_or(0);
-
-    let param_list = (0..params).map(|_| "i32").collect::<Vec<_>>().join(", ");
-    let result_part = if results > 0 { " -> i32" } else { "" };
-    format!("({param_list}){result_part}")
-}
-
-fn extract_field(header: &str, field: &str) -> Option<usize> {
-    let start = header.find(field)? + field.len();
-    let rest = &header[start..];
-    let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
-    rest[..end].parse().ok()
+/// Uses the calling convention: params in x9, x10, x11, ...;
+/// return value in x9.
+fn format_signature(param_count: usize, result_count: usize) -> String {
+    let param_list: Vec<String> = (0..param_count)
+        .map(|i| format!("x{}: i32", 9 + i))
+        .collect();
+    let params = param_list.join(", ");
+    let result_part = if result_count > 0 {
+        " -> x9: i32"
+    } else {
+        ""
+    };
+    format!("({params}){result_part}")
 }
 
 /// Returns true if the word is a conditional branch (b.cond, cbz, cbnz).

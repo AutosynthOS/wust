@@ -21,6 +21,8 @@ pub(crate) struct FuncSnapshot {
     pub(crate) code_start: usize,
     /// Index into the markers array where this function's markers start.
     pub(crate) markers_start: usize,
+    /// Label index → word offset relative to function start.
+    pub(crate) label_offsets: Vec<Option<usize>>,
 }
 
 /// Compile all functions in a module into a shared emitter.
@@ -41,13 +43,16 @@ pub(crate) fn compile_all(
 
     for (i, func) in module.funcs.iter().enumerate() {
         let ir = compiler::compile_with(func, &module.funcs, emit_fuel);
-        let snap = FuncSnapshot {
-            code_start: e.code().len(),
-            markers_start: e.markers().len(),
-        };
-        let body_word =
+        let code_start = e.code().len();
+        let markers_start = e.markers().len();
+        let result =
             lower_aarch64::lower_into(&mut e, &ir, i as u32, &shared, &mut body_offsets, emit_markers);
-        lower_aarch64::patch_jump_table(&mut e, i as u32, body_word);
+        lower_aarch64::patch_jump_table(&mut e, i as u32, result.body_start);
+        let snap = FuncSnapshot {
+            code_start,
+            markers_start,
+            label_offsets: result.label_offsets,
+        };
         on_func(i, &ir, &e, &snap);
     }
 

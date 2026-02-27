@@ -153,6 +153,38 @@ impl IrCompiler {
         }
     }
 
+    /// Collect current local VRegs as branch arguments.
+    /// For locals not currently tracked (None), load from frame first.
+    fn collect_local_args(&mut self) -> Vec<VReg> {
+        (0..self.total_local_count)
+            .map(|i| {
+                if let Some(v) = self.local_vreg[i as usize] {
+                    v
+                } else {
+                    let dst = self.fresh_vreg();
+                    self.emit(IrInst::LocalGet { dst, idx: i });
+                    self.local_vreg[i as usize] = Some(dst);
+                    self.frame_dirty[i as usize] = false;
+                    dst
+                }
+            })
+            .collect()
+    }
+
+    /// Allocate fresh VRegs for block params (one per local).
+    fn allocate_local_params(&mut self) -> Vec<VReg> {
+        (0..self.total_local_count).map(|_| self.fresh_vreg()).collect()
+    }
+
+    /// Update local_vreg tracking from DefLabel block params.
+    /// Marks all as dirty since canonical frame may not match.
+    fn apply_local_params(&mut self, params: &[VReg]) {
+        for (i, &v) in params.iter().enumerate() {
+            self.local_vreg[i] = Some(v);
+            self.frame_dirty[i] = true;
+        }
+    }
+
     /// Invalidate all local VReg tracking — values only exist in frame.
     /// Called after calls (registers clobbered).
     fn invalidate_locals(&mut self) {
@@ -210,7 +242,8 @@ impl IrCompiler {
             .rposition(|b| b.block_idx == block_idx)
             .expect("branch target not on block stack");
         let label = self.block_stack[stack_idx].label;
-        self.emit(IrInst::Br { label, args: vec![] });
+        let args = self.collect_local_args();
+        self.emit(IrInst::Br { label, args });
     }
 
     /// Flush only the values above `depth` from the virtual stack.
@@ -411,7 +444,11 @@ pub(crate) fn compile_with(
                 // No fuel flush at loop entry — fuel is checked at
                 // back-edges (Br to loop label) and after calls.
                 let label = c.fresh_label();
-                c.emit(IrInst::DefLabel { label, params: vec![] });
+                let args = c.collect_local_args();
+                c.emit(IrInst::Br { label, args });
+                let params = c.allocate_local_params();
+                c.emit(IrInst::DefLabel { label, params: params.clone() });
+                c.apply_local_params(&params);
                 c.block_stack.push(OpenBlock {
                     block_idx: imm,
                     kind: blocks[imm as usize].kind,
@@ -422,15 +459,12 @@ pub(crate) fn compile_with(
 
             OpCode::If => {
                 let cond_vreg = c.vpop();
-                // Flush dirty locals before the conditional branch —
-                // the taken path (else/end) arrives at a DefLabel where
-                // locals are invalidated, so frame must be consistent.
-                c.flush_dirty_locals();
+                let args = c.collect_local_args();
                 let label = c.fresh_label();
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
                     label,
-                    args: vec![],
+                    args,
                 });
                 c.block_stack.push(OpenBlock {
                     block_idx: imm,
@@ -446,11 +480,12 @@ pub(crate) fn compile_with(
                     (block.vstack_depth, block.label)
                 };
                 c.flush_vstack_above(depth);
-                c.flush_dirty_locals();
                 let end_label = c.fresh_label();
-                c.emit(IrInst::Br { label: end_label, args: vec![] });
-                c.emit(IrInst::DefLabel { label: if_label, params: vec![] });
-                c.invalidate_locals();
+                let args = c.collect_local_args();
+                c.emit(IrInst::Br { label: end_label, args });
+                let params = c.allocate_local_params();
+                c.emit(IrInst::DefLabel { label: if_label, params: params.clone() });
+                c.apply_local_params(&params);
                 c.block_stack.last_mut().unwrap().label = end_label;
             }
 
@@ -462,19 +497,20 @@ pub(crate) fn compile_with(
                     if block.kind == BlockKind::If {
                         let branch_results = c.vstack.len() - block.vstack_depth;
                         c.flush_vstack_above(block.vstack_depth);
-                        // Flush dirty locals before the merge label —
-                        // the other path (BrIfZero skip) may have
-                        // different register state.
-                        c.flush_dirty_locals();
-                        c.emit(IrInst::DefLabel { label: block.label, params: vec![] });
-                        c.invalidate_locals();
+                        let args = c.collect_local_args();
+                        c.emit(IrInst::Br { label: block.label, args });
+                        let params = c.allocate_local_params();
+                        c.emit(IrInst::DefLabel { label: block.label, params: params.clone() });
+                        c.apply_local_params(&params);
                         if branch_results > 0 {
                             c.reload_from_stack(branch_results);
                         }
                     } else {
-                        c.emit(IrInst::DefLabel { label: block.label, params: vec![] });
-                        // Block/loop end — conservative invalidation.
-                        c.invalidate_locals();
+                        let args = c.collect_local_args();
+                        c.emit(IrInst::Br { label: block.label, args });
+                        let params = c.allocate_local_params();
+                        c.emit(IrInst::DefLabel { label: block.label, params: params.clone() });
+                        c.apply_local_params(&params);
                     }
                 }
             }
@@ -486,12 +522,7 @@ pub(crate) fn compile_with(
                     .rposition(|b| b.block_idx == imm)
                     .expect("branch target not on block stack");
                 if c.block_stack[stack_idx].kind == BlockKind::Loop {
-                    // Loop back-edge: consume fuel + check + flush locals.
                     c.flush_fuel();
-                } else {
-                    // Forward branch to block end — flush dirty locals
-                    // because the DefLabel at End invalidates tracking.
-                    c.flush_dirty_locals();
                 }
                 c.emit_br(imm);
             }
@@ -499,16 +530,12 @@ pub(crate) fn compile_with(
             OpCode::BrIf => {
                 let cond_vreg = c.vpop();
                 let skip_label = c.fresh_label();
-                // Flush dirty locals before the conditional branch —
-                // the taken path may reach a DefLabel with invalidation.
-                c.flush_dirty_locals();
+                let args = c.collect_local_args();
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
                     label: skip_label,
-                    args: vec![],
+                    args: args.clone(),
                 });
-                // Taken path: if targeting a loop, consume+check fuel.
-                // Dirty locals already flushed above.
                 let stack_idx = c
                     .block_stack
                     .iter()
@@ -518,7 +545,9 @@ pub(crate) fn compile_with(
                     c.flush_fuel();
                 }
                 c.emit_br(imm);
-                c.emit(IrInst::DefLabel { label: skip_label, params: vec![] });
+                let params = c.allocate_local_params();
+                c.emit(IrInst::DefLabel { label: skip_label, params: params.clone() });
+                c.apply_local_params(&params);
             }
 
             OpCode::Call => {
@@ -614,10 +643,10 @@ pub(crate) fn compile_with(
 
                 c.emit_local_get(local_idx);
                 let lhs = c.vpop();
-                // Flush dirty locals before the compare+branch sequence —
-                // the else path arrives at a DefLabel with invalidation.
-                // Flushing here (before CmpImm) preserves Cmp+BrIfZero fusion.
-                c.flush_dirty_locals();
+                // Collect local args before the compare+branch sequence —
+                // collect_local_args may emit LocalGet, so placing it before
+                // CmpImm preserves Cmp+BrIfZero fusion.
+                let args = c.collect_local_args();
                 let cmp_dst = c.fresh_vreg();
                 if konst >= 0 && konst < 4096 {
                     c.emit(IrInst::CmpImm {
@@ -641,7 +670,7 @@ pub(crate) fn compile_with(
                 c.emit(IrInst::BrIfZero {
                     cond: cmp_dst,
                     label,
-                    args: vec![],
+                    args,
                 });
                 c.block_stack.push(OpenBlock {
                     block_idx,
@@ -695,9 +724,7 @@ pub(crate) fn compile_with(
 
                 c.emit_local_get(local_idx);
                 let val = c.vpop();
-                // Flush dirty locals before the conditional branch —
-                // the else path arrives at a DefLabel with invalidation.
-                c.flush_dirty_locals();
+                let args = c.collect_local_args();
 
                 // eqz(val) is 1 when val==0, 0 when val!=0.
                 // BrIfZero on eqz(val) branches when val!=0.
@@ -706,7 +733,7 @@ pub(crate) fn compile_with(
                 c.emit(IrInst::BrIfNonZero {
                     cond: val,
                     label,
-                    args: vec![],
+                    args,
                 });
                 c.block_stack.push(OpenBlock {
                     block_idx,

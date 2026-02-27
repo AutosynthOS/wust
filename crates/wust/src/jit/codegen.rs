@@ -72,6 +72,9 @@ impl<'a> Codegen<'a> {
                         ir_inst_count,
                         source_ops,
                         op_labels,
+                        label_offsets: snap.label_offsets.clone(),
+                        param_count: ir.param_count as usize,
+                        result_count: ir.result_count as usize,
                     },
                 ));
             },
