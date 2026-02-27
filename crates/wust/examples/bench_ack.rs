@@ -80,7 +80,7 @@ fn main() {
     let n: i32 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(10);
+        .unwrap_or(8);
 
     let wasm_bytes = wat::parse_str(ACK_WAT).expect("failed to parse WAT");
 

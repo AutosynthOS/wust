@@ -134,11 +134,16 @@ fn lower_body_ra2(
             }
             let next_start = cfg.blocks[next_bi].inst_start as usize;
             match &cfg.insts[next_start] {
-                IrInst::DefLabel { label } => Some(*label),
+                IrInst::DefLabel { label, .. } => Some(*label),
                 _ => None,
             }
         })
         .collect();
+
+    // Track whether any `bl` has been emitted so far (Call or
+    // FuelCheck cold path). When true, Return must reload x30 from
+    // the stack before `ret`. When false, x30 is still valid.
+    let mut lr_clobbered = false;
 
     for block_idx in 0..cfg.blocks.len() {
         let block = regalloc2::Block::new(block_idx);
@@ -170,7 +175,7 @@ fn lower_body_ra2(
                     }
 
                     // Flush pending fuel unless this is a FuelCheck (fuses).
-                    let fuses_fuel = matches!(ir_inst, IrInst::FuelCheck);
+                    let fuses_fuel = matches!(ir_inst, IrInst::FuelCheck { .. });
                     if !fuses_fuel {
                         flush_pending_fuel(e, &mut pending_fuel);
                     }
@@ -258,11 +263,11 @@ fn lower_body_ra2(
                             });
                         }
 
-                        IrInst::DefLabel { label } => {
+                        IrInst::DefLabel { label, .. } => {
                             label_offsets[label.0 as usize] = Some(e.offset());
                         }
 
-                        IrInst::Br { label } => {
+                        IrInst::Br { label, .. } => {
                             // Skip redundant fallthrough branches — the
                             // target is the very next block's DefLabel.
                             let is_fallthrough =
@@ -335,12 +340,17 @@ fn lower_body_ra2(
                                 .unwrap_or(*func_idx as usize);
                             let offset = target_word as i32 - e.offset() as i32;
                             e.bl_offset(offset);
+                            lr_clobbered = true;
 
                             e.sub_x_imm(Reg::X29, Reg::X29, advance);
                         }
 
                         IrInst::Return { .. } => {
-                            e.ldr_x_post(Reg::X30, Reg::SP, 16);
+                            if lr_clobbered {
+                                e.ldr_x_post(Reg::X30, Reg::SP, 16);
+                            } else {
+                                e.add_x_imm(Reg::SP, Reg::SP, 16);
+                            }
                             e.ret();
                         }
 
@@ -353,14 +363,14 @@ fn lower_body_ra2(
                             }
                         }
 
-                        IrInst::FuelCheck => {
+                        IrInst::FuelCheck { .. } => {
                             if let Some(cost) = pending_fuel.take() {
-                                // Fused: subs x21, x21, #cost; b.le cold
                                 emit_fuel_check_with_cost(e, fuel_sites, cost);
                             } else {
-                                // Standalone: check sign bit
                                 emit_fuel_check_sign(e, fuel_sites);
                             }
+                            // Cold path does `bl yield_handler`.
+                            lr_clobbered = true;
                         }
 
                         IrInst::Trap => {
@@ -490,9 +500,7 @@ pub fn lower_into(
     let mut fuel_sites: Vec<FuelCheckSite> = Vec::new();
 
     // ---- Prologue ----
-    // Only save LR. Param stores and local zero-init are handled by
-    // the IR compiler via FrameStore instructions (deferred to first
-    // flush_dirty_locals at the first suspend point).
+    // Always save LR — cheap one-time store.
     if emit_markers {
         e.mark();
     }

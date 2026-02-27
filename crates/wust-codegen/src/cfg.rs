@@ -103,8 +103,8 @@ pub fn build_cfg(original_insts: &[IrInst]) -> CfgInfo {
             );
             let next_start = splits[si + 1];
             match &original_insts[next_start] {
-                IrInst::DefLabel { label } => {
-                    new_insts.push(IrInst::Br { label: *label });
+                IrInst::DefLabel { label, .. } => {
+                    new_insts.push(IrInst::Br { label: *label, args: vec![] });
                 }
                 other => panic!(
                     "fallthrough to non-DefLabel instruction at index {next_start}: {other:?}"
@@ -126,7 +126,7 @@ pub fn build_cfg(original_insts: &[IrInst]) -> CfgInfo {
             new_insts.len()
         };
 
-        if let IrInst::DefLabel { label } = &new_insts[start] {
+        if let IrInst::DefLabel { label, .. } = &new_insts[start] {
             label_to_block[label.0 as usize] = Some(bi as u32);
         }
 
@@ -144,7 +144,7 @@ pub fn build_cfg(original_insts: &[IrInst]) -> CfgInfo {
         let last = &new_insts[end - 1];
 
         let succs = match last {
-            IrInst::Br { label } => {
+            IrInst::Br { label, .. } => {
                 let target = label_to_block[label.0 as usize]
                     .unwrap_or_else(|| panic!("unresolved label L{}", label.0));
                 vec![target]
@@ -211,8 +211,8 @@ pub(crate) fn max_label_index(insts: &[IrInst]) -> usize {
     let mut max = 0usize;
     for inst in insts {
         let l = match inst {
-            IrInst::DefLabel { label }
-            | IrInst::Br { label }
+            IrInst::DefLabel { label, .. }
+            | IrInst::Br { label, .. }
             | IrInst::BrIfZero { label, .. }
             | IrInst::BrIfNonZero { label, .. } => label.0 as usize,
             _ => continue,
@@ -266,18 +266,19 @@ mod tests {
             IrInst::BrIfZero {
                 cond: v(0),
                 label: l(0),
+                args: vec![],
             },
             // Block 1 (then)
             IrInst::IConst { dst: v(1), val: 1 },
             IrInst::FrameStore { slot: 0, src: v(1) },
-            IrInst::Br { label: l(1) },
+            IrInst::Br { label: l(1), args: vec![] },
             // Block 2 (else)
-            IrInst::DefLabel { label: l(0) },
+            IrInst::DefLabel { label: l(0), params: vec![] },
             IrInst::IConst { dst: v(2), val: 2 },
             IrInst::FrameStore { slot: 0, src: v(2) },
-            IrInst::Br { label: l(1) },
+            IrInst::Br { label: l(1), args: vec![] },
             // Block 3 (merge)
-            IrInst::DefLabel { label: l(1) },
+            IrInst::DefLabel { label: l(1), params: vec![] },
             IrInst::FrameLoad { dst: v(3), slot: 0 },
             IrInst::Return {
                 results: vec![v(3)],
@@ -312,7 +313,7 @@ mod tests {
             IrInst::IConst { dst: v(0), val: 1 },
             IrInst::FrameStore { slot: 0, src: v(0) },
             // No Br here — fallthrough to L0
-            IrInst::DefLabel { label: l(0) },
+            IrInst::DefLabel { label: l(0), params: vec![] },
             IrInst::FrameLoad { dst: v(1), slot: 0 },
             IrInst::Return {
                 results: vec![v(1)],
@@ -332,7 +333,7 @@ mod tests {
         // The inserted Br targets L0.
         let last_inst = &cfg.insts[cfg.blocks[0].inst_end as usize - 1];
         assert!(
-            matches!(last_inst, IrInst::Br { label } if *label == l(0)),
+            matches!(last_inst, IrInst::Br { label, .. } if *label == l(0)),
             "expected Br to L0, got {last_inst:?}"
         );
 
@@ -346,11 +347,12 @@ mod tests {
         // Block 0: DefLabel L0 (loop header), body, BrIfNonZero → L0
         // Block 1: (fallthrough from BrIf), Return
         let insts = vec![
-            IrInst::DefLabel { label: l(0) },
+            IrInst::DefLabel { label: l(0), params: vec![] },
             IrInst::IConst { dst: v(0), val: 1 },
             IrInst::BrIfNonZero {
                 cond: v(0),
                 label: l(0),
+                args: vec![],
             },
             // Block 1: exit
             IrInst::IConst { dst: v(1), val: 0 },

@@ -120,7 +120,7 @@ impl IrCompiler {
             self.emit(IrInst::FuelConsume {
                 cost: self.pending_fuel,
             });
-            self.emit(IrInst::FuelCheck);
+            self.emit(IrInst::FuelCheck { live_state: vec![] });
         }
         self.pending_fuel = 0;
     }
@@ -210,7 +210,7 @@ impl IrCompiler {
             .rposition(|b| b.block_idx == block_idx)
             .expect("branch target not on block stack");
         let label = self.block_stack[stack_idx].label;
-        self.emit(IrInst::Br { label });
+        self.emit(IrInst::Br { label, args: vec![] });
     }
 
     /// Flush only the values above `depth` from the virtual stack.
@@ -411,7 +411,7 @@ pub(crate) fn compile_with(
                 // No fuel flush at loop entry — fuel is checked at
                 // back-edges (Br to loop label) and after calls.
                 let label = c.fresh_label();
-                c.emit(IrInst::DefLabel { label });
+                c.emit(IrInst::DefLabel { label, params: vec![] });
                 c.block_stack.push(OpenBlock {
                     block_idx: imm,
                     kind: blocks[imm as usize].kind,
@@ -430,6 +430,7 @@ pub(crate) fn compile_with(
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
                     label,
+                    args: vec![],
                 });
                 c.block_stack.push(OpenBlock {
                     block_idx: imm,
@@ -447,8 +448,8 @@ pub(crate) fn compile_with(
                 c.flush_vstack_above(depth);
                 c.flush_dirty_locals();
                 let end_label = c.fresh_label();
-                c.emit(IrInst::Br { label: end_label });
-                c.emit(IrInst::DefLabel { label: if_label });
+                c.emit(IrInst::Br { label: end_label, args: vec![] });
+                c.emit(IrInst::DefLabel { label: if_label, params: vec![] });
                 c.invalidate_locals();
                 c.block_stack.last_mut().unwrap().label = end_label;
             }
@@ -465,13 +466,13 @@ pub(crate) fn compile_with(
                         // the other path (BrIfZero skip) may have
                         // different register state.
                         c.flush_dirty_locals();
-                        c.emit(IrInst::DefLabel { label: block.label });
+                        c.emit(IrInst::DefLabel { label: block.label, params: vec![] });
                         c.invalidate_locals();
                         if branch_results > 0 {
                             c.reload_from_stack(branch_results);
                         }
                     } else {
-                        c.emit(IrInst::DefLabel { label: block.label });
+                        c.emit(IrInst::DefLabel { label: block.label, params: vec![] });
                         // Block/loop end — conservative invalidation.
                         c.invalidate_locals();
                     }
@@ -504,6 +505,7 @@ pub(crate) fn compile_with(
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
                     label: skip_label,
+                    args: vec![],
                 });
                 // Taken path: if targeting a loop, consume+check fuel.
                 // Dirty locals already flushed above.
@@ -516,7 +518,7 @@ pub(crate) fn compile_with(
                     c.flush_fuel();
                 }
                 c.emit_br(imm);
-                c.emit(IrInst::DefLabel { label: skip_label });
+                c.emit(IrInst::DefLabel { label: skip_label, params: vec![] });
             }
 
             OpCode::Call => {
@@ -639,6 +641,7 @@ pub(crate) fn compile_with(
                 c.emit(IrInst::BrIfZero {
                     cond: cmp_dst,
                     label,
+                    args: vec![],
                 });
                 c.block_stack.push(OpenBlock {
                     block_idx,
@@ -703,6 +706,7 @@ pub(crate) fn compile_with(
                 c.emit(IrInst::BrIfNonZero {
                     cond: val,
                     label,
+                    args: vec![],
                 });
                 c.block_stack.push(OpenBlock {
                     block_idx,

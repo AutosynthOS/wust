@@ -216,7 +216,15 @@ fn classify_inst(
             (ops, empty_clob, true, true)
         }
 
-        IrInst::FuelConsume { .. } | IrInst::FuelCheck => (vec![], empty_clob, false, false),
+        IrInst::FuelConsume { .. } => (vec![], empty_clob, false, false),
+
+        IrInst::FuelCheck { live_state } => {
+            let ops: Vec<Operand> = live_state
+                .iter()
+                .map(|(_, vreg)| Operand::reg_use(to_ra2_vreg(*vreg)))
+                .collect();
+            (ops, empty_clob, false, false)
+        }
 
         IrInst::Trap => (vec![], empty_clob, false, true),
     }
@@ -420,18 +428,19 @@ mod tests {
                 IrInst::BrIfZero {
                     cond: v(2),
                     label: l(0),
+                    args: vec![],
                 },
                 // Then: store 1
                 IrInst::IConst { dst: v(3), val: 1 },
                 IrInst::FrameStore { slot: 1, src: v(3) },
-                IrInst::Br { label: l(1) },
+                IrInst::Br { label: l(1), args: vec![] },
                 // Else: store 2
-                IrInst::DefLabel { label: l(0) },
+                IrInst::DefLabel { label: l(0), params: vec![] },
                 IrInst::IConst { dst: v(4), val: 2 },
                 IrInst::FrameStore { slot: 1, src: v(4) },
-                IrInst::Br { label: l(1) },
+                IrInst::Br { label: l(1), args: vec![] },
                 // Merge
-                IrInst::DefLabel { label: l(1) },
+                IrInst::DefLabel { label: l(1), params: vec![] },
                 IrInst::FrameLoad { dst: v(5), slot: 1 },
                 IrInst::Return {
                     results: vec![v(5)],
@@ -503,14 +512,15 @@ mod tests {
                 IrInst::BrIfZero {
                     cond: v(2),
                     label: l(0),
+                    args: vec![],
                 },
                 // Block 1: then — return local
                 IrInst::LocalGet { dst: v(3), idx: 0 },
                 IrInst::FrameStore { slot: 1, src: v(3) },
-                IrInst::FuelConsume { cost: 5 }, IrInst::FuelCheck,
-                IrInst::Br { label: l(1) },
+                IrInst::FuelConsume { cost: 5 }, IrInst::FuelCheck { live_state: vec![] },
+                IrInst::Br { label: l(1), args: vec![] },
                 // Block 2 (L0): else — recursive calls
-                IrInst::DefLabel { label: l(0) },
+                IrInst::DefLabel { label: l(0), params: vec![] },
                 IrInst::LocalGet { dst: v(4), idx: 0 },
                 IrInst::IConst { dst: v(5), val: 1 },
                 IrInst::Sub {
@@ -518,7 +528,7 @@ mod tests {
                     lhs: v(4),
                     rhs: v(5),
                 },
-                IrInst::FuelConsume { cost: 3 }, IrInst::FuelCheck,
+                IrInst::FuelConsume { cost: 3 }, IrInst::FuelCheck { live_state: vec![] },
                 IrInst::Call {
                     func_idx: 0,
                     args: vec![v(6)],
@@ -526,11 +536,11 @@ mod tests {
                     frame_advance: 48,
                 },
                 IrInst::FrameStore { slot: 1, src: v(7) },
-                IrInst::FuelConsume { cost: 2 }, IrInst::FuelCheck,
+                IrInst::FuelConsume { cost: 2 }, IrInst::FuelCheck { live_state: vec![] },
                 IrInst::FrameLoad { dst: v(8), slot: 1 },
                 IrInst::FrameStore { slot: 1, src: v(8) },
                 // Block 3 (L1): merge
-                IrInst::DefLabel { label: l(1) },
+                IrInst::DefLabel { label: l(1), params: vec![] },
                 IrInst::FrameLoad { dst: v(9), slot: 1 },
                 IrInst::Return {
                     results: vec![v(9)],

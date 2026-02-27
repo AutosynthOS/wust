@@ -38,14 +38,18 @@ pub enum IrInst {
     Cmp { dst: VReg, lhs: VReg, rhs: VReg, cond: IrCond },
     /// Compare a value with a 12-bit unsigned immediate (0..4095).
     CmpImm { dst: VReg, lhs: VReg, imm: u16, cond: IrCond },
-    /// Define a branch target label.
-    DefLabel { label: Label },
-    /// Unconditional branch.
-    Br { label: Label },
+    /// Define a branch target label with block parameters.
+    /// Each param is a fresh VReg defined at block entry.
+    DefLabel { label: Label, params: Vec<VReg> },
+    /// Unconditional branch with block arguments.
+    /// Args are values passed to the target block's params.
+    Br { label: Label, args: Vec<VReg> },
     /// Branch if the condition register is zero.
-    BrIfZero { cond: VReg, label: Label },
+    /// Args are values passed to the target block's params.
+    BrIfZero { cond: VReg, label: Label, args: Vec<VReg> },
     /// Branch if the condition register is nonzero.
-    BrIfNonZero { cond: VReg, label: Label },
+    /// Args are values passed to the target block's params.
+    BrIfNonZero { cond: VReg, label: Label, args: Vec<VReg> },
     /// Store a value to a frame slot: `[x29 + slot * 8]`.
     ///
     /// Slots 0..total_local_count are locals. Slots beyond that are
@@ -73,10 +77,15 @@ pub enum IrInst {
     /// Decrement fuel counter by `cost`. No suspend point — fuel can go
     /// negative between checkpoints.
     FuelConsume { cost: u32 },
-    /// Check if fuel is exhausted (negative); suspend if so. The frame
-    /// must be canonical before this instruction. When preceded by
-    /// `FuelConsume`, the lowerer fuses them into `subs + b.le`.
-    FuelCheck,
+    /// Check if fuel is exhausted (negative); suspend if so.
+    /// When preceded by `FuelConsume`, the lowerer fuses them into
+    /// `subs + b.le`.
+    ///
+    /// `live_state` lists (canonical_slot, vreg) pairs for all values
+    /// that must be materialized to the frame on the cold suspend path.
+    /// On the hot path these VRegs stay in registers; regalloc2 keeps
+    /// them live because they appear as uses.
+    FuelCheck { live_state: Vec<(u32, VReg)> },
     /// Trap (unreachable instruction).
     Trap,
 }
@@ -100,6 +109,11 @@ impl IrInst {
                     f(*r);
                 }
             }
+            IrInst::DefLabel { params, .. } => {
+                for p in params {
+                    f(*p);
+                }
+            }
             _ => {}
         }
     }
@@ -117,7 +131,22 @@ impl IrInst {
             | IrInst::SubImm { lhs, .. }
             | IrInst::CmpImm { lhs, .. } => f(*lhs),
             IrInst::LocalSet { src, .. } | IrInst::FrameStore { src, .. } => f(*src),
-            IrInst::BrIfZero { cond, .. } | IrInst::BrIfNonZero { cond, .. } => f(*cond),
+            IrInst::BrIfZero { cond, args, .. } | IrInst::BrIfNonZero { cond, args, .. } => {
+                f(*cond);
+                for a in args {
+                    f(*a);
+                }
+            }
+            IrInst::Br { args, .. } => {
+                for a in args {
+                    f(*a);
+                }
+            }
+            IrInst::FuelCheck { live_state } => {
+                for (_, vreg) in live_state {
+                    f(*vreg);
+                }
+            }
             IrInst::Call { args, .. } => {
                 for a in args {
                     f(*a);
@@ -182,6 +211,19 @@ impl std::fmt::Display for Label {
     }
 }
 
+/// Format a parenthesized argument list for branch instructions.
+fn fmt_args(f: &mut std::fmt::Formatter<'_>, args: &[VReg]) -> std::fmt::Result {
+    if !args.is_empty() {
+        write!(f, "(")?;
+        for (i, a) in args.iter().enumerate() {
+            if i > 0 { write!(f, ", ")?; }
+            write!(f, "{a}")?;
+        }
+        write!(f, ")")?;
+    }
+    Ok(())
+}
+
 impl std::fmt::Display for IrInst {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -199,11 +241,29 @@ impl std::fmt::Display for IrInst {
             IrInst::CmpImm { dst, lhs, imm, cond } => {
                 write!(f, "  {dst} = {cond} {lhs}, #{imm}")
             }
-            IrInst::DefLabel { label } => write!(f, "{label}:"),
-            IrInst::Br { label } => write!(f, "  br {label}"),
-            IrInst::BrIfZero { cond, label } => write!(f, "  br_if_zero {cond}, {label}"),
-            IrInst::BrIfNonZero { cond, label } => {
-                write!(f, "  br_if_nz {cond}, {label}")
+            IrInst::DefLabel { label, params } => {
+                write!(f, "{label}:")?;
+                if !params.is_empty() {
+                    write!(f, "(")?;
+                    for (i, p) in params.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "{p}")?;
+                    }
+                    write!(f, ")")?;
+                }
+                Ok(())
+            }
+            IrInst::Br { label, args } => {
+                write!(f, "  br {label}")?;
+                fmt_args(f, args)
+            }
+            IrInst::BrIfZero { cond, label, args } => {
+                write!(f, "  br_if_zero {cond}, {label}")?;
+                fmt_args(f, args)
+            }
+            IrInst::BrIfNonZero { cond, label, args } => {
+                write!(f, "  br_if_nz {cond}, {label}")?;
+                fmt_args(f, args)
             }
             IrInst::FrameStore { slot, src } => write!(f, "  frame[{slot}] = {src}"),
             IrInst::FrameLoad { dst, slot } => write!(f, "  {dst} = frame[{slot}]"),
@@ -242,7 +302,18 @@ impl std::fmt::Display for IrInst {
                 Ok(())
             }
             IrInst::FuelConsume { cost } => write!(f, "  fuel_consume {cost}"),
-            IrInst::FuelCheck => write!(f, "  fuel_check"),
+            IrInst::FuelCheck { live_state } => {
+                write!(f, "  fuel_check")?;
+                if !live_state.is_empty() {
+                    write!(f, " [")?;
+                    for (i, (slot, vreg)) in live_state.iter().enumerate() {
+                        if i > 0 { write!(f, ", ")?; }
+                        write!(f, "frame[{slot}]={vreg}")?;
+                    }
+                    write!(f, "]")?;
+                }
+                Ok(())
+            }
             IrInst::Trap => write!(f, "  trap"),
         }
     }
