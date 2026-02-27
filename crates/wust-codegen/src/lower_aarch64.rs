@@ -5,51 +5,6 @@ use crate::ir::{IrCond, IrFunction, IrInst, Label};
 use crate::regalloc_adapter::{self, RegAllocAdapter};
 use regalloc2::{self, Allocation, Edit, InstOrEdit, Output};
 
-/// Determine which non-parameter locals can skip zero-initialization.
-///
-/// A local can skip zero-init if it's unconditionally written (LocalSet)
-/// in the entry block before any read (LocalGet) and before any control
-/// flow instruction. Only considers the straight-line prefix of the body.
-fn compute_skip_zero_init(ir: &IrFunction) -> Vec<bool> {
-    let mut skip = vec![false; ir.total_local_count as usize];
-    for i in 0..ir.param_count as usize {
-        skip[i] = true;
-    }
-
-    let mut seen = vec![false; ir.total_local_count as usize];
-
-    for inst in &ir.insts {
-        match inst {
-            IrInst::Br { .. }
-            | IrInst::BrIfZero { .. }
-            | IrInst::BrIfNonZero { .. }
-            | IrInst::DefLabel { .. }
-            | IrInst::Call { .. }
-            | IrInst::Return { .. }
-            | IrInst::Trap => break,
-
-            IrInst::LocalSet { idx, .. } => {
-                let i = *idx as usize;
-                if !seen[i] {
-                    seen[i] = true;
-                    skip[i] = true;
-                }
-            }
-
-            IrInst::LocalGet { idx, .. } => {
-                let i = *idx as usize;
-                if !seen[i] {
-                    seen[i] = true;
-                }
-            }
-
-            _ => {}
-        }
-    }
-
-    skip
-}
-
 /// Word offsets of shared handlers within a shared code buffer.
 pub struct SharedHandlerOffsets {
     /// Yield handler — called when fuel is exhausted.
