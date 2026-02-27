@@ -8,9 +8,9 @@ use regalloc2::{
 };
 
 use crate::cfg::CfgInfo;
-use crate::ir::{IrFunction, IrInst};
+use crate::ir::IrInst;
 
-/// Wraps `CfgInfo` + `IrFunction` metadata for regalloc2.
+/// Wraps a `CfgInfo` for regalloc2.
 pub struct RegAllocAdapter {
     num_insts: usize,
     num_vregs: usize,
@@ -54,7 +54,7 @@ fn allocatable_set() -> PRegSet {
 
 impl RegAllocAdapter {
     /// Build the adapter from a CFG and IR function metadata.
-    pub fn new(cfg: &CfgInfo, _ir: &IrFunction) -> Self {
+    pub fn new(cfg: &CfgInfo) -> Self {
         let num_insts = cfg.insts.len();
         let num_blocks = cfg.blocks.len();
 
@@ -116,6 +116,13 @@ fn classify_inst(
     match inst {
         IrInst::IConst { dst, .. } => (vec![Operand::reg_def(to_ra2_vreg(*dst))], empty_clob, false, false),
 
+        IrInst::ParamDef { dst, idx } => (
+            vec![Operand::reg_fixed_def(to_ra2_vreg(*dst), arg_preg(*idx as usize))],
+            empty_clob,
+            false,
+            false,
+        ),
+
         IrInst::LocalGet { dst, .. } => (vec![Operand::reg_def(to_ra2_vreg(*dst))], empty_clob, false, false),
 
         IrInst::LocalSet { src, .. } => (vec![Operand::reg_use(to_ra2_vreg(*src))], empty_clob, false, false),
@@ -131,11 +138,31 @@ fn classify_inst(
             false,
         ),
 
+        IrInst::AddImm { dst, lhs, .. } | IrInst::SubImm { dst, lhs, .. } => (
+            vec![
+                Operand::reg_def(to_ra2_vreg(*dst)),
+                Operand::reg_use(to_ra2_vreg(*lhs)),
+            ],
+            empty_clob,
+            false,
+            false,
+        ),
+
         IrInst::Cmp { dst, lhs, rhs, .. } => (
             vec![
                 Operand::reg_def(to_ra2_vreg(*dst)),
                 Operand::reg_use(to_ra2_vreg(*lhs)),
                 Operand::reg_use(to_ra2_vreg(*rhs)),
+            ],
+            empty_clob,
+            false,
+            false,
+        ),
+
+        IrInst::CmpImm { dst, lhs, .. } => (
+            vec![
+                Operand::reg_def(to_ra2_vreg(*dst)),
+                Operand::reg_use(to_ra2_vreg(*lhs)),
             ],
             empty_clob,
             false,
@@ -189,7 +216,7 @@ fn classify_inst(
             (ops, empty_clob, true, true)
         }
 
-        IrInst::FuelCheck { .. } => (vec![], empty_clob, false, false),
+        IrInst::FuelConsume { .. } | IrInst::FuelCheck => (vec![], empty_clob, false, false),
 
         IrInst::Trap => (vec![], empty_clob, false, true),
     }
@@ -197,11 +224,10 @@ fn classify_inst(
 
 /// Count VRegs referenced in the instruction list (max index + 1).
 fn count_vregs(insts: &[IrInst]) -> usize {
-    use crate::lower_aarch64::{for_each_def, for_each_use};
     let mut max = 0u32;
     for inst in insts {
-        for_each_def(inst, |v| max = max.max(v.0 + 1));
-        for_each_use(inst, |v| max = max.max(v.0 + 1));
+        inst.for_each_def(|v| max = max.max(v.0 + 1));
+        inst.for_each_use(|v| max = max.max(v.0 + 1));
     }
     max as usize
 }
@@ -310,8 +336,10 @@ mod tests {
 
     /// Build an IrFunction with the given instructions (minimal metadata).
     fn make_ir(insts: Vec<IrInst>, param_count: u32, total_local_count: u32) -> IrFunction {
+        let source_ops = vec![0; insts.len()];
         IrFunction {
             insts,
+            source_ops,
             param_count,
             total_local_count,
             max_operand_depth: 0,
@@ -333,7 +361,7 @@ mod tests {
         );
 
         let cfg = build_cfg(&ir.insts);
-        let adapter = RegAllocAdapter::new(&cfg, &ir);
+        let adapter = RegAllocAdapter::new(&cfg);
 
         assert_eq!(adapter.num_insts(), 2);
         assert_eq!(adapter.num_blocks(), 1);
@@ -361,7 +389,7 @@ mod tests {
         );
 
         let cfg = build_cfg(&ir.insts);
-        let adapter = RegAllocAdapter::new(&cfg, &ir);
+        let adapter = RegAllocAdapter::new(&cfg);
         let env = build_machine_env();
         let opts = regalloc2::RegallocOptions {
             validate_ssa: true,
@@ -414,7 +442,7 @@ mod tests {
         );
 
         let cfg = build_cfg(&ir.insts);
-        let adapter = RegAllocAdapter::new(&cfg, &ir);
+        let adapter = RegAllocAdapter::new(&cfg);
         let env = build_machine_env();
         let opts = regalloc2::RegallocOptions {
             validate_ssa: true,
@@ -446,7 +474,7 @@ mod tests {
         );
 
         let cfg = build_cfg(&ir.insts);
-        let adapter = RegAllocAdapter::new(&cfg, &ir);
+        let adapter = RegAllocAdapter::new(&cfg);
         let env = build_machine_env();
         let opts = regalloc2::RegallocOptions {
             validate_ssa: true,
@@ -456,5 +484,71 @@ mod tests {
         let output = regalloc2::run(&adapter, &env, &opts).expect("regalloc2 should succeed");
         // Call has 2 operands (1 arg use + 1 result def).
         assert_eq!(output.inst_allocs(Inst::new(1)).len(), 2);
+    }
+
+    #[test]
+    fn regalloc2_runs_on_fib_with_fuel() {
+        // Reproduces the fib IR with coalesced fuel checks.
+        let ir = make_ir(
+            vec![
+                // Block 0: compare + conditional branch
+                IrInst::LocalGet { dst: v(0), idx: 0 },
+                IrInst::IConst { dst: v(1), val: 1 },
+                IrInst::Cmp {
+                    dst: v(2),
+                    lhs: v(0),
+                    rhs: v(1),
+                    cond: crate::ir::IrCond::LeS,
+                },
+                IrInst::BrIfZero {
+                    cond: v(2),
+                    label: l(0),
+                },
+                // Block 1: then — return local
+                IrInst::LocalGet { dst: v(3), idx: 0 },
+                IrInst::FrameStore { slot: 1, src: v(3) },
+                IrInst::FuelConsume { cost: 5 }, IrInst::FuelCheck,
+                IrInst::Br { label: l(1) },
+                // Block 2 (L0): else — recursive calls
+                IrInst::DefLabel { label: l(0) },
+                IrInst::LocalGet { dst: v(4), idx: 0 },
+                IrInst::IConst { dst: v(5), val: 1 },
+                IrInst::Sub {
+                    dst: v(6),
+                    lhs: v(4),
+                    rhs: v(5),
+                },
+                IrInst::FuelConsume { cost: 3 }, IrInst::FuelCheck,
+                IrInst::Call {
+                    func_idx: 0,
+                    args: vec![v(6)],
+                    result: Some(v(7)),
+                    frame_advance: 48,
+                },
+                IrInst::FrameStore { slot: 1, src: v(7) },
+                IrInst::FuelConsume { cost: 2 }, IrInst::FuelCheck,
+                IrInst::FrameLoad { dst: v(8), slot: 1 },
+                IrInst::FrameStore { slot: 1, src: v(8) },
+                // Block 3 (L1): merge
+                IrInst::DefLabel { label: l(1) },
+                IrInst::FrameLoad { dst: v(9), slot: 1 },
+                IrInst::Return {
+                    results: vec![v(9)],
+                },
+            ],
+            1,
+            3,
+        );
+
+        let cfg = build_cfg(&ir.insts);
+        let adapter = RegAllocAdapter::new(&cfg);
+        let env = build_machine_env();
+        let opts = regalloc2::RegallocOptions {
+            validate_ssa: true,
+            ..Default::default()
+        };
+
+        let output = regalloc2::run(&adapter, &env, &opts).expect("regalloc2 should succeed on fib with fuel");
+        assert!(!output.allocs.is_empty());
     }
 }

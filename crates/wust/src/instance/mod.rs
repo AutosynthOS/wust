@@ -1,4 +1,4 @@
-use crate::parse::func::{FuncIdx, ParsedFunction};
+use crate::parse::func::FuncIdx;
 use crate::stack::Stack;
 use crate::value::{Val, WasmArgs, WasmResults};
 use crate::{Module, Store, interpreter};
@@ -43,14 +43,6 @@ impl Instance {
     /// Get an exported global's value by name.
     pub fn get_global<T>(&self, _store: &Store<T>, _name: &str) -> Option<Val> {
         None
-    }
-
-    fn resolve_export(&self, name: &str) -> Result<&ParsedFunction, anyhow::Error> {
-        let idx = self.resolve_export_func_idx(name)?;
-        self.module
-            .funcs
-            .get(idx.0 as usize)
-            .ok_or_else(|| anyhow::anyhow!("func index {} out of bounds", idx.0))
     }
 
     pub(crate) fn resolve_export_func_idx(&self, name: &str) -> Result<FuncIdx, anyhow::Error> {

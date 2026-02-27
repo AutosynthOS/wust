@@ -1,9 +1,54 @@
 use crate::cfg::{self, CfgInfo};
 use crate::context::JitContext;
 use crate::emit::{Cond, Emitter, PatchPoint, Reg};
-use crate::ir::{IrCond, IrFunction, IrInst, Label, VReg};
+use crate::ir::{IrCond, IrFunction, IrInst, Label};
 use crate::regalloc_adapter::{self, RegAllocAdapter};
 use regalloc2::{self, Allocation, Edit, InstOrEdit, Output};
+
+/// Determine which non-parameter locals can skip zero-initialization.
+///
+/// A local can skip zero-init if it's unconditionally written (LocalSet)
+/// in the entry block before any read (LocalGet) and before any control
+/// flow instruction. Only considers the straight-line prefix of the body.
+fn compute_skip_zero_init(ir: &IrFunction) -> Vec<bool> {
+    let mut skip = vec![false; ir.total_local_count as usize];
+    for i in 0..ir.param_count as usize {
+        skip[i] = true;
+    }
+
+    let mut seen = vec![false; ir.total_local_count as usize];
+
+    for inst in &ir.insts {
+        match inst {
+            IrInst::Br { .. }
+            | IrInst::BrIfZero { .. }
+            | IrInst::BrIfNonZero { .. }
+            | IrInst::DefLabel { .. }
+            | IrInst::Call { .. }
+            | IrInst::Return { .. }
+            | IrInst::Trap => break,
+
+            IrInst::LocalSet { idx, .. } => {
+                let i = *idx as usize;
+                if !seen[i] {
+                    seen[i] = true;
+                    skip[i] = true;
+                }
+            }
+
+            IrInst::LocalGet { idx, .. } => {
+                let i = *idx as usize;
+                if !seen[i] {
+                    seen[i] = true;
+                }
+            }
+
+            _ => {}
+        }
+    }
+
+    skip
+}
 
 /// Word offsets of shared handlers within a shared code buffer.
 pub struct SharedHandlerOffsets {
@@ -11,27 +56,17 @@ pub struct SharedHandlerOffsets {
     pub yield_handler: usize,
     /// Completion handler — called when a fiber-mode function returns.
     pub completion: usize,
-    /// Interpret-exit handler — stub target for uncompiled functions.
-    pub interpret_exit: usize,
 }
 
-/// Layout info for a single compiled function within the shared buffer.
-pub struct FunctionLayout {
-    /// Byte offset of the function body start.
-    pub body_offset: usize,
-}
-
-/// Call context for PC-relative call emission in the shared code buffer.
-struct CallContext<'a> {
-    shared: &'a SharedHandlerOffsets,
-    /// For each func_idx, `Some(word_offset)` if its body has been
-    /// compiled already (enables direct BL instead of jump table hop).
-    body_offsets: &'a [Option<usize>],
-}
 
 /// Byte offset of the first local in the wasm frame.
 /// Layout: [prev_fp (8)][header (8)][locals...], so locals start at +16.
 const FRAME_HEADER_SIZE: u16 = 16;
+
+/// Byte offset of a frame slot (local or spill) from the frame pointer.
+fn frame_slot_offset(slot: u32) -> u16 {
+    slot as u16 * 8 + FRAME_HEADER_SIZE
+}
 
 const CTX_IS_FIBER: u16 = std::mem::offset_of!(JitContext, is_fiber) as u16;
 const CTX_RESUME_LR: u16 = std::mem::offset_of!(JitContext, resume_lr) as u16;
@@ -62,6 +97,13 @@ struct PendingCmp {
 fn flush_pending_cmp(e: &mut Emitter, pending: &mut Option<PendingCmp>) {
     if let Some(cmp) = pending.take() {
         e.cset_w(cmp.dst_reg, cmp.arm_cond);
+    }
+}
+
+/// Flush a pending fuel consume by emitting a bare `sub` if one exists.
+fn flush_pending_fuel(e: &mut Emitter, pending: &mut Option<u32>) {
+    if let Some(cost) = pending.take() {
+        e.sub_x_imm(Reg::X21, Reg::X21, cost as u16);
     }
 }
 
@@ -116,25 +158,43 @@ fn emit_edit(e: &mut Emitter, edit: &Edit, ra2_spill_base: u16) {
 /// Preserves compare-and-branch fusion via a `PendingCmp` mechanism.
 fn lower_body_ra2(
     e: &mut Emitter,
-    _ir: &IrFunction,
     cfg: &CfgInfo,
     adapter: &RegAllocAdapter,
     output: &Output,
     fuel_sites: &mut Vec<FuelCheckSite>,
     label_offsets: &mut [Option<usize>],
     label_patches: &mut Vec<(Label, PatchPoint)>,
-    call_ctx: &CallContext,
+    body_offsets: &[Option<usize>],
     ra2_spill_base: u16,
+    min_call_frame_advance: u16,
     emit_markers: bool,
 ) {
+    // For each block, find the label at the start of the next block
+    // (if any). Used to skip redundant fallthrough branches.
+    let next_block_label: Vec<Option<Label>> = (0..cfg.blocks.len())
+        .map(|bi| {
+            let next_bi = bi + 1;
+            if next_bi >= cfg.blocks.len() {
+                return None;
+            }
+            let next_start = cfg.blocks[next_bi].inst_start as usize;
+            match &cfg.insts[next_start] {
+                IrInst::DefLabel { label } => Some(*label),
+                _ => None,
+            }
+        })
+        .collect();
+
     for block_idx in 0..cfg.blocks.len() {
         let block = regalloc2::Block::new(block_idx);
         let mut pending_cmp: Option<PendingCmp> = None;
+        let mut pending_fuel: Option<u32> = None;
 
         for item in output.block_insts_and_edits(adapter, block) {
             match item {
                 InstOrEdit::Edit(edit) => {
                     flush_pending_cmp(e, &mut pending_cmp);
+                    flush_pending_fuel(e, &mut pending_fuel);
                     emit_edit(e, edit, ra2_spill_base);
                 }
                 InstOrEdit::Inst(inst) => {
@@ -145,45 +205,76 @@ fn lower_body_ra2(
                         e.mark();
                     }
 
+                    // Flush pending cmp unless this instruction fuses with it.
+                    let fuses_cmp = matches!(
+                        ir_inst,
+                        IrInst::BrIfZero { .. } | IrInst::BrIfNonZero { .. }
+                    );
+                    if !fuses_cmp {
+                        flush_pending_cmp(e, &mut pending_cmp);
+                    }
+
+                    // Flush pending fuel unless this is a FuelCheck (fuses).
+                    let fuses_fuel = matches!(ir_inst, IrInst::FuelCheck);
+                    if !fuses_fuel {
+                        flush_pending_fuel(e, &mut pending_fuel);
+                    }
+
                     match ir_inst {
                         IrInst::IConst { val, .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
                             let dst = alloc_to_reg(allocs[0]);
                             emit_i64_const(e, dst, *val);
                         }
 
+                        // ParamDef: value is already in the param register
+                        // from the calling convention. Nothing to emit.
+                        IrInst::ParamDef { .. } => {}
+
                         IrInst::LocalGet { idx, .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
                             let dst = alloc_to_reg(allocs[0]);
-                            let offset = (*idx as u16) * 8 + FRAME_HEADER_SIZE;
-                            e.ldr_x_uoff(dst, Reg::X29, offset);
+                            e.ldr_x_uoff(dst, Reg::X29, frame_slot_offset(*idx));
                         }
 
                         IrInst::LocalSet { idx, .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
                             let src = alloc_to_reg(allocs[0]);
-                            let offset = (*idx as u16) * 8 + FRAME_HEADER_SIZE;
-                            e.str_x_uoff(src, Reg::X29, offset);
+                            e.str_x_uoff(src, Reg::X29, frame_slot_offset(*idx));
                         }
 
                         IrInst::Add { .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
-                            let dst = alloc_to_reg(allocs[0]);
-                            let lhs = alloc_to_reg(allocs[1]);
-                            let rhs = alloc_to_reg(allocs[2]);
+                            let (dst, lhs, rhs) = (
+                                alloc_to_reg(allocs[0]),
+                                alloc_to_reg(allocs[1]),
+                                alloc_to_reg(allocs[2]),
+                            );
                             e.add_w(dst, lhs, rhs);
                         }
 
                         IrInst::Sub { .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
-                            let dst = alloc_to_reg(allocs[0]);
-                            let lhs = alloc_to_reg(allocs[1]);
-                            let rhs = alloc_to_reg(allocs[2]);
+                            let (dst, lhs, rhs) = (
+                                alloc_to_reg(allocs[0]),
+                                alloc_to_reg(allocs[1]),
+                                alloc_to_reg(allocs[2]),
+                            );
                             e.sub_w(dst, lhs, rhs);
                         }
 
+                        IrInst::AddImm { imm, .. } => {
+                            let (dst, lhs) = (
+                                alloc_to_reg(allocs[0]),
+                                alloc_to_reg(allocs[1]),
+                            );
+                            e.add_w_imm(dst, lhs, *imm);
+                        }
+
+                        IrInst::SubImm { imm, .. } => {
+                            let (dst, lhs) = (
+                                alloc_to_reg(allocs[0]),
+                                alloc_to_reg(allocs[1]),
+                            );
+                            e.sub_w_imm(dst, lhs, *imm);
+                        }
+
                         IrInst::Cmp { cond, .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
                             let dst = alloc_to_reg(allocs[0]);
                             let lhs = alloc_to_reg(allocs[1]);
                             let rhs = alloc_to_reg(allocs[2]);
@@ -198,74 +289,82 @@ fn lower_body_ra2(
                             });
                         }
 
+                        IrInst::CmpImm { cond, imm, .. } => {
+                            let dst = alloc_to_reg(allocs[0]);
+                            let lhs = alloc_to_reg(allocs[1]);
+                            let arm_cond = match cond {
+                                IrCond::Eq => Cond::EQ,
+                                IrCond::LeS => Cond::LE,
+                            };
+                            e.cmp_w_imm(lhs, *imm);
+                            pending_cmp = Some(PendingCmp {
+                                arm_cond,
+                                dst_reg: dst,
+                            });
+                        }
+
                         IrInst::DefLabel { label } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
                             label_offsets[label.0 as usize] = Some(e.offset());
                         }
 
                         IrInst::Br { label } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
-                            if let Some(target) = label_offsets[label.0 as usize] {
-                                let current = e.offset();
-                                let word_offset = target as i32 - current as i32;
-                                e.b_offset(word_offset);
-                            } else {
-                                let pp = e.b();
-                                label_patches.push((*label, pp));
+                            // Skip redundant fallthrough branches — the
+                            // target is the very next block's DefLabel.
+                            let is_fallthrough =
+                                next_block_label[block_idx] == Some(*label);
+                            if !is_fallthrough {
+                                emit_branch_to_label(
+                                    e, *label, label_offsets, label_patches,
+                                    |e, off| e.b_offset(off),
+                                    |e| e.b(),
+                                );
                             }
                         }
 
                         IrInst::BrIfZero { label, .. } => {
                             if let Some(cmp) = pending_cmp.take() {
-                                // Fuse: cmp already set flags, emit b.cond.
-                                // BrIfZero branches when zero → invert cond.
-                                emit_b_cond(
-                                    e,
-                                    cmp.arm_cond.invert(),
-                                    *label,
-                                    label_offsets,
-                                    label_patches,
+                                let c = cmp.arm_cond.invert();
+                                emit_branch_to_label(
+                                    e, *label, label_offsets, label_patches,
+                                    |e, off| e.b_cond_offset(c, off),
+                                    |e| e.b_cond(c),
                                 );
                             } else {
-                                let cond_reg = alloc_to_reg(allocs[0]);
-                                emit_cbz_w(e, cond_reg, *label, label_offsets, label_patches);
+                                let rt = alloc_to_reg(allocs[0]);
+                                emit_branch_to_label(
+                                    e, *label, label_offsets, label_patches,
+                                    |e, off| e.cbz_w_offset(rt, off),
+                                    |e| e.cbz_w(rt),
+                                );
                             }
                         }
 
                         IrInst::BrIfNonZero { label, .. } => {
                             if let Some(cmp) = pending_cmp.take() {
-                                // Fuse: cmp already set flags, emit b.cond.
-                                emit_b_cond(
-                                    e,
-                                    cmp.arm_cond,
-                                    *label,
-                                    label_offsets,
-                                    label_patches,
+                                let c = cmp.arm_cond;
+                                emit_branch_to_label(
+                                    e, *label, label_offsets, label_patches,
+                                    |e, off| e.b_cond_offset(c, off),
+                                    |e| e.b_cond(c),
                                 );
                             } else {
-                                let cond_reg = alloc_to_reg(allocs[0]);
-                                emit_cbnz_w(e, cond_reg, *label, label_offsets, label_patches);
+                                let rt = alloc_to_reg(allocs[0]);
+                                emit_branch_to_label(
+                                    e, *label, label_offsets, label_patches,
+                                    |e, off| e.cbnz_w_offset(rt, off),
+                                    |e| e.cbnz_w(rt),
+                                );
                             }
                         }
 
                         IrInst::FrameStore { slot, .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
                             let src = alloc_to_reg(allocs[0]);
-                            e.str_x_uoff(
-                                src,
-                                Reg::X29,
-                                (*slot as u16) * 8 + FRAME_HEADER_SIZE,
-                            );
+                            e.str_x_uoff(src, Reg::X29, frame_slot_offset(*slot));
                         }
 
                         IrInst::FrameLoad { slot, .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
                             let dst = alloc_to_reg(allocs[0]);
-                            e.ldr_x_uoff(
-                                dst,
-                                Reg::X29,
-                                (*slot as u16) * 8 + FRAME_HEADER_SIZE,
-                            );
+                            e.ldr_x_uoff(dst, Reg::X29, frame_slot_offset(*slot));
                         }
 
                         IrInst::Call {
@@ -273,42 +372,44 @@ fn lower_body_ra2(
                             frame_advance,
                             ..
                         } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
-                            // Args placed by regalloc2 via fixed-reg constraints
-                            // and Edit::Move before this instruction.
-                            let advance = *frame_advance as u16;
+                            let advance =
+                                (*frame_advance as u16).max(min_call_frame_advance);
                             e.add_x_imm(Reg::X29, Reg::X29, advance);
 
-                            if let Some(body_word) = call_ctx.body_offsets[*func_idx as usize] {
-                                let current = e.offset();
-                                let target = body_word as i32 - current as i32;
-                                e.bl_offset(target);
-                            } else {
-                                let current = e.offset();
-                                let target = *func_idx as i32 - current as i32;
-                                e.bl_offset(target);
-                            }
+                            let target_word = body_offsets[*func_idx as usize]
+                                .unwrap_or(*func_idx as usize);
+                            let offset = target_word as i32 - e.offset() as i32;
+                            e.bl_offset(offset);
 
                             e.sub_x_imm(Reg::X29, Reg::X29, advance);
-                            // Result in x9 via fixed-def; regalloc2 emits
-                            // moves after this if needed.
                         }
 
                         IrInst::Return { .. } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
-                            // Result already in x9 via fixed-use constraint.
                             e.ldr_x_post(Reg::X30, Reg::SP, 16);
                             e.ret();
                         }
 
-                        IrInst::FuelCheck { cost } => {
-                            flush_pending_cmp(e, &mut pending_cmp);
-                            emit_fuel_check(e, fuel_sites, *cost);
+                        IrInst::FuelConsume { cost } => {
+                            // Defer — may fuse with the next FuelCheck.
+                            if let Some(prev) = pending_fuel.as_mut() {
+                                *prev += cost;
+                            } else {
+                                pending_fuel = Some(*cost);
+                            }
+                        }
+
+                        IrInst::FuelCheck => {
+                            if let Some(cost) = pending_fuel.take() {
+                                // Fused: subs x21, x21, #cost; b.le cold
+                                emit_fuel_check_with_cost(e, fuel_sites, cost);
+                            } else {
+                                // Standalone: check sign bit
+                                emit_fuel_check_sign(e, fuel_sites);
+                            }
                         }
 
                         IrInst::Trap => {
-                            flush_pending_cmp(e, &mut pending_cmp);
-                            e.code.push(0xD4200020); // BRK #1
+                            e.brk(1);
                         }
                     }
                 }
@@ -316,6 +417,7 @@ fn lower_body_ra2(
         }
 
         flush_pending_cmp(e, &mut pending_cmp);
+        flush_pending_fuel(e, &mut pending_fuel);
     }
 }
 
@@ -323,58 +425,23 @@ fn lower_body_ra2(
 // Branch helpers
 // ============================================================
 
-/// Emit a conditional branch to a label (forward or backward).
-fn emit_b_cond(
+/// Emit a branch to a label (forward or backward).
+///
+/// `emit_back` is called with the word offset for backward branches.
+/// `emit_fwd` is called for forward branches and returns a PatchPoint.
+fn emit_branch_to_label(
     e: &mut Emitter,
-    cond: Cond,
     label: Label,
     label_offsets: &[Option<usize>],
     label_patches: &mut Vec<(Label, PatchPoint)>,
+    emit_back: impl FnOnce(&mut Emitter, i32),
+    emit_fwd: impl FnOnce(&mut Emitter) -> PatchPoint,
 ) {
     if let Some(target) = label_offsets[label.0 as usize] {
-        let current = e.offset();
-        let word_offset = target as i32 - current as i32;
-        e.b_cond_offset(cond, word_offset);
+        let word_offset = target as i32 - e.offset() as i32;
+        emit_back(e, word_offset);
     } else {
-        let pp = e.b_cond(cond);
-        label_patches.push((label, pp));
-    }
-}
-
-/// Emit cbz (32-bit) to a label (forward or backward).
-fn emit_cbz_w(
-    e: &mut Emitter,
-    rt: Reg,
-    label: Label,
-    label_offsets: &[Option<usize>],
-    label_patches: &mut Vec<(Label, PatchPoint)>,
-) {
-    if let Some(target) = label_offsets[label.0 as usize] {
-        let current = e.offset();
-        let word_offset = target as i32 - current as i32;
-        let imm19 = ((word_offset as u32) & 0x7FFFF) << 5;
-        e.code.push(0x34000000 | imm19 | (rt.0 as u32 & 0x1F));
-    } else {
-        let pp = e.cbz_w(rt);
-        label_patches.push((label, pp));
-    }
-}
-
-/// Emit cbnz (32-bit) to a label (forward or backward).
-fn emit_cbnz_w(
-    e: &mut Emitter,
-    rt: Reg,
-    label: Label,
-    label_offsets: &[Option<usize>],
-    label_patches: &mut Vec<(Label, PatchPoint)>,
-) {
-    if let Some(target) = label_offsets[label.0 as usize] {
-        let current = e.offset();
-        let word_offset = target as i32 - current as i32;
-        let imm19 = ((word_offset as u32) & 0x7FFFF) << 5;
-        e.code.push(0x35000000 | imm19 | (rt.0 as u32 & 0x1F));
-    } else {
-        let pp = e.cbnz_w(rt);
+        let pp = emit_fwd(e);
         label_patches.push((label, pp));
     }
 }
@@ -411,7 +478,7 @@ pub fn emit_shared_preamble(e: &mut Emitter, func_count: usize) -> SharedHandler
     emit_fiber_complete(e);
 
     let interpret_exit = e.offset();
-    e.code.push(0xD4200040); // BRK #2
+    e.brk(2);
 
     for pp in interpret_exit_pps {
         e.patch_to(pp, interpret_exit);
@@ -420,7 +487,6 @@ pub fn emit_shared_preamble(e: &mut Emitter, func_count: usize) -> SharedHandler
     SharedHandlerOffsets {
         yield_handler,
         completion,
-        interpret_exit,
     }
 }
 
@@ -436,13 +502,13 @@ pub fn lower_into(
     shared: &SharedHandlerOffsets,
     body_offsets: &mut [Option<usize>],
     emit_markers: bool,
-) -> FunctionLayout {
+) -> usize {
     let body_start = e.offset();
     body_offsets[func_idx as usize] = Some(body_start);
 
     // ---- Build CFG and run regalloc2 ----
     let cfg = cfg::build_cfg(&ir.insts);
-    let adapter = RegAllocAdapter::new(&cfg, ir);
+    let adapter = RegAllocAdapter::new(&cfg);
     let env = regalloc_adapter::build_machine_env();
     let opts = regalloc2::RegallocOptions::default();
     let output = regalloc2::run(&adapter, &env, &opts).expect("regalloc2 failed");
@@ -450,9 +516,19 @@ pub fn lower_into(
     // regalloc2 spill slots go after locals + IR merge-point slots.
     let ra2_spill_base = (ir.total_local_count + ir.max_operand_depth) as u16;
 
+    // Minimum frame advance for calls. When regalloc2 uses spill slots,
+    // the advance must cover them so the callee doesn't overwrite them.
+    // When there are no spills, the per-call IR frame_advance is used
+    // (smaller — only covers header + locals + live operand stack depth).
+    let min_call_frame_advance = if output.num_spillslots > 0 {
+        FRAME_HEADER_SIZE + (ra2_spill_base + output.num_spillslots as u16) * 8
+    } else {
+        0
+    };
+
     // Label tracking.
-    let max_label = count_labels(&cfg.insts);
-    let mut label_offsets: Vec<Option<usize>> = vec![None; max_label as usize];
+    let max_label = cfg::max_label_index(&cfg.insts) + 1;
+    let mut label_offsets: Vec<Option<usize>> = vec![None; max_label];
     let mut label_patches: Vec<(Label, PatchPoint)> = Vec::new();
 
     // Fuel check sites for cold stubs.
@@ -466,32 +542,38 @@ pub fn lower_into(
 
     for i in 0..ir.param_count {
         let src = Reg(9 + i as u8);
-        e.str_x_uoff(src, Reg::X29, (i as u16) * 8 + 16);
+        e.str_x_uoff(src, Reg::X29, frame_slot_offset(i));
     }
 
+    let skip_zero_init = compute_skip_zero_init(ir);
     let extra_locals = ir.total_local_count - ir.param_count;
     for i in 0..extra_locals {
-        let offset = ((ir.param_count + i) as u16) * 8 + 16;
-        e.str_x_uoff(Reg::XZR, Reg::X29, offset);
+        let local_idx = ir.param_count + i;
+        if !skip_zero_init[local_idx as usize] {
+            e.str_x_uoff(Reg::XZR, Reg::X29, frame_slot_offset(local_idx));
+        }
     }
 
     // ---- Lower body ----
     lower_body_ra2(
         e,
-        ir,
         &cfg,
         &adapter,
         &output,
         &mut fuel_sites,
         &mut label_offsets,
         &mut label_patches,
-        &CallContext {
-            shared,
-            body_offsets,
-        },
+        body_offsets,
         ra2_spill_base,
+        min_call_frame_advance,
         emit_markers,
     );
+
+    // Mark the end of the main body so the last IR region doesn't
+    // extend into the cold stubs.
+    if emit_markers {
+        e.mark();
+    }
 
     // ---- Cold fuel-check stubs ----
     for site in &fuel_sites {
@@ -511,9 +593,7 @@ pub fn lower_into(
         e.patch_to(pp, target);
     }
 
-    FunctionLayout {
-        body_offset: body_start * 4,
-    }
+    body_start
 }
 
 /// Patch a jump table entry to point to a new target (word offset).
@@ -534,10 +614,23 @@ struct FuelCheckSite {
     resume_offset: usize,
 }
 
-/// Emit a fuel check: `subs x21, x21, #cost; bc.le <cold_stub>`.
-fn emit_fuel_check(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>, cost: u32) {
+/// Emit a fused fuel consume+check: `subs x21, x21, #cost; b.le <cold>`.
+fn emit_fuel_check_with_cost(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>, cost: u32) {
     e.subs_x_imm(Reg::X21, Reg::X21, cost as u16);
     let b_le_patch = e.b_cond(Cond::LE);
+    let resume_offset = e.offset();
+    fuel_sites.push(FuelCheckSite {
+        b_le_patch,
+        resume_offset,
+    });
+}
+
+/// Emit a standalone fuel check (no consume): `tbnz x21, #63, <cold>`.
+/// Branches if fuel is negative (sign bit set).
+fn emit_fuel_check_sign(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>) {
+    // cmp x21, #0; b.lt cold — checks if fuel went negative.
+    e.cmp_x_imm(Reg::X21, 0);
+    let b_le_patch = e.b_cond(Cond::LT);
     let resume_offset = e.offset();
     fuel_sites.push(FuelCheckSite {
         b_le_patch,
@@ -583,8 +676,7 @@ fn emit_i32_const_reg(e: &mut Emitter, rd: Reg, val: i32) {
         let hi = ((val as u32) >> 16) & 0xFFFF;
         e.movz_w(rd, lo as u16);
         if hi != 0 {
-            let inst = 0x72A00000 | (hi << 5) | (rd.0 as u32 & 0x1F);
-            e.code.push(inst);
+            e.movk_w(rd, hi as u16, 16);
         }
     }
 }
@@ -597,84 +689,3 @@ fn emit_i64_const(e: &mut Emitter, rd: Reg, val: i64) {
     }
 }
 
-/// Count the maximum Label index + 1.
-fn count_labels(insts: &[IrInst]) -> u32 {
-    let mut max_label = 0u32;
-    for inst in insts {
-        match inst {
-            IrInst::DefLabel { label }
-            | IrInst::Br { label }
-            | IrInst::BrIfZero { label, .. }
-            | IrInst::BrIfNonZero { label, .. } => {
-                max_label = max_label.max(label.0 + 1);
-            }
-            _ => {}
-        }
-    }
-    max_label
-}
-
-/// Call `f` for every VReg that is *defined* by `inst`.
-pub fn for_each_def(inst: &IrInst, mut f: impl FnMut(VReg)) {
-    match inst {
-        IrInst::IConst { dst, .. } => f(*dst),
-        IrInst::LocalGet { dst, .. } => f(*dst),
-        IrInst::LocalSet { .. } => {}
-        IrInst::Add { dst, .. } => f(*dst),
-        IrInst::Sub { dst, .. } => f(*dst),
-        IrInst::Cmp { dst, .. } => f(*dst),
-        IrInst::DefLabel { .. } => {}
-        IrInst::Br { .. } => {}
-        IrInst::BrIfZero { .. } => {}
-        IrInst::BrIfNonZero { .. } => {}
-        IrInst::FrameStore { .. } => {}
-        IrInst::FrameLoad { dst, .. } => f(*dst),
-        IrInst::Call { result, .. } => {
-            if let Some(r) = result {
-                f(*r);
-            }
-        }
-        IrInst::Return { .. } => {}
-        IrInst::FuelCheck { .. } => {}
-        IrInst::Trap => {}
-    }
-}
-
-/// Call `f` for every VReg that is *read* by `inst`.
-pub fn for_each_use(inst: &IrInst, mut f: impl FnMut(VReg)) {
-    match inst {
-        IrInst::IConst { .. } => {}
-        IrInst::LocalGet { .. } => {}
-        IrInst::LocalSet { src, .. } => f(*src),
-        IrInst::Add { lhs, rhs, .. } => {
-            f(*lhs);
-            f(*rhs);
-        }
-        IrInst::Sub { lhs, rhs, .. } => {
-            f(*lhs);
-            f(*rhs);
-        }
-        IrInst::Cmp { lhs, rhs, .. } => {
-            f(*lhs);
-            f(*rhs);
-        }
-        IrInst::DefLabel { .. } => {}
-        IrInst::Br { .. } => {}
-        IrInst::BrIfZero { cond, .. } => f(*cond),
-        IrInst::BrIfNonZero { cond, .. } => f(*cond),
-        IrInst::FrameStore { src, .. } => f(*src),
-        IrInst::FrameLoad { .. } => {}
-        IrInst::Call { args, .. } => {
-            for a in args {
-                f(*a);
-            }
-        }
-        IrInst::Return { results } => {
-            for r in results {
-                f(*r);
-            }
-        }
-        IrInst::FuelCheck { .. } => {}
-        IrInst::Trap => {}
-    }
-}

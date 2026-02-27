@@ -18,6 +18,10 @@ pub enum IrCond {
 pub enum IrInst {
     /// Load a constant into a virtual register.
     IConst { dst: VReg, val: i64 },
+    /// Define a VReg as holding a function parameter. The value is
+    /// already in the param register (x9+idx) from the calling convention.
+    /// The lowerer emits nothing — it just tells regalloc2 where the value is.
+    ParamDef { dst: VReg, idx: u32 },
     /// Load a local variable into a virtual register.
     LocalGet { dst: VReg, idx: u32 },
     /// Store a virtual register into a local variable.
@@ -26,8 +30,14 @@ pub enum IrInst {
     Add { dst: VReg, lhs: VReg, rhs: VReg },
     /// 32-bit integer subtraction.
     Sub { dst: VReg, lhs: VReg, rhs: VReg },
+    /// 32-bit add with 12-bit unsigned immediate (0..4095).
+    AddImm { dst: VReg, lhs: VReg, imm: u16 },
+    /// 32-bit sub with 12-bit unsigned immediate (0..4095).
+    SubImm { dst: VReg, lhs: VReg, imm: u16 },
     /// Compare two values, store boolean result (0 or 1).
     Cmp { dst: VReg, lhs: VReg, rhs: VReg, cond: IrCond },
+    /// Compare a value with a 12-bit unsigned immediate (0..4095).
+    CmpImm { dst: VReg, lhs: VReg, imm: u16, cond: IrCond },
     /// Define a branch target label.
     DefLabel { label: Label },
     /// Unconditional branch.
@@ -60,16 +70,77 @@ pub enum IrInst {
     },
     /// Return from the function with the given result values.
     Return { results: Vec<VReg> },
-    /// Decrement fuel counter by `cost`; yield if exhausted.
-    FuelCheck { cost: u32 },
+    /// Decrement fuel counter by `cost`. No suspend point — fuel can go
+    /// negative between checkpoints.
+    FuelConsume { cost: u32 },
+    /// Check if fuel is exhausted (negative); suspend if so. The frame
+    /// must be canonical before this instruction. When preceded by
+    /// `FuelConsume`, the lowerer fuses them into `subs + b.le`.
+    FuelCheck,
     /// Trap (unreachable instruction).
     Trap,
+}
+
+impl IrInst {
+    /// Call `f` for every VReg that is *defined* by this instruction.
+    pub fn for_each_def(&self, mut f: impl FnMut(VReg)) {
+        match self {
+            IrInst::IConst { dst, .. }
+            | IrInst::ParamDef { dst, .. }
+            | IrInst::LocalGet { dst, .. }
+            | IrInst::Add { dst, .. }
+            | IrInst::Sub { dst, .. }
+            | IrInst::AddImm { dst, .. }
+            | IrInst::SubImm { dst, .. }
+            | IrInst::Cmp { dst, .. }
+            | IrInst::CmpImm { dst, .. }
+            | IrInst::FrameLoad { dst, .. } => f(*dst),
+            IrInst::Call { result, .. } => {
+                if let Some(r) = result {
+                    f(*r);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Call `f` for every VReg that is *read* by this instruction.
+    pub fn for_each_use(&self, mut f: impl FnMut(VReg)) {
+        match self {
+            IrInst::Add { lhs, rhs, .. }
+            | IrInst::Sub { lhs, rhs, .. }
+            | IrInst::Cmp { lhs, rhs, .. } => {
+                f(*lhs);
+                f(*rhs);
+            }
+            IrInst::AddImm { lhs, .. }
+            | IrInst::SubImm { lhs, .. }
+            | IrInst::CmpImm { lhs, .. } => f(*lhs),
+            IrInst::LocalSet { src, .. } | IrInst::FrameStore { src, .. } => f(*src),
+            IrInst::BrIfZero { cond, .. } | IrInst::BrIfNonZero { cond, .. } => f(*cond),
+            IrInst::Call { args, .. } => {
+                for a in args {
+                    f(*a);
+                }
+            }
+            IrInst::Return { results } => {
+                for r in results {
+                    f(*r);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// A compiled IR function — the output of the wasm-to-IR compiler.
 pub struct IrFunction {
     /// The IR instruction sequence.
     pub insts: Vec<IrInst>,
+    /// For each IR instruction, the index of the parsed wasm op it
+    /// came from. Same length as `insts`. Used by the inspector to
+    /// group machine instructions by their source wasm operation.
+    pub source_ops: Vec<u32>,
     /// Number of function parameters.
     pub param_count: u32,
     /// Total number of locals (params + declared locals).
@@ -115,12 +186,18 @@ impl std::fmt::Display for IrInst {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IrInst::IConst { dst, val } => write!(f, "  {dst} = i32.const {val}"),
+            IrInst::ParamDef { dst, idx } => write!(f, "  {dst} = param {idx}"),
             IrInst::LocalGet { dst, idx } => write!(f, "  {dst} = local.get {idx}"),
             IrInst::LocalSet { idx, src } => write!(f, "  local.set {idx}, {src}"),
             IrInst::Add { dst, lhs, rhs } => write!(f, "  {dst} = i32.add {lhs}, {rhs}"),
             IrInst::Sub { dst, lhs, rhs } => write!(f, "  {dst} = i32.sub {lhs}, {rhs}"),
+            IrInst::AddImm { dst, lhs, imm } => write!(f, "  {dst} = i32.add {lhs}, #{imm}"),
+            IrInst::SubImm { dst, lhs, imm } => write!(f, "  {dst} = i32.sub {lhs}, #{imm}"),
             IrInst::Cmp { dst, lhs, rhs, cond } => {
                 write!(f, "  {dst} = {cond} {lhs}, {rhs}")
+            }
+            IrInst::CmpImm { dst, lhs, imm, cond } => {
+                write!(f, "  {dst} = {cond} {lhs}, #{imm}")
             }
             IrInst::DefLabel { label } => write!(f, "{label}:"),
             IrInst::Br { label } => write!(f, "  br {label}"),
@@ -164,7 +241,8 @@ impl std::fmt::Display for IrInst {
                 }
                 Ok(())
             }
-            IrInst::FuelCheck { cost } => write!(f, "  fuel_check {cost}"),
+            IrInst::FuelConsume { cost } => write!(f, "  fuel_consume {cost}"),
+            IrInst::FuelCheck => write!(f, "  fuel_check"),
             IrInst::Trap => write!(f, "  trap"),
         }
     }

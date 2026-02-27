@@ -31,8 +31,6 @@ pub struct CfgInfo {
     pub insts: Vec<IrInst>,
     /// Basic blocks, indexed by block ID.
     pub blocks: Vec<CfgBlock>,
-    /// Maps `Label` index → block ID. `None` if that label doesn't exist.
-    pub label_to_block: Vec<Option<u32>>,
 }
 
 /// Returns true if the instruction is a block terminator.
@@ -168,7 +166,33 @@ pub fn build_cfg(original_insts: &[IrInst]) -> CfgInfo {
         blocks[bi].succs = succs;
     }
 
-    // Phase 5: compute predecessors by inverting successor edges.
+    // Phase 5: find reachable blocks via BFS from the entry block.
+    // Dead code after Return/Trap can create blocks with no incoming
+    // edges — these must be excluded so they don't add phantom
+    // predecessors to real blocks (which would confuse regalloc2).
+    let mut reachable = vec![false; num_blocks];
+    let mut queue = std::collections::VecDeque::new();
+    reachable[0] = true;
+    queue.push_back(0usize);
+    while let Some(bi) = queue.pop_front() {
+        for &s in &blocks[bi].succs {
+            let si = s as usize;
+            if !reachable[si] {
+                reachable[si] = true;
+                queue.push_back(si);
+            }
+        }
+    }
+
+    // Clear successors on unreachable blocks so they don't pollute
+    // predecessor lists.
+    for bi in 0..num_blocks {
+        if !reachable[bi] {
+            blocks[bi].succs.clear();
+        }
+    }
+
+    // Phase 6: compute predecessors by inverting successor edges.
     for bi in 0..num_blocks {
         let succs = blocks[bi].succs.clone();
         for s in succs {
@@ -179,12 +203,11 @@ pub fn build_cfg(original_insts: &[IrInst]) -> CfgInfo {
     CfgInfo {
         insts: new_insts,
         blocks,
-        label_to_block,
     }
 }
 
 /// Find the highest label index referenced in the instruction list.
-fn max_label_index(insts: &[IrInst]) -> usize {
+pub(crate) fn max_label_index(insts: &[IrInst]) -> usize {
     let mut max = 0usize;
     for inst in insts {
         let l = match inst {

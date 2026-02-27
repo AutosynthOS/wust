@@ -17,7 +17,6 @@ use wasmparser::{Parser, Payload};
 pub(crate) struct ParsedModule {
     pub(crate) funcs: Vec<ParsedFunction>,
     pub(crate) exports: HashMap<String, FuncIdx>,
-    types: Types,
 }
 
 pub(crate) fn parse(engine: &Engine, bytes: &[u8]) -> Result<ParsedModule, anyhow::Error> {
@@ -118,7 +117,6 @@ impl ModuleBuilder {
         ParsedModule {
             funcs,
             exports: self.exports,
-            types,
         }
     }
 }

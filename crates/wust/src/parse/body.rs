@@ -83,6 +83,78 @@ impl InlineOp {
     }
 }
 
+impl InlineOp {
+    /// Format this parsed op as a human-readable expression.
+    ///
+    /// Superinstructions are shown as nested expressions:
+    /// `sub(local.get 0, 1)`, `le_s(local.get 0, 1)`, etc.
+    /// Structural ops (block, end, etc.) return empty strings.
+    pub(crate) fn display_label(self) -> String {
+        let imm = self.immediate_u32();
+        match self.opcode() {
+            OpCode::DataStream | OpCode::Nop => String::new(),
+            OpCode::Unreachable => "unreachable".into(),
+            OpCode::Return => "return".into(),
+            OpCode::I32Add => "i32.add".into(),
+            OpCode::I32Sub => "i32.sub".into(),
+            OpCode::I32Eqz => "i32.eqz".into(),
+            OpCode::I32LeS => "i32.le_s".into(),
+            OpCode::RefNull => "ref.null".into(),
+            OpCode::I32Const => {
+                let val = (imm as i32) << 8 >> 8;
+                format!("i32.const {val}")
+            }
+            OpCode::I64Const => {
+                let val = (imm as i32) << 8 >> 8;
+                format!("i64.const {val}")
+            }
+            OpCode::LocalGet => format!("local.get {imm}"),
+            OpCode::LocalSet => format!("local.set {imm}"),
+            OpCode::LocalTee => format!("local.tee {imm}"),
+            OpCode::GlobalGet => format!("global.get {imm}"),
+            OpCode::GlobalSet => format!("global.set {imm}"),
+            OpCode::Call => format!("call {imm}"),
+            OpCode::Block | OpCode::Loop | OpCode::Else | OpCode::End => String::new(),
+            OpCode::If => "if".into(),
+            OpCode::Br => format!("br {imm}"),
+            OpCode::BrIf => format!("br_if {imm}"),
+            OpCode::LocalGetI32ConstSub => {
+                let local = self.imm_u8_a();
+                let konst = self.imm_i16_hi();
+                format!("sub(local.get {local}, {konst})")
+            }
+            OpCode::LocalGetI32ConstAdd => {
+                let local = self.imm_u8_a();
+                let konst = self.imm_i16_hi();
+                format!("add(local.get {local}, {konst})")
+            }
+            OpCode::CallLocalSet => {
+                let func = self.imm_u16_lo();
+                let local = self.imm_u8_c();
+                format!("call {func} -> local.set {local}")
+            }
+            OpCode::LocalGetLocalGetAdd => {
+                let a = self.imm_u8_a();
+                let b = self.imm_u8_b();
+                format!("add(local.get {a}, local.get {b})")
+            }
+            OpCode::LocalGetReturn => {
+                let local = self.imm_u8_a();
+                format!("return local.get {local}")
+            }
+            OpCode::LocalGetI32ConstLeSIf => {
+                let local = self.imm_u8_a();
+                let konst = self.imm_u8_b() as i8;
+                format!("if le_s(local.get {local}, {konst})")
+            }
+            OpCode::LocalGetI32EqzIf => {
+                let local = self.imm_u8_a();
+                format!("if eqz(local.get {local})")
+            }
+        }
+    }
+}
+
 impl std::fmt::Debug for InlineOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InlineOp")

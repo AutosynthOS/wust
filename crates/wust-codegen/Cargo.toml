@@ -3,7 +3,11 @@ name = "wust-codegen"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+inspect = ["disarm64"]
+
 [dependencies]
 anyhow = "1"
+disarm64 = { version = "0.1", optional = true }
 libc = "0.2"
 regalloc2 = "0.13"

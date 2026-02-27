@@ -10,9 +10,49 @@ use crate::value::WasmArgs;
 
 use wust_codegen::code_buffer::CodeBuffer;
 use wust_codegen::context::JitContext;
-use wust_codegen::emit;
+use wust_codegen::emit::{self, Emitter};
+use wust_codegen::ir::IrFunction;
 use wust_codegen::lower_aarch64;
 use wust_codegen::lower_aarch64::SharedHandlerOffsets;
+
+/// Per-function snapshot passed to the `compile_all` callback.
+pub(crate) struct FuncSnapshot {
+    /// Word offset where the function's code starts in the emitter.
+    pub(crate) code_start: usize,
+    /// Index into the markers array where this function's markers start.
+    pub(crate) markers_start: usize,
+}
+
+/// Compile all functions in a module into a shared emitter.
+///
+/// Emits the shared preamble (jump table, handlers), then compiles
+/// each function's IR and lowers it to machine code. Calls `on_func`
+/// after each function is lowered with the IR and pre/post snapshot.
+pub(crate) fn compile_all(
+    module: &Module,
+    emit_fuel: bool,
+    emit_markers: bool,
+    mut on_func: impl FnMut(usize, &IrFunction, &Emitter, &FuncSnapshot),
+) -> (Emitter, SharedHandlerOffsets) {
+    let func_count = module.funcs.len();
+    let mut e = emit::Emitter::new();
+    let shared = lower_aarch64::emit_shared_preamble(&mut e, func_count);
+    let mut body_offsets: Vec<Option<usize>> = vec![None; func_count];
+
+    for (i, func) in module.funcs.iter().enumerate() {
+        let ir = compiler::compile_with(func, &module.funcs, emit_fuel);
+        let snap = FuncSnapshot {
+            code_start: e.code().len(),
+            markers_start: e.markers().len(),
+        };
+        let body_word =
+            lower_aarch64::lower_into(&mut e, &ir, i as u32, &shared, &mut body_offsets, emit_markers);
+        lower_aarch64::patch_jump_table(&mut e, i as u32, body_word);
+        on_func(i, &ir, &e, &snap);
+    }
+
+    (e, shared)
+}
 
 /// A JIT-compiled module with a shared code buffer.
 ///
@@ -73,25 +113,8 @@ impl<'a> JitCompiler<'a> {
     /// Layout: [jump table][interpret stubs][shared handlers][fn0][fn1]...
     pub fn compile(self) -> Result<JitModule, anyhow::Error> {
         let func_count = self.module.funcs.len();
-        let mut e = emit::Emitter::new();
+        let (e, shared) = compile_all(self.module, self.emit_fuel, false, |_, _, _, _| {});
 
-        // Emit shared preamble: jump table, interpret stubs, handlers.
-        let shared = lower_aarch64::emit_shared_preamble(&mut e, func_count);
-
-        // Track body offsets for direct BL optimization.
-        let mut body_offsets: Vec<Option<usize>> = vec![None; func_count];
-
-        // Compile and append each function body.
-        for (i, func) in self.module.funcs.iter().enumerate() {
-            let ir = compiler::compile_with(func, &self.module.funcs, self.emit_fuel);
-            let layout =
-                lower_aarch64::lower_into(&mut e, &ir, i as u32, &shared, &mut body_offsets, false);
-            // Patch jump table entry to point at the compiled body.
-            let body_word = layout.body_offset / 4;
-            lower_aarch64::patch_jump_table(&mut e, i as u32, body_word);
-        }
-
-        // Copy emitter output into executable CodeBuffer.
         let mut buffer = CodeBuffer::new(e.code().len() * 4 + 64)?;
         for &word in e.code() {
             buffer.emit_u32(word);

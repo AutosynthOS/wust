@@ -20,6 +20,11 @@ struct OpenBlock {
 struct IrCompiler {
     /// The IR instruction sequence being built.
     insts: Vec<IrInst>,
+    /// Parallel to `insts` — index of the parsed wasm op each IR
+    /// instruction came from.
+    source_ops: Vec<u32>,
+    /// Index of the parsed op currently being compiled.
+    current_op: u32,
     /// Virtual operand stack — tracks which VReg holds each wasm stack slot.
     vstack: Vec<VReg>,
     /// Next virtual register index.
@@ -33,18 +38,35 @@ struct IrCompiler {
     /// Total number of locals (params + declared). Used to compute
     /// frame slot indices for operand stack spills.
     total_local_count: u32,
+    /// Accumulated fuel cost for the current basic block. Flushed as a
+    /// single FuelCheck before branches, labels, calls, and returns.
+    pending_fuel: u32,
+    /// Whether fuel checking is enabled.
+    emit_fuel: bool,
+    /// Local promotion: which VReg currently holds each local's value.
+    /// `None` means the value only exists in the frame slot.
+    local_vreg: Vec<Option<VReg>>,
+    /// Whether the register value differs from what's in the frame slot.
+    /// When true, must store to frame before any suspend point.
+    frame_dirty: Vec<bool>,
 }
 
 impl IrCompiler {
-    fn new(total_local_count: u32) -> Self {
+    fn new(total_local_count: u32, emit_fuel: bool) -> Self {
         IrCompiler {
             insts: Vec::new(),
+            source_ops: Vec::new(),
+            current_op: 0,
             vstack: Vec::new(),
             next_vreg: 0,
             next_label: 0,
             block_stack: Vec::new(),
             max_vstack_depth: 0,
             total_local_count,
+            pending_fuel: 0,
+            emit_fuel,
+            local_vreg: vec![None; total_local_count as usize],
+            frame_dirty: vec![false; total_local_count as usize],
         }
     }
 
@@ -78,6 +100,66 @@ impl IrCompiler {
 
     fn emit(&mut self, inst: IrInst) {
         self.insts.push(inst);
+        self.source_ops.push(self.current_op);
+    }
+
+    /// Add fuel cost for the current opcode. The cost is batched and
+    /// emitted as a single FuelCheck at the next basic block boundary.
+    fn accrue_fuel(&mut self, cost: u32) {
+        if self.emit_fuel {
+            self.pending_fuel += cost;
+        }
+    }
+
+    /// Emit a FuelConsume + FuelCheck for any accumulated cost, then reset.
+    /// Called at suspend points (before calls, at loop back-edges).
+    /// Always flushes dirty locals to frame (canonical frame contract).
+    fn flush_fuel(&mut self) {
+        self.flush_dirty_locals();
+        if self.pending_fuel > 0 && self.emit_fuel {
+            self.emit(IrInst::FuelConsume {
+                cost: self.pending_fuel,
+            });
+            self.emit(IrInst::FuelCheck);
+        }
+        self.pending_fuel = 0;
+    }
+
+    /// Emit a bare FuelConsume (no check) for accumulated cost.
+    /// Called before returns — fuel goes negative but no suspend point.
+    fn flush_fuel_consume_only(&mut self) {
+        if self.pending_fuel > 0 {
+            self.emit(IrInst::FuelConsume {
+                cost: self.pending_fuel,
+            });
+            self.pending_fuel = 0;
+        }
+    }
+
+    /// Store all dirty locals to their canonical frame slots.
+    /// Called before FuelCheck instructions (suspend points).
+    fn flush_dirty_locals(&mut self) {
+        for idx in 0..self.total_local_count {
+            if self.frame_dirty[idx as usize] {
+                if let Some(v) = self.local_vreg[idx as usize] {
+                    self.insts.push(IrInst::FrameStore {
+                        slot: idx,
+                        src: v,
+                    });
+                    self.source_ops.push(self.current_op);
+                    self.frame_dirty[idx as usize] = false;
+                }
+            }
+        }
+    }
+
+    /// Invalidate all local VReg tracking — values only exist in frame.
+    /// Called after calls (registers clobbered).
+    fn invalidate_locals(&mut self) {
+        for idx in 0..self.total_local_count as usize {
+            self.local_vreg[idx] = None;
+            // frame_dirty is already false (we flushed before the call)
+        }
     }
 
     fn emit_i32_const(&mut self, val: i32) {
@@ -90,14 +172,24 @@ impl IrCompiler {
     }
 
     fn emit_local_get(&mut self, idx: u32) {
-        let dst = self.fresh_vreg();
-        self.emit(IrInst::LocalGet { dst, idx });
-        self.vpush(dst);
+        if let Some(v) = self.local_vreg[idx as usize] {
+            // Value already in a register — reuse it, emit nothing.
+            self.vpush(v);
+        } else {
+            // Value only in frame — load it.
+            let dst = self.fresh_vreg();
+            self.emit(IrInst::LocalGet { dst, idx });
+            self.local_vreg[idx as usize] = Some(dst);
+            self.frame_dirty[idx as usize] = false; // just loaded from frame
+            self.vpush(dst);
+        }
     }
 
     fn emit_local_set(&mut self, idx: u32) {
         let src = self.vpop();
-        self.emit(IrInst::LocalSet { idx, src });
+        // Track in register, defer frame store to next flush.
+        self.local_vreg[idx as usize] = Some(src);
+        self.frame_dirty[idx as usize] = true;
     }
 
     fn emit_return(&mut self, result_count: usize) {
@@ -107,6 +199,8 @@ impl IrCompiler {
         }
         results.reverse();
         self.emit(IrInst::Return { results });
+        // Any fuel accrued after a return is dead code — discard it.
+        self.pending_fuel = 0;
     }
 
     fn emit_br(&mut self, block_idx: u32) {
@@ -127,7 +221,7 @@ impl IrCompiler {
         let base = self.total_local_count;
         let extras: Vec<VReg> = self.vstack.drain(depth..).collect();
         for (i, vreg) in extras.into_iter().enumerate() {
-            self.insts.push(IrInst::FrameStore {
+            self.emit(IrInst::FrameStore {
                 slot: base + depth as u32 + i as u32,
                 src: vreg,
             });
@@ -145,7 +239,7 @@ impl IrCompiler {
         let depth = self.vstack.len() as u32;
         for i in 0..count {
             let dst = self.fresh_vreg();
-            self.insts.push(IrInst::FrameLoad {
+            self.emit(IrInst::FrameLoad {
                 dst,
                 slot: base + depth + i as u32,
             });
@@ -160,33 +254,62 @@ impl IrCompiler {
 /// virtual registers and are only materialized to the physical wasm
 /// stack at call boundaries and control flow merge points.
 ///
-/// Each wasm opcode emits a group of IR instructions, followed by a
-/// single `FuelCheck` (when `emit_fuel` is true). This keeps fused
-/// operations (e.g. Cmp+BrIfZero from i32.eqz+if) adjacent — the
-/// fuel check always comes after the whole group.
+/// Fuel costs are accumulated per basic block and emitted as a single
+/// FuelCheck before branches, labels, calls, and returns. This avoids
+/// redundant checks between adjacent opcodes.
 pub(crate) fn compile_with(
     func: &ParsedFunction,
     all_funcs: &[ParsedFunction],
     emit_fuel: bool,
 ) -> IrFunction {
-    let mut c = IrCompiler::new(func.locals.len() as u32);
+    let mut c = IrCompiler::new(func.locals.len() as u32, emit_fuel);
+
+    // Params start in registers (x9, x10, ...) via ParamDef.
+    // Track them as local VRegs — they're dirty (not yet in frame).
+    // Frame stores are deferred to the first flush_dirty_locals().
+    for i in 0..func.param_count as u32 {
+        let v = c.fresh_vreg();
+        c.emit(IrInst::ParamDef { dst: v, idx: i });
+        c.local_vreg[i as usize] = Some(v);
+        c.frame_dirty[i as usize] = true;
+    }
+
+    // Non-param locals start as zero. Track a zero VReg — dirty
+    // (frame stores deferred to first flush).
+    let extra_locals = func.locals.len() as u32 - func.param_count as u32;
+    if extra_locals > 0 {
+        let v_zero = c.fresh_vreg();
+        c.emit(IrInst::IConst { dst: v_zero, val: 0 });
+        for i in func.param_count as u32..func.locals.len() as u32 {
+            c.local_vreg[i as usize] = Some(v_zero);
+            c.frame_dirty[i as usize] = true;
+        }
+    }
 
     let result_count = func.result_count as usize;
     let ops = &func.body.ops;
     let blocks = &func.body.blocks;
 
-    for op in ops.iter() {
+    for (op_idx, op) in ops.iter().enumerate() {
+        c.current_op = op_idx as u32;
         let opcode = op.opcode();
         let imm = op.immediate_u32();
+
+        // Accrue fuel cost BEFORE processing the opcode, so that
+        // terminators (Return, Trap) can flush then reset pending_fuel
+        // without subsequent dead-code fuel leaking through.
+        c.accrue_fuel(opcode.fuel_cost());
 
         match opcode {
             OpCode::Nop => {}
 
             OpCode::Unreachable => {
                 c.emit(IrInst::Trap);
+                c.pending_fuel = 0; // dead code after trap
             }
 
             OpCode::Return => {
+                c.flush_fuel_consume_only();
                 c.emit_return(result_count);
             }
 
@@ -212,7 +335,9 @@ pub(crate) fn compile_with(
 
             OpCode::LocalTee => {
                 let src = c.vpeek();
-                c.emit(IrInst::LocalSet { idx: imm, src });
+                // Use local promotion — track in register, defer store.
+                c.local_vreg[imm as usize] = Some(src);
+                c.frame_dirty[imm as usize] = true;
             }
 
             OpCode::GlobalGet => {
@@ -249,13 +374,11 @@ pub(crate) fn compile_with(
 
             OpCode::I32Eqz => {
                 let val = c.vpop();
-                let zero = c.fresh_vreg();
-                c.emit(IrInst::IConst { dst: zero, val: 0 });
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Cmp {
+                c.emit(IrInst::CmpImm {
                     dst,
                     lhs: val,
-                    rhs: zero,
+                    imm: 0,
                     cond: IrCond::Eq,
                 });
                 c.vpush(dst);
@@ -285,6 +408,8 @@ pub(crate) fn compile_with(
             }
 
             OpCode::Loop => {
+                // No fuel flush at loop entry — fuel is checked at
+                // back-edges (Br to loop label) and after calls.
                 let label = c.fresh_label();
                 c.emit(IrInst::DefLabel { label });
                 c.block_stack.push(OpenBlock {
@@ -296,14 +421,16 @@ pub(crate) fn compile_with(
             }
 
             OpCode::If => {
+                // Don't flush fuel here — FuelCheck before a conditional
+                // branch would break Cmp+BrIfZero fusion. The accumulated
+                // cost carries into whichever branch is taken and gets
+                // flushed at the next unconditional boundary.
                 let cond_vreg = c.vpop();
                 let label = c.fresh_label();
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
                     label,
                 });
-                // Flush AFTER BrIfZero so Cmp+BrIfZero stay adjacent
-                // for fusion in the lowerer.
                 c.block_stack.push(OpenBlock {
                     block_idx: imm,
                     kind: blocks[imm as usize].kind,
@@ -321,44 +448,65 @@ pub(crate) fn compile_with(
                     (block.vstack_depth, block.label)
                 };
                 c.flush_vstack_above(depth);
+                // No fuel flush — forward branch, not a suspend point.
                 let end_label = c.fresh_label();
                 c.emit(IrInst::Br { label: end_label });
-                c.insts.push(IrInst::DefLabel { label: if_label });
+                c.emit(IrInst::DefLabel { label: if_label });
                 c.block_stack.last_mut().unwrap().label = end_label;
             }
 
             OpCode::End => {
                 if imm == 0 {
+                    c.flush_fuel_consume_only();
                     c.emit_return(result_count);
                 } else if let Some(block) = c.block_stack.pop() {
                     if block.kind == BlockKind::If {
-                        // At End of if/else block: else-branch values are
-                        // on the vstack. Flush them, define the merge label,
-                        // then reload results from the physical stack.
                         let branch_results = c.vstack.len() - block.vstack_depth;
                         c.flush_vstack_above(block.vstack_depth);
+                        // Flush dirty locals before the merge label —
+                        // the other path (BrIfZero skip) may have
+                        // different register state.
+                        c.flush_dirty_locals();
                         c.emit(IrInst::DefLabel { label: block.label });
+                        c.invalidate_locals();
                         if branch_results > 0 {
                             c.reload_from_stack(branch_results);
                         }
                     } else {
                         c.emit(IrInst::DefLabel { label: block.label });
+                        // Block/loop end — conservative invalidation.
+                        c.invalidate_locals();
                     }
                 }
             }
 
             OpCode::Br => {
+                // Only flush fuel (consume+check) for loop back-edges.
+                let stack_idx = c
+                    .block_stack
+                    .iter()
+                    .rposition(|b| b.block_idx == imm)
+                    .expect("branch target not on block stack");
+                if c.block_stack[stack_idx].kind == BlockKind::Loop {
+                    c.flush_fuel();
+                }
                 c.emit_br(imm);
             }
 
             OpCode::BrIf => {
                 let cond_vreg = c.vpop();
+                // Don't flush fuel here — FuelCheck before a conditional
+                // branch would break Cmp+BrIfZero fusion. The accumulated
+                // cost carries into whichever branch is taken and gets
+                // flushed at the next unconditional boundary.
                 let skip_label = c.fresh_label();
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
                     label: skip_label,
                 });
                 c.emit_br(imm);
+                // Skip label has one incoming edge — the fall-through
+                // where BrIfZero didn't branch. Cache is still valid.
                 c.emit(IrInst::DefLabel { label: skip_label });
             }
 
@@ -366,16 +514,14 @@ pub(crate) fn compile_with(
                 let callee = &all_funcs[imm as usize];
                 let param_count = callee.param_count;
                 let has_result = callee.result_count > 0;
-                // Pop args from vstack (in reverse, then reverse back).
                 let mut args = Vec::with_capacity(param_count);
                 for _ in 0..param_count {
                     args.push(c.vpop());
                 }
                 args.reverse();
-                // Spill any remaining vstack values to frame slots so they
-                // survive the call (scratch registers are clobbered).
                 let spill_count = c.vstack.len();
                 c.flush_vstack_above(0);
+                c.flush_fuel();
                 let result = if has_result {
                     Some(c.fresh_vreg())
                 } else {
@@ -388,6 +534,7 @@ pub(crate) fn compile_with(
                     result,
                     frame_advance,
                 });
+                c.invalidate_locals();
                 // Reload spilled values back onto vstack.
                 if spill_count > 0 {
                     c.reload_from_stack(spill_count);
@@ -414,11 +561,15 @@ pub(crate) fn compile_with(
                 let local_idx = op.imm_u8_a() as u32;
                 let konst = op.imm_i16_hi() as i32;
                 c.emit_local_get(local_idx);
-                c.emit_i32_const(konst);
-                let rhs = c.vpop();
                 let lhs = c.vpop();
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Sub { dst, lhs, rhs });
+                if konst >= 0 && konst < 4096 {
+                    c.emit(IrInst::SubImm { dst, lhs, imm: konst as u16 });
+                } else {
+                    c.emit_i32_const(konst);
+                    let rhs = c.vpop();
+                    c.emit(IrInst::Sub { dst, lhs, rhs });
+                }
                 c.vpush(dst);
             }
 
@@ -426,17 +577,22 @@ pub(crate) fn compile_with(
                 let local_idx = op.imm_u8_a() as u32;
                 let konst = op.imm_i16_hi() as i32;
                 c.emit_local_get(local_idx);
-                c.emit_i32_const(konst);
-                let rhs = c.vpop();
                 let lhs = c.vpop();
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Add { dst, lhs, rhs });
+                if konst >= 0 && konst < 4096 {
+                    c.emit(IrInst::AddImm { dst, lhs, imm: konst as u16 });
+                } else {
+                    c.emit_i32_const(konst);
+                    let rhs = c.vpop();
+                    c.emit(IrInst::Add { dst, lhs, rhs });
+                }
                 c.vpush(dst);
             }
 
             OpCode::LocalGetReturn => {
                 let local_idx = op.imm_u8_a() as u32;
                 c.emit_local_get(local_idx);
+                c.flush_fuel_consume_only();
                 c.emit_return(result_count);
             }
 
@@ -446,23 +602,32 @@ pub(crate) fn compile_with(
                 let block_idx = op.imm_u8_c() as u32;
 
                 c.emit_local_get(local_idx);
-                c.emit_i32_const(konst);
-                let rhs = c.vpop();
                 let lhs = c.vpop();
                 let cmp_dst = c.fresh_vreg();
-                c.emit(IrInst::Cmp {
-                    dst: cmp_dst,
-                    lhs,
-                    rhs,
-                    cond: IrCond::LeS,
-                });
+                if konst >= 0 && konst < 4096 {
+                    c.emit(IrInst::CmpImm {
+                        dst: cmp_dst,
+                        lhs,
+                        imm: konst as u16,
+                        cond: IrCond::LeS,
+                    });
+                } else {
+                    c.emit_i32_const(konst);
+                    let rhs = c.vpop();
+                    c.emit(IrInst::Cmp {
+                        dst: cmp_dst,
+                        lhs,
+                        rhs,
+                        cond: IrCond::LeS,
+                    });
+                }
 
+                // Don't flush fuel before conditional branch — same reason as If/BrIf.
                 let label = c.fresh_label();
                 c.emit(IrInst::BrIfZero {
                     cond: cmp_dst,
                     label,
                 });
-                // Flush AFTER BrIfZero so Cmp+BrIfZero stay adjacent.
                 c.block_stack.push(OpenBlock {
                     block_idx,
                     kind: blocks[block_idx as usize].kind,
@@ -482,9 +647,9 @@ pub(crate) fn compile_with(
                     args.push(c.vpop());
                 }
                 args.reverse();
-                // Spill remaining vstack values across the call.
                 let spill_count = c.vstack.len();
                 c.flush_vstack_above(0);
+                c.flush_fuel();
                 let result = if has_result {
                     Some(c.fresh_vreg())
                 } else {
@@ -497,15 +662,15 @@ pub(crate) fn compile_with(
                     result,
                     frame_advance,
                 });
+                c.invalidate_locals();
                 // Reload spilled values back onto vstack.
                 if spill_count > 0 {
                     c.reload_from_stack(spill_count);
                 }
                 if let Some(r) = result {
-                    c.emit(IrInst::LocalSet {
-                        idx: local_idx,
-                        src: r,
-                    });
+                    // Use local promotion — track in register, defer store.
+                    c.local_vreg[local_idx as usize] = Some(r);
+                    c.frame_dirty[local_idx as usize] = true;
                 }
             }
 
@@ -515,19 +680,13 @@ pub(crate) fn compile_with(
 
                 c.emit_local_get(local_idx);
                 let val = c.vpop();
-                let zero = c.fresh_vreg();
-                c.emit(IrInst::IConst { dst: zero, val: 0 });
-                let cmp_dst = c.fresh_vreg();
-                c.emit(IrInst::Cmp {
-                    dst: cmp_dst,
-                    lhs: val,
-                    rhs: zero,
-                    cond: IrCond::Eq,
-                });
 
+                // eqz(val) is 1 when val==0, 0 when val!=0.
+                // BrIfZero on eqz(val) branches when val!=0.
+                // Equivalent to BrIfNonZero(val) — lowers to cbnz.
                 let label = c.fresh_label();
-                c.emit(IrInst::BrIfZero {
-                    cond: cmp_dst,
+                c.emit(IrInst::BrIfNonZero {
+                    cond: val,
                     label,
                 });
                 c.block_stack.push(OpenBlock {
@@ -543,24 +702,60 @@ pub(crate) fn compile_with(
             }
         }
 
-        if emit_fuel {
-            let cost = opcode.fuel_cost();
-            let last_is_terminator = c
-                .insts
-                .last()
-                .is_some_and(|i| matches!(i, IrInst::Return { .. } | IrInst::Trap));
-            if cost > 0 && !last_is_terminator {
-                c.emit(IrInst::FuelCheck { cost });
-            }
-        }
     }
 
-    IrFunction {
+    let mut ir = IrFunction {
         insts: c.insts,
+        source_ops: c.source_ops,
         param_count: func.param_count as u32,
         total_local_count: func.locals.len() as u32,
         max_operand_depth: c.max_vstack_depth as u32,
         result_count: func.result_count,
+    };
+
+    eliminate_dead_load_store_pairs(&mut ir);
+
+    ir
+}
+
+/// Remove redundant FrameLoad+FrameStore pairs where a value is loaded
+/// from a slot and immediately stored back to the same slot.
+///
+/// This pattern arises at call boundaries: `flush_vstack_above` spills
+/// values, `reload_from_stack` reloads them, and a subsequent flush
+/// stores them right back. The reload+re-store is a no-op.
+fn eliminate_dead_load_store_pairs(ir: &mut IrFunction) {
+    let len = ir.insts.len();
+    if len < 2 {
+        return;
+    }
+
+    let mut remove = vec![false; len];
+
+    for i in 0..len - 1 {
+        if let (
+            IrInst::FrameLoad { dst, slot: load_slot },
+            IrInst::FrameStore { slot: store_slot, src },
+        ) = (&ir.insts[i], &ir.insts[i + 1])
+        {
+            if load_slot == store_slot && dst == src {
+                remove[i] = true;
+                remove[i + 1] = true;
+            }
+        }
+    }
+
+    if remove.iter().any(|&r| r) {
+        let mut new_insts = Vec::with_capacity(len);
+        let mut new_source_ops = Vec::with_capacity(len);
+        for i in 0..len {
+            if !remove[i] {
+                new_insts.push(ir.insts[i].clone());
+                new_source_ops.push(ir.source_ops[i]);
+            }
+        }
+        ir.insts = new_insts;
+        ir.source_ops = new_source_ops;
     }
 }
 
@@ -616,7 +811,7 @@ mod tests {
         let ir = compile_wat_ir(r#"(module (func (param i32) (result i32) (local.get 0)))"#);
         let text = format!("{ir}");
         eprintln!("{text}");
-        assert!(text.contains("local.get 0"));
+        assert!(text.contains("param 0"));
         assert!(text.contains("return"));
     }
 

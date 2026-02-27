@@ -4,7 +4,6 @@ use crate::stack::Stack;
 use crate::{Instance, Val, parse::func::FuncIdx};
 
 mod exec_recursive;
-mod exec_stack;
 
 pub(crate) fn call(
     instance: &mut Instance,

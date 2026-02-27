@@ -80,7 +80,7 @@ fn main() {
     let n: i32 = std::env::args()
         .nth(2)
         .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
+        .unwrap_or(10);
 
     let wasm_bytes = wat::parse_str(ACK_WAT).expect("failed to parse WAT");
 
@@ -154,28 +154,25 @@ fn main() {
     let expected = ack_native(m, n);
 
     // Try interpreter (may fail with stack overflow for large inputs).
-    let interp_ms = match interp_instance.call_dynamic(
-        &mut interp_store,
-        "ack",
-        &[Val::I32(m), Val::I32(n)],
-    ) {
-        Ok(_r) => {
-            let (_, ms) = bench(|| {
-                let r = interp_instance
-                    .call_dynamic(&mut interp_store, "ack", &[Val::I32(m), Val::I32(n)])
-                    .unwrap();
-                match r[0] {
-                    Val::I32(v) => v,
-                    _ => panic!("expected i32"),
-                }
-            });
-            ms
-        }
-        Err(_) => {
-            eprintln!("note: interpreter stack too small for ack({m}, {n}), skipping");
-            0.0
-        }
-    };
+    let interp_ms =
+        match interp_instance.call_dynamic(&mut interp_store, "ack", &[Val::I32(m), Val::I32(n)]) {
+            Ok(_r) => {
+                let (_, ms) = bench(|| {
+                    let r = interp_instance
+                        .call_dynamic(&mut interp_store, "ack", &[Val::I32(m), Val::I32(n)])
+                        .unwrap();
+                    match r[0] {
+                        Val::I32(v) => v,
+                        _ => panic!("expected i32"),
+                    }
+                });
+                ms
+            }
+            Err(_) => {
+                eprintln!("note: interpreter stack too small for ack({m}, {n}), skipping");
+                0.0
+            }
+        };
 
     let run = |name: &'static str, mut f: Box<dyn FnMut() -> i32>| -> BenchResult {
         let (result, ms) = bench(|| f());
@@ -191,7 +188,11 @@ fn main() {
 
     let jit_nf_result = run(
         "wust jit (no fuel)",
-        Box::new(|| jit_no_fuel.call(&mut jit_nf_instance, "ack", (m, n)).unwrap()),
+        Box::new(|| {
+            jit_no_fuel
+                .call(&mut jit_nf_instance, "ack", (m, n))
+                .unwrap()
+        }),
     );
 
     let results = vec![

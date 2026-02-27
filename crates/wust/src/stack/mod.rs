@@ -38,7 +38,6 @@ pub(crate) struct Stack {
     mmap_base: *mut u8,
     mmap_size: usize,
     base: *mut u8,
-    size: usize,
     /// Stack pointer offset from `base`, in bytes. Grows upward.
     sp: usize,
 }
@@ -76,7 +75,6 @@ impl Stack {
                 mmap_base: ptr as *mut u8,
                 mmap_size: total_size,
                 base: usable_ptr,
-                size: usable_size,
                 sp: 0,
             })
         }
@@ -139,21 +137,10 @@ impl Stack {
         self.push_u64(val.to_bits());
     }
 
-    #[inline(always)]
-    pub(crate) fn pop_f64(&mut self) -> f64 {
-        f64::from_bits(self.pop_u64())
-    }
-
     /// Base pointer of the usable stack region.
     #[inline(always)]
     pub(crate) fn base(&self) -> *mut u8 {
         self.base
-    }
-
-    /// Raw mutable pointer at a byte offset from base.
-    #[inline(always)]
-    pub(crate) fn ptr_at_mut(&mut self, offset: usize) -> *mut u8 {
-        unsafe { self.base.add(offset) }
     }
 
     // --- Random access by byte offset (for locals, result slots) ---

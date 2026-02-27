@@ -7,17 +7,12 @@
 #[repr(transparent)]
 pub struct Reg(pub u8);
 
-#[allow(dead_code)]
 impl Reg {
     pub const W0: Reg = Reg(0);
     pub const W1: Reg = Reg(1);
     pub const W2: Reg = Reg(2);
     pub const W9: Reg = Reg(9);
-    pub const W10: Reg = Reg(10);
-    pub const W11: Reg = Reg(11);
-    pub const W12: Reg = Reg(12);
     pub const X0: Reg = Reg(0);
-    pub const X1: Reg = Reg(1);
     pub const X9: Reg = Reg(9);
     pub const X10: Reg = Reg(10);
     pub const X20: Reg = Reg(20);
@@ -31,7 +26,6 @@ impl Reg {
 /// Condition codes for conditional branches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-#[allow(dead_code)]
 pub enum Cond {
     EQ = 0b0000,
     NE = 0b0001,
@@ -65,7 +59,7 @@ impl Cond {
 #[derive(Debug, Clone, Copy)]
 pub struct PatchPoint {
     /// Index into the `code` vec (in u32 words).
-    pub index: usize,
+    pub(crate) index: usize,
 }
 
 /// Low-level aarch64 instruction encoder.
@@ -74,9 +68,9 @@ pub struct PatchPoint {
 /// (compiler.rs) decides *what* to emit; this struct only knows *how*
 /// to encode each instruction form.
 pub struct Emitter {
-    pub code: Vec<u32>,
+    pub(crate) code: Vec<u32>,
     /// Word offsets recorded by `mark()` — one per logical boundary.
-    pub markers: Vec<usize>,
+    pub(crate) markers: Vec<usize>,
 }
 
 impl Emitter {
@@ -102,6 +96,11 @@ impl Emitter {
         &self.code
     }
 
+    /// Access the recorded boundary markers.
+    pub fn markers(&self) -> &[usize] {
+        &self.markers
+    }
+
     // ---- Arithmetic (register) ----
 
     /// `ADD Wd, Wn, Wm` — 32-bit register add.
@@ -123,31 +122,22 @@ impl Emitter {
         self.code.push(inst);
     }
 
-    /// `SUB Xd, Xn, Xm` — 64-bit register sub.
-    pub fn sub_x(&mut self, rd: Reg, rn: Reg, rm: Reg) {
-        let inst = 0xCB000000
-            | (rm.0 as u32 & 0x1F) << 16
-            | (rn.0 as u32 & 0x1F) << 5
-            | (rd.0 as u32 & 0x1F);
-        self.code.push(inst);
-    }
-
     // ---- Arithmetic (immediate) ----
 
-    /// `ADD Wd, Wn, #imm12` — 32-bit immediate add.
-    pub fn add_w_imm(&mut self, rd: Reg, rn: Reg, imm: u16) {
+    /// `ADD Xd, Xn, #imm12` — 64-bit immediate add.
+    pub fn add_x_imm(&mut self, rd: Reg, rn: Reg, imm: u16) {
         debug_assert!(imm < 4096);
-        let inst = 0x11000000
+        let inst = 0x91000000
             | (imm as u32 & 0xFFF) << 10
             | (rn.0 as u32 & 0x1F) << 5
             | (rd.0 as u32 & 0x1F);
         self.code.push(inst);
     }
 
-    /// `ADD Xd, Xn, #imm12` — 64-bit immediate add.
-    pub fn add_x_imm(&mut self, rd: Reg, rn: Reg, imm: u16) {
+    /// `ADD Wd, Wn, #imm12` — 32-bit immediate add.
+    pub fn add_w_imm(&mut self, rd: Reg, rn: Reg, imm: u16) {
         debug_assert!(imm < 4096);
-        let inst = 0x91000000
+        let inst = 0x11000000
             | (imm as u32 & 0xFFF) << 10
             | (rn.0 as u32 & 0x1F) << 5
             | (rd.0 as u32 & 0x1F);
@@ -189,6 +179,14 @@ impl Emitter {
         debug_assert!(imm < 4096);
         // sf=0, op=1, S=1 → 0x71, Rd=WZR(31)
         let inst = 0x71000000 | (imm as u32 & 0xFFF) << 10 | (rn.0 as u32 & 0x1F) << 5 | 31; // Rd = WZR
+        self.code.push(inst);
+    }
+
+    /// `CMP Xn, #imm12` — alias for `SUBS XZR, Xn, #imm12`.
+    pub fn cmp_x_imm(&mut self, rn: Reg, imm: u16) {
+        debug_assert!(imm < 4096);
+        // sf=1, op=1, S=1 → 0xF1, Rd=XZR(31)
+        let inst = 0xF1000000 | (imm as u32 & 0xFFF) << 10 | (rn.0 as u32 & 0x1F) << 5 | 31;
         self.code.push(inst);
     }
 
@@ -352,13 +350,6 @@ impl Emitter {
         self.code.push(inst);
     }
 
-    /// `LDR Wt, [Xn, #simm9]` — load 32-bit, unscaled signed offset.
-    pub fn ldur_w(&mut self, rt: Reg, rn: Reg, offset: i16) {
-        let imm9 = (offset as u32) & 0x1FF;
-        let inst = 0xB8400000 | imm9 << 12 | (rn.0 as u32 & 0x1F) << 5 | (rt.0 as u32 & 0x1F);
-        self.code.push(inst);
-    }
-
     // ---- Branches ----
 
     /// `B <label>` — unconditional branch. Returns a PatchPoint for the target.
@@ -430,15 +421,6 @@ impl Emitter {
         pp
     }
 
-    /// `BL <label>` — branch with link (call). Returns a PatchPoint.
-    pub fn bl(&mut self) -> PatchPoint {
-        let pp = PatchPoint {
-            index: self.code.len(),
-        };
-        self.code.push(0x94000000); // placeholder, imm26 = 0
-        pp
-    }
-
     /// `BL <offset>` — branch with link (call), known word offset.
     pub fn bl_offset(&mut self, word_offset: i32) {
         let imm26 = (word_offset as u32) & 0x03FF_FFFF;
@@ -449,6 +431,31 @@ impl Emitter {
     pub fn blr(&mut self, rn: Reg) {
         let inst = 0xD63F0000 | ((rn.0 as u32 & 0x1F) << 5);
         self.code.push(inst);
+    }
+
+    /// `BRK #imm16` — breakpoint.
+    pub fn brk(&mut self, imm16: u16) {
+        self.code.push(0xD4200000 | ((imm16 as u32) << 5));
+    }
+
+    /// `MOVK Wd, #imm16, LSL #shift` — move with keep (16-bit immediate).
+    pub fn movk_w(&mut self, rd: Reg, imm16: u16, shift: u8) {
+        debug_assert!(shift == 0 || shift == 16);
+        let hw = (shift / 16) as u32;
+        self.code
+            .push(0x72800000 | (hw << 21) | ((imm16 as u32) << 5) | (rd.0 as u32 & 0x1F));
+    }
+
+    /// `CBZ Wt, <word_offset>` — compare and branch if zero, known offset.
+    pub fn cbz_w_offset(&mut self, rt: Reg, word_offset: i32) {
+        let imm19 = ((word_offset as u32) & 0x7FFFF) << 5;
+        self.code.push(0x34000000 | imm19 | (rt.0 as u32 & 0x1F));
+    }
+
+    /// `CBNZ Wt, <word_offset>` — compare and branch if nonzero, known offset.
+    pub fn cbnz_w_offset(&mut self, rt: Reg, word_offset: i32) {
+        let imm19 = ((word_offset as u32) & 0x7FFFF) << 5;
+        self.code.push(0x35000000 | imm19 | (rt.0 as u32 & 0x1F));
     }
 
     /// `RET` — return (branch to X30).

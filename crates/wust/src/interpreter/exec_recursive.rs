@@ -14,7 +14,7 @@ pub(crate) enum Trap {
 }
 
 /// Maximum call depth before trapping with `CallStackExhausted`.
-const MAX_CALL_DEPTH: u32 = 1000;
+const MAX_CALL_DEPTH: u32 = 10_000;
 
 impl std::fmt::Display for Trap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
