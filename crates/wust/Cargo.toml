@@ -17,6 +17,10 @@ wast = "245"
 wat = "1"
 wasmtime = { version = "41", features = ["pulley"] }
 
+[[test]]
+name = "spec_tests"
+harness = false
+
 [[example]]
 name = "bench_fib"
 

@@ -1,6 +1,42 @@
+//! WebAssembly spec test runner.
+//!
+//! Runs the official WebAssembly spec `.wast` test files against the wust
+//! engine. Auto-discovers all `.wast` files in `tests/spec/test/core/`.
+//!
+//! # Commands
+//!
+//! Run all spec tests (overview mode):
+//!   cargo test -p wust --test spec_tests
+//!
+//! Run a single spec test (detailed dot grid):
+//!   cargo test -p wust --test spec_tests -- i32
+//!
+//! Force detailed mode for multiple tests:
+//!   cargo test -p wust --test spec_tests -- f32 --expand
+//!
+//! Filter with exact match:
+//!   cargo test -p wust --test spec_tests -- i32 --exact
+//!
+//! Skip tests matching a pattern:
+//!   cargo test -p wust --test spec_tests -- --skip f32
+//!
+//! List discovered tests:
+//!   cargo test -p wust --test spec_tests -- --list
+
+mod harness;
+
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
+use std::time::Instant;
+use harness::{
+    DirectiveResult, TestResult,
+    discover_test_files, matches_filter, parse_cli_args,
+    print_subprocess_results, render_dot_grid, render_overview,
+    run_test_subprocess, DIM, RESET,
+};
 use wust::{Engine, Instance, Linker, Module, Store, Val};
+
+// --- Spec runner ---
 
 struct SpecRunner {
     engine: Engine,
@@ -231,16 +267,8 @@ fn val_matches(got: &Val, expected: &Expected) -> bool {
     }
 }
 
-// --- Test harness ---
+// --- Wast-specific labels ---
 
-struct DirectiveResult {
-    index: usize,
-    passed: bool,
-    label: String,
-    error: Option<String>,
-}
-
-/// Extract a short label describing the directive type.
 fn directive_label(d: &wast::WastDirective) -> String {
     match d {
         wast::WastDirective::Module(_) => "module".into(),
@@ -270,254 +298,87 @@ fn execute_label(exec: &wast::WastExecute) -> String {
     }
 }
 
-fn run_spec_test(name: &str) {
-    let path = Path::new("tests/spec/test/core").join(format!("{name}.wast"));
-    assert!(path.exists(), "spec test not found: {}", path.display());
+// --- Entry points ---
+
+/// Run a single test in-process and return its result.
+fn run_test_inproc(name: &str, path: &Path) -> TestResult {
     let mut runner = SpecRunner::new();
-    let results = runner.run_wast(&path);
-    let output = render_dot_grid(name, &results);
-    println!("\n{output}");
-    let failed = results.iter().filter(|r| !r.passed).count();
-    assert!(failed == 0, "{failed} of {} assertions failed", results.len());
+    let directives = runner.run_wast(path);
+    TestResult {
+        name: name.to_string(),
+        directives,
+        crashed: false,
+    }
 }
 
-// ANSI color codes.
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const GREEN: &str = "\x1b[1;32m";
-const RED: &str = "\x1b[1;31m";
-const RESET: &str = "\x1b[0m";
-const BG_GREEN: &str = "\x1b[1;42;30m";
-const BG_RED: &str = "\x1b[1;41;30m";
+/// Child process entry point: run a single .wast file and print results
+/// using the subprocess protocol.
+fn child_run(_name: &str, path: &Path) -> ! {
+    let mut runner = SpecRunner::new();
+    let results = runner.run_wast(path);
+    print_subprocess_results(&results);
+    let failed = results.iter().filter(|r| !r.passed).count();
+    std::process::exit(if failed > 0 { 1 } else { 0 });
+}
 
-/// Render a boxed dot grid showing per-directive pass/fail with error details.
-fn render_dot_grid(name: &str, results: &[DirectiveResult]) -> String {
-    let total = results.len();
-    let passed = results.iter().filter(|r| r.passed).count();
-    let failed = total - passed;
-    let pct = if total > 0 {
-        passed as f64 / total as f64 * 100.0
-    } else {
-        100.0
-    };
+fn main() {
+    // Internal subcommand: run a single test in a child process.
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() >= 4 && raw_args[1] == "--__run" {
+        child_run(&raw_args[2], Path::new(&raw_args[3]));
+    }
 
-    let cols = 60;
-    let header_text = format!("{name}: {passed}/{total} passed ({pct:.1}%)");
-    let header = format!("{BOLD}{header_text}{RESET}");
-    let inner_width = 80.max(header_text.len());
-
-    // Collect failure lines, truncating to fit the box.
-    let max_errors = 10;
-    let failures: Vec<String> = results
-        .iter()
-        .filter(|r| !r.passed)
-        .take(max_errors)
-        .map(|r| {
-            let err = r.error.as_deref().unwrap_or("unknown");
-            let line = format!("#{}: {} - {err}", r.index + 1, r.label);
-            if line.chars().count() > inner_width {
-                let truncated: String = line.chars().take(inner_width - 1).collect();
-                format!("{truncated}…")
-            } else {
-                line
-            }
+    let cli = parse_cli_args();
+    let spec_dir = Path::new("tests/spec/test/core");
+    let files = discover_test_files(spec_dir, "wast");
+    let matched: Vec<_> = files
+        .into_iter()
+        .filter(|(name, _)| {
+            matches_filter(name, cli.filter.as_deref(), cli.exact, &cli.skip)
         })
         .collect();
-    let remaining_failures = failed.saturating_sub(max_errors);
 
-    let pad_line = |content: &str, display_width: usize| -> String {
-        let pad = inner_width.saturating_sub(display_width);
-        format!("│ {content}{} │", " ".repeat(pad))
-    };
+    if cli.list {
+        for (name, _) in &matched {
+            println!("{name}");
+        }
+        return;
+    }
 
-    let border = |left: char, right: char| -> String {
-        format!("{left}{}{right}", "─".repeat(inner_width + 2))
-    };
+    if matched.is_empty() {
+        println!("No tests matched filter.");
+        return;
+    }
 
-    let mut out = String::new();
-    out.push_str(&border('┌', '┐'));
-    out.push('\n');
-    out.push_str(&pad_line(&header, header_text.len()));
-    out.push('\n');
-    out.push_str(&border('├', '┤'));
-    out.push('\n');
+    let detailed = cli.expand || matched.len() <= 1;
+    let start = Instant::now();
 
-    // Dot grid with colored dots.
-    for chunk in results.chunks(cols) {
-        let mut row = String::new();
-        for r in chunk {
-            if r.passed {
-                row.push_str(&format!("{GREEN}●{RESET}"));
-            } else {
-                row.push_str(&format!("{RED}○{RESET}"));
+    if detailed {
+        let mut any_failed = false;
+        for (name, path) in &matched {
+            let result = run_test_inproc(name, path);
+            println!("\n{}", render_dot_grid(&result.name, &result.directives));
+            if result.is_fail() {
+                any_failed = true;
             }
         }
-        out.push_str(&pad_line(&row, chunk.len()));
-        out.push('\n');
-    }
-
-    // Progress bar.
-    out.push_str(&border('├', '┤'));
-    out.push('\n');
-    let bar_width = inner_width;
-    let green_width = if total > 0 {
-        (passed * bar_width + total / 2) / total
-    } else {
-        bar_width
-    };
-    let red_width = bar_width - green_width;
-    let pass_label = format!(" {passed} passed ");
-    let fail_label = format!(" {failed} failed ");
-
-    let green_bar = if green_width >= pass_label.len() {
-        format!("{BG_GREEN}{:^width$}{RESET}", pass_label, width = green_width)
-    } else if green_width > 0 {
-        format!("{BG_GREEN}{:width$}{RESET}", "", width = green_width)
-    } else {
-        String::new()
-    };
-    let red_bar = if red_width >= fail_label.len() {
-        format!("{BG_RED}{:^width$}{RESET}", fail_label, width = red_width)
-    } else if red_width > 0 {
-        format!("{BG_RED}{:width$}{RESET}", "", width = red_width)
-    } else {
-        String::new()
-    };
-
-    out.push_str(&pad_line(
-        &format!("{green_bar}{red_bar}"),
-        bar_width,
-    ));
-    out.push('\n');
-
-    // Error details.
-    if !failures.is_empty() {
-        out.push_str(&border('├', '┤'));
-        out.push('\n');
-        for line in &failures {
-            let colored = format!("{RED}{line}{RESET}");
-            out.push_str(&pad_line(&colored, line.len()));
-            out.push('\n');
+        let elapsed = start.elapsed();
+        println!("\n{DIM}Finished in {:.2}s{RESET}", elapsed.as_secs_f64());
+        if any_failed {
+            std::process::exit(1);
         }
-        if remaining_failures > 0 {
-            let more = format!("... and {remaining_failures} more");
-            let colored = format!("{DIM}{more}{RESET}");
-            out.push_str(&pad_line(&colored, more.len()));
-            out.push('\n');
+    } else {
+        let results: Vec<TestResult> = matched
+            .iter()
+            .map(|(name, path)| run_test_subprocess(name, path))
+            .collect();
+
+        let any_failed = results.iter().any(|r| r.is_fail());
+        println!("\n{}", render_overview("Spec Tests", &results));
+        let elapsed = start.elapsed();
+        println!("\n{DIM}Finished in {:.2}s{RESET}", elapsed.as_secs_f64());
+        if any_failed {
+            std::process::exit(1);
         }
     }
-
-    out.push_str(&border('└', '┘'));
-    out
 }
-
-macro_rules! spec_tests {
-    ($($name:ident => $file:expr),* $(,)?) => {
-        $( #[test] fn $name() { run_spec_test($file); } )*
-    };
-    (ignored: $($name:ident => $file:expr),* $(,)?) => {
-        $( #[test] #[ignore] fn $name() { run_spec_test($file); } )*
-    };
-}
-
-spec_tests! {
-    spec_address => "address",
-    spec_align => "align",
-    spec_block => "block",
-    spec_br => "br",
-    spec_br_if => "br_if",
-    spec_br_table => "br_table",
-    spec_call => "call",
-    spec_call_indirect => "call_indirect",
-    spec_comments => "comments",
-    spec_const_ => "const",
-    spec_conversions => "conversions",
-    spec_custom => "custom",
-    spec_data => "data",
-    spec_elem => "elem",
-    spec_endianness => "endianness",
-    spec_exports => "exports",
-    spec_f32 => "f32",
-    spec_f32_bitwise => "f32_bitwise",
-    spec_f32_cmp => "f32_cmp",
-    spec_f64 => "f64",
-    spec_f64_bitwise => "f64_bitwise",
-    spec_f64_cmp => "f64_cmp",
-    spec_fac => "fac",
-    spec_float_exprs => "float_exprs",
-    spec_float_literals => "float_literals",
-    spec_float_memory => "float_memory",
-    spec_float_misc => "float_misc",
-    spec_forward => "forward",
-    spec_func => "func",
-    spec_func_ptrs => "func_ptrs",
-    spec_global => "global",
-    spec_i32 => "i32",
-    spec_i64 => "i64",
-    spec_if_ => "if",
-    spec_int_exprs => "int_exprs",
-    spec_int_literals => "int_literals",
-    spec_labels => "labels",
-    spec_left_to_right => "left-to-right",
-    spec_load => "load",
-    spec_local_get => "local_get",
-    spec_local_set => "local_set",
-    spec_local_tee => "local_tee",
-    spec_loop_ => "loop",
-    spec_memory => "memory",
-    spec_memory_grow => "memory_grow",
-    spec_memory_size => "memory_size",
-    spec_memory_redundancy => "memory_redundancy",
-    spec_memory_trap => "memory_trap",
-    spec_nop => "nop",
-    spec_return_ => "return",
-    spec_select => "select",
-    spec_stack => "stack",
-    spec_start => "start",
-    spec_store_ => "store",
-    spec_switch => "switch",
-    spec_table => "table",
-    spec_table_get => "table_get",
-    spec_table_grow => "table_grow",
-    spec_table_set => "table_set",
-    spec_table_size => "table_size",
-    spec_token => "token",
-    spec_traps => "traps",
-    spec_type_ => "type",
-    spec_type_canon => "type-canon",
-    spec_unreachable => "unreachable",
-    spec_unreached_invalid => "unreached-invalid",
-    spec_unreached_valid => "unreached-valid",
-    spec_unwind => "unwind",
-    spec_annotations => "annotations",
-    spec_binary => "binary",
-    spec_binary_leb128 => "binary-leb128",
-    spec_id => "id",
-    spec_inline_module => "inline-module",
-    spec_local_init => "local_init",
-    spec_obsolete_keywords => "obsolete-keywords",
-    spec_ref_ => "ref",
-    spec_ref_func => "ref_func",
-    spec_ref_is_null => "ref_is_null",
-    spec_ref_null => "ref_null",
-    spec_utf8_custom_section_id => "utf8-custom-section-id",
-    spec_utf8_import_field => "utf8-import-field",
-    spec_utf8_import_module => "utf8-import-module",
-    spec_utf8_invalid_encoding => "utf8-invalid-encoding",
-    spec_imports => "imports",
-    spec_instance => "instance",
-    spec_linking => "linking",
-    spec_names => "names",
-    spec_br_on_non_null => "br_on_non_null",
-    spec_br_on_null => "br_on_null",
-    spec_call_ref => "call_ref",
-    spec_ref_as_non_null => "ref_as_non_null",
-    spec_return_call => "return_call",
-    spec_return_call_indirect => "return_call_indirect",
-    spec_return_call_ref => "return_call_ref",
-    spec_type_equivalence => "type-equivalence",
-    spec_type_rec => "type-rec",
-}
-
-// spec_tests! { ignored:
-// }
