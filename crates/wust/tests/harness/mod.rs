@@ -177,9 +177,9 @@ pub fn discover_test_files(dir: &Path, extension: &str) -> Vec<(String, PathBuf)
 
 /// Run a test in a child process with a timeout.
 ///
-/// Like `run_test_subprocess`, but uses `spawn()` + polling so we can
-/// kill the child if it exceeds `timeout`. Returns `timed_out: true`
-/// when the child is killed.
+/// Spawns the child, drains stdout on a background thread (to prevent
+/// pipe-buffer deadlocks when the child produces large output), and
+/// polls `try_wait` for completion or timeout.
 pub fn run_test_subprocess_timed(name: &str, path: &Path, timeout: Duration) -> TestResult {
     let exe = std::env::current_exe().expect("failed to get current exe");
     let start = Instant::now();
@@ -192,15 +192,23 @@ pub fn run_test_subprocess_timed(name: &str, path: &Path, timeout: Duration) -> 
         .spawn()
         .expect("failed to spawn child process");
 
+    // Drain stdout on a background thread so the pipe buffer never fills
+    // up and blocks the child. Without this, tests producing >64KB of
+    // output (e.g. 2400+ failing assertions) would deadlock.
+    let stdout = child.stdout.take().expect("stdout was piped");
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        let mut stdout = stdout;
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let elapsed = start.elapsed();
-                let mut stdout_buf = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = stdout.read_to_string(&mut stdout_buf);
-                }
+                let stdout_buf = reader.join().unwrap_or_default();
                 if !status.success() && stdout_buf.is_empty() {
                     return TestResult {
                         name: name.to_string(),
@@ -223,6 +231,8 @@ pub fn run_test_subprocess_timed(name: &str, path: &Path, timeout: Duration) -> 
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Reader thread will see EOF after kill.
+                    let _ = reader.join();
                     return TestResult {
                         name: name.to_string(),
                         directives: vec![],
@@ -234,6 +244,7 @@ pub fn run_test_subprocess_timed(name: &str, path: &Path, timeout: Duration) -> 
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(_) => {
+                let _ = reader.join();
                 return TestResult {
                     name: name.to_string(),
                     directives: vec![],
@@ -710,14 +721,14 @@ pub struct TestEntry {
 }
 
 // Table column widths for entry rows.
-const STATS_COL: usize = 7; // fits "TIMEOUT", "CRASHED", "176/176"
+const STATS_COL: usize = 9; // fits "TIMEOUT", "CRASHED", "2514/2514"
 const TIME_COL: usize = 5;  // fits "99.9s"
 
 /// Compute the bar width for a given available width and name width.
 fn bar_width_for(avail_width: usize, name_width: usize) -> usize {
     // Layout: " X name  bar  stats  time"
-    //          1 1 1nw 2    2  7   2  5  = nw + 21
-    avail_width.saturating_sub(name_width + 21).max(10)
+    //          1 1 1nw 2    2  9   2  5  = nw + 23
+    avail_width.saturating_sub(name_width + 23).max(10)
 }
 
 /// Render a single entry row with table-aligned columns.
