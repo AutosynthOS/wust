@@ -1,30 +1,12 @@
-//! Reusable test harness with colored output, progress bars, and subprocess
-//! isolation for crash safety.
+//! Reusable test harness with parallel execution, subprocess isolation,
+//! live TUI output, and colored progress bars.
 //!
-//! # Usage
+//! See `tests/harness/HARNESS.md` for full documentation: CLI flags,
+//! display modes, subprocess protocol, and API reference.
 //!
-//! Any `[[test]] harness = false` binary can use this module by adding
-//! `mod harness;` and calling the rendering / CLI helpers.
-//!
-//! # Common commands
-//!
-//! Run all spec tests (overview mode):
-//!   cargo test -p wust --test spec_tests
-//!
-//! Run a single spec test (detailed dot grid):
-//!   cargo test -p wust --test spec_tests -- i32
-//!
-//! Force detailed mode for multiple tests:
-//!   cargo test -p wust --test spec_tests -- f32 --expand
-//!
-//! Filter with exact match:
-//!   cargo test -p wust --test spec_tests -- i32 --exact
-//!
-//! Skip tests matching a pattern:
-//!   cargo test -p wust --test spec_tests -- --skip f32
-//!
-//! List discovered tests:
-//!   cargo test -p wust --test spec_tests -- --list
+//! **NOTE to agents:** If you add, remove, or change any public API,
+//! CLI flags, display modes, or behavior in this module, you MUST
+//! update `HARNESS.md` in this directory to reflect the changes.
 
 use std::collections::VecDeque;
 use std::io::Write;

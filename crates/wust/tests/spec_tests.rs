@@ -2,6 +2,8 @@
 //!
 //! Runs the official WebAssembly spec `.wast` test files against the wust
 //! engine. Auto-discovers all `.wast` files in `tests/spec/test/core/`.
+//!
+//! See `tests/harness/HARNESS.md` for CLI flags and harness documentation.
 
 mod harness;
 
