@@ -4,6 +4,7 @@ use crate::stack::Stack;
 use crate::{Instance, Val, parse::func::FuncIdx};
 
 mod exec_recursive;
+mod exec_tailcall;
 pub(crate) use exec_recursive::Trap;
 
 pub(crate) fn call(
@@ -31,6 +32,43 @@ pub(crate) fn call(
         let mut fuel: i64 = i64::MAX;
         let mut depth: u32 = 0;
         exec_recursive::call_function(module, stack, func, &mut fuel, &mut depth)
+    });
+
+    match result {
+        Ok(()) => {
+            let results = read_results(stack, return_sp, &func.results);
+            Ok(results)
+        }
+        Err(trap) => {
+            stack.set_sp(return_sp);
+            Err(trap.into())
+        }
+    }
+}
+
+/// Call a function using the experimental tail-call dispatch interpreter.
+pub(crate) fn call_tc(
+    instance: &mut Instance,
+    func_idx: FuncIdx,
+    args: &[Val],
+) -> Result<Vec<Val>, anyhow::Error> {
+    let Instance { module, stack } = instance;
+
+    let func = module
+        .get_func(func_idx)
+        .ok_or_else(|| anyhow::anyhow!("function {func_idx:?} not found"))?;
+
+    let return_sp = stack.sp();
+
+    for arg in args {
+        stack.push_val(arg);
+    }
+
+    let guard_pages = stack.guard_page_ranges();
+    let result = crate::trap_handler::enter_wasm(guard_pages, || {
+        let mut fuel: i64 = i64::MAX;
+        let mut depth: u32 = 0;
+        exec_tailcall::call_function_tc(module, stack, func, &mut fuel, &mut depth)
     });
 
     match result {

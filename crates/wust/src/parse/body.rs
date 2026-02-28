@@ -53,6 +53,12 @@ impl InlineOp {
         self.0
     }
 
+    /// Reconstruct from raw bits.
+    #[inline(always)]
+    pub(crate) fn from_raw(bits: u64) -> Self {
+        Self(bits)
+    }
+
     /// Bits 8-15: first u8 field.
     #[inline(always)]
     pub(crate) fn imm_u8_a(self) -> u8 {

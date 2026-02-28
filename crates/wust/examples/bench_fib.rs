@@ -164,6 +164,19 @@ fn main() {
         }
     });
 
+    // Tail-call interpreter benchmark.
+    let (mut tc_store, mut tc_instance) = setup_wust(&wasm_bytes);
+    let (tc_expected, tc_ms) = bench(|| {
+        let r = tc_instance
+            .call_dynamic_tc(&mut tc_store, "fib", &[Val::I32(n)])
+            .expect("wust tc fib failed");
+        match r[0] {
+            Val::I32(v) => v,
+            _ => panic!("expected i32"),
+        }
+    });
+    assert_eq!(tc_expected, expected, "tailcall result mismatch");
+
     let run = |name: &'static str, mut f: Box<dyn FnMut() -> i32>| -> BenchResult {
         let (result, ms) = bench(|| f());
         assert_eq!(result, expected, "{name} result mismatch");
@@ -185,6 +198,10 @@ fn main() {
         BenchResult {
             name: "wust interp",
             ms: interp_ms,
+        },
+        BenchResult {
+            name: "wust interp (tailcall)",
+            ms: tc_ms,
         },
         jit_result,
         jit_nf_result,

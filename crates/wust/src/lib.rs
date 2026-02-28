@@ -1,3 +1,5 @@
+#![feature(explicit_tail_calls)]
+
 mod engine;
 mod instance;
 mod interpreter;

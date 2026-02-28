@@ -40,6 +40,17 @@ impl Instance {
         interpreter::call(self, func_idx, args)
     }
 
+    /// Call an exported function using the tail-call dispatch interpreter.
+    pub fn call_dynamic_tc<T>(
+        &mut self,
+        _store: &mut Store<T>,
+        name: &str,
+        args: &[Val],
+    ) -> Result<Vec<Val>, anyhow::Error> {
+        let func_idx = self.resolve_export_func_idx(name)?;
+        interpreter::call_tc(self, func_idx, args)
+    }
+
     /// Get an exported global's value by name.
     pub fn get_global<T>(&self, _store: &Store<T>, _name: &str) -> Option<Val> {
         None
