@@ -803,6 +803,350 @@ fn execute(
                 }
             }
 
+            // --- f32 binary arithmetic ---
+
+            OpCode::F32Add => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a + b).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Sub => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a - b).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Mul => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a * b).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Div => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a / b).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Min => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = wasm_f32_min(a, b).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Max => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = wasm_f32_max(a, b).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Copysign => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = a.copysign(b).to_bits() as u64;
+                }
+            }
+
+            // --- f32 unary arithmetic ---
+
+            OpCode::F32Abs => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = a.abs().to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Neg => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (-a).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Sqrt => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = a.sqrt().to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Ceil => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = a.ceil().to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Floor => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = a.floor().to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Trunc => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = a.trunc().to_bits() as u64;
+                }
+            }
+
+            OpCode::F32Nearest => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = a.round_ties_even().to_bits() as u64;
+                }
+            }
+
+            // --- f32 comparison ---
+
+            OpCode::F32Eq => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a == b) as u64;
+                }
+            }
+
+            OpCode::F32Ne => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a != b) as u64;
+                }
+            }
+
+            OpCode::F32Lt => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a < b) as u64;
+                }
+            }
+
+            OpCode::F32Gt => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a > b) as u64;
+                }
+            }
+
+            OpCode::F32Le => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a <= b) as u64;
+                }
+            }
+
+            OpCode::F32Ge => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f32::from_bits(*(sp as *const u32));
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a >= b) as u64;
+                }
+            }
+
+            // --- f64 binary arithmetic ---
+
+            OpCode::F64Add => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a + b).to_bits();
+                }
+            }
+
+            OpCode::F64Sub => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a - b).to_bits();
+                }
+            }
+
+            OpCode::F64Mul => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a * b).to_bits();
+                }
+            }
+
+            OpCode::F64Div => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a / b).to_bits();
+                }
+            }
+
+            OpCode::F64Min => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = wasm_f64_min(a, b).to_bits();
+                }
+            }
+
+            OpCode::F64Max => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = wasm_f64_max(a, b).to_bits();
+                }
+            }
+
+            OpCode::F64Copysign => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = a.copysign(b).to_bits();
+                }
+            }
+
+            // --- f64 unary arithmetic ---
+
+            OpCode::F64Abs => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = a.abs().to_bits();
+                }
+            }
+
+            OpCode::F64Neg => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (-a).to_bits();
+                }
+            }
+
+            OpCode::F64Sqrt => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = a.sqrt().to_bits();
+                }
+            }
+
+            OpCode::F64Ceil => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = a.ceil().to_bits();
+                }
+            }
+
+            OpCode::F64Floor => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = a.floor().to_bits();
+                }
+            }
+
+            OpCode::F64Trunc => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = a.trunc().to_bits();
+                }
+            }
+
+            OpCode::F64Nearest => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = a.round_ties_even().to_bits();
+                }
+            }
+
+            // --- f64 comparison ---
+
+            OpCode::F64Eq => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a == b) as u64;
+                }
+            }
+
+            OpCode::F64Ne => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a != b) as u64;
+                }
+            }
+
+            OpCode::F64Lt => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a < b) as u64;
+                }
+            }
+
+            OpCode::F64Gt => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a > b) as u64;
+                }
+            }
+
+            OpCode::F64Le => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a <= b) as u64;
+                }
+            }
+
+            OpCode::F64Ge => {
+                sp = unsafe { sp.sub(8) };
+                unsafe {
+                    let b = f64::from_bits(*(sp as *const u64));
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a >= b) as u64;
+                }
+            }
+
             OpCode::Drop => {
                 sp = unsafe { sp.sub(8) };
             }
@@ -941,6 +1285,16 @@ fn execute(
                         unsafe { *(sp as *mut u64) = val as u64 };
                         sp = unsafe { sp.add(8) };
                     }
+                    OpCode::F32Const => {
+                        let bits = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
+                        unsafe { *(sp as *mut u64) = bits as u64 };
+                        sp = unsafe { sp.add(8) };
+                    }
+                    OpCode::F64Const => {
+                        let bits = u64::from_le_bytes(data[off+1..off+9].try_into().unwrap());
+                        unsafe { *(sp as *mut u64) = bits };
+                        sp = unsafe { sp.add(8) };
+                    }
                     OpCode::LocalGet => {
                         let idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
                         let val = unsafe { *(locals.add((idx as usize) * 8) as *const u64) };
@@ -1022,6 +1376,62 @@ fn execute(
     stack.set_sp(unsafe { dst.add(byte_count).offset_from(base) as usize });
 
     Ok(())
+}
+
+/// WebAssembly f32.min: propagates NaN, min(-0, +0) = -0.
+fn wasm_f32_min(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::NAN;
+    }
+    if a.to_bits() == 0x8000_0000 && b.to_bits() == 0 {
+        return a;
+    }
+    if b.to_bits() == 0x8000_0000 && a.to_bits() == 0 {
+        return b;
+    }
+    a.min(b)
+}
+
+/// WebAssembly f32.max: propagates NaN, max(-0, +0) = +0.
+fn wasm_f32_max(a: f32, b: f32) -> f32 {
+    if a.is_nan() || b.is_nan() {
+        return f32::NAN;
+    }
+    if a.to_bits() == 0x8000_0000 && b.to_bits() == 0 {
+        return b;
+    }
+    if b.to_bits() == 0x8000_0000 && a.to_bits() == 0 {
+        return a;
+    }
+    a.max(b)
+}
+
+/// WebAssembly f64.min: propagates NaN, min(-0, +0) = -0.
+fn wasm_f64_min(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a.to_bits() == 0x8000_0000_0000_0000 && b.to_bits() == 0 {
+        return a;
+    }
+    if b.to_bits() == 0x8000_0000_0000_0000 && a.to_bits() == 0 {
+        return b;
+    }
+    a.min(b)
+}
+
+/// WebAssembly f64.max: propagates NaN, max(-0, +0) = +0.
+fn wasm_f64_max(a: f64, b: f64) -> f64 {
+    if a.is_nan() || b.is_nan() {
+        return f64::NAN;
+    }
+    if a.to_bits() == 0x8000_0000_0000_0000 && b.to_bits() == 0 {
+        return b;
+    }
+    if b.to_bits() == 0x8000_0000_0000_0000 && a.to_bits() == 0 {
+        return a;
+    }
+    a.max(b)
 }
 
 /// Copy `count` result values from the top of the stack down to `entry_sp`,
