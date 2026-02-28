@@ -14,6 +14,9 @@ impl Engine {
 
 impl Default for Engine {
     fn default() -> Self {
+        // Install SIGSEGV/SIGBUS handler for guard page trap recovery.
+        crate::trap_handler::init();
+
         let mut features = WasmFeatures::default();
         features.set(WasmFeatures::COMPONENT_MODEL, true);
         features.set(WasmFeatures::CM_ASYNC, true);

@@ -161,6 +161,24 @@ impl Stack {
         }
     }
 
+    /// Returns the address ranges of the lower and upper guard pages
+    /// as `(lower_start, lower_end, upper_start, upper_end)`.
+    ///
+    /// Used by the trap handler to check if a SIGSEGV fault address
+    /// falls within a known guard page.
+    pub(crate) fn guard_page_ranges(&self) -> (usize, usize, usize, usize) {
+        let page_size = page_size();
+        let guard_size = GUARD_PAGES * page_size;
+        let usable_size = self.mmap_size - 2 * guard_size;
+
+        let lower_start = self.mmap_base as usize;
+        let lower_end = lower_start + guard_size;
+        let upper_start = self.base as usize + usable_size;
+        let upper_end = upper_start + guard_size;
+
+        (lower_start, lower_end, upper_start, upper_end)
+    }
+
     /// Push a Val onto the stack.
     #[inline(always)]
     pub(crate) fn push_val(&mut self, val: &Val) {

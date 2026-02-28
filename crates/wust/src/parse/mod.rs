@@ -23,24 +23,33 @@ pub(crate) fn parse(engine: &Engine, bytes: &[u8]) -> Result<ParsedModule, anyho
     let mut validator = engine.new_validator();
     let types = validator.validate_all(bytes)?;
 
-    let mut builder = ModuleBuilder::default();
+    let mut builder = ModuleBuilder::new(&types);
     let parser = Parser::new(0);
     for payload in parser.parse_all(bytes) {
         builder.process_payload(payload?)?;
     }
 
-    Ok(builder.build(types))
+    Ok(builder.build())
 }
 
-#[derive(Default)]
-struct ModuleBuilder {
+struct ModuleBuilder<'a> {
+    /// Validated types, needed to resolve multi-value block types.
+    types: &'a Types,
     /// Parsed function bodies with their declared locals.
     bodies: Vec<(ParsedBody, Vec<ValType>)>,
     /// Function exports: name → function index.
     exports: HashMap<String, FuncIdx>,
 }
 
-impl ModuleBuilder {
+impl<'a> ModuleBuilder<'a> {
+    fn new(types: &'a Types) -> Self {
+        Self {
+            types,
+            bodies: Vec::new(),
+            exports: HashMap::new(),
+        }
+    }
+
     fn process_payload(&mut self, payload: Payload) -> Result<(), anyhow::Error> {
         match payload {
             Payload::CodeSectionEntry(body) => self.parse_body(body),
@@ -72,15 +81,16 @@ impl ModuleBuilder {
                 body_locals.push(val_type);
             }
         }
-        let parsed = ParsedBody::parse(&body)?;
+        let types_ref = self.types.as_ref();
+        let parsed = ParsedBody::parse(&body, &types_ref)?;
         self.bodies.push((parsed, body_locals));
         Ok(())
     }
 
-    fn build(mut self, types: Types) -> ParsedModule {
-        let total = types.as_ref().function_count();
+    fn build(mut self) -> ParsedModule {
+        let types_ref = self.types.as_ref();
+        let total = types_ref.function_count();
         let num_imported = total - self.bodies.len() as u32;
-        let types_ref = types.as_ref();
 
         let funcs = (0..total)
             .map(|idx| {
@@ -89,7 +99,7 @@ impl ModuleBuilder {
                 let params = func_type.params();
                 let param_count = params.len();
 
-                let (body, body_locals) = if idx < num_imported {
+                let (mut body, body_locals) = if idx < num_imported {
                     (ParsedBody::empty(), vec![])
                 } else {
                     // Take to avoid cloning.
@@ -102,8 +112,14 @@ impl ModuleBuilder {
 
                 let results: Box<[ValType]> = func_type.results().into();
                 let local_count = locals.len();
+                // Patch the function-level block (index 0) with the actual
+                // result count, which wasn't available during body parsing.
+                let rc = results.len() as u32;
+                if !body.blocks.is_empty() {
+                    body.blocks[0].result_count = rc;
+                }
                 ParsedFunction {
-                    result_count: results.len() as u32,
+                    result_count: rc,
                     arg_byte_count: param_count * 8,
                     extra_local_bytes: (local_count - param_count) * 8,
                     locals: locals.into(),

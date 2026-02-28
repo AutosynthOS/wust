@@ -7,6 +7,7 @@ mod module;
 mod parse;
 mod stack;
 mod store;
+mod trap_handler;
 mod value;
 
 pub use engine::Engine;

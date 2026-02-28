@@ -10,6 +10,7 @@ pub(crate) enum Trap {
     Unreachable,
     OutOfFuel,
     CallStackExhausted,
+    StackOverflow,
     Unimplemented(OpCode),
 }
 
@@ -24,6 +25,7 @@ impl std::fmt::Display for Trap {
             Trap::Unreachable => write!(f, "unreachable executed"),
             Trap::OutOfFuel => write!(f, "out of fuel"),
             Trap::CallStackExhausted => write!(f, "call stack exhausted"),
+            Trap::StackOverflow => write!(f, "wasm stack overflow"),
             Trap::Unimplemented(op) => write!(f, "unimplemented opcode: {op:?}"),
         }
     }
@@ -94,6 +96,10 @@ fn execute(
     let locals = frame.locals;
     let mut pc: usize = 0;
 
+    // Runtime block stack: tracks (entry_sp, block_idx) for each
+    // open Block/Loop/If so we can restore SP on br/End.
+    let mut block_frames: Vec<(*mut u8, u32)> = Vec::with_capacity(8);
+
     loop {
         *fuel -= 1;
         if *fuel < 0 {
@@ -108,7 +114,11 @@ fn execute(
         let imm = entry.immediate_u32();
 
         match opcode {
-            OpCode::Nop | OpCode::Block | OpCode::Loop => {}
+            OpCode::Nop => {}
+
+            OpCode::Block | OpCode::Loop => {
+                block_frames.push((sp, imm));
+            }
 
             OpCode::Unreachable => {
                 stack.set_sp(unsafe { sp.offset_from(base) as usize });
@@ -120,18 +130,26 @@ fn execute(
             OpCode::If => {
                 sp = unsafe { sp.sub(8) };
                 let condition = unsafe { *(sp as *const i32) };
+                let block = unsafe { &*blocks.add(imm as usize) };
                 if condition == 0 {
-                    let block = unsafe { &*blocks.add(imm as usize) };
                     if block.else_pc != 0 {
                         pc = block.else_pc as usize + 1;
                     } else {
                         pc = block.end_pc as usize + 1;
+                        // Skip the block entirely — don't push a frame.
+                        continue;
                     }
                 }
+                block_frames.push((sp, imm));
             }
 
             OpCode::Else => {
+                // End of the then-branch. Clean up stack to entry_sp,
+                // preserving result values, then skip the else body.
                 let block = unsafe { &*blocks.add(imm as usize) };
+                let (entry_sp, _) = block_frames.pop()
+                    .expect("Else without matching block frame");
+                sp = copy_block_results(sp, entry_sp, block.result_count);
                 pc = block.end_pc as usize + 1;
             }
 
@@ -139,10 +157,15 @@ fn execute(
                 if imm == 0 {
                     break;
                 }
+                let block = unsafe { &*blocks.add(imm as usize) };
+                let (entry_sp, _) = block_frames.pop()
+                    .expect("End without matching block frame");
+                sp = copy_block_results(sp, entry_sp, block.result_count);
             }
 
             OpCode::Br => {
                 let block = unsafe { &*blocks.add(imm as usize) };
+                sp = do_branch(&mut block_frames, sp, block, imm);
                 pc = branch_target(block);
             }
 
@@ -151,6 +174,7 @@ fn execute(
                 let condition = unsafe { *(sp as *const i32) };
                 if condition != 0 {
                     let block = unsafe { &*blocks.add(imm as usize) };
+                    sp = do_branch(&mut block_frames, sp, block, imm);
                     pc = branch_target(block);
                 }
             }
@@ -874,34 +898,32 @@ fn execute(
                 let konst = entry.imm_u8_b() as i8 as i32;
                 let block_idx = entry.imm_u8_c() as usize;
                 let val = unsafe { *(locals.add(local_idx * 8) as *const i32) };
-                if val <= konst {
-                    // Condition true: fall through into if-body.
-                } else {
-                    // Condition false: jump to else or end.
+                if val > konst {
                     let block = unsafe { &*blocks.add(block_idx) };
                     if block.else_pc != 0 {
                         pc = block.else_pc as usize + 1;
                     } else {
                         pc = block.end_pc as usize + 1;
+                        continue;
                     }
                 }
+                block_frames.push((sp, block_idx as u32));
             }
 
             OpCode::LocalGetI32EqzIf => {
                 let local_idx = entry.imm_u8_a() as usize;
                 let block_idx = entry.imm_u8_b() as usize;
                 let val = unsafe { *(locals.add(local_idx * 8) as *const i32) };
-                if val == 0 {
-                    // eqz is true: fall through into if-body.
-                } else {
-                    // eqz is false: jump to else or end.
+                if val != 0 {
                     let block = unsafe { &*blocks.add(block_idx) };
                     if block.else_pc != 0 {
                         pc = block.else_pc as usize + 1;
                     } else {
                         pc = block.end_pc as usize + 1;
+                        continue;
                     }
                 }
+                block_frames.push((sp, block_idx as u32));
             }
 
             OpCode::DataStream => {
@@ -953,6 +975,7 @@ fn execute(
                     OpCode::Br => {
                         let block_idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
                         let block = unsafe { &*blocks.add(block_idx as usize) };
+                        sp = do_branch(&mut block_frames, sp, block, block_idx);
                         pc = branch_target(block);
                     }
                     OpCode::BrIf => {
@@ -961,6 +984,7 @@ fn execute(
                         let condition = unsafe { *(sp as *const i32) };
                         if condition != 0 {
                             let block = unsafe { &*blocks.add(block_idx as usize) };
+                            sp = do_branch(&mut block_frames, sp, block, block_idx);
                             pc = branch_target(block);
                         }
                     }
@@ -998,6 +1022,58 @@ fn execute(
     stack.set_sp(unsafe { dst.add(byte_count).offset_from(base) as usize });
 
     Ok(())
+}
+
+/// Copy `count` result values from the top of the stack down to `entry_sp`,
+/// then return the new SP (entry_sp + count * 8).
+///
+/// If count is 0 or the values are already in place, this is a no-op.
+fn copy_block_results(sp: *mut u8, entry_sp: *mut u8, count: u32) -> *mut u8 {
+    if count == 0 {
+        return entry_sp;
+    }
+    let byte_count = count as usize * 8;
+    let src = unsafe { sp.sub(byte_count) };
+    if src != entry_sp {
+        unsafe { std::ptr::copy(src, entry_sp, byte_count) };
+    }
+    unsafe { entry_sp.add(byte_count) }
+}
+
+/// Execute a branch to the given block: clean up the stack and pop
+/// block frames up to (and including for Block/If, excluding for Loop)
+/// the target block.
+fn do_branch(
+    block_frames: &mut Vec<(*mut u8, u32)>,
+    sp: *mut u8,
+    block: &Block,
+    block_idx: u32,
+) -> *mut u8 {
+    // Find the target block frame.
+    let frame_pos = block_frames.iter().rposition(|(_, idx)| *idx == block_idx)
+        .expect("branch target not found in block frames");
+    let entry_sp = block_frames[frame_pos].0;
+
+    // For Loop, branch carries param_count values and re-enters the loop
+    // (don't pop the loop frame). For Block/If, branch carries result_count
+    // values and exits (pop up through the target).
+    let arity = if block.kind == BlockKind::Loop {
+        block.param_count
+    } else {
+        block.result_count
+    };
+
+    let new_sp = copy_block_results(sp, entry_sp, arity);
+
+    if block.kind == BlockKind::Loop {
+        // Truncate frames above the loop (but keep the loop frame).
+        block_frames.truncate(frame_pos + 1);
+    } else {
+        // Pop all frames up to and including the target.
+        block_frames.truncate(frame_pos);
+    }
+
+    new_sp
 }
 
 /// Resolve a branch target PC from a block.

@@ -179,12 +179,16 @@ fn fuse_fib_sequence() {
         start_pc: 0,
         end_pc: 20, // will be remapped
         else_pc: 0,
+        result_count: 0,
+        param_count: 0,
     });
     body.blocks.push(Block {
         kind: BlockKind::If,
         start_pc: 3, // the If instruction
         end_pc: 6,   // the End(1) instruction
         else_pc: 0,  // no else branch — uses end as else target
+        result_count: 0,
+        param_count: 0,
     });
 
     // 0: local.get 0

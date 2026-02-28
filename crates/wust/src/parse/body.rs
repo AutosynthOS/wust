@@ -1,4 +1,5 @@
-use wasmparser::{FunctionBody, Operator};
+use wasmparser::{BlockType, FunctionBody, Operator};
+use wasmparser::types::TypesRef;
 #[cfg(test)]
 mod tests;
 
@@ -401,6 +402,10 @@ pub(crate) struct Block {
     pub(crate) end_pc: u32,
     /// PC of the `else` instruction (only for `If`, 0 if no else).
     pub(crate) else_pc: u32,
+    /// Number of result values this block produces.
+    pub(crate) result_count: u32,
+    /// Number of parameter values this block consumes (non-zero only for multi-value).
+    pub(crate) param_count: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -453,6 +458,19 @@ fn pack_three_u8(opcode: OpCode, a: u8, b: u8, c: u8) -> InlineOp {
     InlineOp((opcode as u64) | ((a as u64) << 8) | ((b as u64) << 16) | ((c as u64) << 24))
 }
 
+/// Resolve a wasm `BlockType` to (result_count, param_count).
+fn resolve_block_type(bt: BlockType, types: &TypesRef) -> (u32, u32) {
+    match bt {
+        BlockType::Empty => (0, 0),
+        BlockType::Type(_) => (1, 0),
+        BlockType::FuncType(idx) => {
+            let core_type_id = types.core_type_at_in_module(idx);
+            let func_type = types[core_type_id].unwrap_func();
+            (func_type.results().len() as u32, func_type.params().len() as u32)
+        }
+    }
+}
+
 fn fits_imm24(val: i64) -> bool {
     val >= IMM24_MIN as i64 && val <= IMM24_MAX as i64
 }
@@ -463,36 +481,40 @@ fn fits_imm24_unsigned(val: u64) -> bool {
 
 impl ParsedBody {
     /// Parse raw wasm function body bytes into a pre-decoded body.
-    pub(crate) fn parse(reader: &FunctionBody) -> Result<Self, anyhow::Error> {
+    pub(crate) fn parse(reader: &FunctionBody, types: &TypesRef) -> Result<Self, anyhow::Error> {
         let mut body = Self::default();
 
         // Implicit function-level block (index 0).
-        let func_block_idx = body.open_block(BlockKind::Function);
+        // Result count is patched later in build() since we don't have
+        // access to the function signature here.
+        let func_block_idx = body.open_block(BlockKind::Function, 0, 0);
 
         let ops_reader = reader.get_operators_reader()?;
         // Track open block indices so `end` can find the right one.
         let mut block_stack: Vec<u32> = vec![func_block_idx];
 
         for op in ops_reader {
-            body.parse_op(op?, &mut block_stack)?;
+            body.parse_op(op?, &mut block_stack, types)?;
         }
         body.fuse();
         Ok(body)
     }
 
     /// Allocate a new block entry, returning its index.
-    fn open_block(&mut self, kind: BlockKind) -> u32 {
+    fn open_block(&mut self, kind: BlockKind, result_count: u32, param_count: u32) -> u32 {
         let idx = self.blocks.len() as u32;
         self.blocks.push(Block {
             kind,
             start_pc: self.ops.len() as u32,
             end_pc: 0,
             else_pc: 0,
+            result_count,
+            param_count,
         });
         idx
     }
 
-    fn parse_op(&mut self, op: Operator, block_stack: &mut Vec<u32>) -> Result<(), anyhow::Error> {
+    fn parse_op(&mut self, op: Operator, block_stack: &mut Vec<u32>, types: &TypesRef) -> Result<(), anyhow::Error> {
         match op {
             // No-immediate ops
             Operator::Nop => self.ops.push(pack(OpCode::Nop)),
@@ -500,18 +522,21 @@ impl ParsedBody {
             Operator::Return => self.ops.push(pack(OpCode::Return)),
 
             // Block control flow
-            Operator::Block { .. } => {
-                let idx = self.open_block(BlockKind::Block);
+            Operator::Block { blockty } => {
+                let (rc, pc) = resolve_block_type(blockty, types);
+                let idx = self.open_block(BlockKind::Block, rc, pc);
                 block_stack.push(idx);
                 self.ops.push(pack_imm_u(OpCode::Block, idx));
             }
-            Operator::Loop { .. } => {
-                let idx = self.open_block(BlockKind::Loop);
+            Operator::Loop { blockty } => {
+                let (rc, pc) = resolve_block_type(blockty, types);
+                let idx = self.open_block(BlockKind::Loop, rc, pc);
                 block_stack.push(idx);
                 self.ops.push(pack_imm_u(OpCode::Loop, idx));
             }
-            Operator::If { .. } => {
-                let idx = self.open_block(BlockKind::If);
+            Operator::If { blockty } => {
+                let (rc, pc) = resolve_block_type(blockty, types);
+                let idx = self.open_block(BlockKind::If, rc, pc);
                 block_stack.push(idx);
                 self.ops.push(pack_imm_u(OpCode::If, idx));
             }

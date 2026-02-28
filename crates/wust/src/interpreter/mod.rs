@@ -4,6 +4,7 @@ use crate::stack::Stack;
 use crate::{Instance, Val, parse::func::FuncIdx};
 
 mod exec_recursive;
+pub(crate) use exec_recursive::Trap;
 
 pub(crate) fn call(
     instance: &mut Instance,
@@ -23,17 +24,21 @@ pub(crate) fn call(
         stack.push_val(arg);
     }
 
-    // call_function expects args already on stack.
-    let mut fuel: i64 = i64::MAX;
-    let mut depth: u32 = 0;
-    match exec_recursive::call_function(module, stack, func, &mut fuel, &mut depth) {
+    // Wrap execution in the trap handler so that SIGSEGV from hitting
+    // a guard page is caught and converted to Trap::StackOverflow.
+    let guard_pages = stack.guard_page_ranges();
+    let result = crate::trap_handler::enter_wasm(guard_pages, || {
+        let mut fuel: i64 = i64::MAX;
+        let mut depth: u32 = 0;
+        exec_recursive::call_function(module, stack, func, &mut fuel, &mut depth)
+    });
+
+    match result {
         Ok(()) => {
-            // Results are now at return_sp.
             let results = read_results(stack, return_sp, &func.results);
             Ok(results)
         }
         Err(trap) => {
-            // Reset SP so the instance stays usable after a trap.
             stack.set_sp(return_sp);
             Err(trap.into())
         }
