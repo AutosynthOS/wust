@@ -26,7 +26,11 @@
 //! List discovered tests:
 //!   cargo test -p wust --test spec_tests -- --list
 
+use std::collections::VecDeque;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // --- ANSI color codes ---
 
@@ -61,6 +65,10 @@ pub struct TestResult {
     pub directives: Vec<DirectiveResult>,
     /// Set when the child process crashed (segfault, etc.)
     pub crashed: bool,
+    /// Set when the child process exceeded the timeout.
+    pub timed_out: bool,
+    /// Wall-clock time the test took to run.
+    pub elapsed: Duration,
 }
 
 impl TestResult {
@@ -77,7 +85,7 @@ impl TestResult {
     }
 
     pub fn is_fail(&self) -> bool {
-        self.crashed || self.failed() > 0
+        self.crashed || self.timed_out || self.failed() > 0
     }
 }
 
@@ -170,36 +178,74 @@ pub fn discover_test_files(dir: &Path, extension: &str) -> Vec<(String, PathBuf)
 
 // --- Subprocess protocol ---
 
-/// Run a test in a child process to isolate segfaults.
+/// Run a test in a child process with a timeout.
 ///
-/// Re-invokes the current binary with `--__run <name> <path>`.
-/// The child should print lines of `PASS|FAIL <index> <label>\t<error>` to stdout
-/// and exit 0 (all pass) or 1 (some fail). A crash (signal kill, empty stdout)
-/// is reported as `TestResult { crashed: true }`.
-pub fn run_test_subprocess(name: &str, path: &Path) -> TestResult {
+/// Like `run_test_subprocess`, but uses `spawn()` + polling so we can
+/// kill the child if it exceeds `timeout`. Returns `timed_out: true`
+/// when the child is killed.
+pub fn run_test_subprocess_timed(name: &str, path: &Path, timeout: Duration) -> TestResult {
     let exe = std::env::current_exe().expect("failed to get current exe");
-    let output = std::process::Command::new(exe)
+    let start = Instant::now();
+    let mut child = std::process::Command::new(exe)
         .arg("--__run")
         .arg(name)
         .arg(path)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .expect("failed to spawn child process");
 
-    if !output.status.success() && output.stdout.is_empty() {
-        return TestResult {
-            name: name.to_string(),
-            directives: vec![],
-            crashed: true,
-        };
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let directives = parse_subprocess_output(&stdout);
-
-    TestResult {
-        name: name.to_string(),
-        directives,
-        crashed: false,
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let elapsed = start.elapsed();
+                let mut stdout_buf = String::new();
+                if let Some(mut stdout) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = stdout.read_to_string(&mut stdout_buf);
+                }
+                if !status.success() && stdout_buf.is_empty() {
+                    return TestResult {
+                        name: name.to_string(),
+                        directives: vec![],
+                        crashed: true,
+                        timed_out: false,
+                        elapsed,
+                    };
+                }
+                let directives = parse_subprocess_output(&stdout_buf);
+                return TestResult {
+                    name: name.to_string(),
+                    directives,
+                    crashed: false,
+                    timed_out: false,
+                    elapsed,
+                };
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return TestResult {
+                        name: name.to_string(),
+                        directives: vec![],
+                        crashed: false,
+                        timed_out: true,
+                        elapsed: start.elapsed(),
+                    };
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => {
+                return TestResult {
+                    name: name.to_string(),
+                    directives: vec![],
+                    crashed: true,
+                    timed_out: false,
+                    elapsed: start.elapsed(),
+                };
+            }
+        }
     }
 }
 
@@ -404,143 +450,424 @@ pub fn render_dot_grid(name: &str, results: &[DirectiveResult]) -> String {
     out
 }
 
-/// Render the overview box containing all test results in a single bordered table.
-///
-/// Used in overview mode (multiple tests). Each test is one row with
-/// name, mini progress bar, and pass/fail count. Failed tests show
-/// error details. A combined progress bar sits at the bottom.
-pub fn render_overview(title: &str, results: &[TestResult]) -> String {
-    let inner_width: usize = 80;
-    let name_width = results.iter().map(|r| r.name.len()).max().unwrap_or(0);
-    let bar_col_width: usize = 30;
+// --- Live TUI test runner ---
 
+/// Status of a single test in the parallel runner.
+pub enum TestStatus {
+    Pending,
+    Running { started: Instant },
+    Completed(TestResult),
+}
+
+/// A test entry tracked by the parallel runner.
+pub struct TestEntry {
+    pub name: String,
+    pub path: PathBuf,
+    pub status: TestStatus,
+}
+
+/// Render a single entry row with the appropriate format for its status.
+fn render_entry_row(entry: &TestEntry, name_width: usize, bar_width: usize) -> String {
+    match &entry.status {
+        TestStatus::Pending => {
+            format!(
+                "  {DIM}·{RESET} {DIM}{:<name_width$}{RESET}",
+                entry.name,
+            )
+        }
+        TestStatus::Running { started } => {
+            let elapsed_str = format!("{:.1}s", started.elapsed().as_secs_f64());
+            let bar = render_bar(0, 1, bar_width);
+            format!(
+                "  {DIM}⟳{RESET} {BOLD}{:<name_width$}{RESET}  {bar}  {DIM}...{RESET}      {DIM}{elapsed_str}{RESET}",
+                entry.name,
+            )
+        }
+        TestStatus::Completed(r) => {
+            let (icon, stats) = if r.timed_out {
+                (format!("{RED}⏱{RESET}"), format!("{RED}TIMED OUT{RESET}"))
+            } else if r.crashed {
+                (format!("{RED}!{RESET}"), format!("{RED}CRASHED{RESET}"))
+            } else if r.is_fail() {
+                let s = format!("{}/{}", r.passed(), r.total());
+                (format!("{RED}✗{RESET}"), s)
+            } else {
+                let s = format!("{}/{}", r.passed(), r.total());
+                (format!("{GREEN}✓{RESET}"), s)
+            };
+
+            let bar = if r.timed_out || r.crashed {
+                render_bar(0, 1, bar_width)
+            } else {
+                render_bar(r.passed(), r.total(), bar_width)
+            };
+
+            let elapsed_str = format!("{:.1}s", r.elapsed.as_secs_f64());
+            format!(
+                "  {icon} {BOLD}{:<name_width$}{RESET}  {bar}  {stats}  {DIM}{elapsed_str}{RESET}",
+                r.name,
+            )
+        }
+    }
+}
+
+/// Compute the plain-text display width of an entry row (no ANSI escapes).
+fn entry_row_plain_len(entry: &TestEntry, name_width: usize, bar_width: usize) -> usize {
+    match &entry.status {
+        TestStatus::Pending => {
+            // "  · name"
+            2 + 1 + 1 + name_width
+        }
+        TestStatus::Running { started } => {
+            let elapsed_str = format!("{:.1}s", started.elapsed().as_secs_f64());
+            // "  ⟳ name  bar  ...      elapsed"
+            2 + 1 + 1 + name_width + 2 + bar_width + 2 + 3 + 6 + elapsed_str.len()
+        }
+        TestStatus::Completed(r) => {
+            let stats_plain_len = if r.timed_out {
+                9
+            } else if r.crashed {
+                7
+            } else {
+                format!("{}/{}", r.passed(), r.total()).len()
+            };
+            let elapsed_str = format!("{:.1}s", r.elapsed.as_secs_f64());
+            2 + 1 + 1 + name_width + 2 + bar_width + 2 + stats_plain_len + 2 + elapsed_str.len()
+        }
+    }
+}
+
+// --- Live footer helpers ---
+
+/// Render a live footer as a bordered box section showing running tests and progress.
+/// Returns the footer string and how many lines it occupies.
+fn render_footer(
+    entries: &[TestEntry],
+    completed: usize,
+    total: usize,
+    files_passed: usize,
+    files_failed: usize,
+    elapsed: Duration,
+    inner_width: usize,
+) -> (String, usize) {
+    let mut lines = 0usize;
+    let mut out = String::new();
+
+    // Separator from the completed rows above.
+    out.push_str(&border('├', '┤', inner_width));
+    out.push('\n');
+    lines += 1;
+
+    // Show running tests.
+    for e in entries {
+        if let TestStatus::Running { started } = &e.status {
+            let elapsed_str = format!("{:.1}s", started.elapsed().as_secs_f64());
+            let text = format!("  {DIM}⟳ {}  {elapsed_str}{RESET}", e.name);
+            let plain_len = 4 + e.name.len() + 2 + elapsed_str.len();
+            out.push_str(&pad_line(&text, plain_len, inner_width));
+            out.push('\n');
+            lines += 1;
+        }
+    }
+
+    // Progress summary line.
+    let stats = if files_failed > 0 {
+        format!("{GREEN}{files_passed} passed{RESET}  {RED}{files_failed} failed{RESET}")
+    } else {
+        format!("{GREEN}{files_passed} passed{RESET}")
+    };
+    let stats_plain = if files_failed > 0 {
+        format!("{files_passed} passed  {files_failed} failed")
+    } else {
+        format!("{files_passed} passed")
+    };
+    let elapsed_str = format!("{:.1}s", elapsed.as_secs_f64());
+    let summary = format!(
+        "  {DIM}[{completed}/{total}]{RESET} {stats}  {DIM}{elapsed_str}{RESET}",
+    );
+    let summary_plain_len = format!("  [{completed}/{total}] ").len() + stats_plain.len() + 2 + elapsed_str.len();
+    out.push_str(&pad_line(&summary, summary_plain_len, inner_width));
+    out.push('\n');
+    lines += 1;
+
+    // Bottom border.
+    out.push_str(&border('└', '┘', inner_width));
+    lines += 1;
+
+    (out, lines)
+}
+
+/// Erase N lines of footer content.
+///
+/// Assumes the cursor is at the end of the last line (no trailing newline).
+/// Clears the current line, then moves up and clears each remaining line.
+fn erase_lines(out: &mut impl Write, count: usize) {
+    if count == 0 {
+        return;
+    }
+    // Clear the line the cursor is currently on.
+    let _ = write!(out, "\r\x1b[2K");
+    // Move up and clear each remaining line.
+    for _ in 1..count {
+        let _ = write!(out, "\x1b[A\x1b[2K");
+    }
+    let _ = out.flush();
+}
+
+/// Print the bottom portion of the overview box: failing test names, summary,
+/// progress bars, helper commands, and bottom border.
+fn print_box_summary(
+    out: &mut impl Write,
+    title: &str,
+    test_command: &str,
+    results: &[TestResult],
+    inner_width: usize,
+) {
     let total_files = results.len();
     let files_passed = results.iter().filter(|r| !r.is_fail()).count();
     let files_failed = total_files - files_passed;
     let total_directives: usize = results.iter().map(|r| r.total()).sum();
     let total_passed: usize = results.iter().map(|r| r.passed()).sum();
+    let total_failed = total_directives - total_passed;
     let pct = if total_files > 0 {
         files_passed as f64 / total_files as f64 * 100.0
     } else {
         100.0
     };
 
-    let mut out = String::new();
+    // Failing test names (compact — just names, no individual assertions).
+    let failing: Vec<&TestResult> = results.iter().filter(|r| r.is_fail()).collect();
+    if !failing.is_empty() {
+        let _ = writeln!(out, "{}", border('├', '┤', inner_width));
 
-    // Header.
-    out.push_str(&border('┌', '┐', inner_width));
-    out.push('\n');
-    let header_text = format!(
-        "{title}: {files_passed}/{total_files} files passed ({pct:.1}%) \
-         - {total_passed}/{total_directives} directives"
-    );
-    let header = format!("{BOLD}{header_text}{RESET}");
-    out.push_str(&pad_line(&header, header_text.len(), inner_width));
-    out.push('\n');
-    out.push_str(&border('├', '┤', inner_width));
-    out.push('\n');
-
-    // One row per test.
-    for r in results {
-        let passed = r.passed();
-        let total = r.total();
-
-        let (icon, stats) = if r.crashed {
-            (format!("{RED}!{RESET}"), format!("{RED}CRASHED{RESET}"))
-        } else if r.is_fail() {
-            (format!("{RED}✗{RESET}"), format!("{passed}/{total}"))
-        } else {
-            (format!("{GREEN}✓{RESET}"), format!("{passed}/{total}"))
-        };
-
-        let bar = if r.crashed {
-            render_bar(0, 1, bar_col_width)
-        } else {
-            render_bar(passed, total, bar_col_width)
-        };
-
-        let stats_plain_len = if r.crashed { 7 } else { stats.len() };
-        let row_text_width = 2 + 1 + 1 + name_width + 2 + bar_col_width + 2 + stats_plain_len;
-        let row = format!(
-            "  {icon} {BOLD}{:<name_width$}{RESET}  {bar}  {stats}",
-            r.name,
-        );
-        out.push_str(&pad_line(&row, row_text_width, inner_width));
-        out.push('\n');
-    }
-
-    // Error details for failing tests.
-    let failing_tests: Vec<&TestResult> = results.iter().filter(|r| r.is_fail()).collect();
-    if !failing_tests.is_empty() {
-        out.push_str(&border('├', '┤', inner_width));
-        out.push('\n');
-        let max_failing_tests = 10;
-        for r in failing_tests.iter().take(max_failing_tests) {
-            if r.crashed {
-                let header_line = format!("{} (CRASHED - segfault or signal):", r.name);
-                let colored_header = format!("{RED}{BOLD}{header_line}{RESET}");
-                out.push_str(&pad_line(
-                    &format!("  {colored_header}"),
-                    2 + header_line.len(),
-                    inner_width,
-                ));
-                out.push('\n');
-                continue;
-            }
-            let header_line = format!("{} ({} failed):", r.name, r.failed());
-            let colored_header = format!("{RED}{BOLD}{header_line}{RESET}");
-            out.push_str(&pad_line(
-                &format!("  {colored_header}"),
-                2 + header_line.len(),
+        let max_shown = 15;
+        for r in failing.iter().take(max_shown) {
+            let detail = if r.timed_out {
+                format!("TIMED OUT ({:.1}s)", r.elapsed.as_secs_f64())
+            } else if r.crashed {
+                "CRASHED".to_string()
+            } else {
+                format!("{} failed", r.failed())
+            };
+            let line = format!("{} - {detail}", r.name);
+            let colored = format!("{RED}{line}{RESET}");
+            let _ = writeln!(out, "{}", pad_line(
+                &format!("  {colored}"),
+                2 + line.len(),
                 inner_width,
             ));
-            out.push('\n');
-            out.push_str(&render_error_lines(&r.directives, 3, inner_width, 4));
         }
-        let remaining_tests = failing_tests.len().saturating_sub(max_failing_tests);
-        if remaining_tests > 0 {
-            let more = format!("... and {remaining_tests} more failing tests");
+        let remaining = failing.len().saturating_sub(max_shown);
+        if remaining > 0 {
+            let more = format!("... and {remaining} more");
             let colored = format!("{DIM}{more}{RESET}");
-            out.push_str(&pad_line(
+            let _ = writeln!(out, "{}", pad_line(
                 &format!("  {colored}"),
                 2 + more.len(),
                 inner_width,
             ));
-            out.push('\n');
         }
     }
 
-    // File-level progress bar.
-    out.push_str(&border('├', '┤', inner_width));
-    out.push('\n');
-    let files_label = format!("{DIM}files{RESET}");
-    let files_label_plain = "files";
-    out.push_str(&pad_line(&files_label, files_label_plain.len(), inner_width));
-    out.push('\n');
-    out.push_str(&pad_line(
+    // Summary + progress bars.
+    let _ = writeln!(out, "{}", border('├', '┤', inner_width));
+    let summary_text = format!(
+        "{title}: {files_passed}/{total_files} files passed ({pct:.1}%) \
+         - {total_passed}/{total_directives} directives"
+    );
+    let summary = format!("{BOLD}{summary_text}{RESET}");
+    let _ = writeln!(out, "{}", pad_line(&summary, summary_text.len(), inner_width));
+
+    let _ = writeln!(out, "{}", pad_line(
         &render_bar(files_passed, total_files, inner_width),
-        inner_width,
-        inner_width,
+        inner_width, inner_width,
     ));
-    out.push('\n');
-    out.push_str(&render_stats_line(files_passed, files_failed, inner_width));
-    out.push('\n');
+    let _ = writeln!(out, "{}", render_stats_line(files_passed, files_failed, inner_width));
 
-    // Directive-level progress bar.
-    let total_failed = total_directives - total_passed;
-    let dir_label = format!("{DIM}directives{RESET}");
-    let dir_label_plain = "directives";
-    out.push_str(&pad_line(&dir_label, dir_label_plain.len(), inner_width));
-    out.push('\n');
-    out.push_str(&pad_line(
+    let _ = writeln!(out, "{}", pad_line(
         &render_bar(total_passed, total_directives, inner_width),
-        inner_width,
-        inner_width,
+        inner_width, inner_width,
     ));
-    out.push('\n');
-    out.push_str(&render_stats_line(total_passed, total_failed, inner_width));
-    out.push('\n');
+    let _ = writeln!(out, "{}", render_stats_line(total_passed, total_failed, inner_width));
 
-    out.push_str(&border('└', '┘', inner_width));
-    out
+    // Helper commands.
+    let _ = writeln!(out, "{}", border('├', '┤', inner_width));
+    let cmd_header = format!("{DIM}Run a single test for details:{RESET}");
+    let _ = writeln!(out, "{}", pad_line(&cmd_header, "Run a single test for details:".len(), inner_width));
+    let cmd = format!("  {test_command} -- <name>");
+    let _ = writeln!(out, "{}", pad_line(&cmd, cmd.len(), inner_width));
+
+    let _ = writeln!(out, "{}", border('└', '┘', inner_width));
+    let _ = out.flush();
+}
+
+/// Run tests in parallel with a live bordered display.
+///
+/// Prints a complete bordered box as tests run:
+/// - Top border + header printed immediately
+/// - Completed test rows stream inside the box as they finish
+/// - TTY: a live footer section shows running tests (redrawn in-place)
+/// - After all tests finish, prints failing names + summary bars + helper commands
+///
+/// `test_command` is the cargo command prefix shown in the helper section
+/// (e.g. `"cargo test -p wust --test spec_tests"`).
+pub fn run_tests_parallel(
+    title: &str,
+    test_command: &str,
+    tests: Vec<(String, PathBuf)>,
+    timeout: Duration,
+    is_tty: bool,
+) -> Vec<TestResult> {
+    let total = tests.len();
+    let inner_width: usize = 80;
+    let bar_col_width: usize = 30;
+    let name_width = tests.iter().map(|(n, _)| n.len()).max().unwrap_or(0);
+
+    // Build shared state.
+    let entries: Vec<TestEntry> = tests
+        .into_iter()
+        .map(|(name, path)| TestEntry {
+            name,
+            path,
+            status: TestStatus::Pending,
+        })
+        .collect();
+    let state = Arc::new(Mutex::new(entries));
+
+    // Build work queue (indices into the entries vec).
+    let queue: VecDeque<usize> = (0..total).collect();
+    let queue = Arc::new(Mutex::new(queue));
+
+    // Spawn worker threads.
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total);
+
+    let mut handles = Vec::with_capacity(num_workers);
+    for _ in 0..num_workers {
+        let queue = Arc::clone(&queue);
+        let state = Arc::clone(&state);
+        let handle = std::thread::spawn(move || {
+            loop {
+                let idx = {
+                    let mut q = queue.lock().unwrap();
+                    q.pop_front()
+                };
+                let Some(idx) = idx else { break };
+
+                let (name, path) = {
+                    let mut entries = state.lock().unwrap();
+                    let e = &mut entries[idx];
+                    e.status = TestStatus::Running {
+                        started: Instant::now(),
+                    };
+                    (e.name.clone(), e.path.clone())
+                };
+
+                let result = run_test_subprocess_timed(&name, &path, timeout);
+
+                {
+                    let mut entries = state.lock().unwrap();
+                    entries[idx].status = TestStatus::Completed(result);
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    // Print top border + header.
+    let start = Instant::now();
+    let mut stdout = std::io::stdout().lock();
+    let header_text = format!("{title}");
+    let header = format!("{BOLD}{header_text}{RESET}");
+    let _ = writeln!(stdout, "{}", border('┌', '┐', inner_width));
+    let _ = writeln!(stdout, "{}", pad_line(&header, header_text.len(), inner_width));
+    let _ = writeln!(stdout, "{}", border('├', '┤', inner_width));
+    let _ = stdout.flush();
+
+    // Render loop on the main thread.
+    let mut printed = vec![false; total];
+    let mut footer_lines = 0usize;
+    let mut completed = 0usize;
+    let mut files_passed = 0usize;
+    let mut files_failed = 0usize;
+
+    loop {
+        // Erase the previous footer (TTY only).
+        if is_tty && footer_lines > 0 {
+            erase_lines(&mut stdout, footer_lines);
+            footer_lines = 0;
+        }
+
+        // Print any newly completed test rows.
+        let all_done = {
+            let entries = state.lock().unwrap();
+            for (i, e) in entries.iter().enumerate() {
+                if !printed[i] {
+                    if let TestStatus::Completed(r) = &e.status {
+                        let row = render_entry_row(e, name_width, bar_col_width);
+                        let row_len = entry_row_plain_len(e, name_width, bar_col_width);
+                        let _ = writeln!(stdout, "{}", pad_line(&row, row_len, inner_width));
+                        printed[i] = true;
+                        completed += 1;
+                        if r.is_fail() {
+                            files_failed += 1;
+                        } else {
+                            files_passed += 1;
+                        }
+                    }
+                }
+            }
+
+            // Draw live footer (TTY only).
+            if is_tty {
+                let (footer, lines) = render_footer(
+                    &entries, completed, total,
+                    files_passed, files_failed, start.elapsed(),
+                    inner_width,
+                );
+                let _ = write!(stdout, "{footer}");
+                let _ = stdout.flush();
+                footer_lines = lines;
+            }
+
+            entries
+                .iter()
+                .all(|e| matches!(e.status, TestStatus::Completed(_)))
+        };
+
+        if all_done {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // Erase final footer.
+    if is_tty && footer_lines > 0 {
+        erase_lines(&mut stdout, footer_lines);
+    }
+
+    // Join all workers.
+    for h in handles {
+        let _ = h.join();
+    }
+
+    // Extract results in original order.
+    let entries = Arc::try_unwrap(state)
+        .unwrap_or_else(|_| panic!("workers should be done"))
+        .into_inner()
+        .unwrap();
+    let results: Vec<TestResult> = entries
+        .into_iter()
+        .map(|e| match e.status {
+            TestStatus::Completed(r) => r,
+            _ => unreachable!("all tests should be completed"),
+        })
+        .collect();
+
+    // Print box bottom: failing names + summary bars + helper commands.
+    print_box_summary(&mut stdout, title, test_command, &results, inner_width);
+
+    results
 }

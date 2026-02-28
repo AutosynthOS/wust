@@ -2,37 +2,18 @@
 //!
 //! Runs the official WebAssembly spec `.wast` test files against the wust
 //! engine. Auto-discovers all `.wast` files in `tests/spec/test/core/`.
-//!
-//! # Commands
-//!
-//! Run all spec tests (overview mode):
-//!   cargo test -p wust --test spec_tests
-//!
-//! Run a single spec test (detailed dot grid):
-//!   cargo test -p wust --test spec_tests -- i32
-//!
-//! Force detailed mode for multiple tests:
-//!   cargo test -p wust --test spec_tests -- f32 --expand
-//!
-//! Filter with exact match:
-//!   cargo test -p wust --test spec_tests -- i32 --exact
-//!
-//! Skip tests matching a pattern:
-//!   cargo test -p wust --test spec_tests -- --skip f32
-//!
-//! List discovered tests:
-//!   cargo test -p wust --test spec_tests -- --list
 
 mod harness;
 
+use std::io::IsTerminal;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use harness::{
     DirectiveResult, TestResult,
     discover_test_files, matches_filter, parse_cli_args,
-    print_subprocess_results, render_dot_grid, render_overview,
-    run_test_subprocess, DIM, RESET,
+    print_subprocess_results, render_dot_grid,
+    run_tests_parallel, DIM, RESET,
 };
 use wust::{Engine, Instance, Linker, Module, Store, Val};
 
@@ -302,12 +283,15 @@ fn execute_label(exec: &wast::WastExecute) -> String {
 
 /// Run a single test in-process and return its result.
 fn run_test_inproc(name: &str, path: &Path) -> TestResult {
+    let start = Instant::now();
     let mut runner = SpecRunner::new();
     let directives = runner.run_wast(path);
     TestResult {
         name: name.to_string(),
         directives,
         crashed: false,
+        timed_out: false,
+        elapsed: start.elapsed(),
     }
 }
 
@@ -368,15 +352,20 @@ fn main() {
             std::process::exit(1);
         }
     } else {
-        let results: Vec<TestResult> = matched
-            .iter()
-            .map(|(name, path)| run_test_subprocess(name, path))
-            .collect();
+        let is_tty = std::io::stdout().is_terminal();
+        let timeout = Duration::from_secs(5);
+
+        let results = run_tests_parallel(
+            "Spec Tests",
+            "cargo test -p wust --test spec_tests",
+            matched,
+            timeout,
+            is_tty,
+        );
 
         let any_failed = results.iter().any(|r| r.is_fail());
-        println!("\n{}", render_overview("Spec Tests", &results));
         let elapsed = start.elapsed();
-        println!("\n{DIM}Finished in {:.2}s{RESET}", elapsed.as_secs_f64());
+        println!("{DIM}Finished in {:.2}s{RESET}", elapsed.as_secs_f64());
         if any_failed {
             std::process::exit(1);
         }
