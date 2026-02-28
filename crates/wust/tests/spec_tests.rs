@@ -10,12 +10,11 @@ mod harness;
 use std::io::IsTerminal;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use harness::{
-    DirectiveResult, TestResult,
+    DirectiveResult,
     discover_test_files, matches_filter, parse_cli_args,
-    print_subprocess_results, render_dot_grid,
-    run_tests_parallel, DIM, RESET,
+    print_subprocess_results, run_tests_parallel,
 };
 use wust::{Engine, Instance, Linker, Module, Store, Val};
 
@@ -92,8 +91,28 @@ impl SpecRunner {
 
     fn run_wast(&mut self, path: &Path) -> Vec<DirectiveResult> {
         let source = std::fs::read_to_string(path).unwrap();
-        let buf = wast::parser::ParseBuffer::new(&source).unwrap();
-        let wast = wast::parser::parse::<wast::Wast>(&buf).unwrap();
+        let buf = match wast::parser::ParseBuffer::new(&source) {
+            Ok(buf) => buf,
+            Err(e) => {
+                return vec![DirectiveResult {
+                    index: 0, passed: false,
+                    label: "parse".into(),
+                    error: Some(format!("failed to lex .wast file: {e}")),
+                    line: None, source: None,
+                }];
+            }
+        };
+        let wast = match wast::parser::parse::<wast::Wast>(&buf) {
+            Ok(wast) => wast,
+            Err(e) => {
+                return vec![DirectiveResult {
+                    index: 0, passed: false,
+                    label: "parse".into(),
+                    error: Some(format!("failed to parse .wast file: {e}")),
+                    line: None, source: None,
+                }];
+            }
+        };
 
         // Suppress default panic output so interpreter panics don't
         // produce noisy stack traces — they show up as red dots instead.
@@ -106,19 +125,46 @@ impl SpecRunner {
             .enumerate()
             .map(|(i, d)| {
                 let label = directive_label(&d);
+                let span = directive_span(&d);
                 let result = panic::catch_unwind(AssertUnwindSafe(|| {
                     self.run_directive(d)
                 }));
+                // Only compute source info for failures.
+                let (line, src) = match &result {
+                    Ok(Ok(())) => (None, None),
+                    _ => {
+                        if let Some(sp) = span {
+                            let offset = sp.offset();
+                            (
+                                Some(line_number(&source, offset)),
+                                extract_sexp(&source, offset),
+                            )
+                        } else {
+                            (None, None)
+                        }
+                    }
+                };
                 match result {
-                    Ok(Ok(())) => DirectiveResult { index: i, passed: true, label, error: None },
-                    Ok(Err(e)) => DirectiveResult { index: i, passed: false, label, error: Some(format!("{e}")) },
+                    Ok(Ok(())) => DirectiveResult {
+                        index: i, passed: true, label,
+                        error: None, line: None, source: None,
+                    },
+                    Ok(Err(e)) => DirectiveResult {
+                        index: i, passed: false, label,
+                        error: Some(format!("{e}")),
+                        line, source: src,
+                    },
                     Err(payload) => {
                         let msg = payload
                             .downcast_ref::<String>()
                             .map(|s| s.clone())
                             .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
                             .unwrap_or_else(|| "panic".to_string());
-                        DirectiveResult { index: i, passed: false, label, error: Some(format!("panic: {msg}")) }
+                        DirectiveResult {
+                            index: i, passed: false, label,
+                            error: Some(format!("panic: {msg}")),
+                            line, source: src,
+                        }
                     }
                 }
             })
@@ -281,21 +327,74 @@ fn execute_label(exec: &wast::WastExecute) -> String {
     }
 }
 
-// --- Entry points ---
+// --- Source extraction ---
 
-/// Run a single test in-process and return its result.
-fn run_test_inproc(name: &str, path: &Path) -> TestResult {
-    let start = Instant::now();
-    let mut runner = SpecRunner::new();
-    let directives = runner.run_wast(path);
-    TestResult {
-        name: name.to_string(),
-        directives,
-        crashed: false,
-        timed_out: false,
-        elapsed: start.elapsed(),
-    }
+/// Extract the byte offset of a directive's span.
+///
+/// Every `WastDirective` variant carries a `Span` pointing at its keyword
+/// in the source text (e.g. `assert_return`, `module`, etc.).
+fn directive_span(d: &wast::WastDirective) -> Option<wast::token::Span> {
+    Some(match d {
+        wast::WastDirective::AssertReturn { span, .. }
+        | wast::WastDirective::AssertTrap { span, .. }
+        | wast::WastDirective::AssertExhaustion { span, .. }
+        | wast::WastDirective::AssertInvalid { span, .. }
+        | wast::WastDirective::AssertMalformed { span, .. }
+        | wast::WastDirective::AssertUnlinkable { span, .. }
+        | wast::WastDirective::Register { span, .. } => *span,
+        wast::WastDirective::Invoke(invoke) => invoke.span,
+        wast::WastDirective::Module(quote_wat) => {
+            match quote_wat {
+                wast::QuoteWat::Wat(wat) => match wat {
+                    wast::Wat::Module(m) => m.span,
+                    wast::Wat::Component(c) => c.span,
+                },
+                wast::QuoteWat::QuoteModule(span, _)
+                | wast::QuoteWat::QuoteComponent(span, _) => *span,
+            }
+        }
+        _ => return None,
+    })
 }
+
+/// Extract the full s-expression starting at (or just before) `offset`.
+///
+/// Scans backwards from `offset` to find the opening `(`, then counts
+/// parens forward until balanced to find the closing `)`. Returns the
+/// extracted substring.
+fn extract_sexp(source: &str, offset: usize) -> Option<String> {
+    let bytes = source.as_bytes();
+    // Scan backwards from offset to find the opening paren.
+    let start = (0..offset)
+        .rev()
+        .find(|&i| bytes[i] == b'(')?;
+    // Count parens forward to find the matching close.
+    let mut depth = 0;
+    for (i, &b) in bytes[start..].iter().enumerate() {
+        match b {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(source[start..start + i + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Compute the 1-indexed line number for a byte offset in source text.
+fn line_number(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|&b| b == b'\n')
+        .count()
+        + 1
+}
+
+// --- Entry points ---
 
 /// Child process entry point: run a single .wast file and print results
 /// using the subprocess protocol.
@@ -337,39 +436,16 @@ fn main() {
     }
 
     let detailed = cli.expand || matched.len() <= 1;
-    let start = Instant::now();
+    let is_tty = std::io::stdout().is_terminal();
+    let timeout = Duration::from_secs(5);
 
-    if detailed {
-        let mut any_failed = false;
-        for (name, path) in &matched {
-            let result = run_test_inproc(name, path);
-            println!("\n{}", render_dot_grid(&result.name, &result.directives));
-            if result.is_fail() {
-                any_failed = true;
-            }
-        }
-        let elapsed = start.elapsed();
-        println!("\n{DIM}Finished in {:.2}s{RESET}", elapsed.as_secs_f64());
-        if any_failed {
-            std::process::exit(1);
-        }
-    } else {
-        let is_tty = std::io::stdout().is_terminal();
-        let timeout = Duration::from_secs(5);
+    run_tests_parallel(
+        "Spec Tests",
+        matched,
+        timeout,
+        is_tty,
+        detailed,
+        cli.verbose,
+    );
 
-        let results = run_tests_parallel(
-            "Spec Tests",
-            "cargo test -p wust --test spec_tests",
-            matched,
-            timeout,
-            is_tty,
-        );
-
-        let any_failed = results.iter().any(|r| r.is_fail());
-        let elapsed = start.elapsed();
-        println!("{DIM}Finished in {:.2}s{RESET}", elapsed.as_secs_f64());
-        if any_failed {
-            std::process::exit(1);
-        }
-    }
 }
