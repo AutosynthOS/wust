@@ -181,6 +181,7 @@ fn fuse_fib_sequence() {
         else_pc: 0,
         result_count: 0,
         param_count: 0,
+        entry_sp_offset: 0,
     });
     body.blocks.push(Block {
         kind: BlockKind::If,
@@ -189,6 +190,7 @@ fn fuse_fib_sequence() {
         else_pc: 0,  // no else branch — uses end as else target
         result_count: 0,
         param_count: 0,
+        entry_sp_offset: 0,
     });
 
     // 0: local.get 0

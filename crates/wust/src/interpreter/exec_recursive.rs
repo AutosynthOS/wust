@@ -11,13 +11,15 @@ pub(crate) enum Trap {
     OutOfFuel,
     CallStackExhausted,
     StackOverflow,
+    IntegerOverflow,
     Unimplemented(OpCode),
 }
 
 /// Maximum call depth before trapping with `CallStackExhausted`.
-/// Kept at 1000 to avoid native Rust stack overflow in debug builds
-/// (the recursive interpreter uses one Rust frame per wasm call).
-const MAX_CALL_DEPTH: u32 = 1_000;
+/// High enough for ack(3,10) (~8K depth). The recursive interpreter
+/// uses one Rust frame per wasm call, so this is bounded by the
+/// native stack size (~8MB / ~1KB per frame ≈ 8000 frames).
+const MAX_CALL_DEPTH: u32 = 10_000;
 
 impl std::fmt::Display for Trap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -26,6 +28,7 @@ impl std::fmt::Display for Trap {
             Trap::OutOfFuel => write!(f, "out of fuel"),
             Trap::CallStackExhausted => write!(f, "call stack exhausted"),
             Trap::StackOverflow => write!(f, "wasm stack overflow"),
+            Trap::IntegerOverflow => write!(f, "integer overflow"),
             Trap::Unimplemented(op) => write!(f, "unimplemented opcode: {op:?}"),
         }
     }
@@ -94,11 +97,8 @@ fn execute(
     let base = stack.base();
     let mut sp: *mut u8 = unsafe { base.add(stack.sp()) };
     let locals = frame.locals;
+    let operand_base = unsafe { locals.add(func.arg_byte_count + func.extra_local_bytes) };
     let mut pc: usize = 0;
-
-    // Runtime block stack: tracks (entry_sp, block_idx) for each
-    // open Block/Loop/If so we can restore SP on br/End.
-    let mut block_frames: Vec<(*mut u8, u32)> = Vec::with_capacity(8);
 
     loop {
         *fuel -= 1;
@@ -116,9 +116,7 @@ fn execute(
         match opcode {
             OpCode::Nop => {}
 
-            OpCode::Block | OpCode::Loop => {
-                block_frames.push((sp, imm));
-            }
+            OpCode::Block | OpCode::Loop => {}
 
             OpCode::Unreachable => {
                 stack.set_sp(unsafe { sp.offset_from(base) as usize });
@@ -130,26 +128,20 @@ fn execute(
             OpCode::If => {
                 sp = unsafe { sp.sub(8) };
                 let condition = unsafe { *(sp as *const i32) };
-                let block = unsafe { &*blocks.add(imm as usize) };
                 if condition == 0 {
+                    let block = unsafe { &*blocks.add(imm as usize) };
                     if block.else_pc != 0 {
                         pc = block.else_pc as usize + 1;
                     } else {
                         pc = block.end_pc as usize + 1;
-                        // Skip the block entirely — don't push a frame.
-                        continue;
                     }
                 }
-                block_frames.push((sp, imm));
             }
 
             OpCode::Else => {
-                // End of the then-branch. Clean up stack to entry_sp,
-                // preserving result values, then skip the else body.
+                // Validated wasm: stack is at entry_sp + result_count * 8.
+                // Just jump past the else body.
                 let block = unsafe { &*blocks.add(imm as usize) };
-                let (entry_sp, _) = block_frames.pop()
-                    .expect("Else without matching block frame");
-                sp = copy_block_results(sp, entry_sp, block.result_count);
                 pc = block.end_pc as usize + 1;
             }
 
@@ -157,15 +149,15 @@ fn execute(
                 if imm == 0 {
                     break;
                 }
-                let block = unsafe { &*blocks.add(imm as usize) };
-                let (entry_sp, _) = block_frames.pop()
-                    .expect("End without matching block frame");
-                sp = copy_block_results(sp, entry_sp, block.result_count);
+                // Validated wasm: stack is already at entry_sp + result_count * 8.
+                // No copying needed.
             }
 
             OpCode::Br => {
                 let block = unsafe { &*blocks.add(imm as usize) };
-                sp = do_branch(&mut block_frames, sp, block, imm);
+                let entry_sp = unsafe { operand_base.add(block.entry_sp_offset as usize * 8) };
+                let arity = if block.kind == BlockKind::Loop { block.param_count } else { block.result_count };
+                sp = copy_block_results(sp, entry_sp, arity);
                 pc = branch_target(block);
             }
 
@@ -174,7 +166,9 @@ fn execute(
                 let condition = unsafe { *(sp as *const i32) };
                 if condition != 0 {
                     let block = unsafe { &*blocks.add(imm as usize) };
-                    sp = do_branch(&mut block_frames, sp, block, imm);
+                    let entry_sp = unsafe { operand_base.add(block.entry_sp_offset as usize * 8) };
+                    let arity = if block.kind == BlockKind::Loop { block.param_count } else { block.result_count };
+                    sp = copy_block_results(sp, entry_sp, arity);
                     pc = branch_target(block);
                 }
             }
@@ -494,6 +488,122 @@ fn execute(
                 }
             }
 
+            // --- i32 trapping truncation from floats ---
+
+            OpCode::I32TruncF32S => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    if a.is_nan() || a >= 2147483648.0_f32 || a < -2147483648.0_f32 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::IntegerOverflow);
+                    }
+                    *(sp.sub(8) as *mut u64) = (a as i32) as u64;
+                }
+            }
+
+            OpCode::I32TruncF32U => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    if a.is_nan() || a >= 4294967296.0_f32 || a <= -1.0_f32 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::IntegerOverflow);
+                    }
+                    *(sp.sub(8) as *mut u64) = (a as u32) as u64;
+                }
+            }
+
+            OpCode::I32TruncF64S => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    if a.is_nan() || a >= 2147483648.0_f64 || a <= -2147483649.0_f64 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::IntegerOverflow);
+                    }
+                    *(sp.sub(8) as *mut u64) = (a as i32) as u64;
+                }
+            }
+
+            OpCode::I32TruncF64U => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    if a.is_nan() || a >= 4294967296.0_f64 || a <= -1.0_f64 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::IntegerOverflow);
+                    }
+                    *(sp.sub(8) as *mut u64) = (a as u32) as u64;
+                }
+            }
+
+            // --- i32 saturating truncation from floats ---
+
+            OpCode::I32TruncSatF32S => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    let result = if a.is_nan() {
+                        0_i32
+                    } else if a >= 2147483648.0_f32 {
+                        i32::MAX
+                    } else if a < -2147483648.0_f32 {
+                        i32::MIN
+                    } else {
+                        a as i32
+                    };
+                    *(sp.sub(8) as *mut u64) = result as u64;
+                }
+            }
+
+            OpCode::I32TruncSatF32U => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    let result = if a.is_nan() || a <= -1.0_f32 {
+                        0_u32
+                    } else if a >= 4294967296.0_f32 {
+                        u32::MAX
+                    } else {
+                        a as u32
+                    };
+                    *(sp.sub(8) as *mut u64) = result as u64;
+                }
+            }
+
+            OpCode::I32TruncSatF64S => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    let result = if a.is_nan() {
+                        0_i32
+                    } else if a >= 2147483648.0_f64 {
+                        i32::MAX
+                    } else if a <= -2147483649.0_f64 {
+                        i32::MIN
+                    } else {
+                        a as i32
+                    };
+                    *(sp.sub(8) as *mut u64) = result as u64;
+                }
+            }
+
+            OpCode::I32TruncSatF64U => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    let result = if a.is_nan() || a <= -1.0_f64 {
+                        0_u32
+                    } else if a >= 4294967296.0_f64 {
+                        u32::MAX
+                    } else {
+                        a as u32
+                    };
+                    *(sp.sub(8) as *mut u64) = result as u64;
+                }
+            }
+
+            // --- i32 reinterpret ---
+
+            OpCode::I32ReinterpretF32 => {
+                // No-op: bits are already in the correct position on the stack.
+                // f32 is stored as u32 in the low 32 bits, which is the same
+                // as i32 representation.
+            }
+
             OpCode::I64Add => {
                 sp = unsafe { sp.sub(8) };
                 unsafe {
@@ -803,6 +913,120 @@ fn execute(
                 }
             }
 
+            // --- i64 trapping truncation from floats ---
+
+            OpCode::I64TruncF32S => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    if a.is_nan() || a >= 9223372036854775808.0_f32 || a < -9223372036854775808.0_f32 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::IntegerOverflow);
+                    }
+                    *(sp.sub(8) as *mut u64) = (a as i64) as u64;
+                }
+            }
+
+            OpCode::I64TruncF32U => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    if a.is_nan() || a >= 18446744073709551616.0_f32 || a <= -1.0_f32 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::IntegerOverflow);
+                    }
+                    *(sp.sub(8) as *mut u64) = a as u64;
+                }
+            }
+
+            OpCode::I64TruncF64S => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    if a.is_nan() || a >= 9223372036854775808.0_f64 || a < -9223372036854775808.0_f64 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::IntegerOverflow);
+                    }
+                    *(sp.sub(8) as *mut u64) = (a as i64) as u64;
+                }
+            }
+
+            OpCode::I64TruncF64U => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    if a.is_nan() || a >= 18446744073709551616.0_f64 || a <= -1.0_f64 {
+                        stack.set_sp(sp.offset_from(base) as usize);
+                        return Err(Trap::IntegerOverflow);
+                    }
+                    *(sp.sub(8) as *mut u64) = a as u64;
+                }
+            }
+
+            // --- i64 saturating truncation from floats ---
+
+            OpCode::I64TruncSatF32S => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    let result = if a.is_nan() {
+                        0_i64
+                    } else if a >= 9223372036854775808.0_f32 {
+                        i64::MAX
+                    } else if a < -9223372036854775808.0_f32 {
+                        i64::MIN
+                    } else {
+                        a as i64
+                    };
+                    *(sp.sub(8) as *mut u64) = result as u64;
+                }
+            }
+
+            OpCode::I64TruncSatF32U => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    let result = if a.is_nan() || a <= -1.0_f32 {
+                        0_u64
+                    } else if a >= 18446744073709551616.0_f32 {
+                        u64::MAX
+                    } else {
+                        a as u64
+                    };
+                    *(sp.sub(8) as *mut u64) = result;
+                }
+            }
+
+            OpCode::I64TruncSatF64S => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    let result = if a.is_nan() {
+                        0_i64
+                    } else if a >= 9223372036854775808.0_f64 {
+                        i64::MAX
+                    } else if a < -9223372036854775808.0_f64 {
+                        i64::MIN
+                    } else {
+                        a as i64
+                    };
+                    *(sp.sub(8) as *mut u64) = result as u64;
+                }
+            }
+
+            OpCode::I64TruncSatF64U => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    let result = if a.is_nan() || a <= -1.0_f64 {
+                        0_u64
+                    } else if a >= 18446744073709551616.0_f64 {
+                        u64::MAX
+                    } else {
+                        a as u64
+                    };
+                    *(sp.sub(8) as *mut u64) = result;
+                }
+            }
+
+            // --- i64 reinterpret ---
+
+            OpCode::I64ReinterpretF64 => {
+                // No-op: f64 bits are already stored as u64 on the stack.
+            }
+
             // --- f32 binary arithmetic ---
 
             OpCode::F32Add => {
@@ -973,6 +1197,48 @@ fn execute(
                     let a = f32::from_bits(*(sp.sub(8) as *const u32));
                     *(sp.sub(8) as *mut u64) = (a >= b) as u64;
                 }
+            }
+
+            // --- f32 conversion ---
+
+            OpCode::F32ConvertI32S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a as f32).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32ConvertI32U => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = (a as f32).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32ConvertI64S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a as f32).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32ConvertI64U => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = (a as f32).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32DemoteF64 => {
+                unsafe {
+                    let a = f64::from_bits(*(sp.sub(8) as *const u64));
+                    *(sp.sub(8) as *mut u64) = (a as f32).to_bits() as u64;
+                }
+            }
+
+            OpCode::F32ReinterpretI32 => {
+                // No-op: i32 bits are stored in the low 32 bits, which is
+                // already the f32 representation on the stack.
             }
 
             // --- f64 binary arithmetic ---
@@ -1147,6 +1413,48 @@ fn execute(
                 }
             }
 
+            // --- f64 conversion ---
+
+            OpCode::F64ConvertI32S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i32);
+                    *(sp.sub(8) as *mut u64) = (a as f64).to_bits();
+                }
+            }
+
+            OpCode::F64ConvertI32U => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u32);
+                    *(sp.sub(8) as *mut u64) = (a as f64).to_bits();
+                }
+            }
+
+            OpCode::F64ConvertI64S => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const i64);
+                    *(sp.sub(8) as *mut u64) = (a as f64).to_bits();
+                }
+            }
+
+            OpCode::F64ConvertI64U => {
+                unsafe {
+                    let a = *(sp.sub(8) as *const u64);
+                    *(sp.sub(8) as *mut u64) = (a as f64).to_bits();
+                }
+            }
+
+            OpCode::F64PromoteF32 => {
+                unsafe {
+                    let a = f32::from_bits(*(sp.sub(8) as *const u32));
+                    *(sp.sub(8) as *mut u64) = (a as f64).to_bits();
+                }
+            }
+
+            OpCode::F64ReinterpretI64 => {
+                // No-op: i64 bits are already stored as u64 on the stack,
+                // which is the same as f64 representation.
+            }
+
             OpCode::Drop => {
                 sp = unsafe { sp.sub(8) };
             }
@@ -1251,7 +1559,6 @@ fn execute(
                         continue;
                     }
                 }
-                block_frames.push((sp, block_idx as u32));
             }
 
             OpCode::LocalGetI32EqzIf => {
@@ -1267,7 +1574,6 @@ fn execute(
                         continue;
                     }
                 }
-                block_frames.push((sp, block_idx as u32));
             }
 
             OpCode::DataStream => {
@@ -1329,7 +1635,9 @@ fn execute(
                     OpCode::Br => {
                         let block_idx = u32::from_le_bytes(data[off+1..off+5].try_into().unwrap());
                         let block = unsafe { &*blocks.add(block_idx as usize) };
-                        sp = do_branch(&mut block_frames, sp, block, block_idx);
+                        let entry_sp = unsafe { operand_base.add(block.entry_sp_offset as usize * 8) };
+                        let arity = if block.kind == BlockKind::Loop { block.param_count } else { block.result_count };
+                        sp = copy_block_results(sp, entry_sp, arity);
                         pc = branch_target(block);
                     }
                     OpCode::BrIf => {
@@ -1338,7 +1646,9 @@ fn execute(
                         let condition = unsafe { *(sp as *const i32) };
                         if condition != 0 {
                             let block = unsafe { &*blocks.add(block_idx as usize) };
-                            sp = do_branch(&mut block_frames, sp, block, block_idx);
+                            let entry_sp = unsafe { operand_base.add(block.entry_sp_offset as usize * 8) };
+                            let arity = if block.kind == BlockKind::Loop { block.param_count } else { block.result_count };
+                            sp = copy_block_results(sp, entry_sp, arity);
                             pc = branch_target(block);
                         }
                     }
@@ -1448,42 +1758,6 @@ fn copy_block_results(sp: *mut u8, entry_sp: *mut u8, count: u32) -> *mut u8 {
         unsafe { std::ptr::copy(src, entry_sp, byte_count) };
     }
     unsafe { entry_sp.add(byte_count) }
-}
-
-/// Execute a branch to the given block: clean up the stack and pop
-/// block frames up to (and including for Block/If, excluding for Loop)
-/// the target block.
-fn do_branch(
-    block_frames: &mut Vec<(*mut u8, u32)>,
-    sp: *mut u8,
-    block: &Block,
-    block_idx: u32,
-) -> *mut u8 {
-    // Find the target block frame.
-    let frame_pos = block_frames.iter().rposition(|(_, idx)| *idx == block_idx)
-        .expect("branch target not found in block frames");
-    let entry_sp = block_frames[frame_pos].0;
-
-    // For Loop, branch carries param_count values and re-enters the loop
-    // (don't pop the loop frame). For Block/If, branch carries result_count
-    // values and exits (pop up through the target).
-    let arity = if block.kind == BlockKind::Loop {
-        block.param_count
-    } else {
-        block.result_count
-    };
-
-    let new_sp = copy_block_results(sp, entry_sp, arity);
-
-    if block.kind == BlockKind::Loop {
-        // Truncate frames above the loop (but keep the loop frame).
-        block_frames.truncate(frame_pos + 1);
-    } else {
-        // Pop all frames up to and including the target.
-        block_frames.truncate(frame_pos);
-    }
-
-    new_sp
 }
 
 /// Resolve a branch target PC from a block.

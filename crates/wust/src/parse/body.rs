@@ -128,6 +128,15 @@ impl InlineOp {
             OpCode::I32WrapI64 => "i32.wrap_i64".into(),
             OpCode::I32Extend8S => "i32.extend8_s".into(),
             OpCode::I32Extend16S => "i32.extend16_s".into(),
+            OpCode::I32TruncF32S => "i32.trunc_f32_s".into(),
+            OpCode::I32TruncF32U => "i32.trunc_f32_u".into(),
+            OpCode::I32TruncF64S => "i32.trunc_f64_s".into(),
+            OpCode::I32TruncF64U => "i32.trunc_f64_u".into(),
+            OpCode::I32TruncSatF32S => "i32.trunc_sat_f32_s".into(),
+            OpCode::I32TruncSatF32U => "i32.trunc_sat_f32_u".into(),
+            OpCode::I32TruncSatF64S => "i32.trunc_sat_f64_s".into(),
+            OpCode::I32TruncSatF64U => "i32.trunc_sat_f64_u".into(),
+            OpCode::I32ReinterpretF32 => "i32.reinterpret_f32".into(),
             OpCode::I64Add => "i64.add".into(),
             OpCode::I64Sub => "i64.sub".into(),
             OpCode::I64Mul => "i64.mul".into(),
@@ -162,6 +171,15 @@ impl InlineOp {
             OpCode::I64Extend8S => "i64.extend8_s".into(),
             OpCode::I64Extend16S => "i64.extend16_s".into(),
             OpCode::I64Extend32S => "i64.extend32_s".into(),
+            OpCode::I64TruncF32S => "i64.trunc_f32_s".into(),
+            OpCode::I64TruncF32U => "i64.trunc_f32_u".into(),
+            OpCode::I64TruncF64S => "i64.trunc_f64_s".into(),
+            OpCode::I64TruncF64U => "i64.trunc_f64_u".into(),
+            OpCode::I64TruncSatF32S => "i64.trunc_sat_f32_s".into(),
+            OpCode::I64TruncSatF32U => "i64.trunc_sat_f32_u".into(),
+            OpCode::I64TruncSatF64S => "i64.trunc_sat_f64_s".into(),
+            OpCode::I64TruncSatF64U => "i64.trunc_sat_f64_u".into(),
+            OpCode::I64ReinterpretF64 => "i64.reinterpret_f64".into(),
             OpCode::F32Add => "f32.add".into(),
             OpCode::F32Sub => "f32.sub".into(),
             OpCode::F32Mul => "f32.mul".into(),
@@ -182,6 +200,12 @@ impl InlineOp {
             OpCode::F32Gt => "f32.gt".into(),
             OpCode::F32Le => "f32.le".into(),
             OpCode::F32Ge => "f32.ge".into(),
+            OpCode::F32ConvertI32S => "f32.convert_i32_s".into(),
+            OpCode::F32ConvertI32U => "f32.convert_i32_u".into(),
+            OpCode::F32ConvertI64S => "f32.convert_i64_s".into(),
+            OpCode::F32ConvertI64U => "f32.convert_i64_u".into(),
+            OpCode::F32DemoteF64 => "f32.demote_f64".into(),
+            OpCode::F32ReinterpretI32 => "f32.reinterpret_i32".into(),
             OpCode::F64Add => "f64.add".into(),
             OpCode::F64Sub => "f64.sub".into(),
             OpCode::F64Mul => "f64.mul".into(),
@@ -202,6 +226,12 @@ impl InlineOp {
             OpCode::F64Gt => "f64.gt".into(),
             OpCode::F64Le => "f64.le".into(),
             OpCode::F64Ge => "f64.ge".into(),
+            OpCode::F64ConvertI32S => "f64.convert_i32_s".into(),
+            OpCode::F64ConvertI32U => "f64.convert_i32_u".into(),
+            OpCode::F64ConvertI64S => "f64.convert_i64_s".into(),
+            OpCode::F64ConvertI64U => "f64.convert_i64_u".into(),
+            OpCode::F64PromoteF32 => "f64.promote_f32".into(),
+            OpCode::F64ReinterpretI64 => "f64.reinterpret_i64".into(),
             OpCode::F32Const => "f32.const".into(),
             OpCode::F64Const => "f64.const".into(),
             OpCode::Drop => "drop".into(),
@@ -328,6 +358,18 @@ pub(crate) enum OpCode {
     I32WrapI64,
     I32Extend8S,
     I32Extend16S,
+    // --- i32 truncation from floats (trapping) ---
+    I32TruncF32S,
+    I32TruncF32U,
+    I32TruncF64S,
+    I32TruncF64U,
+    // --- i32 truncation from floats (saturating) ---
+    I32TruncSatF32S,
+    I32TruncSatF32U,
+    I32TruncSatF64S,
+    I32TruncSatF64U,
+    // --- i32 reinterpret ---
+    I32ReinterpretF32,
     // --- i64 arithmetic ---
     I64Add,
     I64Sub,
@@ -367,6 +409,18 @@ pub(crate) enum OpCode {
     I64Extend8S,
     I64Extend16S,
     I64Extend32S,
+    // --- i64 truncation from floats (trapping) ---
+    I64TruncF32S,
+    I64TruncF32U,
+    I64TruncF64S,
+    I64TruncF64U,
+    // --- i64 truncation from floats (saturating) ---
+    I64TruncSatF32S,
+    I64TruncSatF32U,
+    I64TruncSatF64S,
+    I64TruncSatF64U,
+    // --- i64 reinterpret ---
+    I64ReinterpretF64,
 
     // --- f32 arithmetic (binary) ---
     F32Add,
@@ -391,6 +445,13 @@ pub(crate) enum OpCode {
     F32Gt,
     F32Le,
     F32Ge,
+    // --- f32 conversion ---
+    F32ConvertI32S,
+    F32ConvertI32U,
+    F32ConvertI64S,
+    F32ConvertI64U,
+    F32DemoteF64,
+    F32ReinterpretI32,
 
     // --- f64 arithmetic (binary) ---
     F64Add,
@@ -415,6 +476,13 @@ pub(crate) enum OpCode {
     F64Gt,
     F64Le,
     F64Ge,
+    // --- f64 conversion ---
+    F64ConvertI32S,
+    F64ConvertI32U,
+    F64ConvertI64S,
+    F64ConvertI64U,
+    F64PromoteF32,
+    F64ReinterpretI64,
 
     // --- f32/f64 constants ---
     F32Const,
@@ -501,6 +569,9 @@ pub(crate) struct Block {
     pub(crate) result_count: u32,
     /// Number of parameter values this block consumes (non-zero only for multi-value).
     pub(crate) param_count: u32,
+    /// Operand stack height (bytes, relative to locals base) at block entry.
+    /// Precomputed at parse time so the interpreter never tracks block frames.
+    pub(crate) entry_sp_offset: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -579,24 +650,28 @@ impl ParsedBody {
     pub(crate) fn parse(reader: &FunctionBody, types: &TypesRef) -> Result<Self, anyhow::Error> {
         let mut body = Self::default();
 
+        // Operand stack height in bytes, relative to locals base.
+        // Tracked at parse time so blocks can record their entry_sp_offset.
+        let mut stack_height: u32 = 0;
+
         // Implicit function-level block (index 0).
         // Result count is patched later in build() since we don't have
         // access to the function signature here.
-        let func_block_idx = body.open_block(BlockKind::Function, 0, 0);
+        let func_block_idx = body.open_block(BlockKind::Function, 0, 0, stack_height);
 
         let ops_reader = reader.get_operators_reader()?;
         // Track open block indices so `end` can find the right one.
         let mut block_stack: Vec<u32> = vec![func_block_idx];
 
         for op in ops_reader {
-            body.parse_op(op?, &mut block_stack, types)?;
+            body.parse_op(op?, &mut block_stack, types, &mut stack_height)?;
         }
         body.fuse();
         Ok(body)
     }
 
     /// Allocate a new block entry, returning its index.
-    fn open_block(&mut self, kind: BlockKind, result_count: u32, param_count: u32) -> u32 {
+    fn open_block(&mut self, kind: BlockKind, result_count: u32, param_count: u32, entry_sp_offset: u32) -> u32 {
         let idx = self.blocks.len() as u32;
         self.blocks.push(Block {
             kind,
@@ -605,11 +680,12 @@ impl ParsedBody {
             else_pc: 0,
             result_count,
             param_count,
+            entry_sp_offset,
         });
         idx
     }
 
-    fn parse_op(&mut self, op: Operator, block_stack: &mut Vec<u32>, types: &TypesRef) -> Result<(), anyhow::Error> {
+    fn parse_op(&mut self, op: Operator, block_stack: &mut Vec<u32>, types: &TypesRef, _stack_height: &mut u32) -> Result<(), anyhow::Error> {
         match op {
             // No-immediate ops
             Operator::Nop => self.ops.push(pack(OpCode::Nop)),
@@ -619,19 +695,19 @@ impl ParsedBody {
             // Block control flow
             Operator::Block { blockty } => {
                 let (rc, pc) = resolve_block_type(blockty, types);
-                let idx = self.open_block(BlockKind::Block, rc, pc);
+                let idx = self.open_block(BlockKind::Block, rc, pc, 0);
                 block_stack.push(idx);
                 self.ops.push(pack_imm_u(OpCode::Block, idx));
             }
             Operator::Loop { blockty } => {
                 let (rc, pc) = resolve_block_type(blockty, types);
-                let idx = self.open_block(BlockKind::Loop, rc, pc);
+                let idx = self.open_block(BlockKind::Loop, rc, pc, 0);
                 block_stack.push(idx);
                 self.ops.push(pack_imm_u(OpCode::Loop, idx));
             }
             Operator::If { blockty } => {
                 let (rc, pc) = resolve_block_type(blockty, types);
-                let idx = self.open_block(BlockKind::If, rc, pc);
+                let idx = self.open_block(BlockKind::If, rc, pc, 0);
                 block_stack.push(idx);
                 self.ops.push(pack_imm_u(OpCode::If, idx));
             }
@@ -691,6 +767,18 @@ impl ParsedBody {
             Operator::I32WrapI64 => self.ops.push(pack(OpCode::I32WrapI64)),
             Operator::I32Extend8S => self.ops.push(pack(OpCode::I32Extend8S)),
             Operator::I32Extend16S => self.ops.push(pack(OpCode::I32Extend16S)),
+            // i32 truncation from floats (trapping)
+            Operator::I32TruncF32S => self.ops.push(pack(OpCode::I32TruncF32S)),
+            Operator::I32TruncF32U => self.ops.push(pack(OpCode::I32TruncF32U)),
+            Operator::I32TruncF64S => self.ops.push(pack(OpCode::I32TruncF64S)),
+            Operator::I32TruncF64U => self.ops.push(pack(OpCode::I32TruncF64U)),
+            // i32 truncation from floats (saturating)
+            Operator::I32TruncSatF32S => self.ops.push(pack(OpCode::I32TruncSatF32S)),
+            Operator::I32TruncSatF32U => self.ops.push(pack(OpCode::I32TruncSatF32U)),
+            Operator::I32TruncSatF64S => self.ops.push(pack(OpCode::I32TruncSatF64S)),
+            Operator::I32TruncSatF64U => self.ops.push(pack(OpCode::I32TruncSatF64U)),
+            // i32 reinterpret
+            Operator::I32ReinterpretF32 => self.ops.push(pack(OpCode::I32ReinterpretF32)),
             // i64 arithmetic
             Operator::I64Add => self.ops.push(pack(OpCode::I64Add)),
             Operator::I64Sub => self.ops.push(pack(OpCode::I64Sub)),
@@ -730,6 +818,18 @@ impl ParsedBody {
             Operator::I64Extend8S => self.ops.push(pack(OpCode::I64Extend8S)),
             Operator::I64Extend16S => self.ops.push(pack(OpCode::I64Extend16S)),
             Operator::I64Extend32S => self.ops.push(pack(OpCode::I64Extend32S)),
+            // i64 truncation from floats (trapping)
+            Operator::I64TruncF32S => self.ops.push(pack(OpCode::I64TruncF32S)),
+            Operator::I64TruncF32U => self.ops.push(pack(OpCode::I64TruncF32U)),
+            Operator::I64TruncF64S => self.ops.push(pack(OpCode::I64TruncF64S)),
+            Operator::I64TruncF64U => self.ops.push(pack(OpCode::I64TruncF64U)),
+            // i64 truncation from floats (saturating)
+            Operator::I64TruncSatF32S => self.ops.push(pack(OpCode::I64TruncSatF32S)),
+            Operator::I64TruncSatF32U => self.ops.push(pack(OpCode::I64TruncSatF32U)),
+            Operator::I64TruncSatF64S => self.ops.push(pack(OpCode::I64TruncSatF64S)),
+            Operator::I64TruncSatF64U => self.ops.push(pack(OpCode::I64TruncSatF64U)),
+            // i64 reinterpret
+            Operator::I64ReinterpretF64 => self.ops.push(pack(OpCode::I64ReinterpretF64)),
             // f32 arithmetic
             Operator::F32Add => self.ops.push(pack(OpCode::F32Add)),
             Operator::F32Sub => self.ops.push(pack(OpCode::F32Sub)),
@@ -753,6 +853,13 @@ impl ParsedBody {
             Operator::F32Gt => self.ops.push(pack(OpCode::F32Gt)),
             Operator::F32Le => self.ops.push(pack(OpCode::F32Le)),
             Operator::F32Ge => self.ops.push(pack(OpCode::F32Ge)),
+            // f32 conversion
+            Operator::F32ConvertI32S => self.ops.push(pack(OpCode::F32ConvertI32S)),
+            Operator::F32ConvertI32U => self.ops.push(pack(OpCode::F32ConvertI32U)),
+            Operator::F32ConvertI64S => self.ops.push(pack(OpCode::F32ConvertI64S)),
+            Operator::F32ConvertI64U => self.ops.push(pack(OpCode::F32ConvertI64U)),
+            Operator::F32DemoteF64 => self.ops.push(pack(OpCode::F32DemoteF64)),
+            Operator::F32ReinterpretI32 => self.ops.push(pack(OpCode::F32ReinterpretI32)),
             // f64 arithmetic
             Operator::F64Add => self.ops.push(pack(OpCode::F64Add)),
             Operator::F64Sub => self.ops.push(pack(OpCode::F64Sub)),
@@ -776,6 +883,13 @@ impl ParsedBody {
             Operator::F64Gt => self.ops.push(pack(OpCode::F64Gt)),
             Operator::F64Le => self.ops.push(pack(OpCode::F64Le)),
             Operator::F64Ge => self.ops.push(pack(OpCode::F64Ge)),
+            // f64 conversion
+            Operator::F64ConvertI32S => self.ops.push(pack(OpCode::F64ConvertI32S)),
+            Operator::F64ConvertI32U => self.ops.push(pack(OpCode::F64ConvertI32U)),
+            Operator::F64ConvertI64S => self.ops.push(pack(OpCode::F64ConvertI64S)),
+            Operator::F64ConvertI64U => self.ops.push(pack(OpCode::F64ConvertI64U)),
+            Operator::F64PromoteF32 => self.ops.push(pack(OpCode::F64PromoteF32)),
+            Operator::F64ReinterpretI64 => self.ops.push(pack(OpCode::F64ReinterpretI64)),
             // f32/f64 constants (always spill to data stream)
             Operator::F32Const { value } => {
                 self.emit_data(OpCode::F32Const, &value.bits().to_le_bytes());
