@@ -23,6 +23,9 @@ cargo test -p wust --test spec_tests i32
 # Force detailed mode for multiple tests:
 cargo test -p wust --test spec_tests f32 -- --expand
 
+# Show all errors (no cap) in detailed mode:
+cargo test -p wust --test spec_tests block -- --verbose
+
 # Filter with exact match:
 cargo test -p wust --test spec_tests i32 -- --exact
 
@@ -34,8 +37,8 @@ cargo test -p wust --test spec_tests -- --list
 ```
 
 > **Note:** Positional filter names (like `i32`) can go before or after `--`.
-> Flags like `--skip`, `--list`, `--expand`, `--exact` must go after `--`
-> to prevent cargo from consuming them.
+> Flags like `--skip`, `--list`, `--expand`, `--exact`, `--verbose` must go
+> after `--` to prevent cargo from consuming them.
 
 ## CLI Flags
 
@@ -49,6 +52,7 @@ binaries using the harness:
 | `-- --skip <pattern>` | Skip tests whose name contains `<pattern>` (repeatable) |
 | `-- --list` | List discovered test names without running them |
 | `-- --expand` | Force detailed (dot grid) mode even with multiple tests |
+| `-- --verbose` / `-v` | Show all errors (no cap) in detailed mode |
 
 ## Display Modes
 
@@ -57,15 +61,24 @@ binaries using the harness:
 Tests run in parallel with a live bordered box:
 
 - Top border + title printed immediately
-- Completed test rows stream in as they finish (with progress bar, pass/fail count, elapsed time)
-- TTY: a live footer shows currently running tests and overall progress
+- Completed test rows stream in as they finish (table-aligned with
+  progress bar, pass/fail count, elapsed time)
+- TTY: a live footer shows running tests, file/directive progress bars,
+  and summary stats (redrawn in-place)
 - Non-TTY: rows print as they complete with no cursor movement
-- After completion: failing test names, summary bars, and helper commands
+- After completion: failing test names and summary bars
 
 ### Detailed mode (single test, or `--expand`)
 
-Tests run sequentially in-process. Each test gets a dot grid showing
-per-directive pass/fail, a progress bar, and error details.
+Each completed test renders an inner box with:
+
+- Header row (icon, name, progress bar, stats, elapsed)
+- Dot grid showing per-directive pass/fail
+- Error diagnostics with source snippets (Rust compiler style):
+  - Combined `#N: label - error message` header (wrapped if long)
+  - Source lines with line number gutter
+  - `^^^` underline on the first source line
+- Capped at 6 errors by default; use `--verbose` to show all
 
 ## Parallel Execution
 
@@ -74,7 +87,7 @@ per-directive pass/fail, a progress bar, and error details.
 - Worker count: `std::thread::available_parallelism()` (capped at test count)
 - Each test runs in a child process for crash isolation
 - Default timeout: 5 seconds per test (configurable via `timeout` param)
-- Timed-out tests are killed and marked `TIMED OUT`
+- Timed-out tests are killed and marked `TIMEOUT`
 - Crashed tests (segfault, signal) are marked `CRASHED`
 
 ## Subprocess Protocol
@@ -82,8 +95,12 @@ per-directive pass/fail, a progress bar, and error details.
 Child processes communicate results via stdout, one line per directive:
 
 ```
-PASS|FAIL <index> <label>\t<error>
+PASS|FAIL <index> <label>\t<error>\t<line>\t<source>
 ```
+
+Fields after label are tab-separated. Source newlines are escaped as
+literal `\n` in the protocol. The `line` field is a 1-indexed line number;
+`source` is the full s-expression text of the directive.
 
 The child entry point must:
 1. Accept `--__run <name> <path>` args
@@ -95,11 +112,11 @@ The child entry point must:
 
 | Type | Description |
 |------|-------------|
-| `DirectiveResult` | Result of a single assertion/directive within a test |
+| `DirectiveResult` | Result of a single directive (index, passed, label, error, line, source) |
 | `TestResult` | Aggregated results for one test file (directives, crashed, timed_out, elapsed) |
 | `TestEntry` | A test tracked by the parallel runner (name, path, status) |
 | `TestStatus` | `Pending`, `Running { started }`, or `Completed(TestResult)` |
-| `CliArgs` | Parsed CLI arguments (filter, exact, skip, list, expand) |
+| `CliArgs` | Parsed CLI arguments (filter, exact, skip, list, expand, verbose) |
 
 ## Key Functions
 
@@ -108,9 +125,9 @@ The child entry point must:
 | `parse_cli_args()` | Parse CLI flags from `std::env::args()` |
 | `discover_test_files(dir, ext)` | Find all files with extension in a directory |
 | `matches_filter(name, filter, exact, skip)` | Check if a test name matches CLI filters |
-| `run_tests_parallel(title, test_command, tests, timeout, is_tty)` | Run tests in parallel with live TUI |
+| `run_tests_parallel(title, tests, timeout, is_tty, detailed, verbose)` | Run tests in parallel with live TUI |
 | `run_test_subprocess_timed(name, path, timeout)` | Run a single test in a child process with timeout |
-| `render_dot_grid(name, results)` | Render detailed dot grid for a single test |
 | `render_bar(passed, total, width)` | Render a Fira Code progress bar |
+| `render_bar_three(passed, failed, total, width)` | Three-state progress bar (green/red/dim) |
 | `print_subprocess_results(results)` | Emit subprocess protocol lines (child side) |
 | `parse_subprocess_output(stdout)` | Parse subprocess protocol lines (parent side) |
