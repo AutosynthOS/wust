@@ -3,10 +3,12 @@ pub(crate) mod compiler;
 #[cfg(test)]
 pub(crate) mod tests;
 
+use wasmparser::ValType;
+
 use crate::Instance;
 use crate::Module;
 use crate::stack::Stack;
-use crate::value::WasmArgs;
+use crate::value::{Val, WasmArgs};
 
 use wust_codegen::code_buffer::CodeBuffer;
 use wust_codegen::context::JitContext;
@@ -142,24 +144,45 @@ impl JitModule {
         JitCompiler::new(module).compile()
     }
 
-    /// Call a compiled function by export name (non-fiber, unlimited fuel).
+    /// Call a compiled function by export name (dynamic API).
+    ///
+    /// Returns results as `Vec<Val>`, supporting multi-value returns.
+    pub fn call_dynamic(
+        &self,
+        instance: &mut Instance,
+        name: &str,
+        args: &[Val],
+    ) -> Result<Vec<Val>, anyhow::Error> {
+        let func_idx = instance.resolve_export_func_idx(name)?;
+        let func = instance
+            .module
+            .get_func(func_idx)
+            .ok_or_else(|| anyhow::anyhow!("function {func_idx:?} not found"))?;
+        let result_types = func.results.clone();
+        let stack = &mut instance.stack;
+
+        stack.set_sp(0);
+        for val in args {
+            stack.push_val(val);
+        }
+
+        let regs = unsafe { self.enter(func_idx.0 as usize, stack) };
+        Ok(regs_to_vals(&regs, &result_types))
+    }
+
+    /// Call a compiled function by export name (typed API).
     pub fn call<A: WasmArgs>(
         &self,
         instance: &mut Instance,
         name: &str,
         args: A,
     ) -> Result<i32, anyhow::Error> {
-        let func_idx = instance.resolve_export_func_idx(name)?;
-        let stack = &mut instance.stack;
-
-        // Push args onto the wasm stack.
-        stack.set_sp(0);
-        for val in args.to_vals() {
-            stack.push_val(&val);
+        let vals = self.call_dynamic(instance, name, &args.to_vals())?;
+        match vals.first() {
+            Some(Val::I32(v)) => Ok(*v),
+            Some(other) => anyhow::bail!("expected i32 result, got {other:?}"),
+            None => anyhow::bail!("expected i32 result, got no results"),
         }
-
-        let result = unsafe { self.enter(func_idx.0 as usize, stack) };
-        Ok(result)
     }
 
     /// Create a fiber for calling a function with bounded fuel.
@@ -221,8 +244,8 @@ impl JitModule {
     /// Enter JIT code for a function (non-fiber mode).
     ///
     /// Sets x20=ctx, x21=fuel, x29=frame base, passes args in x9-x15.
-    /// Result is returned in x9.
-    unsafe fn enter(&self, func_idx: usize, stack: &mut Stack) -> i32 {
+    /// Returns all 7 return registers (x9-x15) as raw u64 values.
+    unsafe fn enter(&self, func_idx: usize, stack: &mut Stack) -> [u64; 7] {
         let code_ptr = self.jump_table_entry(func_idx);
         let base = stack.base();
         let fuel: i64 = i64::MAX;
@@ -239,7 +262,13 @@ impl JitModule {
             args[i] = stack.read_u64_at(i * 8);
         }
 
-        let result: i64;
+        let r9: u64;
+        let r10: u64;
+        let r11: u64;
+        let r12: u64;
+        let r13: u64;
+        let r14: u64;
+        let r15: u64;
         unsafe {
             std::arch::asm!(
                 "stp x29, x30, [sp, #-16]!",
@@ -250,7 +279,6 @@ impl JitModule {
                 "str x29, [x29, #0]",
                 "mov x3, x8",
                 "blr x3",
-                "mov x0, x9",
                 "ldp x29, x30, [sp], #16",
                 in("x0") ctx_ptr as u64,
                 in("x1") fuel as u64,
@@ -263,20 +291,43 @@ impl JitModule {
                 in("x13") args[4],
                 in("x14") args[5],
                 in("x15") args[6],
-                lateout("x0") result,
-                lateout("x1") _, lateout("x2") _, lateout("x3") _,
+                lateout("x0") _, lateout("x1") _,
+                lateout("x2") _, lateout("x3") _,
                 lateout("x8") _,
-                lateout("x9") _, lateout("x10") _,
-                lateout("x11") _, lateout("x12") _,
-                lateout("x13") _, lateout("x14") _,
-                lateout("x15") _,
+                lateout("x9") r9, lateout("x10") r10,
+                lateout("x11") r11, lateout("x12") r12,
+                lateout("x13") r13, lateout("x14") r14,
+                lateout("x15") r15,
                 out("x20") _, out("x21") _,
                 out("x30") _,
             );
         }
 
-        result as i32
+        [r9, r10, r11, r12, r13, r14, r15]
     }
+}
+
+/// Interpret raw register values as typed `Val`s using the function's
+/// result type signature.
+///
+/// The JIT calling convention places return values in x9, x10, x11, ...
+/// (up to x15). Each register holds one result as a raw u64; this
+/// function reinterprets the bits according to `ValType`.
+fn regs_to_vals(regs: &[u64; 7], result_types: &[ValType]) -> Vec<Val> {
+    result_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            let raw = regs[i];
+            match ty {
+                ValType::I32 => Val::I32(raw as i32),
+                ValType::I64 => Val::I64(raw as i64),
+                ValType::F32 => Val::F32(f32::from_bits(raw as u32)),
+                ValType::F64 => Val::F64(f64::from_bits(raw)),
+                _ => todo!("JIT return type {ty:?} not yet supported"),
+            }
+        })
+        .collect()
 }
 
 // ---- Fiber types ----

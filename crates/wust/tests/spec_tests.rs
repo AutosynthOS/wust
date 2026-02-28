@@ -16,24 +16,53 @@ use harness::{
     discover_test_files, matches_filter, parse_cli_args,
     print_subprocess_results, run_tests_parallel,
 };
-use wust::{Engine, Instance, Linker, Module, Store, Val};
+use wust::{Engine, Instance, JitModule, Linker, Module, Store, Val};
+
+// --- Execution mode ---
+
+#[derive(Clone, Copy)]
+enum ExecMode {
+    Interpreter,
+    Jit,
+}
+
+impl ExecMode {
+    fn prefix(self) -> &'static str {
+        match self {
+            ExecMode::Interpreter => "int",
+            ExecMode::Jit => "jit",
+        }
+    }
+
+    fn from_prefix(s: &str) -> Option<Self> {
+        match s {
+            "int" => Some(ExecMode::Interpreter),
+            "jit" => Some(ExecMode::Jit),
+            _ => None,
+        }
+    }
+}
 
 // --- Spec runner ---
 
 struct SpecRunner {
     engine: Engine,
     instance: Option<Instance>,
+    jit_module: Option<JitModule>,
     store: Store<()>,
+    mode: ExecMode,
 }
 
 impl SpecRunner {
-    fn new() -> Self {
+    fn new(mode: ExecMode) -> Self {
         let engine = Engine::default();
         let store = Store::new(&engine, ());
         Self {
             engine,
             instance: None,
+            jit_module: None,
             store,
+            mode,
         }
     }
 
@@ -42,6 +71,9 @@ impl SpecRunner {
         let module =
             Module::from_bytes(&self.engine, &binary).map_err(|e| anyhow::anyhow!("{e}"))?;
         let linker = Linker::new(&self.engine);
+        if matches!(self.mode, ExecMode::Jit) {
+            self.jit_module = Some(JitModule::compile(&module)?);
+        }
         self.instance = Some(
             linker
                 .instantiate(&mut self.store, &module)
@@ -56,9 +88,19 @@ impl SpecRunner {
             .instance
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("no active instance"))?;
-        instance
-            .call_dynamic(&mut self.store, invoke.name, &args)
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        match self.mode {
+            ExecMode::Interpreter => instance
+                .call_dynamic(&mut self.store, invoke.name, &args)
+                .map_err(|e| anyhow::anyhow!("{e}")),
+            ExecMode::Jit => {
+                let jit = self
+                    .jit_module
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("no JIT module compiled"))?;
+                jit.call_dynamic(instance, invoke.name, &args)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            }
+        }
     }
 
     fn execute(&mut self, exec: wast::WastExecute) -> anyhow::Result<Vec<Val>> {
@@ -398,8 +440,13 @@ fn line_number(source: &str, offset: usize) -> usize {
 
 /// Child process entry point: run a single .wast file and print results
 /// using the subprocess protocol.
-fn child_run(_name: &str, path: &Path) -> ! {
-    let mut runner = SpecRunner::new();
+fn child_run(name: &str, path: &Path) -> ! {
+    // Parse mode from "int:foo" or "jit:foo" prefix.
+    let mode = name
+        .split_once(':')
+        .and_then(|(prefix, _)| ExecMode::from_prefix(prefix))
+        .unwrap_or(ExecMode::Interpreter);
+    let mut runner = SpecRunner::new(mode);
     let results = runner.run_wast(path);
     print_subprocess_results(&results);
     let failed = results.iter().filter(|r| !r.passed).count();
@@ -416,7 +463,19 @@ fn main() {
     let cli = parse_cli_args();
     let spec_dir = Path::new("tests/spec/test/core");
     let files = discover_test_files(spec_dir, "wast");
-    let matched: Vec<_> = files
+
+    // Each spec file becomes two tests: int:<name> and jit:<name>.
+    let all_tests: Vec<(String, std::path::PathBuf)> = files
+        .into_iter()
+        .flat_map(|(name, path)| {
+            vec![
+                (format!("int:{name}"), path.clone()),
+                (format!("jit:{name}"), path),
+            ]
+        })
+        .collect();
+
+    let matched: Vec<_> = all_tests
         .into_iter()
         .filter(|(name, _)| {
             matches_filter(name, cli.filter.as_deref(), cli.exact, &cli.skip)
@@ -447,5 +506,4 @@ fn main() {
         detailed,
         cli.verbose,
     );
-
 }

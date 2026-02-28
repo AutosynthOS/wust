@@ -13,12 +13,29 @@ Add `mod harness;` to your test binary and call the helpers. See
 
 ### Spec Tests
 
+Every spec test runs twice: once through the interpreter (`int::`) and once
+through the JIT compiler (`jit::`). Test names are prefixed accordingly:
+
+```
+int::spec_i32    # interpreter mode
+jit::spec_i32    # JIT mode
+```
+
 ```bash
-# Run all spec tests (parallel overview mode):
+# Run all spec tests (both int + jit, parallel overview mode):
 cargo test -p wust --test spec_tests
+
+# Run only interpreter tests:
+cargo test -p wust --test spec_tests -- int::
+
+# Run only JIT tests:
+cargo test -p wust --test spec_tests -- jit::
 
 # Run a single test (detailed dot grid):
 cargo test -p wust --test spec_tests i32
+
+# Run a single test in one mode only:
+cargo test -p wust --test spec_tests -- jit::spec_i32 --exact
 
 # Force detailed mode for multiple tests:
 cargo test -p wust --test spec_tests f32 -- --expand
