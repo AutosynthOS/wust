@@ -18,13 +18,13 @@ Add `mod harness;` to your test binary and call the helpers. See
 cargo test -p wust --test spec_tests
 
 # Run a single test (detailed dot grid):
-cargo test -p wust --test spec_tests -- i32
+cargo test -p wust --test spec_tests i32
 
 # Force detailed mode for multiple tests:
-cargo test -p wust --test spec_tests -- f32 --expand
+cargo test -p wust --test spec_tests f32 -- --expand
 
 # Filter with exact match:
-cargo test -p wust --test spec_tests -- i32 --exact
+cargo test -p wust --test spec_tests i32 -- --exact
 
 # Skip tests matching a pattern:
 cargo test -p wust --test spec_tests -- --skip f32
@@ -33,6 +33,10 @@ cargo test -p wust --test spec_tests -- --skip f32
 cargo test -p wust --test spec_tests -- --list
 ```
 
+> **Note:** Positional filter names (like `i32`) can go before or after `--`.
+> Flags like `--skip`, `--list`, `--expand`, `--exact` must go after `--`
+> to prevent cargo from consuming them.
+
 ## CLI Flags
 
 These flags are parsed by `parse_cli_args()` and available to all test
@@ -40,11 +44,11 @@ binaries using the harness:
 
 | Flag | Description |
 |------|-------------|
-| `-- <filter>` | Only run tests whose name contains `<filter>` |
-| `-- <filter> --exact` | Only run the test with this exact name |
-| `--skip <pattern>` | Skip tests whose name contains `<pattern>` (repeatable) |
-| `--list` | List discovered test names without running them |
-| `--expand` | Force detailed (dot grid) mode even with multiple tests |
+| `<filter>` | Only run tests whose name contains `<filter>` |
+| `-- --exact` | Combined with a filter, only run the test with that exact name |
+| `-- --skip <pattern>` | Skip tests whose name contains `<pattern>` (repeatable) |
+| `-- --list` | List discovered test names without running them |
+| `-- --expand` | Force detailed (dot grid) mode even with multiple tests |
 
 ## Display Modes
 

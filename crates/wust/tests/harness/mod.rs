@@ -676,7 +676,7 @@ fn print_box_summary(
     let _ = writeln!(out, "{}", border('├', '┤', inner_width));
     let cmd_header = format!("{DIM}Run a single test for details:{RESET}");
     let _ = writeln!(out, "{}", pad_line(&cmd_header, "Run a single test for details:".len(), inner_width));
-    let cmd = format!("  {test_command} -- <name>");
+    let cmd = format!("  {test_command} <name>");
     let _ = writeln!(out, "{}", pad_line(&cmd, cmd.len(), inner_width));
 
     let _ = writeln!(out, "{}", border('└', '┘', inner_width));
