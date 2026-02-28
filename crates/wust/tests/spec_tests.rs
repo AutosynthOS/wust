@@ -1,3 +1,4 @@
+use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use wust::{Engine, Instance, Linker, Module, Store, Val};
 
@@ -70,22 +71,42 @@ impl SpecRunner {
         }
     }
 
-    fn run_wast(&mut self, path: &Path) -> (usize, usize) {
+    fn run_wast(&mut self, path: &Path) -> Vec<DirectiveResult> {
         let source = std::fs::read_to_string(path).unwrap();
         let buf = wast::parser::ParseBuffer::new(&source).unwrap();
         let wast = wast::parser::parse::<wast::Wast>(&buf).unwrap();
 
-        let (mut passed, mut failed) = (0, 0);
-        for directive in wast.directives {
-            match self.run_directive(directive) {
-                Ok(()) => passed += 1,
-                Err(e) => {
-                    failed += 1;
-                    eprintln!("  FAIL {e}");
+        // Suppress default panic output so interpreter panics don't
+        // produce noisy stack traces — they show up as red dots instead.
+        let prev_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+
+        let results: Vec<DirectiveResult> = wast
+            .directives
+            .into_iter()
+            .enumerate()
+            .map(|(i, d)| {
+                let label = directive_label(&d);
+                let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                    self.run_directive(d)
+                }));
+                match result {
+                    Ok(Ok(())) => DirectiveResult { index: i, passed: true, label, error: None },
+                    Ok(Err(e)) => DirectiveResult { index: i, passed: false, label, error: Some(format!("{e}")) },
+                    Err(payload) => {
+                        let msg = payload
+                            .downcast_ref::<String>()
+                            .map(|s| s.clone())
+                            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+                            .unwrap_or_else(|| "panic".to_string());
+                        DirectiveResult { index: i, passed: false, label, error: Some(format!("panic: {msg}")) }
+                    }
                 }
-            }
-        }
-        (passed, failed)
+            })
+            .collect();
+
+        panic::set_hook(prev_hook);
+        results
     }
 
     fn run_directive(&mut self, directive: wast::WastDirective) -> anyhow::Result<()> {
@@ -212,13 +233,182 @@ fn val_matches(got: &Val, expected: &Expected) -> bool {
 
 // --- Test harness ---
 
+struct DirectiveResult {
+    index: usize,
+    passed: bool,
+    label: String,
+    error: Option<String>,
+}
+
+/// Extract a short label describing the directive type.
+fn directive_label(d: &wast::WastDirective) -> String {
+    match d {
+        wast::WastDirective::Module(_) => "module".into(),
+        wast::WastDirective::Register { .. } => "register".into(),
+        wast::WastDirective::AssertReturn { exec, .. } => {
+            format!("assert_return({})", execute_label(exec))
+        }
+        wast::WastDirective::AssertTrap { exec, .. } => {
+            format!("assert_trap({})", execute_label(exec))
+        }
+        wast::WastDirective::AssertExhaustion { call, .. } => {
+            format!("assert_exhaustion({})", call.name)
+        }
+        wast::WastDirective::AssertInvalid { .. } => "assert_invalid".into(),
+        wast::WastDirective::AssertMalformed { .. } => "assert_malformed".into(),
+        wast::WastDirective::AssertUnlinkable { .. } => "assert_unlinkable".into(),
+        wast::WastDirective::Invoke(invoke) => format!("invoke({})", invoke.name),
+        _ => "directive".into(),
+    }
+}
+
+fn execute_label(exec: &wast::WastExecute) -> String {
+    match exec {
+        wast::WastExecute::Invoke(invoke) => invoke.name.to_string(),
+        wast::WastExecute::Get { global, .. } => format!("get {global}"),
+        wast::WastExecute::Wat(_) => "wat".into(),
+    }
+}
+
 fn run_spec_test(name: &str) {
     let path = Path::new("tests/spec/test/core").join(format!("{name}.wast"));
     assert!(path.exists(), "spec test not found: {}", path.display());
     let mut runner = SpecRunner::new();
-    let (passed, failed) = runner.run_wast(&path);
-    println!("{name}: {passed} passed, {failed} failed");
-    assert_eq!(failed, 0, "{name}: {failed} assertions failed");
+    let results = runner.run_wast(&path);
+    let output = render_dot_grid(name, &results);
+    println!("\n{output}");
+    let failed = results.iter().filter(|r| !r.passed).count();
+    assert!(failed == 0, "{failed} of {} assertions failed", results.len());
+}
+
+// ANSI color codes.
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const GREEN: &str = "\x1b[1;32m";
+const RED: &str = "\x1b[1;31m";
+const RESET: &str = "\x1b[0m";
+const BG_GREEN: &str = "\x1b[1;42;30m";
+const BG_RED: &str = "\x1b[1;41;30m";
+
+/// Render a boxed dot grid showing per-directive pass/fail with error details.
+fn render_dot_grid(name: &str, results: &[DirectiveResult]) -> String {
+    let total = results.len();
+    let passed = results.iter().filter(|r| r.passed).count();
+    let failed = total - passed;
+    let pct = if total > 0 {
+        passed as f64 / total as f64 * 100.0
+    } else {
+        100.0
+    };
+
+    let cols = 60;
+    let header_text = format!("{name}: {passed}/{total} passed ({pct:.1}%)");
+    let header = format!("{BOLD}{header_text}{RESET}");
+    let inner_width = 80.max(header_text.len());
+
+    // Collect failure lines, truncating to fit the box.
+    let max_errors = 10;
+    let failures: Vec<String> = results
+        .iter()
+        .filter(|r| !r.passed)
+        .take(max_errors)
+        .map(|r| {
+            let err = r.error.as_deref().unwrap_or("unknown");
+            let line = format!("#{}: {} - {err}", r.index + 1, r.label);
+            if line.chars().count() > inner_width {
+                let truncated: String = line.chars().take(inner_width - 1).collect();
+                format!("{truncated}…")
+            } else {
+                line
+            }
+        })
+        .collect();
+    let remaining_failures = failed.saturating_sub(max_errors);
+
+    let pad_line = |content: &str, display_width: usize| -> String {
+        let pad = inner_width.saturating_sub(display_width);
+        format!("│ {content}{} │", " ".repeat(pad))
+    };
+
+    let border = |left: char, right: char| -> String {
+        format!("{left}{}{right}", "─".repeat(inner_width + 2))
+    };
+
+    let mut out = String::new();
+    out.push_str(&border('┌', '┐'));
+    out.push('\n');
+    out.push_str(&pad_line(&header, header_text.len()));
+    out.push('\n');
+    out.push_str(&border('├', '┤'));
+    out.push('\n');
+
+    // Dot grid with colored dots.
+    for chunk in results.chunks(cols) {
+        let mut row = String::new();
+        for r in chunk {
+            if r.passed {
+                row.push_str(&format!("{GREEN}●{RESET}"));
+            } else {
+                row.push_str(&format!("{RED}○{RESET}"));
+            }
+        }
+        out.push_str(&pad_line(&row, chunk.len()));
+        out.push('\n');
+    }
+
+    // Progress bar.
+    out.push_str(&border('├', '┤'));
+    out.push('\n');
+    let bar_width = inner_width;
+    let green_width = if total > 0 {
+        (passed * bar_width + total / 2) / total
+    } else {
+        bar_width
+    };
+    let red_width = bar_width - green_width;
+    let pass_label = format!(" {passed} passed ");
+    let fail_label = format!(" {failed} failed ");
+
+    let green_bar = if green_width >= pass_label.len() {
+        format!("{BG_GREEN}{:^width$}{RESET}", pass_label, width = green_width)
+    } else if green_width > 0 {
+        format!("{BG_GREEN}{:width$}{RESET}", "", width = green_width)
+    } else {
+        String::new()
+    };
+    let red_bar = if red_width >= fail_label.len() {
+        format!("{BG_RED}{:^width$}{RESET}", fail_label, width = red_width)
+    } else if red_width > 0 {
+        format!("{BG_RED}{:width$}{RESET}", "", width = red_width)
+    } else {
+        String::new()
+    };
+
+    out.push_str(&pad_line(
+        &format!("{green_bar}{red_bar}"),
+        bar_width,
+    ));
+    out.push('\n');
+
+    // Error details.
+    if !failures.is_empty() {
+        out.push_str(&border('├', '┤'));
+        out.push('\n');
+        for line in &failures {
+            let colored = format!("{RED}{line}{RESET}");
+            out.push_str(&pad_line(&colored, line.len()));
+            out.push('\n');
+        }
+        if remaining_failures > 0 {
+            let more = format!("... and {remaining_failures} more");
+            let colored = format!("{DIM}{more}{RESET}");
+            out.push_str(&pad_line(&colored, more.len()));
+            out.push('\n');
+        }
+    }
+
+    out.push_str(&border('└', '┘'));
+    out
 }
 
 macro_rules! spec_tests {
