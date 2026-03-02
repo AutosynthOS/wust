@@ -2,13 +2,11 @@
 resolver = "2"
 members = [
     "crates/wust",
+    "crates/wust-core",
     "crates/wust-codegen",
     "crates/plasma",
     "crates/plasma_hello",
 ]
-
-[profile.dev]
-opt-level = 1
 
 [profile.release]
 debug = true

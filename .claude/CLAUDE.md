@@ -272,6 +272,48 @@ Add `///` doc comments to public API. Write usage examples. Explain non-obvious 
 
 — Robert C. Martin
 
+## WUST — WHAT WE'RE BUILDING AND WHY
+
+Wust is a WASM runtime designed for **suspendable, serializable computation**. The core product promise: you can pause a running WASM program at any point, serialize its entire state, ship it across a network, and resume it on a completely different machine — potentially on a different CPU architecture, and potentially in a different execution mode (interpreter vs JIT).
+
+This means:
+
+1. **All execution state must be portable.** Suspend state is defined in terms of WASM-level concepts (locals, operand stack values, resume point IDs) — never in terms of native CPU registers, stack pointers, or machine-specific artifacts. If you can't serialize it and send it over the wire, it's wrong.
+
+2. **The interpreter and JIT are interchangeable.** A function suspended mid-execution in the JIT must be resumable in the interpreter, and vice versa. They share a universal stack ABI. Any design that ties suspend/resume to one execution mode breaks the product.
+
+3. **The JIT exists for speed, not for correctness.** The interpreter is the reference implementation. The JIT is an optimization that keeps values in native registers during normal execution and only materializes them to the portable stack format at suspend points. Do not add work to the JIT hot path that compromises this — the performance model depends on it.
+
+**Bottom line:** Every design decision flows from portability and serializability of execution state. If a change makes state non-portable or ties behavior to a specific execution mode or architecture, it violates the core design. Ask before proceeding.
+
+---
+
+## Testing
+
+- **Spec tests:** `cargo test -p wust --test spec_tests`. See `crates/wust/tests/harness/HARNESS.md` for full CLI reference.
+- **Unit tests:** `cargo test -p wust --lib`
+- **Benchmarks:** `cargo run --example bench_fib --release` — **always `--release`**, debug mode numbers are meaningless.
+
+---
+
+## Worktrees and subagents
+
+1. **"My code" means what is on disk right now.** Not main, not origin, not a worktree. When comparing behavior or benchmarks, always verify you are running the user's actual working tree — check `git log --oneline -1` and `git status` before drawing conclusions.
+
+2. **Subagents must initialize submodules.** Worktrees don't get submodules automatically. Run `git submodule update --init --recursive` in every worktree that needs test fixtures.
+
+3. **Subagents must implement both interpreter AND JIT.** Any new opcode or feature must work in both execution modes. They share a universal stack ABI and must be interchangeable. Work that only covers one side has to be redone.
+
+---
+
+## The managed stack — no heap in the hot loop
+
+The managed wasm stack is the snapshot format. `memcpy` to save, `memcpy` to restore. This is the foundation of suspend/resume.
+
+**Never add heap allocations (`Vec`, `HashMap`, etc.) inside the interpreter execution loop.** Each wasm function call = one Rust stack frame. A per-call heap allocation causes catastrophic performance regression on recursive workloads. Use parse-time precomputed metadata instead of runtime tracking.
+
+---
+
 ## Extra rules
 
 1. When specifying stub functions, use the following syntax so that we don't have unused variables warnings:

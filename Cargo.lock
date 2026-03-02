@@ -2926,6 +2926,7 @@ dependencies = [
  "wast",
  "wat",
  "wust-codegen",
+ "wust-core",
 ]
 
 [[package]]
@@ -2936,6 +2937,15 @@ dependencies = [
  "disarm64",
  "libc",
  "regalloc2",
+]
+
+[[package]]
+name = "wust-core"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "wasmparser 0.245.1",
 ]
 
 [[package]]

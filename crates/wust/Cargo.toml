@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+wust-core = { path = "../wust-core" }
 wasmparser = "0.245"
 libc = "0.2"
 anyhow = "1"

@@ -7,15 +7,14 @@
 
 mod harness;
 
+use harness::{
+    DirectiveResult, discover_test_files, matches_filter, parse_cli_args, print_subprocess_results,
+    run_tests_parallel,
+};
 use std::io::IsTerminal;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::time::Duration;
-use harness::{
-    DirectiveResult,
-    discover_test_files, matches_filter, parse_cli_args,
-    print_subprocess_results, run_tests_parallel,
-};
 use wust::{Engine, Instance, JitModule, Linker, Module, Store, Val};
 
 // --- Execution mode ---
@@ -137,10 +136,12 @@ impl SpecRunner {
             Ok(buf) => buf,
             Err(e) => {
                 return vec![DirectiveResult {
-                    index: 0, passed: false,
+                    index: 0,
+                    passed: false,
                     label: "parse".into(),
                     error: Some(format!("failed to lex .wast file: {e}")),
-                    line: None, source: None,
+                    line: None,
+                    source: None,
                 }];
             }
         };
@@ -148,10 +149,12 @@ impl SpecRunner {
             Ok(wast) => wast,
             Err(e) => {
                 return vec![DirectiveResult {
-                    index: 0, passed: false,
+                    index: 0,
+                    passed: false,
                     label: "parse".into(),
                     error: Some(format!("failed to parse .wast file: {e}")),
-                    line: None, source: None,
+                    line: None,
+                    source: None,
                 }];
             }
         };
@@ -168,9 +171,7 @@ impl SpecRunner {
             .map(|(i, d)| {
                 let label = directive_label(&d);
                 let span = directive_span(&d);
-                let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                    self.run_directive(d)
-                }));
+                let result = panic::catch_unwind(AssertUnwindSafe(|| self.run_directive(d)));
                 // Only compute source info for failures.
                 let (line, src) = match &result {
                     Ok(Ok(())) => (None, None),
@@ -188,13 +189,20 @@ impl SpecRunner {
                 };
                 match result {
                     Ok(Ok(())) => DirectiveResult {
-                        index: i, passed: true, label,
-                        error: None, line: None, source: None,
+                        index: i,
+                        passed: true,
+                        label,
+                        error: None,
+                        line: None,
+                        source: None,
                     },
                     Ok(Err(e)) => DirectiveResult {
-                        index: i, passed: false, label,
+                        index: i,
+                        passed: false,
+                        label,
                         error: Some(format!("{e}")),
-                        line, source: src,
+                        line,
+                        source: src,
                     },
                     Err(payload) => {
                         let msg = payload
@@ -203,9 +211,12 @@ impl SpecRunner {
                             .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
                             .unwrap_or_else(|| "panic".to_string());
                         DirectiveResult {
-                            index: i, passed: false, label,
+                            index: i,
+                            passed: false,
+                            label,
                             error: Some(format!("panic: {msg}")),
-                            line, source: src,
+                            line,
+                            source: src,
                         }
                     }
                 }
@@ -385,16 +396,13 @@ fn directive_span(d: &wast::WastDirective) -> Option<wast::token::Span> {
         | wast::WastDirective::AssertUnlinkable { span, .. }
         | wast::WastDirective::Register { span, .. } => *span,
         wast::WastDirective::Invoke(invoke) => invoke.span,
-        wast::WastDirective::Module(quote_wat) => {
-            match quote_wat {
-                wast::QuoteWat::Wat(wat) => match wat {
-                    wast::Wat::Module(m) => m.span,
-                    wast::Wat::Component(c) => c.span,
-                },
-                wast::QuoteWat::QuoteModule(span, _)
-                | wast::QuoteWat::QuoteComponent(span, _) => *span,
-            }
-        }
+        wast::WastDirective::Module(quote_wat) => match quote_wat {
+            wast::QuoteWat::Wat(wat) => match wat {
+                wast::Wat::Module(m) => m.span,
+                wast::Wat::Component(c) => c.span,
+            },
+            wast::QuoteWat::QuoteModule(span, _) | wast::QuoteWat::QuoteComponent(span, _) => *span,
+        },
         _ => return None,
     })
 }
@@ -407,9 +415,7 @@ fn directive_span(d: &wast::WastDirective) -> Option<wast::token::Span> {
 fn extract_sexp(source: &str, offset: usize) -> Option<String> {
     let bytes = source.as_bytes();
     // Scan backwards from offset to find the opening paren.
-    let start = (0..offset)
-        .rev()
-        .find(|&i| bytes[i] == b'(')?;
+    let start = (0..offset).rev().find(|&i| bytes[i] == b'(')?;
     // Count parens forward to find the matching close.
     let mut depth = 0;
     for (i, &b) in bytes[start..].iter().enumerate() {
@@ -477,9 +483,7 @@ fn main() {
 
     let matched: Vec<_> = all_tests
         .into_iter()
-        .filter(|(name, _)| {
-            matches_filter(name, cli.filter.as_deref(), cli.exact, &cli.skip)
-        })
+        .filter(|(name, _)| matches_filter(name, cli.filter.as_deref(), cli.exact, &cli.skip))
         .collect();
 
     if cli.list {
