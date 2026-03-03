@@ -1,7 +1,7 @@
 use wasmparser::{RefType, ValType};
 
 /// Dynamic WASM value for untyped function calls.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Val {
     I32(i32),
     I64(i64),
@@ -9,6 +9,20 @@ pub enum Val {
     F64(f64),
     V128(u128),
     Ref(RefType),
+}
+
+impl Val {
+    /// Convert to a raw u64 for frame slot storage.
+    pub fn to_raw(&self) -> u64 {
+        match self {
+            Val::I32(v) => *v as u64,
+            Val::I64(v) => *v as u64,
+            Val::F32(v) => v.to_bits() as u64,
+            Val::F64(v) => v.to_bits(),
+            Val::V128(v) => *v as u64,
+            Val::Ref(_) => 0,
+        }
+    }
 }
 
 /// Convert a single Rust value to/from a `Val`.

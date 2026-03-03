@@ -33,7 +33,7 @@ fn inspect(file: Option<String>) -> anyhow::Result<()> {
     let module = Module::from_bytes(&engine, &wasm_bytes)?;
 
     let output = Codegen::new(&module).compile()?;
-    print!("{}", output.render_inspect());
+    print!("{}", output.render());
     Ok(())
 }
 

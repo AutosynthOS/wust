@@ -1,5 +1,5 @@
 use std::time::Instant;
-use wust::{Engine, JitCompiler, JitModule, Linker, Module, Store, Val};
+use wust::{Engine, Instance, JitCompiler, JitModule, Module, Val};
 
 const ACK_WAT: &str = r#"
 (module
@@ -84,34 +84,24 @@ fn main() {
 
     let wasm_bytes = wat::parse_str(ACK_WAT).expect("failed to parse WAT");
 
-    // Setup wust interpreter.
     let engine = Engine::default();
     let module = Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-    let linker = Linker::new(&engine);
-    let (mut interp_store, mut interp_instance) = {
-        let mut store = Store::new(&engine, ());
-        let instance = linker
-            .instantiate(&mut store, &module)
-            .expect("failed to instantiate");
-        (store, instance)
-    };
 
-    // Setup wust JIT (with fuel).
+    // Interpreter instance.
+    let mut interp_instance = Instance::new().expect("failed to create instance");
+
+    // JIT (with fuel).
     let jit_module = JitModule::compile(&module).expect("JIT compilation failed");
-    let mut jit_instance = linker
-        .instantiate(&mut Store::new(&engine, ()), &module)
-        .expect("failed to instantiate for JIT");
+    let mut jit_instance = Instance::new().expect("failed to create JIT instance");
 
-    // Setup wust JIT (no fuel).
+    // JIT (no fuel).
     let jit_no_fuel = JitCompiler::new(&module)
         .fuel(false)
         .compile()
         .expect("JIT no-fuel compilation failed");
-    let mut jit_nf_instance = linker
-        .instantiate(&mut Store::new(&engine, ()), &module)
-        .expect("failed to instantiate for JIT no-fuel");
+    let mut jit_nf_instance = Instance::new().expect("failed to create JIT no-fuel instance");
 
-    // Setup wasmtime.
+    // Wasmtime.
     let wt_engine = wasmtime::Engine::default();
     let wt_module =
         wasmtime::Module::new(&wt_engine, &wasm_bytes).expect("wasmtime compile failed");
@@ -122,7 +112,7 @@ fn main() {
         .get_typed_func::<(i32, i32), i32>(&mut wt_store, "ack")
         .expect("wasmtime get_func failed");
 
-    // Setup pulley.
+    // Pulley.
     let mut pulley_config = wasmtime::Config::new();
     pulley_config
         .target("pulley64")
@@ -150,29 +140,36 @@ fn main() {
         }
     }
 
-    // Compute expected result from native.
     let expected = ack_native(m, n);
 
     // Try interpreter (may fail with stack overflow for large inputs).
-    let interp_ms =
-        match interp_instance.call_dynamic(&mut interp_store, "ack", &[Val::I32(m), Val::I32(n)]) {
-            Ok(_r) => {
-                let (_, ms) = bench(|| {
-                    let r = interp_instance
-                        .call_dynamic(&mut interp_store, "ack", &[Val::I32(m), Val::I32(n)])
-                        .unwrap();
-                    match r[0] {
-                        Val::I32(v) => v,
-                        _ => panic!("expected i32"),
-                    }
-                });
-                ms
-            }
-            Err(_) => {
-                eprintln!("note: interpreter stack too small for ack({m}, {n}), skipping");
-                0.0
-            }
-        };
+    let interp_ms = match wust::call_dynamic(
+        &module,
+        &mut interp_instance,
+        "ack",
+        &[Val::I32(m), Val::I32(n)],
+    ) {
+        Ok(_r) => {
+            let (_, ms) = bench(|| {
+                let r = wust::call_dynamic(
+                    &module,
+                    &mut interp_instance,
+                    "ack",
+                    &[Val::I32(m), Val::I32(n)],
+                )
+                .unwrap();
+                match r[0] {
+                    Val::I32(v) => v,
+                    _ => panic!("expected i32"),
+                }
+            });
+            ms
+        }
+        Err(_) => {
+            eprintln!("note: interpreter stack too small for ack({m}, {n}), skipping");
+            0.0
+        }
+    };
 
     let run = |name: &'static str, mut f: Box<dyn FnMut() -> i32>| -> BenchResult {
         let (result, ms) = bench(|| f());
@@ -182,16 +179,33 @@ fn main() {
 
     let jit_result = run(
         "wust jit",
-        Box::new(|| jit_module.call(&mut jit_instance, "ack", (m, n)).unwrap()),
+        Box::new(|| {
+            match jit_module
+                .call_dynamic(&module, &mut jit_instance, "ack", &[Val::I32(m), Val::I32(n)])
+                .unwrap()[0]
+            {
+                Val::I32(v) => v,
+                _ => panic!("expected i32"),
+            }
+        }),
     );
     let jit_ms = jit_result.ms;
 
     let jit_nf_result = run(
         "wust jit (no fuel)",
         Box::new(|| {
-            jit_no_fuel
-                .call(&mut jit_nf_instance, "ack", (m, n))
-                .unwrap()
+            match jit_no_fuel
+                .call_dynamic(
+                    &module,
+                    &mut jit_nf_instance,
+                    "ack",
+                    &[Val::I32(m), Val::I32(n)],
+                )
+                .unwrap()[0]
+            {
+                Val::I32(v) => v,
+                _ => panic!("expected i32"),
+            }
         }),
     );
 
@@ -229,13 +243,8 @@ mod tests {
         let wasm_bytes = wat::parse_str(ACK_WAT).expect("failed to parse WAT");
         let engine = Engine::default();
         let module = Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-        let linker = Linker::new(&engine);
-        let mut store = Store::new(&engine, ());
-        let mut instance = linker
-            .instantiate(&mut store, &module)
-            .expect("failed to instantiate");
-        let r = instance
-            .call_dynamic(&mut store, "ack", &[Val::I32(3), Val::I32(4)])
+        let mut instance = Instance::new().expect("failed to create instance");
+        let r = wust::call_dynamic(&module, &mut instance, "ack", &[Val::I32(3), Val::I32(4)])
             .expect("wust ack failed");
         match r[0] {
             Val::I32(v) => assert_eq!(v, 125),

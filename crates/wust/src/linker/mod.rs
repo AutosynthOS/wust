@@ -11,8 +11,8 @@ impl Linker {
     pub fn instantiate<T>(
         &self,
         _store: &mut Store<T>,
-        module: &Module,
+        _module: &Module,
     ) -> Result<Instance, anyhow::Error> {
-        Instance::new(module)
+        Instance::new()
     }
 }

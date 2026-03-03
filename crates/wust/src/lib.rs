@@ -11,11 +11,12 @@ mod trap_handler;
 mod value;
 
 pub use engine::Engine;
-pub use instance::Instance;
+pub use instance::{Instance, call, call_dynamic};
 pub use jit::codegen::Codegen;
-pub use jit::{FiberResult, JitCompiler, JitFiber, JitModule};
-pub use wust_codegen::disasm::{CodegenOutput, FunctionOutput};
+pub use jit::{JitCompiler, JitModule};
+pub use wust_codegen::disasm::CodegenOutput;
 pub use linker::Linker;
 pub use module::Module;
 pub use store::Store;
+pub use stack::Stack;
 pub use value::Val;

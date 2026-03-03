@@ -29,6 +29,6 @@ fn main() -> anyhow::Result<()> {
     let engine = Engine::default();
     let module = Module::new(&engine, ACK_WAT)?;
     let output = Codegen::new(&module).compile()?;
-    print!("{}", output.render_blocks());
+    print!("{}", output.render());
     Ok(())
 }

@@ -5,13 +5,10 @@ pub(crate) mod tests;
 
 use wasmparser::ValType;
 
-use crate::Instance;
 use crate::Module;
-use crate::stack::Stack;
-use crate::value::{Val, WasmArgs};
+use crate::value::Val;
 
 use wust_codegen::code_buffer::CodeBuffer;
-use wust_codegen::context::JitContext;
 use wust_codegen::emit::{self, Emitter};
 use wust_codegen::ir::IrFunction;
 use wust_codegen::lower_aarch64;
@@ -37,19 +34,21 @@ pub(crate) fn compile_all(
     emit_fuel: bool,
     emit_markers: bool,
     mut on_func: impl FnMut(usize, &IrFunction, &Emitter, &FuncSnapshot),
-) -> (Emitter, SharedHandlerOffsets) {
+) -> (Emitter, SharedHandlerOffsets, Vec<usize>) {
     let func_count = module.funcs.len();
     let mut e = emit::Emitter::new();
     let shared = lower_aarch64::emit_shared_preamble(&mut e, func_count);
     let mut body_offsets: Vec<Option<usize>> = vec![None; func_count];
+    let mut func_body_starts: Vec<usize> = Vec::with_capacity(func_count);
 
     for (i, func) in module.funcs.iter().enumerate() {
         let ir = compiler::compile_with(func, &module.funcs, emit_fuel);
         let code_start = e.code().len();
         let markers_start = e.markers().len();
         let result =
-            lower_aarch64::lower_into(&mut e, &ir, i as u32, &shared, &mut body_offsets, emit_markers);
+            lower_aarch64::lower_into(&mut e, &ir, i as u32, &mut body_offsets, emit_markers);
         lower_aarch64::patch_jump_table(&mut e, i as u32, result.body_start);
+        func_body_starts.push(result.body_start);
         let snap = FuncSnapshot {
             code_start,
             markers_start,
@@ -58,7 +57,20 @@ pub(crate) fn compile_all(
         on_func(i, &ir, &e, &snap);
     }
 
-    (e, shared)
+    // Emit per-function entry trampolines (host→JIT entry points).
+    let entry_trampolines: Vec<usize> = (0..func_count)
+        .map(|i| {
+            let func = &module.funcs[i];
+            lower_aarch64::emit_entry_trampoline(
+                &mut e,
+                func_body_starts[i],
+                func.param_count(),
+                func.results.len(),
+            )
+        })
+        .collect();
+
+    (e, shared, entry_trampolines)
 }
 
 /// A JIT-compiled module with a shared code buffer.
@@ -69,10 +81,8 @@ pub(crate) fn compile_all(
 pub struct JitModule {
     /// Single code buffer containing all compiled code.
     buffer: CodeBuffer,
-    /// Number of functions in the module.
-    func_count: usize,
-    /// Shared handler offsets (word offsets within the buffer).
-    shared: SharedHandlerOffsets,
+    /// Per-function entry trampoline word offsets.
+    entry_trampolines: Vec<usize>,
 }
 
 // The compiled code buffer is mmap'd memory — safe to send across threads.
@@ -119,8 +129,8 @@ impl<'a> JitCompiler<'a> {
     ///
     /// Layout: [jump table][interpret stubs][shared handlers][fn0][fn1]...
     pub fn compile(self) -> Result<JitModule, anyhow::Error> {
-        let func_count = self.module.funcs.len();
-        let (e, shared) = compile_all(self.module, self.emit_fuel, false, |_, _, _, _| {});
+        let (e, _shared, entry_trampolines) =
+            compile_all(self.module, self.emit_fuel, false, |_, _, _, _| {});
 
         let mut buffer = CodeBuffer::new(e.code().len() * 4 + 64)?;
         for &word in e.code() {
@@ -130,8 +140,7 @@ impl<'a> JitCompiler<'a> {
 
         Ok(JitModule {
             buffer,
-            func_count,
-            shared,
+            entry_trampolines,
         })
     }
 }
@@ -144,436 +153,105 @@ impl JitModule {
         JitCompiler::new(module).compile()
     }
 
-    /// Call a compiled function by export name (dynamic API).
+    /// Call an exported function by name, returning results as `Vec<Val>`.
     ///
-    /// Returns results as `Vec<Val>`, supporting multi-value returns.
+    /// Writes args into the wasm frame, calls the entry trampoline,
+    /// and reads results back using the function's type signature.
     pub fn call_dynamic(
         &self,
-        instance: &mut Instance,
+        module: &Module,
+        instance: &mut wust_core::Instance,
         name: &str,
         args: &[Val],
     ) -> Result<Vec<Val>, anyhow::Error> {
-        let func_idx = instance.resolve_export_func_idx(name)?;
-        let func = instance
-            .module
-            .get_func(func_idx)
-            .ok_or_else(|| anyhow::anyhow!("function {func_idx:?} not found"))?;
-        let result_types = func.results.clone();
-        let stack = &mut instance.stack;
+        let func_idx = module
+            .resolve_export(name)
+            .ok_or_else(|| anyhow::anyhow!("export '{name}' not found"))?
+            as usize;
+        let func = module
+            .funcs
+            .get(func_idx)
+            .ok_or_else(|| anyhow::anyhow!("function {func_idx} not found"))?;
 
-        stack.set_sp(0);
-        for val in args {
-            stack.push_val(val);
+        // Write args into frame slots (after the 16-byte header).
+        instance.stack.set_sp(0);
+        instance.stack.write_u64_at(0, 0); // zero frame header
+        instance.stack.write_u64_at(8, 0);
+        for (i, arg) in args.iter().enumerate() {
+            instance.stack.write_u64_at(FRAME_HEADER_SIZE + i * 8, arg.to_raw());
         }
 
-        let regs = unsafe { self.enter(func_idx.0 as usize, stack) };
-        Ok(regs_to_vals(&regs, &result_types))
+        self.call_trampoline(instance, func_idx, i64::MAX);
+
+        // Read results from frame slots using the function's result types.
+        let results = func
+            .results
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| {
+                let raw = instance.stack.read_u64_at(FRAME_HEADER_SIZE + i * 8);
+                read_typed(raw, ty)
+            })
+            .collect();
+
+        Ok(results)
     }
 
-    /// Call a compiled function by export name (typed API).
-    pub fn call<A: WasmArgs>(
-        &self,
-        instance: &mut Instance,
-        name: &str,
-        args: A,
-    ) -> Result<i32, anyhow::Error> {
-        let vals = self.call_dynamic(instance, name, &args.to_vals())?;
-        match vals.first() {
-            Some(Val::I32(v)) => Ok(*v),
-            Some(other) => anyhow::bail!("expected i32 result, got {other:?}"),
-            None => anyhow::bail!("expected i32 result, got no results"),
-        }
-    }
-
-    /// Create a fiber for calling a function with bounded fuel.
+    /// Low-level trampoline call.
     ///
-    /// The fiber can be suspended and resumed, allowing cooperative
-    /// multitasking and bounded execution.
-    pub fn fiber<A: WasmArgs>(
-        &self,
-        instance: &mut Instance,
-        name: &str,
-        args: A,
-    ) -> Result<JitFiber, anyhow::Error> {
-        let func_idx = instance.resolve_export_func_idx(name)?;
-        let stack = &mut instance.stack;
+    /// Swaps the native stack pointer to the fiber stack on entry so
+    /// that JIT function prologues (`str x30, [sp, #-16]!`) save
+    /// return addresses on the fiber stack — not the host stack.
+    fn call_trampoline(&self, instance: &wust_core::Instance, func_idx: usize, fuel: i64) {
+        let trampoline_offset = self.entry_trampolines[func_idx];
+        let trampoline_ptr = unsafe { self.buffer.entry().add(trampoline_offset * 4) };
+        let frame_base = instance.stack.base() as u64;
+        let fibre_top = instance.fibre.top() as u64;
 
-        stack.set_sp(0);
-        for val in args.to_vals() {
-            stack.push_val(&val);
-        }
-
-        // Entry via jump table.
-        let code_ptr = self.jump_table_entry(func_idx.0 as usize);
-        // Shared completion handler.
-        let completion_ptr = self.shared_handler_ptr(self.shared.completion);
-
-        // Load args from wasm stack for register passing.
-        let num_args = stack.sp() / 8;
-        let mut arg_regs = [0u64; 7];
-        for i in 0..num_args.min(7) {
-            arg_regs[i] = stack.read_u64_at(i * 8);
-        }
-
-        let mut ctx = JitContext::new();
-        ctx.stack_base = stack.base() as u64;
-        ctx.is_fiber = 1;
-
-        Ok(JitFiber {
-            ctx,
-            jit_stack: JitStack::new(1024 * 1024)?, // 1MB native stack
-            code_ptr,
-            completion_ptr,
-            frame_base: stack.base() as u64,
-            arg_regs,
-            status: FiberStatus::Ready,
-        })
-    }
-
-    /// Pointer to jump table entry for a given function index.
-    fn jump_table_entry(&self, func_idx: usize) -> *const u8 {
-        debug_assert!(func_idx < self.func_count);
-        unsafe { self.buffer.entry().add(func_idx * 4) }
-    }
-
-    /// Pointer to a shared handler at a given word offset.
-    fn shared_handler_ptr(&self, word_offset: usize) -> *const u8 {
-        unsafe { self.buffer.entry().add(word_offset * 4) }
-    }
-
-    /// Enter JIT code for a function (non-fiber mode).
-    ///
-    /// Sets x20=ctx, x21=fuel, x29=frame base, passes args in x9-x15.
-    /// Returns all 7 return registers (x9-x15) as raw u64 values.
-    unsafe fn enter(&self, func_idx: usize, stack: &mut Stack) -> [u64; 7] {
-        let code_ptr = self.jump_table_entry(func_idx);
-        let base = stack.base();
-        let fuel: i64 = i64::MAX;
-
-        let mut ctx = JitContext::new();
-        ctx.stack_base = base as u64;
-
-        let ctx_ptr = &mut ctx as *mut JitContext;
-
-        // Load up to 7 args from the wasm stack.
-        let num_args = stack.sp() / 8;
-        let mut args = [0u64; 7];
-        for i in 0..num_args.min(7) {
-            args[i] = stack.read_u64_at(i * 8);
-        }
-
-        let r9: u64;
-        let r10: u64;
-        let r11: u64;
-        let r12: u64;
-        let r13: u64;
-        let r14: u64;
-        let r15: u64;
         unsafe {
             std::arch::asm!(
+                // Save host callee-saved regs on host stack.
                 "stp x29, x30, [sp, #-16]!",
-                "mov x20, x0",
-                "mov x21, x1",
-                "mov x29, x2",
-                // Write prev_fp sentinel at [x29, #0] for the outermost frame.
-                "str x29, [x29, #0]",
-                "mov x3, x8",
-                "blr x3",
+                "stp x20, x21, [sp, #-16]!",
+                "stp x28, xzr, [sp, #-16]!",
+                // Save host SP, switch to fiber stack.
+                "mov x28, sp",
+                "mov sp, {fibre_top}",
+                // Set up JIT pinned registers.
+                "mov x29, {frame_base}",     // g.fp = frame base
+                "mov x21, {fuel}",           // g.fuel = fuel
+                // Call the per-function trampoline.
+                "blr {code}",
+                // Restore host SP from x28.
+                "mov sp, x28",
+                // Restore host callee-saved regs.
+                "ldp x28, xzr, [sp], #16",
+                "ldp x20, x21, [sp], #16",
                 "ldp x29, x30, [sp], #16",
-                in("x0") ctx_ptr as u64,
-                in("x1") fuel as u64,
-                in("x2") base as u64,
-                in("x8") code_ptr as u64,
-                in("x9") args[0],
-                in("x10") args[1],
-                in("x11") args[2],
-                in("x12") args[3],
-                in("x13") args[4],
-                in("x14") args[5],
-                in("x15") args[6],
-                lateout("x0") _, lateout("x1") _,
-                lateout("x2") _, lateout("x3") _,
-                lateout("x8") _,
-                lateout("x9") r9, lateout("x10") r10,
-                lateout("x11") r11, lateout("x12") r12,
-                lateout("x13") r13, lateout("x14") r14,
-                lateout("x15") r15,
-                out("x20") _, out("x21") _,
-                out("x30") _,
+                frame_base = in(reg) frame_base,
+                fuel = in(reg) fuel as u64,
+                fibre_top = in(reg) fibre_top,
+                code = in(reg) trampoline_ptr,
+                out("x9") _, out("x10") _, out("x11") _,
+                out("x12") _, out("x13") _, out("x14") _,
+                out("x15") _, out("x28") _,
+                clobber_abi("C"),
             );
         }
-
-        [r9, r10, r11, r12, r13, r14, r15]
     }
 }
 
-/// Interpret raw register values as typed `Val`s using the function's
+/// Frame header size in bytes (2 slots: prev_fp + header word).
+const FRAME_HEADER_SIZE: usize = 16;
+
+/// Interpret raw u64 bits as a typed `Val` based on the function's
 /// result type signature.
-///
-/// The JIT calling convention places return values in x9, x10, x11, ...
-/// (up to x15). Each register holds one result as a raw u64; this
-/// function reinterprets the bits according to `ValType`.
-fn regs_to_vals(regs: &[u64; 7], result_types: &[ValType]) -> Vec<Val> {
-    result_types
-        .iter()
-        .enumerate()
-        .map(|(i, ty)| {
-            let raw = regs[i];
-            match ty {
-                ValType::I32 => Val::I32(raw as i32),
-                ValType::I64 => Val::I64(raw as i64),
-                ValType::F32 => Val::F32(f32::from_bits(raw as u32)),
-                ValType::F64 => Val::F64(f64::from_bits(raw)),
-                _ => todo!("JIT return type {ty:?} not yet supported"),
-            }
-        })
-        .collect()
-}
-
-// ---- Fiber types ----
-
-/// Result of a fiber resume.
-pub enum FiberResult {
-    /// The function completed normally. Contains the i32 result.
-    Complete(i32),
-    /// Fuel was exhausted. Call `resume()` with more fuel to continue.
-    Suspended,
-}
-
-/// Status of a JIT fiber.
-enum FiberStatus {
-    /// Ready for first entry (hasn't started yet).
-    Ready,
-    /// Suspended mid-execution (can be resumed).
-    Suspended,
-    /// Completed (no further resumes possible).
-    Complete,
-}
-
-
-/// A separate native stack for JIT code execution.
-///
-/// Allocated via mmap so we get proper page alignment.
-struct JitStack {
-    base: *mut u8, // bottom of allocated region
-    size: usize,
-}
-
-impl JitStack {
-    fn new(size: usize) -> Result<Self, anyhow::Error> {
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                size,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        if base == libc::MAP_FAILED {
-            anyhow::bail!("mmap failed for JIT stack");
-        }
-        Ok(JitStack {
-            base: base as *mut u8,
-            size,
-        })
-    }
-
-    /// Top of the stack (initial SP value — stacks grow downward).
-    /// Aligned to 16 bytes as required by aarch64 ABI.
-    fn top(&self) -> *mut u8 {
-        unsafe { self.base.add(self.size & !0xF) }
-    }
-}
-
-impl Drop for JitStack {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.base as *mut libc::c_void, self.size);
-        }
-    }
-}
-
-/// A suspendable JIT execution fiber.
-///
-/// Runs JIT-compiled code on a separate native stack. When fuel runs
-/// out, the fiber suspends, preserving the entire call chain. Calling
-/// `resume()` with fresh fuel continues from exactly where it left off.
-pub struct JitFiber {
-    ctx: JitContext,
-    jit_stack: JitStack,
-    code_ptr: *const u8,
-    completion_ptr: *const u8,
-    frame_base: u64,
-    arg_regs: [u64; 7],
-    status: FiberStatus,
-}
-
-impl JitFiber {
-    /// Resume (or start) execution with the given fuel budget.
-    ///
-    /// Returns `Complete(result)` when the function finishes, or
-    /// `Suspended` when fuel runs out (call `resume` again to continue).
-    pub fn resume(&mut self, fuel: i64) -> FiberResult {
-        match self.status {
-            FiberStatus::Complete => panic!("cannot resume a completed fiber"),
-            FiberStatus::Ready => {
-                self.status = FiberStatus::Suspended; // will be updated below
-                let status = unsafe { self.fiber_start(fuel) };
-                self.finish(status)
-            }
-            FiberStatus::Suspended => {
-                let status = unsafe { self.fiber_resume(fuel) };
-                self.finish(status)
-            }
-        }
-    }
-
-    fn finish(&mut self, status: u32) -> FiberResult {
-        match status {
-            0 => {
-                self.status = FiberStatus::Suspended;
-                FiberResult::Suspended
-            }
-            1 => {
-                self.status = FiberStatus::Complete;
-                // Read result from context (saved by completion handler).
-                let result = self.ctx.wasm_sp_off as i32; // repurposed as result_value
-                FiberResult::Complete(result)
-            }
-            _ => panic!("unexpected fiber status: {status}"),
-        }
-    }
-
-    /// First entry into JIT code via fiber.
-    ///
-    /// 1. Saves host state (sp, fp, lr, x20) to JitContext.
-    /// 2. Switches sp to the JIT stack.
-    /// 3. Sets x20=ctx, x21=fuel, x30=completion.
-    /// 4. Branches to function entry.
-    ///
-    /// Returns when the yield handler or completion handler switches
-    /// back to the host stack: 0 = suspended, 1 = complete.
-    unsafe fn fiber_start(&mut self, fuel: i64) -> u32 {
-        let ctx_ptr = &mut self.ctx as *mut JitContext;
-        let jit_sp = self.jit_stack.top();
-        let completion = self.completion_ptr;
-        let code = self.code_ptr;
-        let frame_base = self.frame_base;
-        let status: u32;
-
-        unsafe {
-            std::arch::asm!(
-                // Save host state to JitContext.
-                // x0=ctx, x1=jit_sp, x2=fuel, x3=completion, x4=code, x5=frame_base
-                "adr x6, 2f",
-                "stp x29, x6, [x0, #72]",    // host_fp + host_lr (landing pad)
-                "mov x6, sp",
-                "str x6, [x0, #64]",          // host_sp
-                "str x20, [x0, #88]",         // host_ctx
-
-                // Switch to JIT stack.
-                "mov sp, x1",
-
-                // Set up pinned registers.
-                "mov x20, x0",
-                "mov x21, x2",
-                "mov x29, x5",
-                // Write prev_fp sentinel at [x29, #0] for the outermost frame.
-                "str x29, [x29, #0]",
-
-                // Set lr = completion handler, then enter JIT.
-                // x9-x15 already hold the args from in() constraints.
-                "mov x30, x3",
-                "br x4",
-
-                // Landing pad: yield/completion handler restored host state
-                // and did `ret`, which jumps here (host_lr = this address).
-                "2:",
-
-                in("x0") ctx_ptr as u64,
-                in("x1") jit_sp as u64,
-                in("x2") fuel as u64,
-                in("x3") completion as u64,
-                in("x4") code as u64,
-                in("x5") frame_base,
-                in("x9") self.arg_regs[0],
-                in("x10") self.arg_regs[1],
-                in("x11") self.arg_regs[2],
-                in("x12") self.arg_regs[3],
-                in("x13") self.arg_regs[4],
-                in("x14") self.arg_regs[5],
-                in("x15") self.arg_regs[6],
-                lateout("x0") status,
-                lateout("x1") _, lateout("x2") _,
-                lateout("x3") _, lateout("x4") _,
-                lateout("x5") _, lateout("x6") _,
-                lateout("x9") _, lateout("x10") _,
-                lateout("x11") _, lateout("x12") _,
-                lateout("x13") _, lateout("x14") _,
-                lateout("x15") _,
-                out("x20") _, out("x21") _,
-                out("x30") _,
-            );
-        }
-
-        status as u32
-    }
-
-    /// Resume a suspended fiber with fresh fuel.
-    ///
-    /// 1. Saves host state to JitContext.
-    /// 2. Restores JIT state (x29, x30, sp, scratch regs x9-x15).
-    /// 3. Sets x20=ctx, x21=fuel.
-    /// 4. `ret` → resumes at the saved resume point (.continue after fuel check).
-    unsafe fn fiber_resume(&mut self, fuel: i64) -> u32 {
-        let ctx_ptr = &mut self.ctx as *mut JitContext;
-        let status: u32;
-
-        unsafe {
-            std::arch::asm!(
-                // Save host state.
-                "adr x0, 2f",
-                "stp x29, x0, [{ctx}, #72]",   // host_fp + host_lr
-                "mov x0, sp",
-                "str x0, [{ctx}, #64]",         // host_sp
-                "str x20, [{ctx}, #88]",        // host_ctx
-
-                // Restore JIT state.
-                "mov x20, {ctx}",
-                "ldr x29, [x20, #56]",          // locals base
-                "ldr x30, [x20, #32]",          // resume LR
-                "ldr x0, [x20, #40]",           // jit SP
-                "mov sp, x0",
-
-                // Restore scratch registers (x9-x15).
-                "ldp x9, x10, [x20, #104]",
-                "ldp x11, x12, [x20, #120]",
-                "ldp x13, x14, [x20, #136]",
-                "ldr x15, [x20, #152]",
-
-                // Refuel.
-                "mov x21, {fuel}",
-
-                // Resume: ret → resume_lr → .continue after fuel check.
-                "ret",
-
-                // Landing pad (same as fiber_start).
-                "2:",
-
-                ctx = in(reg) ctx_ptr,
-                fuel = in(reg) fuel,
-                out("x0") status,
-                out("x9") _, out("x10") _,
-                out("x11") _, out("x12") _,
-                out("x13") _, out("x14") _,
-                out("x15") _,
-                out("x20") _, out("x21") _,
-                out("x30") _,
-            );
-        }
-
-        status
+fn read_typed(raw: u64, ty: &ValType) -> Val {
+    match ty {
+        ValType::I32 => Val::I32(raw as i32),
+        ValType::I64 => Val::I64(raw as i64),
+        ValType::F32 => Val::F32(f32::from_bits(raw as u32)),
+        ValType::F64 => Val::F64(f64::from_bits(raw)),
+        _ => todo!("JIT return type {ty:?} not yet supported"),
     }
 }

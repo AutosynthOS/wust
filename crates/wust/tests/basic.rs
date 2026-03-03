@@ -1,4 +1,4 @@
-use wust::{Engine, Linker, Module, Store};
+use wust::{Engine, Instance, Module};
 
 #[test]
 fn return_const_i32() -> Result<(), anyhow::Error> {
@@ -12,12 +12,9 @@ fn return_const_i32() -> Result<(), anyhow::Error> {
             )
         )
     "#,
-    )
-    .unwrap();
-    let linker = Linker::new(&engine);
-    let mut store = Store::new(&engine, ());
-    let mut instance = linker.instantiate(&mut store, &module)?;
-    let result: (i32,) = instance.call(&mut store, "answer", ())?;
+    )?;
+    let mut instance = Instance::new()?;
+    let result: (i32,) = wust::call(&module, &mut instance, "answer", ())?;
     assert_eq!(result, (42,));
     Ok(())
 }
@@ -39,12 +36,9 @@ fn multi_value_results_with_multiple_arguments() -> Result<(), anyhow::Error> {
             )
         )
     "#,
-    )
-    .unwrap();
-    let linker = Linker::new(&engine);
-    let mut store = Store::new(&engine, ());
-    let mut instance = linker.instantiate(&mut store, &module)?;
-    let result: (i32, i32) = instance.call(&mut store, "add", (0, 0))?;
+    )?;
+    let mut instance = Instance::new()?;
+    let result: (i32, i32) = wust::call(&module, &mut instance, "add", (0, 0))?;
     assert_eq!(result, (0, 0));
     Ok(())
 }
@@ -63,12 +57,9 @@ fn multi_value_results_with_carry() -> Result<(), anyhow::Error> {
             )
         )
     "#,
-    )
-    .unwrap();
-    let linker = Linker::new(&engine);
-    let mut store = Store::new(&engine, ());
-    let mut instance = linker.instantiate(&mut store, &module)?;
-    let result: (i32, i32, i32) = instance.call(&mut store, "add_carry", (0, 0, 0))?;
+    )?;
+    let mut instance = Instance::new()?;
+    let result: (i32, i32, i32) = wust::call(&module, &mut instance, "add_carry", (0, 0, 0))?;
     assert_eq!(result, (0, 0, 0));
     Ok(())
 }

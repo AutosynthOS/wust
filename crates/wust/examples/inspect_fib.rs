@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
     let module = Module::new(&engine, FIB_WAT)?;
 
     let output = Codegen::new(&module).compile()?;
-    print!("{}", output.render_blocks());
+    print!("{}", output.render());
 
     Ok(())
 }

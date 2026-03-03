@@ -1,17 +1,18 @@
 use wasmparser::ValType;
 
 use crate::stack::Stack;
-use crate::{Instance, Val, parse::func::FuncIdx};
+use crate::{Instance, Module, Val, parse::func::FuncIdx};
 
 mod exec_recursive;
 pub(crate) use exec_recursive::Trap;
 
 pub(crate) fn call(
+    module: &Module,
     instance: &mut Instance,
     func_idx: FuncIdx,
     args: &[Val],
 ) -> Result<Vec<Val>, anyhow::Error> {
-    let Instance { module, stack } = instance;
+    let stack = &mut instance.stack;
 
     let func = module
         .get_func(func_idx)

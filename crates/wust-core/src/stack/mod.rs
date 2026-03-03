@@ -1,6 +1,7 @@
 use std::ptr;
 
 use crate::Val;
+use crate::mmap::MmapRegion;
 
 const DEFAULT_STACK_PAGES: usize = 64;
 const GUARD_PAGES: usize = 1;
@@ -35,49 +36,17 @@ const GUARD_PAGES: usize = 1;
 /// explicit bounds checks must be added to `read_u64_at`, `write_u64_at`,
 /// and any `sp - N` arithmetic.
 pub struct Stack {
-    mmap_base: *mut u8,
-    mmap_size: usize,
-    base: *mut u8,
+    region: MmapRegion,
     /// Stack pointer offset from `base`, in bytes. Grows upward.
     sp: usize,
 }
 
 impl Stack {
     pub fn new() -> Result<Self, anyhow::Error> {
-        let page_size = page_size();
-        let usable_size = DEFAULT_STACK_PAGES * page_size;
-        let guard_size = GUARD_PAGES * page_size;
-        let total_size = usable_size + 2 * guard_size;
-
-        unsafe {
-            let ptr = libc::mmap(
-                ptr::null_mut(),
-                total_size,
-                libc::PROT_NONE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            );
-            anyhow::ensure!(ptr != libc::MAP_FAILED, "stack mmap failed");
-
-            let usable_ptr = (ptr as *mut u8).add(guard_size);
-            let ret = libc::mprotect(
-                usable_ptr as *mut libc::c_void,
-                usable_size,
-                libc::PROT_READ | libc::PROT_WRITE,
-            );
-            if ret != 0 {
-                libc::munmap(ptr, total_size);
-                anyhow::bail!("stack mprotect failed");
-            }
-
-            Ok(Stack {
-                mmap_base: ptr as *mut u8,
-                mmap_size: total_size,
-                base: usable_ptr,
-                sp: 0,
-            })
-        }
+        Ok(Stack {
+            region: MmapRegion::new(DEFAULT_STACK_PAGES, GUARD_PAGES)?,
+            sp: 0,
+        })
     }
 
     /// Current stack pointer offset from base, in bytes.
@@ -97,7 +66,7 @@ impl Stack {
     #[inline(always)]
     pub fn push_u64(&mut self, val: u64) {
         unsafe {
-            let dst = self.base.add(self.sp) as *mut u64;
+            let dst = self.region.base().add(self.sp) as *mut u64;
             ptr::write(dst, val);
         }
         self.sp += 8;
@@ -107,7 +76,7 @@ impl Stack {
     pub fn pop_u64(&mut self) -> u64 {
         self.sp -= 8;
         unsafe {
-            let src = self.base.add(self.sp) as *const u64;
+            let src = self.region.base().add(self.sp) as *const u64;
             ptr::read(src)
         }
     }
@@ -140,7 +109,7 @@ impl Stack {
     /// Base pointer of the usable stack region.
     #[inline(always)]
     pub fn base(&self) -> *mut u8 {
-        self.base
+        self.region.base()
     }
 
     // --- Random access by byte offset (for locals, result slots) ---
@@ -148,7 +117,7 @@ impl Stack {
     #[inline(always)]
     pub fn read_u64_at(&self, offset: usize) -> u64 {
         unsafe {
-            let src = self.base.add(offset) as *const u64;
+            let src = self.region.base().add(offset) as *const u64;
             ptr::read(src)
         }
     }
@@ -156,7 +125,7 @@ impl Stack {
     #[inline(always)]
     pub fn write_u64_at(&mut self, offset: usize, val: u64) {
         unsafe {
-            let dst = self.base.add(offset) as *mut u64;
+            let dst = self.region.base().add(offset) as *mut u64;
             ptr::write(dst, val);
         }
     }
@@ -167,16 +136,7 @@ impl Stack {
     /// Used by the trap handler to check if a SIGSEGV fault address
     /// falls within a known guard page.
     pub fn guard_page_ranges(&self) -> (usize, usize, usize, usize) {
-        let page_size = page_size();
-        let guard_size = GUARD_PAGES * page_size;
-        let usable_size = self.mmap_size - 2 * guard_size;
-
-        let lower_start = self.mmap_base as usize;
-        let lower_end = lower_start + guard_size;
-        let upper_start = self.base as usize + usable_size;
-        let upper_end = upper_start + guard_size;
-
-        (lower_start, lower_end, upper_start, upper_end)
+        self.region.guard_ranges()
     }
 
     /// Push a Val onto the stack.
@@ -195,17 +155,4 @@ impl Stack {
             Val::Ref(_) => self.push_u64(0),
         }
     }
-}
-
-impl Drop for Stack {
-    fn drop(&mut self) {
-        unsafe {
-            libc::munmap(self.mmap_base as *mut libc::c_void, self.mmap_size);
-        }
-    }
-}
-
-fn page_size() -> usize {
-    // SAFETY: sysconf(_SC_PAGESIZE) always succeeds on POSIX systems.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
 }

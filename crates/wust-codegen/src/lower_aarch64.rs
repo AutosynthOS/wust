@@ -1,5 +1,4 @@
 use crate::cfg::{self, CfgInfo};
-use crate::context::JitContext;
 use crate::emit::{Cond, Emitter, PatchPoint, Reg};
 use crate::ir::{AluOp, IrFunction, IrInst, Label, Operand, UnaryOp};
 use crate::regalloc_adapter::{self, RegAllocAdapter};
@@ -14,13 +13,11 @@ pub struct LowerResult {
 }
 
 /// Word offsets of shared handlers within a shared code buffer.
+/// Word offsets of shared code regions within the code buffer.
 pub struct SharedHandlerOffsets {
-    /// Yield handler — called when fuel is exhausted.
-    pub yield_handler: usize,
-    /// Completion handler — called when a fiber-mode function returns.
-    pub completion: usize,
+    /// Word offset immediately after the last shared preamble instruction.
+    pub end: usize,
 }
-
 
 /// Byte offset of the first local in the wasm frame.
 /// Layout: [prev_fp (8)][header (8)][locals...], so locals start at +16.
@@ -30,17 +27,6 @@ const FRAME_HEADER_SIZE: u16 = 16;
 fn frame_slot_offset(slot: u32) -> u16 {
     slot as u16 * 8 + FRAME_HEADER_SIZE
 }
-
-const CTX_IS_FIBER: u16 = std::mem::offset_of!(JitContext, is_fiber) as u16;
-const CTX_RESUME_LR: u16 = std::mem::offset_of!(JitContext, resume_lr) as u16;
-const CTX_JIT_SP: u16 = std::mem::offset_of!(JitContext, jit_sp) as u16;
-const CTX_SAVED_FUEL: u16 = std::mem::offset_of!(JitContext, saved_fuel) as u16;
-const CTX_SAVED_FP: u16 = std::mem::offset_of!(JitContext, saved_fp) as u16;
-const CTX_HOST_SP: u16 = std::mem::offset_of!(JitContext, host_sp) as u16;
-const CTX_HOST_FP: u16 = std::mem::offset_of!(JitContext, host_fp) as u16;
-const CTX_HOST_CTX: u16 = std::mem::offset_of!(JitContext, host_ctx) as u16;
-const CTX_WASM_SP_OFF: u16 = std::mem::offset_of!(JitContext, wasm_sp_off) as u16;
-const CTX_SCRATCH: u16 = std::mem::offset_of!(JitContext, scratch) as u16;
 
 // ============================================================
 // regalloc2-based lowering
@@ -395,38 +381,15 @@ fn emit_branch_to_label(
 /// Returns the handler offsets. The jump table starts at word offset 0
 /// and has one `b <stub>` instruction per function.
 pub fn emit_shared_preamble(e: &mut Emitter, func_count: usize) -> SharedHandlerOffsets {
-    let jump_table_pps: Vec<PatchPoint> = (0..func_count).map(|_| e.b()).collect();
-
-    let mut interpret_exit_pps: Vec<PatchPoint> = Vec::with_capacity(func_count);
-    for (i, jt_pp) in jump_table_pps.iter().enumerate() {
-        e.patch(*jt_pp);
-        emit_i32_const_reg(e, Reg::W0, i as i32);
-        interpret_exit_pps.push(e.b());
+    // Jump table: one `brk` per function (placeholder — not used in
+    // the trampoline entry path).
+    for _ in 0..func_count {
+        e.brk(2);
     }
 
-    let yield_handler = e.offset();
-    e.ldr_x_uoff(Reg::X0, Reg::X20, CTX_IS_FIBER);
-    let fiber_branch = e.cbnz_x(Reg::X0);
-    emit_i32_const_reg(e, Reg::W0, -1);
-    e.ldr_x_post(Reg::X30, Reg::SP, 16);
-    e.ret();
-    e.patch(fiber_branch);
-    emit_fiber_yield(e);
+    let end = e.offset();
 
-    let completion = e.offset();
-    emit_fiber_complete(e);
-
-    let interpret_exit = e.offset();
-    e.brk(2);
-
-    for pp in interpret_exit_pps {
-        e.patch_to(pp, interpret_exit);
-    }
-
-    SharedHandlerOffsets {
-        yield_handler,
-        completion,
-    }
+    SharedHandlerOffsets { end }
 }
 
 /// Lower an IR function into a shared emitter using PC-relative calls
@@ -438,7 +401,6 @@ pub fn lower_into(
     e: &mut Emitter,
     ir: &IrFunction,
     func_idx: u32,
-    shared: &SharedHandlerOffsets,
     body_offsets: &mut [Option<usize>],
     emit_markers: bool,
 ) -> LowerResult {
@@ -502,14 +464,11 @@ pub fn lower_into(
     }
 
     // ---- Cold fuel-check stubs ----
+    // TODO: implement proper suspend/yield when fuel is exhausted.
+    // For now, each cold stub is: brk #5; b @resume.
     for site in &fuel_sites {
-        e.patch(site.b_le_patch);
-        let current = e.offset();
-        let yield_offset = shared.yield_handler as i32 - current as i32;
-        e.bl_offset(yield_offset);
-        let current = e.offset();
-        let offset = site.resume_offset as i32 - current as i32;
-        e.b_offset(offset);
+        e.patch_to(site.b_le_patch, e.offset());
+        e.brk(5);
     }
 
     // Patch forward label branches.
@@ -546,59 +505,76 @@ pub fn patch_jump_table(e: &mut Emitter, func_idx: u32, target_word: usize) {
 /// Info for a fuel check that needs cold-path patching.
 struct FuelCheckSite {
     b_le_patch: PatchPoint,
-    resume_offset: usize,
 }
 
 /// Emit a fused fuel consume+check: `subs x21, x21, #cost; b.le <cold>`.
 fn emit_fuel_check_with_cost(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>, cost: u32) {
     e.subs_x_imm(Reg::X21, Reg::X21, cost as u16);
     let b_le_patch = e.b_cond(Cond::LE);
-    let resume_offset = e.offset();
-    fuel_sites.push(FuelCheckSite {
-        b_le_patch,
-        resume_offset,
-    });
+    fuel_sites.push(FuelCheckSite { b_le_patch });
 }
 
-/// Emit a standalone fuel check (no consume): `tbnz x21, #63, <cold>`.
+/// Emit a standalone fuel check (no consume): `cmp x21, #0; b.lt <cold>`.
 /// Branches if fuel is negative (sign bit set).
 fn emit_fuel_check_sign(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>) {
-    // cmp x21, #0; b.lt cold — checks if fuel went negative.
     e.cmp_x_imm(Reg::X21, 0);
     let b_le_patch = e.b_cond(Cond::LT);
-    let resume_offset = e.offset();
-    fuel_sites.push(FuelCheckSite {
-        b_le_patch,
-        resume_offset,
-    });
+    fuel_sites.push(FuelCheckSite { b_le_patch });
 }
 
-fn emit_fiber_yield(e: &mut Emitter) {
-    e.str_x_uoff(Reg::X30, Reg::X20, CTX_RESUME_LR);
-    e.stp_x_soff(Reg::X9, Reg::X10, Reg::X20, CTX_SCRATCH as i16);
-    e.stp_x_soff(Reg(11), Reg(12), Reg::X20, (CTX_SCRATCH + 16) as i16);
-    e.stp_x_soff(Reg(13), Reg(14), Reg::X20, (CTX_SCRATCH + 32) as i16);
-    e.str_x_uoff(Reg(15), Reg::X20, CTX_SCRATCH + 48);
-    e.mov_x_from_sp(Reg::X9);
-    e.str_x_uoff(Reg::X9, Reg::X20, CTX_JIT_SP);
-    e.str_x_uoff(Reg::X21, Reg::X20, CTX_SAVED_FUEL);
-    e.str_x_uoff(Reg::X29, Reg::X20, CTX_SAVED_FP);
-    e.ldr_x_uoff(Reg::X9, Reg::X20, CTX_HOST_SP);
-    e.ldp_x_soff(Reg::X29, Reg::X30, Reg::X20, CTX_HOST_FP as i16);
-    e.ldr_x_uoff(Reg::X20, Reg::X20, CTX_HOST_CTX);
-    e.mov_sp_from(Reg::X9);
-    e.movz_w(Reg::W0, 0);
-    e.ret();
-}
 
-fn emit_fiber_complete(e: &mut Emitter) {
-    e.str_x_uoff(Reg::X9, Reg::X20, CTX_WASM_SP_OFF);
-    e.ldr_x_uoff(Reg::X9, Reg::X20, CTX_HOST_SP);
-    e.ldp_x_soff(Reg::X29, Reg::X30, Reg::X20, CTX_HOST_FP as i16);
-    e.ldr_x_uoff(Reg::X20, Reg::X20, CTX_HOST_CTX);
-    e.mov_sp_from(Reg::X9);
-    e.movz_w(Reg::W0, 1);
+/// Emit a per-function entry trampoline for host→JIT calls.
+///
+/// Layout:
+/// ```text
+/// stp  x29, x30, [sp, #-16]!    ; save host fp + lr
+/// bl   save_host_state           ; shared: save x20/x21, set x29/x21
+/// ; -- load params from frame into registers --
+/// ldr  x9,  [x29, #8]           ; param 0
+/// ldr  x10, [x29, #16]          ; param 1
+/// ...
+/// bl   func_body                 ; call compiled function
+/// ; -- store results from registers to frame --
+/// str  x9, [x29, #8]            ; result 0
+/// ...
+/// bl   restore_host_state        ; shared: restore x20/x21
+/// ldp  x29, x30, [sp], #16      ; restore host fp + lr
+/// ret                            ; back to Rust
+/// ```
+///
+/// Returns the word offset of the trampoline entry point.
+pub fn emit_entry_trampoline(
+    e: &mut Emitter,
+    func_body_offset: usize,
+    param_count: usize,
+    result_count: usize,
+) -> usize {
+    let entry = e.offset();
+
+    // Save LR — bl to body will clobber it, and we need it to ret.
+    e.str_x_pre(Reg::X30, Reg::SP, -16);
+
+    // Load params from frame into x9, x10, ...
+    for i in 0..param_count.min(7) {
+        let reg = Reg(9 + i as u8);
+        e.ldr_x_uoff(reg, Reg::X29, frame_slot_offset(i as u32));
+    }
+
+    // bl func_body
+    let offset = func_body_offset as i32 - e.offset() as i32;
+    e.bl_offset(offset);
+
+    // Store results from x9, x10, ... back to frame.
+    for i in 0..result_count.min(7) {
+        let reg = Reg(9 + i as u8);
+        e.str_x_uoff(reg, Reg::X29, frame_slot_offset(i as u32));
+    }
+
+    // Restore LR and return to caller.
+    e.ldr_x_post(Reg::X30, Reg::SP, 16);
     e.ret();
+
+    entry
 }
 
 fn emit_i32_const_reg(e: &mut Emitter, rd: Reg, val: i32) {

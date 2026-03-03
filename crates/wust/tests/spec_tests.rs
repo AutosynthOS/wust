@@ -15,7 +15,7 @@ use std::io::IsTerminal;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::time::Duration;
-use wust::{Engine, Instance, JitModule, Linker, Module, Store, Val};
+use wust::{Engine, Instance, JitModule, Linker, Module, Val};
 
 // --- Execution mode ---
 
@@ -46,21 +46,20 @@ impl ExecMode {
 
 struct SpecRunner {
     engine: Engine,
+    module: Option<Module>,
     instance: Option<Instance>,
     jit_module: Option<JitModule>,
-    store: Store<()>,
     mode: ExecMode,
 }
 
 impl SpecRunner {
     fn new(mode: ExecMode) -> Self {
         let engine = Engine::default();
-        let store = Store::new(&engine, ());
         Self {
             engine,
+            module: None,
             instance: None,
             jit_module: None,
-            store,
             mode,
         }
     }
@@ -69,34 +68,33 @@ impl SpecRunner {
         let binary = wat.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
         let module =
             Module::from_bytes(&self.engine, &binary).map_err(|e| anyhow::anyhow!("{e}"))?;
-        let linker = Linker::new(&self.engine);
         if matches!(self.mode, ExecMode::Jit) {
             self.jit_module = Some(JitModule::compile(&module)?);
         }
-        self.instance = Some(
-            linker
-                .instantiate(&mut self.store, &module)
-                .map_err(|e| anyhow::anyhow!("{e}"))?,
-        );
+        self.module = Some(module);
+        self.instance = Some(Instance::new()?);
         Ok(())
     }
 
     fn invoke(&mut self, invoke: &wast::WastInvoke) -> anyhow::Result<Vec<Val>> {
         let args = parse_args(invoke)?;
+        let module = self
+            .module
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active module"))?;
         let instance = self
             .instance
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("no active instance"))?;
         match self.mode {
-            ExecMode::Interpreter => instance
-                .call_dynamic(&mut self.store, invoke.name, &args)
+            ExecMode::Interpreter => wust::call_dynamic(module, instance, invoke.name, &args)
                 .map_err(|e| anyhow::anyhow!("{e}")),
             ExecMode::Jit => {
                 let jit = self
                     .jit_module
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("no JIT module compiled"))?;
-                jit.call_dynamic(instance, invoke.name, &args)
+                jit.call_dynamic(module, instance, invoke.name, &args)
                     .map_err(|e| anyhow::anyhow!("{e}"))
             }
         }
@@ -107,14 +105,7 @@ impl SpecRunner {
             wast::WastExecute::Invoke(invoke) => self.invoke(&invoke),
             wast::WastExecute::Get { module, global, .. } => {
                 anyhow::ensure!(module.is_none(), "named module gets not supported");
-                let instance = self
-                    .instance
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("no active instance"))?;
-                let val = instance
-                    .get_global(&self.store, global)
-                    .ok_or_else(|| anyhow::anyhow!("global {global} not found"))?;
-                Ok(vec![val])
+                anyhow::bail!("global gets not yet implemented (global: {global})")
             }
             wast::WastExecute::Wat(wat) => {
                 self.instantiate(wast::QuoteWat::Wat(wat))?;
