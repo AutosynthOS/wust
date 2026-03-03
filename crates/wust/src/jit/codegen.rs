@@ -99,9 +99,12 @@ impl<'a> Codegen<'a> {
                     .iter()
                     .map(|m| m - snap.code_start)
                     .collect();
-                let op_labels: Vec<String> = module.funcs[i]
-                    .body.ops.iter()
-                    .map(|op| op.display_label())
+                let (fused_ops, _) = crate::jit::fuse::fuse(&module.funcs[i].body);
+                let op_labels: Vec<String> = fused_ops.iter()
+                    .map(|op| {
+                        crate::jit::fuse::display_label(*op)
+                            .unwrap_or_else(|| op.display_label())
+                    })
                     .collect();
 
                 blocks.push(Block {

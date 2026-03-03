@@ -23,6 +23,15 @@ impl InlineOp {
         unsafe { *(&self.0 as *const u64 as *const OpCode) }
     }
 
+    /// Read the raw opcode byte without interpreting it as an OpCode.
+    ///
+    /// Used by engine-specific fuse passes that pack non-standard opcodes
+    /// (≥128) into the same InlineOp layout.
+    #[inline(always)]
+    pub fn raw_opcode(&self) -> u8 {
+        self.0 as u8
+    }
+
     /// Read the immediate as a u32 (lower 24 bits of the immediate field).
     #[inline(always)]
     pub fn immediate_u32(self) -> u32 {
@@ -32,6 +41,13 @@ impl InlineOp {
     /// Raw u64 value (for debugging/dump).
     pub fn raw(self) -> u64 {
         self.0
+    }
+
+    /// Construct an InlineOp from a raw u64 value.
+    ///
+    /// Used by engine-specific fuse passes to pack custom opcodes.
+    pub fn from_raw(raw: u64) -> Self {
+        Self(raw)
     }
 
     /// Bits 8-15: first u8 field.
@@ -72,15 +88,25 @@ impl InlineOp {
         let op = self.opcode();
         match op {
             OpCode::DataStream | OpCode::Nop => String::new(),
-            OpCode::I32Const | OpCode::I64Const => format!("{op:?} {imm}"),
-            OpCode::LocalGet | OpCode::LocalSet | OpCode::LocalTee => format!("{op:?} {imm}"),
-            OpCode::GlobalGet | OpCode::GlobalSet => format!("{op:?} {imm}"),
-            OpCode::Call => format!("call {imm}"),
-            OpCode::Block | OpCode::Loop | OpCode::If | OpCode::Else | OpCode::End => {
-                format!("{op:?} @{imm}")
+            OpCode::I32Const => {
+                let val = (imm as i32) << 8 >> 8;
+                format!("i32.const {val}")
             }
-            OpCode::Br | OpCode::BrIf => format!("{op:?} @{imm}"),
-            _ => format!("{op:?}"),
+            OpCode::I64Const => {
+                let val = (imm as i32) << 8 >> 8;
+                format!("i64.const {val}")
+            }
+            OpCode::LocalGet => format!("local.get {imm}"),
+            OpCode::LocalSet => format!("local.set {imm}"),
+            OpCode::LocalTee => format!("local.tee {imm}"),
+            OpCode::GlobalGet => format!("global.get {imm}"),
+            OpCode::GlobalSet => format!("global.set {imm}"),
+            OpCode::Call => format!("call {imm}"),
+            OpCode::Block | OpCode::Loop | OpCode::Else | OpCode::End => String::new(),
+            OpCode::If => "if".into(),
+            OpCode::Br => format!("br {imm}"),
+            OpCode::BrIf => format!("br_if {imm}"),
+            _ => op.wasm_name().into(),
         }
     }
 }

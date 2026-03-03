@@ -1,5 +1,6 @@
 pub mod codegen;
 pub(crate) mod compiler;
+pub(crate) mod fuse;
 #[cfg(test)]
 pub(crate) mod tests;
 

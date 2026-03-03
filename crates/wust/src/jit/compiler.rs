@@ -1,5 +1,8 @@
 use wust_codegen::ir::{AluOp, IrFunction, IrInst, Label, Operand, UnaryOp, VReg};
+use wust_core::module::op::InlineOp;
 use wust_core::{BlockKind, FuncMeta, OpCode};
+
+use crate::jit::fuse;
 
 /// Open block during IR compilation — tracks label resolution.
 struct OpenBlock {
@@ -322,19 +325,27 @@ pub(crate) fn compile_with(
     }
 
     let result_count = func.result_count();
-    let ops = &func.body.ops;
-    let blocks = &func.body.blocks;
+    let (fused_ops, fused_blocks) = fuse::fuse(&func.body);
+    let ops = &fused_ops;
+    let blocks = &fused_blocks;
 
     for (op_idx, op) in ops.iter().enumerate() {
         c.current_op = op_idx as u32;
-        let opcode = op.opcode();
+        let raw = op.raw_opcode();
         let imm = op.immediate_u32();
 
-        // Accrue fuel cost BEFORE processing the opcode, so that
-        // terminators (Return, Trap) can flush then reset pending_fuel
-        // without subsequent dead-code fuel leaking through.
-        c.accrue_fuel(opcode.fuel_cost());
+        // Fused opcodes have their own fuel costs; standard opcodes
+        // use OpCode::fuel_cost().
+        let fuel_cost = fuse::fuel_cost(raw);
+        c.accrue_fuel(fuel_cost);
 
+        // Handle fused opcodes (raw byte ≥ FUSED_BASE) before standard opcodes.
+        if raw >= fuse::FUSED_BASE {
+            compile_fused_op(&mut c, *op, raw, all_funcs, blocks, result_count);
+            continue;
+        }
+
+        let opcode = op.opcode();
         match opcode {
             OpCode::Nop => {}
 
@@ -705,9 +716,8 @@ pub(crate) fn compile_with(
                 }
             }
 
-            // TODO: re-add superinstruction fuse pass (task #10)
-
             _ => {
+                // Unknown standard opcode — should not happen for valid wasm.
                 c.emit(IrInst::Trap);
             }
         }
@@ -725,6 +735,172 @@ pub(crate) fn compile_with(
     eliminate_dead_load_store_pairs(&mut ir);
 
     ir
+}
+
+/// Compile a fused opcode (raw byte ≥128) into IR instructions.
+fn compile_fused_op(
+    c: &mut IrCompiler,
+    op: InlineOp,
+    raw: u8,
+    all_funcs: &[FuncMeta],
+    blocks: &[wust_core::module::body::Block],
+    result_count: usize,
+) {
+    match raw {
+        fuse::LOCAL_GET_LOCAL_GET_ADD => {
+            let a_idx = op.imm_u8_a() as u32;
+            let b_idx = op.imm_u8_b() as u32;
+            c.emit_local_get(a_idx);
+            c.emit_local_get(b_idx);
+            let rhs = c.vpop();
+            let lhs = c.vpop();
+            let dst = c.fresh_vreg();
+            c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Reg(rhs) });
+            c.vpush(dst);
+        }
+
+        fuse::LOCAL_GET_I32_CONST_SUB => {
+            let local_idx = op.imm_u8_a() as u32;
+            let konst = op.imm_i16_hi() as i32;
+            c.emit_local_get(local_idx);
+            let lhs = c.vpop();
+            let dst = c.fresh_vreg();
+            if konst >= 0 && konst < 4096 {
+                c.emit(IrInst::Alu { op: AluOp::I32Sub, dst, lhs, rhs: Operand::Imm(konst as i64) });
+            } else {
+                c.emit_i32_const(konst);
+                let rhs = c.vpop();
+                c.emit(IrInst::Alu { op: AluOp::I32Sub, dst, lhs, rhs: Operand::Reg(rhs) });
+            }
+            c.vpush(dst);
+        }
+
+        fuse::LOCAL_GET_I32_CONST_ADD => {
+            let local_idx = op.imm_u8_a() as u32;
+            let konst = op.imm_i16_hi() as i32;
+            c.emit_local_get(local_idx);
+            let lhs = c.vpop();
+            let dst = c.fresh_vreg();
+            if konst >= 0 && konst < 4096 {
+                c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Imm(konst as i64) });
+            } else {
+                c.emit_i32_const(konst);
+                let rhs = c.vpop();
+                c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Reg(rhs) });
+            }
+            c.vpush(dst);
+        }
+
+        fuse::LOCAL_GET_RETURN => {
+            let local_idx = op.imm_u8_a() as u32;
+            c.emit_local_get(local_idx);
+            c.flush_fuel_consume_only();
+            c.emit_return(result_count);
+        }
+
+        fuse::LOCAL_GET_I32_CONST_LE_S_IF => {
+            let local_idx = op.imm_u8_a() as u32;
+            let konst = op.imm_u8_b() as i8 as i32;
+            let block_idx = op.imm_u8_c() as u32;
+
+            c.emit_local_get(local_idx);
+            let lhs = c.vpop();
+            let args = c.collect_local_args();
+            let cmp_dst = c.fresh_vreg();
+            if konst >= 0 && konst < 4096 {
+                c.emit(IrInst::Alu {
+                    op: AluOp::I32LeS,
+                    dst: cmp_dst,
+                    lhs,
+                    rhs: Operand::Imm(konst as i64),
+                });
+            } else {
+                c.emit_i32_const(konst);
+                let rhs = c.vpop();
+                c.emit(IrInst::Alu {
+                    op: AluOp::I32LeS,
+                    dst: cmp_dst,
+                    lhs,
+                    rhs: Operand::Reg(rhs),
+                });
+            }
+
+            let label = c.fresh_label();
+            c.emit(IrInst::BrIfZero {
+                cond: cmp_dst,
+                label,
+                args,
+            });
+            c.block_stack.push(OpenBlock {
+                block_idx,
+                kind: blocks[block_idx as usize].kind,
+                label,
+                vstack_depth: c.vstack.len(),
+            });
+        }
+
+        fuse::CALL_LOCAL_SET => {
+            let func_idx = op.imm_u16_lo() as u32;
+            let local_idx = op.imm_u8_c() as u32;
+            let callee = &all_funcs[func_idx as usize];
+            let param_count = callee.param_count();
+            let has_result = callee.result_count() > 0;
+            let mut args = Vec::with_capacity(param_count);
+            for _ in 0..param_count {
+                args.push(c.vpop());
+            }
+            args.reverse();
+            let spill_count = c.vstack.len();
+            c.flush_vstack_above(0);
+            c.flush_fuel();
+            let result = if has_result {
+                Some(c.fresh_vreg())
+            } else {
+                None
+            };
+            let frame_advance = (2 + c.total_local_count + spill_count as u32) * 8;
+            c.emit(IrInst::Call {
+                func_idx,
+                args,
+                result,
+                frame_advance,
+            });
+            c.invalidate_locals();
+            if spill_count > 0 {
+                c.reload_from_stack(spill_count);
+            }
+            if let Some(r) = result {
+                c.local_vreg[local_idx as usize] = Some(r);
+                c.frame_dirty[local_idx as usize] = true;
+            }
+        }
+
+        fuse::LOCAL_GET_I32_EQZ_IF => {
+            let local_idx = op.imm_u8_a() as u32;
+            let block_idx = op.imm_u8_b() as u32;
+
+            c.emit_local_get(local_idx);
+            let val = c.vpop();
+            let args = c.collect_local_args();
+
+            let label = c.fresh_label();
+            c.emit(IrInst::BrIfNonZero {
+                cond: val,
+                label,
+                args,
+            });
+            c.block_stack.push(OpenBlock {
+                block_idx,
+                kind: blocks[block_idx as usize].kind,
+                label,
+                vstack_depth: c.vstack.len(),
+            });
+        }
+
+        _ => {
+            c.emit(IrInst::Trap);
+        }
+    }
 }
 
 /// Remove redundant FrameLoad+FrameStore pairs where a value is loaded
