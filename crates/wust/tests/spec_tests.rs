@@ -15,7 +15,7 @@ use std::io::IsTerminal;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::time::Duration;
-use wust::{Engine, Instance, JitModule, Linker, Module, Val};
+use wust::{Engine, ExecBackend, JitModule, Linker, Module, Task, Val};
 
 // --- Execution mode ---
 
@@ -47,7 +47,7 @@ impl ExecMode {
 struct SpecRunner {
     engine: Engine,
     module: Option<Module>,
-    instance: Option<Instance>,
+    task: Option<Task>,
     jit_module: Option<JitModule>,
     mode: ExecMode,
 }
@@ -58,7 +58,7 @@ impl SpecRunner {
         Self {
             engine,
             module: None,
-            instance: None,
+            task: None,
             jit_module: None,
             mode,
         }
@@ -72,7 +72,7 @@ impl SpecRunner {
             self.jit_module = Some(JitModule::compile(&module)?);
         }
         self.module = Some(module);
-        self.instance = Some(Instance::new()?);
+        self.task = Some(Task::new()?);
         Ok(())
     }
 
@@ -82,20 +82,22 @@ impl SpecRunner {
             .module
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no active module"))?;
-        let instance = self
-            .instance
+        let task = self
+            .task
             .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("no active instance"))?;
+            .ok_or_else(|| anyhow::anyhow!("no active task"))?;
         match self.mode {
-            ExecMode::Interpreter => wust::call_dynamic(module, instance, invoke.name, &args)
+            ExecMode::Interpreter => wust::call_dynamic(module, task, invoke.name, &args)
                 .map_err(|e| anyhow::anyhow!("{e}")),
             ExecMode::Jit => {
                 let jit = self
                     .jit_module
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("no JIT module compiled"))?;
-                jit.call_dynamic(module, instance, invoke.name, &args)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
+                wust::setup(module, task, invoke.name, &args)?;
+                let outcome = jit.poll(module, task, i64::MAX);
+                debug_assert_eq!(outcome, wust::Outcome::Return);
+                Ok(wust::results(module, task))
             }
         }
     }

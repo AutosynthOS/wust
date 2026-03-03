@@ -464,11 +464,24 @@ pub fn lower_into(
     }
 
     // ---- Cold fuel-check stubs ----
-    // TODO: implement proper suspend/yield when fuel is exhausted.
-    // For now, each cold stub is: brk #5; b @resume.
+    // All fuel sites branch to a shared suspend handler that longjmps
+    // back to the host via the Context pointer (x20).
+    let suspend_handler = e.offset();
+    // mov x9, #1              ; Outcome::Suspended
+    e.movz_x(Reg::X9, 1);
+    // str x9, [x20, #0]       ; ctx.outcome = Suspended
+    e.str_x_uoff(Reg::X9, Reg::X20, 0);
+    // ldr x9, [x20, #8]       ; x9 = ctx.fibre_top
+    e.ldr_x_uoff(Reg::X9, Reg::X20, 8);
+    // ldur x30, [x9, #-16]    ; x30 = entry trampoline's saved LR
+    e.ldur_x(Reg::X30, Reg::X9, -16);
+    // mov sp, x28             ; restore host SP
+    e.mov_sp_from(Reg::X28);
+    // ret                      ; longjmp to inline asm (after blr)
+    e.ret();
+
     for site in &fuel_sites {
-        e.patch_to(site.b_le_patch, e.offset());
-        e.brk(5);
+        e.patch_to(site.b_le_patch, suspend_handler);
     }
 
     // Patch forward label branches.

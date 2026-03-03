@@ -1,6 +1,5 @@
 use wust_codegen::ir::{AluOp, IrFunction, IrInst, Label, Operand, UnaryOp, VReg};
-use crate::parse::body::{BlockKind, OpCode};
-use crate::parse::func::ParsedFunction;
+use wust_core::{BlockKind, FuncMeta, OpCode};
 
 /// Open block during IR compilation — tracks label resolution.
 struct OpenBlock {
@@ -142,10 +141,7 @@ impl IrCompiler {
         for idx in 0..self.total_local_count {
             if self.frame_dirty[idx as usize] {
                 if let Some(v) = self.local_vreg[idx as usize] {
-                    self.insts.push(IrInst::FrameStore {
-                        slot: idx,
-                        src: v,
-                    });
+                    self.insts.push(IrInst::FrameStore { slot: idx, src: v });
                     self.source_ops.push(self.current_op);
                     self.frame_dirty[idx as usize] = false;
                 }
@@ -173,7 +169,9 @@ impl IrCompiler {
 
     /// Allocate fresh VRegs for block params (one per local).
     fn allocate_local_params(&mut self) -> Vec<VReg> {
-        (0..self.total_local_count).map(|_| self.fresh_vreg()).collect()
+        (0..self.total_local_count)
+            .map(|_| self.fresh_vreg())
+            .collect()
     }
 
     /// Update local_vreg tracking from DefLabel block params.
@@ -291,16 +289,18 @@ impl IrCompiler {
 /// FuelCheck before branches, labels, calls, and returns. This avoids
 /// redundant checks between adjacent opcodes.
 pub(crate) fn compile_with(
-    func: &ParsedFunction,
-    all_funcs: &[ParsedFunction],
+    func: &FuncMeta,
+    all_funcs: &[FuncMeta],
     emit_fuel: bool,
 ) -> IrFunction {
-    let mut c = IrCompiler::new(func.locals.len() as u32, emit_fuel);
+    let total_locals = func.local_count() as u32;
+    let param_count = func.param_count() as u32;
+    let mut c = IrCompiler::new(total_locals, emit_fuel);
 
     // Params start in registers (x9, x10, ...) via ParamDef.
     // Track them as local VRegs — they're dirty (not yet in frame).
     // Frame stores are deferred to the first flush_dirty_locals().
-    for i in 0..func.param_count as u32 {
+    for i in 0..param_count {
         let v = c.fresh_vreg();
         c.emit(IrInst::ParamDef { dst: v, idx: i });
         c.local_vreg[i as usize] = Some(v);
@@ -309,17 +309,19 @@ pub(crate) fn compile_with(
 
     // Non-param locals start as zero. Track a zero VReg — dirty
     // (frame stores deferred to first flush).
-    let extra_locals = func.locals.len() as u32 - func.param_count as u32;
-    if extra_locals > 0 {
+    if total_locals > param_count {
         let v_zero = c.fresh_vreg();
-        c.emit(IrInst::IConst { dst: v_zero, val: 0 });
-        for i in func.param_count as u32..func.locals.len() as u32 {
+        c.emit(IrInst::IConst {
+            dst: v_zero,
+            val: 0,
+        });
+        for i in param_count..total_locals {
             c.local_vreg[i as usize] = Some(v_zero);
             c.frame_dirty[i as usize] = true;
         }
     }
 
-    let result_count = func.result_count as usize;
+    let result_count = func.result_count();
     let ops = &func.body.ops;
     let blocks = &func.body.blocks;
 
@@ -389,41 +391,93 @@ pub(crate) fn compile_with(
                 c.vpush(dst);
             }
 
-            OpCode::I32Add | OpCode::I32Sub
-            | OpCode::I32Mul | OpCode::I32DivS | OpCode::I32DivU
-            | OpCode::I32RemS | OpCode::I32RemU
-            | OpCode::I32And | OpCode::I32Or | OpCode::I32Xor
-            | OpCode::I32Shl | OpCode::I32ShrS | OpCode::I32ShrU
-            | OpCode::I32Rotl | OpCode::I32Rotr
-            | OpCode::I32Eq | OpCode::I32Ne
-            | OpCode::I32LtS | OpCode::I32LtU | OpCode::I32GtS | OpCode::I32GtU
-            | OpCode::I32LeS | OpCode::I32LeU | OpCode::I32GeS | OpCode::I32GeU
-            | OpCode::I64Add | OpCode::I64Sub | OpCode::I64Mul
-            | OpCode::I64DivS | OpCode::I64DivU | OpCode::I64RemS | OpCode::I64RemU
-            | OpCode::I64And | OpCode::I64Or | OpCode::I64Xor
-            | OpCode::I64Shl | OpCode::I64ShrS | OpCode::I64ShrU
-            | OpCode::I64Rotl | OpCode::I64Rotr
-            | OpCode::I64Eq | OpCode::I64Ne
-            | OpCode::I64LtS | OpCode::I64LtU | OpCode::I64GtS | OpCode::I64GtU
-            | OpCode::I64LeS | OpCode::I64LeU | OpCode::I64GeS | OpCode::I64GeU => {
+            OpCode::I32Add
+            | OpCode::I32Sub
+            | OpCode::I32Mul
+            | OpCode::I32DivS
+            | OpCode::I32DivU
+            | OpCode::I32RemS
+            | OpCode::I32RemU
+            | OpCode::I32And
+            | OpCode::I32Or
+            | OpCode::I32Xor
+            | OpCode::I32Shl
+            | OpCode::I32ShrS
+            | OpCode::I32ShrU
+            | OpCode::I32Rotl
+            | OpCode::I32Rotr
+            | OpCode::I32Eq
+            | OpCode::I32Ne
+            | OpCode::I32LtS
+            | OpCode::I32LtU
+            | OpCode::I32GtS
+            | OpCode::I32GtU
+            | OpCode::I32LeS
+            | OpCode::I32LeU
+            | OpCode::I32GeS
+            | OpCode::I32GeU
+            | OpCode::I64Add
+            | OpCode::I64Sub
+            | OpCode::I64Mul
+            | OpCode::I64DivS
+            | OpCode::I64DivU
+            | OpCode::I64RemS
+            | OpCode::I64RemU
+            | OpCode::I64And
+            | OpCode::I64Or
+            | OpCode::I64Xor
+            | OpCode::I64Shl
+            | OpCode::I64ShrS
+            | OpCode::I64ShrU
+            | OpCode::I64Rotl
+            | OpCode::I64Rotr
+            | OpCode::I64Eq
+            | OpCode::I64Ne
+            | OpCode::I64LtS
+            | OpCode::I64LtU
+            | OpCode::I64GtS
+            | OpCode::I64GtU
+            | OpCode::I64LeS
+            | OpCode::I64LeU
+            | OpCode::I64GeS
+            | OpCode::I64GeU => {
                 let alu_op = opcode_to_alu_op(opcode);
                 let rhs = c.vpop();
                 let lhs = c.vpop();
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Alu { op: alu_op, dst, lhs, rhs: Operand::Reg(rhs) });
+                c.emit(IrInst::Alu {
+                    op: alu_op,
+                    dst,
+                    lhs,
+                    rhs: Operand::Reg(rhs),
+                });
                 c.vpush(dst);
             }
 
-            OpCode::I32Eqz | OpCode::I32Clz | OpCode::I32Ctz | OpCode::I32Popcnt
-            | OpCode::I32WrapI64 | OpCode::I32Extend8S | OpCode::I32Extend16S
-            | OpCode::I64Clz | OpCode::I64Ctz | OpCode::I64Popcnt
+            OpCode::I32Eqz
+            | OpCode::I32Clz
+            | OpCode::I32Ctz
+            | OpCode::I32Popcnt
+            | OpCode::I32WrapI64
+            | OpCode::I32Extend8S
+            | OpCode::I32Extend16S
+            | OpCode::I64Clz
+            | OpCode::I64Ctz
+            | OpCode::I64Popcnt
             | OpCode::I64Eqz
-            | OpCode::I64ExtendI32S | OpCode::I64ExtendI32U
-            | OpCode::I64Extend8S | OpCode::I64Extend16S | OpCode::I64Extend32S => {
+            | OpCode::I64ExtendI32S
+            | OpCode::I64ExtendI32U
+            | OpCode::I64Extend8S
+            | OpCode::I64Extend16S
+            | OpCode::I64Extend32S => {
                 let unary_op = opcode_to_unary_op(opcode);
                 let src = c.vpop();
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::Unary { op: unary_op, dst, src });
+                c.emit(IrInst::Unary {
+                    op: unary_op,
+                    dst,
+                    src,
+                });
                 c.vpush(dst);
             }
 
@@ -439,18 +493,34 @@ pub(crate) fn compile_with(
                 let end_label = c.fresh_label();
                 let args = c.collect_local_args();
                 let slot = c.total_local_count + c.vstack.len() as u32;
-                c.emit(IrInst::BrIfZero { cond, label: else_label, args: args.clone() });
+                c.emit(IrInst::BrIfZero {
+                    cond,
+                    label: else_label,
+                    args: args.clone(),
+                });
                 c.emit(IrInst::FrameStore { slot, src: val1 });
                 let args2 = c.collect_local_args();
-                c.emit(IrInst::Br { label: end_label, args: args2 });
+                c.emit(IrInst::Br {
+                    label: end_label,
+                    args: args2,
+                });
                 let params = c.allocate_local_params();
-                c.emit(IrInst::DefLabel { label: else_label, params: params.clone() });
+                c.emit(IrInst::DefLabel {
+                    label: else_label,
+                    params: params.clone(),
+                });
                 c.apply_local_params(&params);
                 c.emit(IrInst::FrameStore { slot, src: val2 });
                 let args3 = c.collect_local_args();
-                c.emit(IrInst::Br { label: end_label, args: args3 });
+                c.emit(IrInst::Br {
+                    label: end_label,
+                    args: args3,
+                });
                 let params2 = c.allocate_local_params();
-                c.emit(IrInst::DefLabel { label: end_label, params: params2.clone() });
+                c.emit(IrInst::DefLabel {
+                    label: end_label,
+                    params: params2.clone(),
+                });
                 c.apply_local_params(&params2);
                 let dst = c.fresh_vreg();
                 c.emit(IrInst::FrameLoad { dst, slot });
@@ -474,7 +544,10 @@ pub(crate) fn compile_with(
                 let args = c.collect_local_args();
                 c.emit(IrInst::Br { label, args });
                 let params = c.allocate_local_params();
-                c.emit(IrInst::DefLabel { label, params: params.clone() });
+                c.emit(IrInst::DefLabel {
+                    label,
+                    params: params.clone(),
+                });
                 c.apply_local_params(&params);
                 c.block_stack.push(OpenBlock {
                     block_idx: imm,
@@ -509,9 +582,15 @@ pub(crate) fn compile_with(
                 c.flush_vstack_above(depth);
                 let end_label = c.fresh_label();
                 let args = c.collect_local_args();
-                c.emit(IrInst::Br { label: end_label, args });
+                c.emit(IrInst::Br {
+                    label: end_label,
+                    args,
+                });
                 let params = c.allocate_local_params();
-                c.emit(IrInst::DefLabel { label: if_label, params: params.clone() });
+                c.emit(IrInst::DefLabel {
+                    label: if_label,
+                    params: params.clone(),
+                });
                 c.apply_local_params(&params);
                 c.block_stack.last_mut().unwrap().label = end_label;
             }
@@ -525,18 +604,30 @@ pub(crate) fn compile_with(
                         let branch_results = c.vstack.len() - block.vstack_depth;
                         c.flush_vstack_above(block.vstack_depth);
                         let args = c.collect_local_args();
-                        c.emit(IrInst::Br { label: block.label, args });
+                        c.emit(IrInst::Br {
+                            label: block.label,
+                            args,
+                        });
                         let params = c.allocate_local_params();
-                        c.emit(IrInst::DefLabel { label: block.label, params: params.clone() });
+                        c.emit(IrInst::DefLabel {
+                            label: block.label,
+                            params: params.clone(),
+                        });
                         c.apply_local_params(&params);
                         if branch_results > 0 {
                             c.reload_from_stack(branch_results);
                         }
                     } else {
                         let args = c.collect_local_args();
-                        c.emit(IrInst::Br { label: block.label, args });
+                        c.emit(IrInst::Br {
+                            label: block.label,
+                            args,
+                        });
                         let params = c.allocate_local_params();
-                        c.emit(IrInst::DefLabel { label: block.label, params: params.clone() });
+                        c.emit(IrInst::DefLabel {
+                            label: block.label,
+                            params: params.clone(),
+                        });
                         c.apply_local_params(&params);
                     }
                 }
@@ -573,14 +664,17 @@ pub(crate) fn compile_with(
                 }
                 c.emit_br(imm);
                 let params = c.allocate_local_params();
-                c.emit(IrInst::DefLabel { label: skip_label, params: params.clone() });
+                c.emit(IrInst::DefLabel {
+                    label: skip_label,
+                    params: params.clone(),
+                });
                 c.apply_local_params(&params);
             }
 
             OpCode::Call => {
                 let callee = &all_funcs[imm as usize];
-                let param_count = callee.param_count;
-                let has_result = callee.result_count > 0;
+                let param_count = callee.param_count();
+                let has_result = callee.result_count() > 0;
                 let mut args = Vec::with_capacity(param_count);
                 for _ in 0..param_count {
                     args.push(c.vpop());
@@ -611,179 +705,21 @@ pub(crate) fn compile_with(
                 }
             }
 
-            // --- Superinstructions: decompose into primitive IR ops ---
-            OpCode::LocalGetLocalGetAdd => {
-                let a_idx = op.imm_u8_a() as u32;
-                let b_idx = op.imm_u8_b() as u32;
-                c.emit_local_get(a_idx);
-                c.emit_local_get(b_idx);
-                let rhs = c.vpop();
-                let lhs = c.vpop();
-                let dst = c.fresh_vreg();
-                c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Reg(rhs) });
-                c.vpush(dst);
-            }
-
-            OpCode::LocalGetI32ConstSub => {
-                let local_idx = op.imm_u8_a() as u32;
-                let konst = op.imm_i16_hi() as i32;
-                c.emit_local_get(local_idx);
-                let lhs = c.vpop();
-                let dst = c.fresh_vreg();
-                if konst >= 0 && konst < 4096 {
-                    c.emit(IrInst::Alu { op: AluOp::I32Sub, dst, lhs, rhs: Operand::Imm(konst as i64) });
-                } else {
-                    c.emit_i32_const(konst);
-                    let rhs = c.vpop();
-                    c.emit(IrInst::Alu { op: AluOp::I32Sub, dst, lhs, rhs: Operand::Reg(rhs) });
-                }
-                c.vpush(dst);
-            }
-
-            OpCode::LocalGetI32ConstAdd => {
-                let local_idx = op.imm_u8_a() as u32;
-                let konst = op.imm_i16_hi() as i32;
-                c.emit_local_get(local_idx);
-                let lhs = c.vpop();
-                let dst = c.fresh_vreg();
-                if konst >= 0 && konst < 4096 {
-                    c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Imm(konst as i64) });
-                } else {
-                    c.emit_i32_const(konst);
-                    let rhs = c.vpop();
-                    c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Reg(rhs) });
-                }
-                c.vpush(dst);
-            }
-
-            OpCode::LocalGetReturn => {
-                let local_idx = op.imm_u8_a() as u32;
-                c.emit_local_get(local_idx);
-                c.flush_fuel_consume_only();
-                c.emit_return(result_count);
-            }
-
-            OpCode::LocalGetI32ConstLeSIf => {
-                let local_idx = op.imm_u8_a() as u32;
-                let konst = op.imm_u8_b() as i8 as i32;
-                let block_idx = op.imm_u8_c() as u32;
-
-                c.emit_local_get(local_idx);
-                let lhs = c.vpop();
-                // Collect local args before the compare+branch sequence —
-                // collect_local_args may emit LocalGet, so placing it before
-                // Alu cmp preserves Cmp+BrIfZero fusion.
-                let args = c.collect_local_args();
-                let cmp_dst = c.fresh_vreg();
-                if konst >= 0 && konst < 4096 {
-                    c.emit(IrInst::Alu {
-                        op: AluOp::I32LeS,
-                        dst: cmp_dst,
-                        lhs,
-                        rhs: Operand::Imm(konst as i64),
-                    });
-                } else {
-                    c.emit_i32_const(konst);
-                    let rhs = c.vpop();
-                    c.emit(IrInst::Alu {
-                        op: AluOp::I32LeS,
-                        dst: cmp_dst,
-                        lhs,
-                        rhs: Operand::Reg(rhs),
-                    });
-                }
-
-                let label = c.fresh_label();
-                c.emit(IrInst::BrIfZero {
-                    cond: cmp_dst,
-                    label,
-                    args,
-                });
-                c.block_stack.push(OpenBlock {
-                    block_idx,
-                    kind: blocks[block_idx as usize].kind,
-                    label,
-                    vstack_depth: c.vstack.len(),
-                });
-            }
-
-            OpCode::CallLocalSet => {
-                let func_idx = op.imm_u16_lo() as u32;
-                let local_idx = op.imm_u8_c() as u32;
-                let callee = &all_funcs[func_idx as usize];
-                let param_count = callee.param_count;
-                let has_result = callee.result_count > 0;
-                let mut args = Vec::with_capacity(param_count);
-                for _ in 0..param_count {
-                    args.push(c.vpop());
-                }
-                args.reverse();
-                let spill_count = c.vstack.len();
-                c.flush_vstack_above(0);
-                c.flush_fuel();
-                let result = if has_result {
-                    Some(c.fresh_vreg())
-                } else {
-                    None
-                };
-                let frame_advance = (2 + c.total_local_count + spill_count as u32) * 8;
-                c.emit(IrInst::Call {
-                    func_idx,
-                    args,
-                    result,
-                    frame_advance,
-                });
-                c.invalidate_locals();
-                // Reload spilled values back onto vstack.
-                if spill_count > 0 {
-                    c.reload_from_stack(spill_count);
-                }
-                if let Some(r) = result {
-                    // Use local promotion — track in register, defer store.
-                    c.local_vreg[local_idx as usize] = Some(r);
-                    c.frame_dirty[local_idx as usize] = true;
-                }
-            }
-
-            OpCode::LocalGetI32EqzIf => {
-                let local_idx = op.imm_u8_a() as u32;
-                let block_idx = op.imm_u8_b() as u32;
-
-                c.emit_local_get(local_idx);
-                let val = c.vpop();
-                let args = c.collect_local_args();
-
-                // eqz(val) is 1 when val==0, 0 when val!=0.
-                // BrIfZero on eqz(val) branches when val!=0.
-                // Equivalent to BrIfNonZero(val) — lowers to cbnz.
-                let label = c.fresh_label();
-                c.emit(IrInst::BrIfNonZero {
-                    cond: val,
-                    label,
-                    args,
-                });
-                c.block_stack.push(OpenBlock {
-                    block_idx,
-                    kind: blocks[block_idx as usize].kind,
-                    label,
-                    vstack_depth: c.vstack.len(),
-                });
-            }
+            // TODO: re-add superinstruction fuse pass (task #10)
 
             _ => {
                 c.emit(IrInst::Trap);
             }
         }
-
     }
 
     let mut ir = IrFunction {
         insts: c.insts,
         source_ops: c.source_ops,
-        param_count: func.param_count as u32,
-        total_local_count: func.locals.len() as u32,
+        param_count: func.param_count() as u32,
+        total_local_count: func.local_count() as u32,
         max_operand_depth: c.max_vstack_depth as u32,
-        result_count: func.result_count,
+        result_count: func.result_count() as u32,
     };
 
     eliminate_dead_load_store_pairs(&mut ir);
@@ -807,8 +743,14 @@ fn eliminate_dead_load_store_pairs(ir: &mut IrFunction) {
 
     for i in 0..len - 1 {
         if let (
-            IrInst::FrameLoad { dst, slot: load_slot },
-            IrInst::FrameStore { slot: store_slot, src },
+            IrInst::FrameLoad {
+                dst,
+                slot: load_slot,
+            },
+            IrInst::FrameStore {
+                slot: store_slot,
+                src,
+            },
         ) = (&ir.insts[i], &ir.insts[i + 1])
         {
             if load_slot == store_slot && dst == src {
@@ -834,42 +776,70 @@ fn eliminate_dead_load_store_pairs(ir: &mut IrFunction) {
 
 fn opcode_to_alu_op(op: OpCode) -> AluOp {
     match op {
-        OpCode::I32Add => AluOp::I32Add, OpCode::I32Sub => AluOp::I32Sub,
-        OpCode::I32Mul => AluOp::I32Mul, OpCode::I32DivS => AluOp::I32DivS,
-        OpCode::I32DivU => AluOp::I32DivU, OpCode::I32RemS => AluOp::I32RemS,
+        OpCode::I32Add => AluOp::I32Add,
+        OpCode::I32Sub => AluOp::I32Sub,
+        OpCode::I32Mul => AluOp::I32Mul,
+        OpCode::I32DivS => AluOp::I32DivS,
+        OpCode::I32DivU => AluOp::I32DivU,
+        OpCode::I32RemS => AluOp::I32RemS,
         OpCode::I32RemU => AluOp::I32RemU,
-        OpCode::I32And => AluOp::I32And, OpCode::I32Or => AluOp::I32Or,
-        OpCode::I32Xor => AluOp::I32Xor, OpCode::I32Shl => AluOp::I32Shl,
-        OpCode::I32ShrS => AluOp::I32ShrS, OpCode::I32ShrU => AluOp::I32ShrU,
-        OpCode::I32Rotl => AluOp::I32Rotl, OpCode::I32Rotr => AluOp::I32Rotr,
-        OpCode::I32Eq => AluOp::I32Eq, OpCode::I32Ne => AluOp::I32Ne,
-        OpCode::I32LtS => AluOp::I32LtS, OpCode::I32LtU => AluOp::I32LtU,
-        OpCode::I32GtS => AluOp::I32GtS, OpCode::I32GtU => AluOp::I32GtU,
-        OpCode::I32LeS => AluOp::I32LeS, OpCode::I32LeU => AluOp::I32LeU,
-        OpCode::I32GeS => AluOp::I32GeS, OpCode::I32GeU => AluOp::I32GeU,
-        OpCode::I64Add => AluOp::I64Add, OpCode::I64Sub => AluOp::I64Sub,
-        OpCode::I64Mul => AluOp::I64Mul, OpCode::I64DivS => AluOp::I64DivS,
-        OpCode::I64DivU => AluOp::I64DivU, OpCode::I64RemS => AluOp::I64RemS,
+        OpCode::I32And => AluOp::I32And,
+        OpCode::I32Or => AluOp::I32Or,
+        OpCode::I32Xor => AluOp::I32Xor,
+        OpCode::I32Shl => AluOp::I32Shl,
+        OpCode::I32ShrS => AluOp::I32ShrS,
+        OpCode::I32ShrU => AluOp::I32ShrU,
+        OpCode::I32Rotl => AluOp::I32Rotl,
+        OpCode::I32Rotr => AluOp::I32Rotr,
+        OpCode::I32Eq => AluOp::I32Eq,
+        OpCode::I32Ne => AluOp::I32Ne,
+        OpCode::I32LtS => AluOp::I32LtS,
+        OpCode::I32LtU => AluOp::I32LtU,
+        OpCode::I32GtS => AluOp::I32GtS,
+        OpCode::I32GtU => AluOp::I32GtU,
+        OpCode::I32LeS => AluOp::I32LeS,
+        OpCode::I32LeU => AluOp::I32LeU,
+        OpCode::I32GeS => AluOp::I32GeS,
+        OpCode::I32GeU => AluOp::I32GeU,
+        OpCode::I64Add => AluOp::I64Add,
+        OpCode::I64Sub => AluOp::I64Sub,
+        OpCode::I64Mul => AluOp::I64Mul,
+        OpCode::I64DivS => AluOp::I64DivS,
+        OpCode::I64DivU => AluOp::I64DivU,
+        OpCode::I64RemS => AluOp::I64RemS,
         OpCode::I64RemU => AluOp::I64RemU,
-        OpCode::I64And => AluOp::I64And, OpCode::I64Or => AluOp::I64Or,
-        OpCode::I64Xor => AluOp::I64Xor, OpCode::I64Shl => AluOp::I64Shl,
-        OpCode::I64ShrS => AluOp::I64ShrS, OpCode::I64ShrU => AluOp::I64ShrU,
-        OpCode::I64Rotl => AluOp::I64Rotl, OpCode::I64Rotr => AluOp::I64Rotr,
-        OpCode::I64Eq => AluOp::I64Eq, OpCode::I64Ne => AluOp::I64Ne,
-        OpCode::I64LtS => AluOp::I64LtS, OpCode::I64LtU => AluOp::I64LtU,
-        OpCode::I64GtS => AluOp::I64GtS, OpCode::I64GtU => AluOp::I64GtU,
-        OpCode::I64LeS => AluOp::I64LeS, OpCode::I64LeU => AluOp::I64LeU,
-        OpCode::I64GeS => AluOp::I64GeS, OpCode::I64GeU => AluOp::I64GeU,
+        OpCode::I64And => AluOp::I64And,
+        OpCode::I64Or => AluOp::I64Or,
+        OpCode::I64Xor => AluOp::I64Xor,
+        OpCode::I64Shl => AluOp::I64Shl,
+        OpCode::I64ShrS => AluOp::I64ShrS,
+        OpCode::I64ShrU => AluOp::I64ShrU,
+        OpCode::I64Rotl => AluOp::I64Rotl,
+        OpCode::I64Rotr => AluOp::I64Rotr,
+        OpCode::I64Eq => AluOp::I64Eq,
+        OpCode::I64Ne => AluOp::I64Ne,
+        OpCode::I64LtS => AluOp::I64LtS,
+        OpCode::I64LtU => AluOp::I64LtU,
+        OpCode::I64GtS => AluOp::I64GtS,
+        OpCode::I64GtU => AluOp::I64GtU,
+        OpCode::I64LeS => AluOp::I64LeS,
+        OpCode::I64LeU => AluOp::I64LeU,
+        OpCode::I64GeS => AluOp::I64GeS,
+        OpCode::I64GeU => AluOp::I64GeU,
         _ => unreachable!("not a binary alu opcode: {op:?}"),
     }
 }
 
 fn opcode_to_unary_op(op: OpCode) -> UnaryOp {
     match op {
-        OpCode::I32Clz => UnaryOp::I32Clz, OpCode::I32Ctz => UnaryOp::I32Ctz,
-        OpCode::I32Popcnt => UnaryOp::I32Popcnt, OpCode::I32Eqz => UnaryOp::I32Eqz,
-        OpCode::I64Clz => UnaryOp::I64Clz, OpCode::I64Ctz => UnaryOp::I64Ctz,
-        OpCode::I64Popcnt => UnaryOp::I64Popcnt, OpCode::I64Eqz => UnaryOp::I64Eqz,
+        OpCode::I32Clz => UnaryOp::I32Clz,
+        OpCode::I32Ctz => UnaryOp::I32Ctz,
+        OpCode::I32Popcnt => UnaryOp::I32Popcnt,
+        OpCode::I32Eqz => UnaryOp::I32Eqz,
+        OpCode::I64Clz => UnaryOp::I64Clz,
+        OpCode::I64Ctz => UnaryOp::I64Ctz,
+        OpCode::I64Popcnt => UnaryOp::I64Popcnt,
+        OpCode::I64Eqz => UnaryOp::I64Eqz,
         OpCode::I32WrapI64 => UnaryOp::I32WrapI64,
         OpCode::I64ExtendI32S => UnaryOp::I64ExtendI32S,
         OpCode::I64ExtendI32U => UnaryOp::I64ExtendI32U,

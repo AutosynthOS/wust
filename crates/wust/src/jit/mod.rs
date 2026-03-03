@@ -3,10 +3,9 @@ pub(crate) mod compiler;
 #[cfg(test)]
 pub(crate) mod tests;
 
-use wasmparser::ValType;
+use wust_core::{Outcome, ParsedModule, Task};
 
-use crate::Module;
-use crate::value::Val;
+use crate::exec::ModuleExecutor;
 
 use wust_codegen::code_buffer::CodeBuffer;
 use wust_codegen::emit::{self, Emitter};
@@ -30,7 +29,7 @@ pub(crate) struct FuncSnapshot {
 /// each function's IR and lowers it to machine code. Calls `on_func`
 /// after each function is lowered with the IR and pre/post snapshot.
 pub(crate) fn compile_all(
-    module: &Module,
+    module: &ParsedModule,
     emit_fuel: bool,
     emit_markers: bool,
     mut on_func: impl FnMut(usize, &IrFunction, &Emitter, &FuncSnapshot),
@@ -83,6 +82,7 @@ pub struct JitModule {
     buffer: CodeBuffer,
     /// Per-function entry trampoline word offsets.
     entry_trampolines: Vec<usize>,
+    // TODO: store ModuleId once Module wraps ModuleMeta
 }
 
 // The compiled code buffer is mmap'd memory — safe to send across threads.
@@ -103,12 +103,12 @@ unsafe impl Sync for JitModule {}
 /// let jit = JitCompiler::new(&module).fuel(false).compile()?;
 /// ```
 pub struct JitCompiler<'a> {
-    module: &'a Module,
+    module: &'a ParsedModule,
     emit_fuel: bool,
 }
 
 impl<'a> JitCompiler<'a> {
-    pub fn new(module: &'a Module) -> Self {
+    pub fn new(module: &'a ParsedModule) -> Self {
         JitCompiler {
             module,
             emit_fuel: true,
@@ -149,52 +149,8 @@ impl JitModule {
     /// Compile all functions in a module with default settings (fuel enabled).
     ///
     /// Pipeline: wasm ops → IR (virtual registers) → aarch64 machine code.
-    pub fn compile(module: &Module) -> Result<Self, anyhow::Error> {
+    pub fn compile(module: &ParsedModule) -> Result<Self, anyhow::Error> {
         JitCompiler::new(module).compile()
-    }
-
-    /// Call an exported function by name, returning results as `Vec<Val>`.
-    ///
-    /// Writes args into the wasm frame, calls the entry trampoline,
-    /// and reads results back using the function's type signature.
-    pub fn call_dynamic(
-        &self,
-        module: &Module,
-        instance: &mut wust_core::Instance,
-        name: &str,
-        args: &[Val],
-    ) -> Result<Vec<Val>, anyhow::Error> {
-        let func_idx = module
-            .resolve_export(name)
-            .ok_or_else(|| anyhow::anyhow!("export '{name}' not found"))?
-            as usize;
-        let func = module
-            .funcs
-            .get(func_idx)
-            .ok_or_else(|| anyhow::anyhow!("function {func_idx} not found"))?;
-
-        // Write args into frame slots (after the 16-byte header).
-        instance.stack.set_sp(0);
-        instance.stack.write_u64_at(0, 0); // zero frame header
-        instance.stack.write_u64_at(8, 0);
-        for (i, arg) in args.iter().enumerate() {
-            instance.stack.write_u64_at(FRAME_HEADER_SIZE + i * 8, arg.to_raw());
-        }
-
-        self.call_trampoline(instance, func_idx, i64::MAX);
-
-        // Read results from frame slots using the function's result types.
-        let results = func
-            .results
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| {
-                let raw = instance.stack.read_u64_at(FRAME_HEADER_SIZE + i * 8);
-                read_typed(raw, ty)
-            })
-            .collect();
-
-        Ok(results)
     }
 
     /// Low-level trampoline call.
@@ -202,11 +158,20 @@ impl JitModule {
     /// Swaps the native stack pointer to the fiber stack on entry so
     /// that JIT function prologues (`str x30, [sp, #-16]!`) save
     /// return addresses on the fiber stack — not the host stack.
-    fn call_trampoline(&self, instance: &wust_core::Instance, func_idx: usize, fuel: i64) {
+    ///
+    /// Returns `Outcome::Return` if the function completed normally,
+    /// or `Outcome::Suspended` if fuel was exhausted.
+    fn call_trampoline(&self, task: &mut Task, func_idx: usize) -> Outcome {
+        const FUEL: usize = std::mem::offset_of!(wust_core::Context, fuel);
+        const WASM_FP: usize = std::mem::offset_of!(wust_core::Context, wasm_fp);
+        const FIBRE_SP: usize = std::mem::offset_of!(wust_core::Context, fibre_sp);
+
         let trampoline_offset = self.entry_trampolines[func_idx];
         let trampoline_ptr = unsafe { self.buffer.entry().add(trampoline_offset * 4) };
-        let frame_base = instance.stack.base() as u64;
-        let fibre_top = instance.fibre.top() as u64;
+        let ctx = &mut task.context;
+
+        ctx.outcome = Outcome::Running;
+        let ctx_ptr = ctx as *mut wust_core::Context as u64;
 
         unsafe {
             std::arch::asm!(
@@ -214,44 +179,48 @@ impl JitModule {
                 "stp x29, x30, [sp, #-16]!",
                 "stp x20, x21, [sp, #-16]!",
                 "stp x28, xzr, [sp, #-16]!",
+                // Load JIT state from context.
+                "mov x20, {ctx}",
+                "ldr x21, [x20, #{fuel}]",
+                "ldr x29, [x20, #{wasm_fp}]",
+                "ldr x9,  [x20, #{fibre_sp}]",
                 // Save host SP, switch to fiber stack.
                 "mov x28, sp",
-                "mov sp, {fibre_top}",
-                // Set up JIT pinned registers.
-                "mov x29, {frame_base}",     // g.fp = frame base
-                "mov x21, {fuel}",           // g.fuel = fuel
+                "mov sp, x9",
                 // Call the per-function trampoline.
                 "blr {code}",
+                // Store JIT state back to context.
+                "str x21, [x20, #{fuel}]",
+                "str x29, [x20, #{wasm_fp}]",
                 // Restore host SP from x28.
                 "mov sp, x28",
                 // Restore host callee-saved regs.
                 "ldp x28, xzr, [sp], #16",
                 "ldp x20, x21, [sp], #16",
                 "ldp x29, x30, [sp], #16",
-                frame_base = in(reg) frame_base,
-                fuel = in(reg) fuel as u64,
-                fibre_top = in(reg) fibre_top,
+                ctx = in(reg) ctx_ptr,
                 code = in(reg) trampoline_ptr,
+                fuel = const FUEL,
+                wasm_fp = const WASM_FP,
+                fibre_sp = const FIBRE_SP,
                 out("x9") _, out("x10") _, out("x11") _,
                 out("x12") _, out("x13") _, out("x14") _,
                 out("x15") _, out("x28") _,
-                clobber_abi("C"),
             );
+        }
+
+        // On normal return, the JIT doesn't write to ctx.outcome —
+        // it stays Running. The cold stub sets it to Suspended.
+        match task.context.outcome {
+            Outcome::Running => Outcome::Return,
+            other => other,
         }
     }
 }
 
-/// Frame header size in bytes (2 slots: prev_fp + header word).
-const FRAME_HEADER_SIZE: usize = 16;
-
-/// Interpret raw u64 bits as a typed `Val` based on the function's
-/// result type signature.
-fn read_typed(raw: u64, ty: &ValType) -> Val {
-    match ty {
-        ValType::I32 => Val::I32(raw as i32),
-        ValType::I64 => Val::I64(raw as i64),
-        ValType::F32 => Val::F32(f32::from_bits(raw as u32)),
-        ValType::F64 => Val::F64(f64::from_bits(raw)),
-        _ => todo!("JIT return type {ty:?} not yet supported"),
+impl ModuleExecutor for JitModule {
+    fn poll(&self, task: &mut Task) -> Outcome {
+        let func_idx = *task.context.wasm_fp.frame().func_idx() as usize;
+        self.call_trampoline(task, func_idx)
     }
 }

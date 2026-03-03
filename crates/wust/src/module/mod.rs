@@ -1,12 +1,20 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Engine;
 use crate::parse::func::{FuncIdx, ParsedFunction};
 use crate::parse::parse;
 
+static NEXT_MODULE_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Unique identifier for a compiled module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModuleId(u64);
+
 /// A parsed and compiled WASM module (immutable).
 #[derive(Debug, Clone)]
 pub struct Module {
+    id: ModuleId,
     pub(crate) funcs: Vec<ParsedFunction>,
     pub(crate) exports: HashMap<String, FuncIdx>,
 }
@@ -22,9 +30,15 @@ impl Module {
     pub fn from_bytes(engine: &Engine, bytes: &[u8]) -> Result<Self, anyhow::Error> {
         let parsed = parse(engine, bytes)?;
         Ok(Module {
+            id: ModuleId(NEXT_MODULE_ID.fetch_add(1, Ordering::Relaxed)),
             funcs: parsed.funcs,
             exports: parsed.exports,
         })
+    }
+
+    /// This module's unique identifier.
+    pub fn id(&self) -> ModuleId {
+        self.id
     }
 
     /// Resolve an export name to a function index.

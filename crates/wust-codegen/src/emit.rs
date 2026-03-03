@@ -17,6 +17,7 @@ impl Reg {
     pub const X10: Reg = Reg(10);
     pub const X20: Reg = Reg(20);
     pub const X21: Reg = Reg(21);
+    pub const X28: Reg = Reg(28);
     pub const X29: Reg = Reg(29);
     pub const X30: Reg = Reg(30);
     pub const XZR: Reg = Reg(31);
@@ -683,6 +684,13 @@ impl Emitter {
     pub fn ldr_x_post(&mut self, rt: Reg, rn: Reg, offset: i16) {
         let imm9 = (offset as u32) & 0x1FF;
         let inst = 0xF8400400 | imm9 << 12 | (rn.0 as u32 & 0x1F) << 5 | (rt.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `LDUR Xt, [Xn, #simm9]` — load 64-bit, unscaled offset.
+    pub fn ldur_x(&mut self, rt: Reg, rn: Reg, offset: i16) {
+        let imm9 = (offset as u32) & 0x1FF;
+        let inst = 0xF8400000 | imm9 << 12 | (rn.0 as u32 & 0x1F) << 5 | (rt.0 as u32 & 0x1F);
         self.code.push(inst);
     }
 

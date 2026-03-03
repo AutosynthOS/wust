@@ -1,5 +1,5 @@
 use std::time::Instant;
-use wust::{Engine, Instance, JitCompiler, JitModule, Module, Val};
+use wust::{Engine, ExecBackend, JitCompiler, JitModule, Module, Task, Val};
 
 const ACK_WAT: &str = r#"
 (module
@@ -87,19 +87,19 @@ fn main() {
     let engine = Engine::default();
     let module = Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
 
-    // Interpreter instance.
-    let mut interp_instance = Instance::new().expect("failed to create instance");
+    // Interpreter task.
+    let mut interp_task = Task::new().expect("failed to create task");
 
     // JIT (with fuel).
     let jit_module = JitModule::compile(&module).expect("JIT compilation failed");
-    let mut jit_instance = Instance::new().expect("failed to create JIT instance");
+    let mut jit_task = Task::new().expect("failed to create JIT task");
 
     // JIT (no fuel).
     let jit_no_fuel = JitCompiler::new(&module)
         .fuel(false)
         .compile()
         .expect("JIT no-fuel compilation failed");
-    let mut jit_nf_instance = Instance::new().expect("failed to create JIT no-fuel instance");
+    let mut jit_nf_task = Task::new().expect("failed to create JIT no-fuel task");
 
     // Wasmtime.
     let wt_engine = wasmtime::Engine::default();
@@ -145,7 +145,7 @@ fn main() {
     // Try interpreter (may fail with stack overflow for large inputs).
     let interp_ms = match wust::call_dynamic(
         &module,
-        &mut interp_instance,
+        &mut interp_task,
         "ack",
         &[Val::I32(m), Val::I32(n)],
     ) {
@@ -153,7 +153,7 @@ fn main() {
             let (_, ms) = bench(|| {
                 let r = wust::call_dynamic(
                     &module,
-                    &mut interp_instance,
+                    &mut interp_task,
                     "ack",
                     &[Val::I32(m), Val::I32(n)],
                 )
@@ -180,10 +180,9 @@ fn main() {
     let jit_result = run(
         "wust jit",
         Box::new(|| {
-            match jit_module
-                .call_dynamic(&module, &mut jit_instance, "ack", &[Val::I32(m), Val::I32(n)])
-                .unwrap()[0]
-            {
+            wust::setup(&module, &mut jit_task, "ack", &[Val::I32(m), Val::I32(n)]).unwrap();
+            jit_module.poll(&module, &mut jit_task, i64::MAX);
+            match wust::results(&module, &jit_task)[0] {
                 Val::I32(v) => v,
                 _ => panic!("expected i32"),
             }
@@ -194,15 +193,9 @@ fn main() {
     let jit_nf_result = run(
         "wust jit (no fuel)",
         Box::new(|| {
-            match jit_no_fuel
-                .call_dynamic(
-                    &module,
-                    &mut jit_nf_instance,
-                    "ack",
-                    &[Val::I32(m), Val::I32(n)],
-                )
-                .unwrap()[0]
-            {
+            wust::setup(&module, &mut jit_nf_task, "ack", &[Val::I32(m), Val::I32(n)]).unwrap();
+            jit_no_fuel.poll(&module, &mut jit_nf_task, i64::MAX);
+            match wust::results(&module, &jit_nf_task)[0] {
                 Val::I32(v) => v,
                 _ => panic!("expected i32"),
             }
@@ -243,8 +236,8 @@ mod tests {
         let wasm_bytes = wat::parse_str(ACK_WAT).expect("failed to parse WAT");
         let engine = Engine::default();
         let module = Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-        let mut instance = Instance::new().expect("failed to create instance");
-        let r = wust::call_dynamic(&module, &mut instance, "ack", &[Val::I32(3), Val::I32(4)])
+        let mut task = Task::new().expect("failed to create task");
+        let r = wust::call_dynamic(&module, &mut task, "ack", &[Val::I32(3), Val::I32(4)])
             .expect("wust ack failed");
         match r[0] {
             Val::I32(v) => assert_eq!(v, 125),

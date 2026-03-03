@@ -1,4 +1,5 @@
-use wust::{Codegen, Engine, Module};
+use wust::Codegen;
+use wust_core::ParsedModule;
 
 const FIB_WAT: &str = r#"
 (module
@@ -16,8 +17,8 @@ const FIB_WAT: &str = r#"
 "#;
 
 fn main() -> anyhow::Result<()> {
-    let engine = Engine::default();
-    let module = Module::new(&engine, FIB_WAT)?;
+    let wasm_bytes = wat::parse_str(FIB_WAT)?;
+    let module = ParsedModule::new(&wasm_bytes)?;
 
     let output = Codegen::new(&module).compile()?;
     print!("{}", output.render());

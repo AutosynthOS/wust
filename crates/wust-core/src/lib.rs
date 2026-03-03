@@ -1,14 +1,12 @@
-pub mod context;
-pub mod fibre;
-pub mod instance;
-pub mod mmap;
+mod instance;
+mod mmap;
 pub mod module;
-pub mod stack;
-pub mod value;
+mod task;
+mod value;
 
-pub use context::Context;
-pub use fibre::FibreStack;
-pub use instance::{Instance, InstanceInner};
-pub use module::{FuncIdx, FuncMeta, ModuleMeta};
-pub use stack::Stack;
+pub use instance::Instance;
+pub use module::body::{Block, BlockKind, ParsedBody};
+pub use module::op::{InlineOp, OpCode};
+pub use module::{FuncIdx, FuncMeta, ModuleId, ParsedModule};
+pub use task::{Context, FRAME_HEADER_SIZE, FibreStackPointer, Outcome, Task, WasmFramePointer};
 pub use value::{Val, WasmArgs, WasmResults, WasmVal};

@@ -1,4 +1,4 @@
-use crate::{Engine, Instance, Module, Store};
+use crate::{Engine};
 
 /// Resolves imports and produces instances.
 pub struct Linker;
@@ -8,11 +8,5 @@ impl Linker {
         Self
     }
 
-    pub fn instantiate<T>(
-        &self,
-        _store: &mut Store<T>,
-        _module: &Module,
-    ) -> Result<Instance, anyhow::Error> {
-        Instance::new()
-    }
+    // TODO: instantiate() needs updating once Module wraps ModuleMeta
 }

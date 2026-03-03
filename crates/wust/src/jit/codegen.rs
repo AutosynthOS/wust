@@ -1,8 +1,7 @@
 use wasmparser::ValType;
 
-use crate::Module;
+use wust_core::{FuncMeta, ParsedModule};
 use crate::jit::compile_all;
-use crate::parse::func::ParsedFunction;
 
 use wust_codegen::disasm::{Block, BlockAnnotations, CodegenOutput};
 
@@ -26,9 +25,9 @@ fn func_name(export_name: Option<&str>, idx: usize) -> String {
 }
 
 /// Build a full signature like `answer<1>(x9: i32) -> x9: i32`.
-fn func_signature(func: &ParsedFunction, export_name: Option<&str>, idx: usize) -> String {
+fn func_signature(func: &FuncMeta, export_name: Option<&str>, idx: usize) -> String {
     let name = func_name(export_name, idx);
-    let params: Vec<String> = func.locals[..func.param_count]
+    let params: Vec<String> = func.params
         .iter()
         .enumerate()
         .map(|(i, ty)| format!("x{}<{}>", 9 + i, valtype_str(ty)))
@@ -48,12 +47,12 @@ fn func_signature(func: &ParsedFunction, export_name: Option<&str>, idx: usize) 
 
 /// Builder for the codegen pipeline.
 pub struct Codegen<'a> {
-    module: &'a Module,
+    module: &'a ParsedModule,
     emit_fuel: bool,
 }
 
 impl<'a> Codegen<'a> {
-    pub fn new(module: &'a Module) -> Self {
+    pub fn new(module: &'a ParsedModule) -> Self {
         Codegen {
             module,
             emit_fuel: true,
@@ -73,7 +72,7 @@ impl<'a> Codegen<'a> {
         // Reverse map: func index → export name.
         let mut export_names: Vec<Option<&str>> = vec![None; func_count];
         for (name, idx) in &self.module.exports {
-            let i = idx.0 as usize;
+            let i = **idx as usize;
             if i < export_names.len() {
                 export_names[i] = Some(name.as_str());
             }

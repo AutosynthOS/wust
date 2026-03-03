@@ -1,4 +1,4 @@
-use wust::{Engine, Instance, Module};
+use wust::{Engine, Module, Task};
 
 #[test]
 fn return_const_i32() -> Result<(), anyhow::Error> {
@@ -13,8 +13,8 @@ fn return_const_i32() -> Result<(), anyhow::Error> {
         )
     "#,
     )?;
-    let mut instance = Instance::new()?;
-    let result: (i32,) = wust::call(&module, &mut instance, "answer", ())?;
+    let mut task = Task::new()?;
+    let result: (i32,) = wust::call(&module, &mut task, "answer", ())?;
     assert_eq!(result, (42,));
     Ok(())
 }
@@ -37,8 +37,8 @@ fn multi_value_results_with_multiple_arguments() -> Result<(), anyhow::Error> {
         )
     "#,
     )?;
-    let mut instance = Instance::new()?;
-    let result: (i32, i32) = wust::call(&module, &mut instance, "add", (0, 0))?;
+    let mut task = Task::new()?;
+    let result: (i32, i32) = wust::call(&module, &mut task, "add", (0, 0))?;
     assert_eq!(result, (0, 0));
     Ok(())
 }
@@ -58,8 +58,8 @@ fn multi_value_results_with_carry() -> Result<(), anyhow::Error> {
         )
     "#,
     )?;
-    let mut instance = Instance::new()?;
-    let result: (i32, i32, i32) = wust::call(&module, &mut instance, "add_carry", (0, 0, 0))?;
+    let mut task = Task::new()?;
+    let result: (i32, i32, i32) = wust::call(&module, &mut task, "add_carry", (0, 0, 0))?;
     assert_eq!(result, (0, 0, 0));
     Ok(())
 }

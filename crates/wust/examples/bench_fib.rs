@@ -1,5 +1,6 @@
 use std::time::Instant;
-use wust::{Engine, Instance, JitCompiler, JitModule, Module, Val};
+use wust::{JitCompiler, JitModule, ModuleExecutor, Outcome, Val};
+use wust_core::{Instance, ParsedModule};
 
 const FIB_WAT: &str = r#"
 (module
@@ -75,15 +76,15 @@ fn setup_pulley(wasm_bytes: &[u8]) -> (wasmtime::Store<()>, wasmtime::TypedFunc<
     (store, func)
 }
 
-fn print_table(results: &[BenchResult], jit_ms: f64, interp_ms: f64) {
+fn print_table(results: &[BenchResult], jit_ms: f64) {
     let name_w = results.iter().map(|r| r.name.len()).max().unwrap_or(10);
 
     // Header
     println!(
-        "  {:<name_w$}  {:>10}  {:>10}  {:>10}",
-        "engine", "avg ms", "vs jit", "vs interp"
+        "  {:<name_w$}  {:>10}  {:>10}",
+        "engine", "avg ms", "vs jit"
     );
-    println!("  {}", "-".repeat(name_w + 36));
+    println!("  {}", "-".repeat(name_w + 24));
 
     for r in results {
         let vs_jit = if jit_ms > 0.001 && r.ms > 0.001 {
@@ -91,15 +92,21 @@ fn print_table(results: &[BenchResult], jit_ms: f64, interp_ms: f64) {
         } else {
             "-".to_string()
         };
-        let vs_interp = if interp_ms > 0.001 && r.ms > 0.001 {
-            format!("{:.2}x", r.ms / interp_ms)
-        } else {
-            "-".to_string()
-        };
         println!(
-            "  {:<name_w$}  {:>10.3}  {:>10}  {:>10}",
-            r.name, r.ms, vs_jit, vs_interp
+            "  {:<name_w$}  {:>10.3}  {:>10}",
+            r.name, r.ms, vs_jit
         );
+    }
+}
+
+fn run_jit(jit: &JitModule, instance: &Instance, n: i32) -> i32 {
+    let mut task = instance.setup_call("fib", &[Val::I32(n)]).unwrap();
+    task.context.fuel = i64::MAX;
+    let outcome = jit.poll(&mut task);
+    assert_eq!(outcome, Outcome::Return);
+    match task.results()[0] {
+        Val::I32(v) => v,
+        _ => panic!("expected i32"),
     }
 }
 
@@ -110,23 +117,17 @@ fn main() {
         .unwrap_or(30);
 
     let wasm_bytes = wat::parse_str(FIB_WAT).expect("failed to parse WAT");
-
-    let engine = Engine::default();
-    let module = Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-
-    // Interpreter instance.
-    let mut interp_instance = Instance::new().expect("failed to create instance");
+    let module = ParsedModule::new(&wasm_bytes).expect("failed to parse module");
+    let instance = Instance::new(&module);
 
     // JIT (with fuel).
     let jit_module = JitModule::compile(&module).expect("JIT compilation failed");
-    let mut jit_instance = Instance::new().expect("failed to create JIT instance");
 
     // JIT (no fuel).
     let jit_no_fuel = JitCompiler::new(&module)
         .fuel(false)
         .compile()
         .expect("JIT no-fuel compilation failed");
-    let mut jit_nf_instance = Instance::new().expect("failed to create JIT no-fuel instance");
 
     // Wasmtime / Pulley.
     let (mut wt_store, wt_func) = setup_wasmtime(&wasm_bytes);
@@ -140,83 +141,69 @@ fn main() {
         fib_native(n - 1) + fib_native(n - 2)
     }
 
-    // Run all benchmarks.
-    let (expected, interp_ms) = bench(|| {
-        let r = wust::call_dynamic(&module, &mut interp_instance, "fib", &[Val::I32(n)])
-            .expect("wust fib failed");
-        match r[0] {
-            Val::I32(v) => v,
-            _ => panic!("expected i32"),
-        }
-    });
-
-    let run = |name: &'static str, mut f: Box<dyn FnMut() -> i32>| -> BenchResult {
+    let run = |name: &'static str, expected: i32, mut f: Box<dyn FnMut() -> i32>| -> BenchResult {
         let (result, ms) = bench(|| f());
         assert_eq!(result, expected, "{name} result mismatch");
         BenchResult { name, ms }
     };
 
+    // Get expected value.
+    let expected = run_jit(&jit_no_fuel, &instance, n);
+
     let jit_result = run(
         "wust jit",
-        Box::new(|| {
-            match jit_module
-                .call_dynamic(&module, &mut jit_instance, "fib", &[Val::I32(n)])
-                .unwrap()[0]
-            {
-                Val::I32(v) => v,
-                _ => panic!("expected i32"),
-            }
-        }),
+        expected,
+        Box::new(|| run_jit(&jit_module, &instance, n)),
     );
     let jit_ms = jit_result.ms;
 
     let jit_nf_result = run(
         "wust jit (no fuel)",
-        Box::new(|| {
-            match jit_no_fuel
-                .call_dynamic(&module, &mut jit_nf_instance, "fib", &[Val::I32(n)])
-                .unwrap()[0]
-            {
-                Val::I32(v) => v,
-                _ => panic!("expected i32"),
-            }
-        }),
+        expected,
+        Box::new(|| run_jit(&jit_no_fuel, &instance, n)),
     );
 
     let results = vec![
-        BenchResult {
-            name: "wust interp",
-            ms: interp_ms,
-        },
         jit_result,
         jit_nf_result,
         run(
             "wasmtime",
+            expected,
             Box::new(|| wt_func.call(&mut wt_store, n).unwrap()),
         ),
         run(
             "pulley",
+            expected,
             Box::new(|| pulley_func.call(&mut pulley_store, n).unwrap()),
         ),
-        run("native", Box::new(|| fib_native(std::hint::black_box(n)))),
+        run(
+            "native",
+            expected,
+            Box::new(|| fib_native(std::hint::black_box(n))),
+        ),
         run(
             "asm",
+            expected,
             Box::new(|| unsafe { fib_asm(std::hint::black_box(n)) }),
         ),
         run(
             "asm+fuel",
+            expected,
             Box::new(|| unsafe { fib_asm_fuel_entry(std::hint::black_box(n), i64::MAX) }),
         ),
         run(
             "asm+jit",
+            expected,
             Box::new(|| unsafe { fib_asm_jit_entry(std::hint::black_box(n), i64::MAX) }),
         ),
         run(
             "asm+jit+frame16",
+            expected,
             Box::new(|| unsafe { fib_asm_jit_frame16_entry(std::hint::black_box(n), i64::MAX) }),
         ),
         run(
             "asm+jit+frame16+hdr",
+            expected,
             Box::new(|| unsafe {
                 fib_asm_jit_frame16_hdr_entry(std::hint::black_box(n), i64::MAX)
             }),
@@ -224,21 +211,5 @@ fn main() {
     ];
 
     println!("\nfib({n}) = {expected}  (avg of {RUNS} runs)\n");
-    print_table(&results, jit_ms, interp_ms);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_fib() {
-        let wasm_bytes = wat::parse_str(FIB_WAT).expect("failed to parse WAT");
-        let engine = Engine::default();
-        let module = Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-        let mut instance = Instance::new().expect("failed to create instance");
-        let (result,): (i32,) =
-            wust::call(&module, &mut instance, "fib", (30,)).expect("wust fib failed");
-        assert_eq!(result, 832040);
-    }
+    print_table(&results, jit_ms);
 }

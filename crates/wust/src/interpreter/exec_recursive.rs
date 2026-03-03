@@ -1,7 +1,10 @@
+#![allow(dead_code, unused_imports)]
 use crate::Module;
 use crate::parse::body::{Block, BlockKind, OpCode};
 use crate::parse::func::ParsedFunction;
-use crate::stack::Stack;
+
+// TODO: rewrite interpreter for new WasmFramePointer API
+type WasmStack = wust_core::WasmFramePointer;
 
 /// Trap reasons that can occur during execution.
 /// Stack-allocated, no heap — keeps the hot loop cheap.
@@ -50,7 +53,7 @@ pub(crate) struct Frame {
 /// point and the `call` opcode.
 pub(crate) fn call_function(
     module: &Module,
-    stack: &mut Stack,
+    stack: &mut WasmStack,
     func: &ParsedFunction,
     fuel: &mut i64,
     depth: &mut u32,
@@ -87,7 +90,7 @@ pub(crate) fn call_function(
 fn execute(
     module: &Module,
     func: &ParsedFunction,
-    stack: &mut Stack,
+    stack: &mut WasmStack,
     frame: &Frame,
     fuel: &mut i64,
     depth: &mut u32,

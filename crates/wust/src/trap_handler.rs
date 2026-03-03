@@ -18,7 +18,16 @@
 use std::cell::UnsafeCell;
 use std::sync::Once;
 
-use crate::interpreter::Trap;
+// TODO: move Trap to a shared location
+/// Trap reasons that can occur during execution.
+#[derive(Debug)]
+pub(crate) enum Trap {
+    Unreachable,
+    OutOfFuel,
+    CallStackExhausted,
+    StackOverflow,
+    IntegerOverflow,
+}
 
 /// Alternate signal stack size (bytes). 64 KB is generous.
 const ALT_STACK_SIZE: usize = 64 * 1024;
