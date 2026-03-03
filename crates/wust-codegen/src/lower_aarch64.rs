@@ -467,6 +467,8 @@ pub fn lower_into(
     // All fuel sites branch to a shared suspend handler that longjmps
     // back to the host via the Context pointer (x20).
     let suspend_handler = e.offset();
+    // DEBUG: trap if suspend path is ever taken
+    e.brk(0xDEAD);
     // mov x9, #1              ; Outcome::Suspended
     e.movz_x(Reg::X9, 1);
     // str x9, [x20, #0]       ; ctx.outcome = Suspended

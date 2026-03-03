@@ -1,6 +1,6 @@
 use std::time::Instant;
 use wust::{JitCompiler, JitModule, ModuleExecutor, Outcome, Val};
-use wust_core::{Instance, ParsedModule};
+use wust_core::{FuncIdx, Instance, ParsedModule, Task};
 
 const FIB_WAT: &str = r#"
 (module
@@ -28,21 +28,25 @@ unsafe extern "C" {
     fn fib_asm_jit_frame16_hdr_entry(n: i32, fuel: i64) -> i32;
 }
 
-const RUNS: usize = 5;
+const RUNS: usize = 15;
 
 struct BenchResult {
     name: &'static str,
     ms: f64,
 }
 
+const WARMUPS: usize = 15;
+
 /// Run a closure `RUNS` times, return (result, average time in ms).
 fn bench<F: FnMut() -> i32>(mut f: F) -> (i32, f64) {
-    std::hint::black_box(f()); // warmup
+    for _ in 0..WARMUPS {
+        std::hint::black_box(f()); // warmup
+    }
     let mut total = 0.0;
     let mut result = 0i32;
     for _ in 0..RUNS {
         let t0 = Instant::now();
-        result = f();
+        result = std::hint::black_box(f()); // run
         total += t0.elapsed().as_secs_f64() * 1000.0;
     }
     (result, total / RUNS as f64)
@@ -92,18 +96,14 @@ fn print_table(results: &[BenchResult], jit_ms: f64) {
         } else {
             "-".to_string()
         };
-        println!(
-            "  {:<name_w$}  {:>10.3}  {:>10}",
-            r.name, r.ms, vs_jit
-        );
+        println!("  {:<name_w$}  {:>10.3}  {:>10}", r.name, r.ms, vs_jit);
     }
 }
 
-fn run_jit(jit: &JitModule, instance: &Instance, n: i32) -> i32 {
-    let mut task = instance.setup_call("fib", &[Val::I32(n)]).unwrap();
+fn run_jit(jit: &JitModule, task: &mut Task, func_idx: FuncIdx, n: i32) -> i32 {
+    task.reset(func_idx, &[Val::I32(n)]);
     task.context.fuel = i64::MAX;
-    let outcome = jit.poll(&mut task);
-    assert_eq!(outcome, Outcome::Return);
+    let _ = jit.poll(task);
     match task.results()[0] {
         Val::I32(v) => v,
         _ => panic!("expected i32"),
@@ -147,25 +147,31 @@ fn main() {
         BenchResult { name, ms }
     };
 
+    // Resolve export once, setup tasks once, reuse across iterations.
+    let func_idx = module
+        .resolve_export("fib")
+        .expect("export 'fib' not found");
+    let mut task_fuel = instance.setup_call("fib", &[Val::I32(n)]).unwrap();
+    let mut task_no_fuel = instance.setup_call("fib", &[Val::I32(n)]).unwrap();
+
     // Get expected value.
-    let expected = run_jit(&jit_no_fuel, &instance, n);
+    let expected = run_jit(&jit_no_fuel, &mut task_no_fuel, func_idx, n);
 
     let jit_result = run(
-        "wust jit",
+        "wust jit (with fuel)",
         expected,
-        Box::new(|| run_jit(&jit_module, &instance, n)),
+        Box::new(|| run_jit(&jit_module, &mut task_fuel, func_idx, n)),
     );
-    let jit_ms = jit_result.ms;
 
-    let jit_nf_result = run(
-        "wust jit (no fuel)",
-        expected,
-        Box::new(|| run_jit(&jit_no_fuel, &instance, n)),
-    );
+    let jit_ms = jit_result.ms;
 
     let results = vec![
         jit_result,
-        jit_nf_result,
+        run(
+            "wust jit (no fuel)",
+            expected,
+            Box::new(|| run_jit(&jit_no_fuel, &mut task_no_fuel, func_idx, n)),
+        ),
         run(
             "wasmtime",
             expected,

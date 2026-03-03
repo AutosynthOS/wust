@@ -216,7 +216,7 @@ pub(crate) fn fuel_cost(raw: u8) -> u32 {
         LOCAL_GET_RETURN => 1,            // get=0, return=1
         // Standard opcodes: delegate to OpCode.
         _ => {
-            // SAFETY: raw < 128 is a valid OpCode discriminant.
+            // SAFETY: raw < FUSED_BASE is a valid OpCode discriminant.
             let op: OpCode = unsafe { std::mem::transmute(raw) };
             op.fuel_cost()
         }

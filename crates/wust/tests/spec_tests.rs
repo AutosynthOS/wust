@@ -15,7 +15,8 @@ use std::io::IsTerminal;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::Path;
 use std::time::Duration;
-use wust::{Engine, ExecBackend, JitModule, Linker, Module, Task, Val};
+use wust::{JitModule, ModuleExecutor, Outcome, Val};
+use wust_core::{Instance, ParsedModule, Task};
 
 // --- Execution mode ---
 
@@ -45,20 +46,17 @@ impl ExecMode {
 // --- Spec runner ---
 
 struct SpecRunner {
-    engine: Engine,
-    module: Option<Module>,
-    task: Option<Task>,
+    module: Option<ParsedModule>,
+    instance: Option<Instance>,
     jit_module: Option<JitModule>,
     mode: ExecMode,
 }
 
 impl SpecRunner {
     fn new(mode: ExecMode) -> Self {
-        let engine = Engine::default();
         Self {
-            engine,
             module: None,
-            task: None,
+            instance: None,
             jit_module: None,
             mode,
         }
@@ -66,38 +64,38 @@ impl SpecRunner {
 
     fn instantiate(&mut self, mut wat: wast::QuoteWat) -> anyhow::Result<()> {
         let binary = wat.encode().map_err(|e| anyhow::anyhow!("{e}"))?;
-        let module =
-            Module::from_bytes(&self.engine, &binary).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let module = ParsedModule::new(&binary).map_err(|e| anyhow::anyhow!("{e}"))?;
         if matches!(self.mode, ExecMode::Jit) {
             self.jit_module = Some(JitModule::compile(&module)?);
         }
+        self.instance = Some(Instance::new(&module));
         self.module = Some(module);
-        self.task = Some(Task::new()?);
         Ok(())
     }
 
     fn invoke(&mut self, invoke: &wast::WastInvoke) -> anyhow::Result<Vec<Val>> {
         let args = parse_args(invoke)?;
-        let module = self
-            .module
+        let instance = self
+            .instance
             .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no active module"))?;
-        let task = self
-            .task
-            .as_mut()
-            .ok_or_else(|| anyhow::anyhow!("no active task"))?;
+            .ok_or_else(|| anyhow::anyhow!("no active instance"))?;
         match self.mode {
-            ExecMode::Interpreter => wust::call_dynamic(module, task, invoke.name, &args)
-                .map_err(|e| anyhow::anyhow!("{e}")),
+            ExecMode::Interpreter => {
+                // TODO: rewrite interpreter for new WasmFramePointer API
+                anyhow::bail!("interpreter not yet available on this branch")
+            }
             ExecMode::Jit => {
                 let jit = self
                     .jit_module
                     .as_ref()
                     .ok_or_else(|| anyhow::anyhow!("no JIT module compiled"))?;
-                wust::setup(module, task, invoke.name, &args)?;
-                let outcome = jit.poll(module, task, i64::MAX);
-                debug_assert_eq!(outcome, wust::Outcome::Return);
-                Ok(wust::results(module, task))
+                let mut task = instance.setup_call(invoke.name, &args)?;
+                task.context.fuel = i64::MAX;
+                let outcome = jit.poll(&mut task);
+                if outcome != Outcome::Return {
+                    anyhow::bail!("unexpected outcome: {outcome:?}");
+                }
+                Ok(task.results())
             }
         }
     }
@@ -444,7 +442,7 @@ fn child_run(name: &str, path: &Path) -> ! {
     let mode = name
         .split_once(':')
         .and_then(|(prefix, _)| ExecMode::from_prefix(prefix))
-        .unwrap_or(ExecMode::Interpreter);
+        .unwrap_or(ExecMode::Jit);
     let mut runner = SpecRunner::new(mode);
     let results = runner.run_wast(path);
     print_subprocess_results(&results);

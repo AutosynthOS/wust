@@ -65,6 +65,26 @@ impl Task {
         })
     }
 
+    /// Reset the task for another call to the same function, reusing
+    /// existing stack allocations. Rewrites the frame header and args.
+    pub fn reset(&mut self, func_idx: FuncIdx, args: &[Val]) {
+        let frame = WasmFrame::from(func_idx, 0);
+        let wasm_fp = &mut self.context.wasm_fp;
+        // Reset fp to base of stack.
+        wasm_fp.ptr = wasm_fp.base();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                &frame as *const WasmFrame as *const u8,
+                wasm_fp.ptr,
+                std::mem::size_of::<WasmFrame>(),
+            );
+        }
+        for (i, arg) in args.iter().enumerate() {
+            wasm_fp.write_local(i * 8, arg.to_raw());
+        }
+        self.context.outcome = Outcome::Ready;
+    }
+
     /// Read results from the frame after `Outcome::Return`.
     pub fn results(&self) -> Vec<Val> {
         let wasm_fp = &self.context.wasm_fp;

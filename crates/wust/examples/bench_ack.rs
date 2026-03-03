@@ -1,5 +1,6 @@
 use std::time::Instant;
-use wust::{Engine, ExecBackend, JitCompiler, JitModule, Module, Task, Val};
+use wust::{JitCompiler, JitModule, ModuleExecutor, Outcome, Val};
+use wust_core::{FuncIdx, Instance, ParsedModule, Task};
 
 const ACK_WAT: &str = r#"
 (module
@@ -27,6 +28,7 @@ const ACK_WAT: &str = r#"
 "#;
 
 const RUNS: usize = 5;
+const WARMUPS: usize = 5;
 
 struct BenchResult {
     name: &'static str,
@@ -34,25 +36,27 @@ struct BenchResult {
 }
 
 fn bench<F: FnMut() -> i32>(mut f: F) -> (i32, f64) {
-    std::hint::black_box(f()); // warmup
+    for _ in 0..WARMUPS {
+        std::hint::black_box(f());
+    }
     let mut total = 0.0;
     let mut result = 0i32;
     for _ in 0..RUNS {
         let t0 = Instant::now();
-        result = f();
+        result = std::hint::black_box(f());
         total += t0.elapsed().as_secs_f64() * 1000.0;
     }
     (result, total / RUNS as f64)
 }
 
-fn print_table(results: &[BenchResult], jit_ms: f64, interp_ms: f64) {
+fn print_table(results: &[BenchResult], jit_ms: f64) {
     let name_w = results.iter().map(|r| r.name.len()).max().unwrap_or(10);
 
     println!(
-        "  {:<name_w$}  {:>10}  {:>10}  {:>10}",
-        "engine", "avg ms", "vs jit", "vs interp"
+        "  {:<name_w$}  {:>10}  {:>10}",
+        "engine", "avg ms", "vs jit"
     );
-    println!("  {}", "-".repeat(name_w + 36));
+    println!("  {}", "-".repeat(name_w + 24));
 
     for r in results {
         let vs_jit = if jit_ms > 0.001 && r.ms > 0.001 {
@@ -60,15 +64,17 @@ fn print_table(results: &[BenchResult], jit_ms: f64, interp_ms: f64) {
         } else {
             "-".to_string()
         };
-        let vs_interp = if interp_ms > 0.001 && r.ms > 0.001 {
-            format!("{:.2}x", r.ms / interp_ms)
-        } else {
-            "-".to_string()
-        };
-        println!(
-            "  {:<name_w$}  {:>10.3}  {:>10}  {:>10}",
-            r.name, r.ms, vs_jit, vs_interp
-        );
+        println!("  {:<name_w$}  {:>10.3}  {:>10}", r.name, r.ms, vs_jit);
+    }
+}
+
+fn run_jit(jit: &JitModule, task: &mut Task, func_idx: FuncIdx, m: i32, n: i32) -> i32 {
+    task.reset(func_idx, &[Val::I32(m), Val::I32(n)]);
+    task.context.fuel = i64::MAX;
+    let _ = jit.poll(task);
+    match task.results()[0] {
+        Val::I32(v) => v,
+        _ => panic!("expected i32"),
     }
 }
 
@@ -83,23 +89,17 @@ fn main() {
         .unwrap_or(10);
 
     let wasm_bytes = wat::parse_str(ACK_WAT).expect("failed to parse WAT");
-
-    let engine = Engine::default();
-    let module = Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-
-    // Interpreter task.
-    let mut interp_task = Task::new().expect("failed to create task");
+    let module = ParsedModule::new(&wasm_bytes).expect("failed to parse module");
+    let instance = Instance::new(&module);
 
     // JIT (with fuel).
     let jit_module = JitModule::compile(&module).expect("JIT compilation failed");
-    let mut jit_task = Task::new().expect("failed to create JIT task");
 
     // JIT (no fuel).
     let jit_no_fuel = JitCompiler::new(&module)
         .fuel(false)
         .compile()
         .expect("JIT no-fuel compilation failed");
-    let mut jit_nf_task = Task::new().expect("failed to create JIT no-fuel task");
 
     // Wasmtime.
     let wt_engine = wasmtime::Engine::default();
@@ -142,34 +142,19 @@ fn main() {
 
     let expected = ack_native(m, n);
 
-    // Try interpreter (may fail with stack overflow for large inputs).
-    let interp_ms = match wust::call_dynamic(
-        &module,
-        &mut interp_task,
-        "ack",
-        &[Val::I32(m), Val::I32(n)],
-    ) {
-        Ok(_r) => {
-            let (_, ms) = bench(|| {
-                let r = wust::call_dynamic(
-                    &module,
-                    &mut interp_task,
-                    "ack",
-                    &[Val::I32(m), Val::I32(n)],
-                )
-                .unwrap();
-                match r[0] {
-                    Val::I32(v) => v,
-                    _ => panic!("expected i32"),
-                }
-            });
-            ms
-        }
-        Err(_) => {
-            eprintln!("note: interpreter stack too small for ack({m}, {n}), skipping");
-            0.0
-        }
-    };
+    let func_idx = module
+        .resolve_export("ack")
+        .expect("export 'ack' not found");
+    let mut task_fuel = instance
+        .setup_call("ack", &[Val::I32(m), Val::I32(n)])
+        .unwrap();
+    let mut task_no_fuel = instance
+        .setup_call("ack", &[Val::I32(m), Val::I32(n)])
+        .unwrap();
+
+    // Get expected value from JIT.
+    let jit_expected = run_jit(&jit_no_fuel, &mut task_no_fuel, func_idx, m, n);
+    assert_eq!(jit_expected, expected, "JIT result mismatch vs native");
 
     let run = |name: &'static str, mut f: Box<dyn FnMut() -> i32>| -> BenchResult {
         let (result, ms) = bench(|| f());
@@ -178,37 +163,17 @@ fn main() {
     };
 
     let jit_result = run(
-        "wust jit",
-        Box::new(|| {
-            wust::setup(&module, &mut jit_task, "ack", &[Val::I32(m), Val::I32(n)]).unwrap();
-            jit_module.poll(&module, &mut jit_task, i64::MAX);
-            match wust::results(&module, &jit_task)[0] {
-                Val::I32(v) => v,
-                _ => panic!("expected i32"),
-            }
-        }),
+        "wust jit (with fuel)",
+        Box::new(|| run_jit(&jit_module, &mut task_fuel, func_idx, m, n)),
     );
     let jit_ms = jit_result.ms;
 
-    let jit_nf_result = run(
-        "wust jit (no fuel)",
-        Box::new(|| {
-            wust::setup(&module, &mut jit_nf_task, "ack", &[Val::I32(m), Val::I32(n)]).unwrap();
-            jit_no_fuel.poll(&module, &mut jit_nf_task, i64::MAX);
-            match wust::results(&module, &jit_nf_task)[0] {
-                Val::I32(v) => v,
-                _ => panic!("expected i32"),
-            }
-        }),
-    );
-
     let results = vec![
-        BenchResult {
-            name: "wust interp",
-            ms: interp_ms,
-        },
         jit_result,
-        jit_nf_result,
+        run(
+            "wust jit (no fuel)",
+            Box::new(|| run_jit(&jit_no_fuel, &mut task_no_fuel, func_idx, m, n)),
+        ),
         run(
             "wasmtime",
             Box::new(|| wt_func.call(&mut wt_store, (m, n)).unwrap()),
@@ -224,7 +189,7 @@ fn main() {
     ];
 
     println!("\nack({m}, {n}) = {expected}  (avg of {RUNS} runs)\n");
-    print_table(&results, jit_ms, interp_ms);
+    print_table(&results, jit_ms);
 }
 
 #[cfg(test)]
@@ -234,12 +199,19 @@ mod tests {
     #[test]
     fn test_ack() {
         let wasm_bytes = wat::parse_str(ACK_WAT).expect("failed to parse WAT");
-        let engine = Engine::default();
-        let module = Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-        let mut task = Task::new().expect("failed to create task");
-        let r = wust::call_dynamic(&module, &mut task, "ack", &[Val::I32(3), Val::I32(4)])
-            .expect("wust ack failed");
-        match r[0] {
+        let module = ParsedModule::new(&wasm_bytes).expect("failed to parse module");
+        let instance = Instance::new(&module);
+        let jit = JitModule::compile(&module).expect("JIT compilation failed");
+        let func_idx = module
+            .resolve_export("ack")
+            .expect("export 'ack' not found");
+        let mut task = instance
+            .setup_call("ack", &[Val::I32(3), Val::I32(4)])
+            .unwrap();
+        task.context.fuel = i64::MAX;
+        let outcome = jit.poll(&mut task);
+        assert_eq!(outcome, Outcome::Return);
+        match task.results()[0] {
             Val::I32(v) => assert_eq!(v, 125),
             _ => panic!("expected i32"),
         }

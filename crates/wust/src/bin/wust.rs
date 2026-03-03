@@ -1,7 +1,8 @@
 use std::io::Read;
 
 use clap::{Parser, Subcommand};
-use wust::{Codegen, Engine, Module};
+use wust::Codegen;
+use wust_core::ParsedModule;
 
 #[derive(Parser)]
 #[command(name = "wust", about = "WebAssembly toolkit")]
@@ -29,8 +30,7 @@ fn main() -> anyhow::Result<()> {
 fn inspect(file: Option<String>) -> anyhow::Result<()> {
     let wat = read_input(file)?;
     let wasm_bytes = wat::parse_str(&wat)?;
-    let engine = Engine::default();
-    let module = Module::from_bytes(&engine, &wasm_bytes)?;
+    let module = ParsedModule::new(&wasm_bytes)?;
 
     let output = Codegen::new(&module).compile()?;
     print!("{}", output.render());

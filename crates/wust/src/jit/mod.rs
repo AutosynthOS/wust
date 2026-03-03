@@ -154,6 +154,11 @@ impl JitModule {
         JitCompiler::new(module).compile()
     }
 
+    /// Raw code buffer bytes for debugging/dumping.
+    pub fn code_bytes(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.buffer.entry(), self.buffer.len()) }
+    }
+
     /// Low-level trampoline call.
     ///
     /// Swaps the native stack pointer to the fiber stack on entry so
@@ -210,12 +215,7 @@ impl JitModule {
             );
         }
 
-        // On normal return, the JIT doesn't write to ctx.outcome —
-        // it stays Running. The cold stub sets it to Suspended.
-        match task.context.outcome {
-            Outcome::Running => Outcome::Return,
-            other => other,
-        }
+        task.context.outcome
     }
 }
 
