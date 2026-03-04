@@ -25,17 +25,25 @@ fn func_name(export_name: Option<&str>, idx: usize) -> String {
 }
 
 /// Build a full signature like `answer<1>(x9: i32) -> x9: i32`.
+/// Register prefix for a ValType: `w` for 32-bit, `x` for 64-bit.
+fn reg_prefix(ty: &ValType) -> &'static str {
+    match ty {
+        ValType::I32 | ValType::F32 => "w",
+        _ => "x",
+    }
+}
+
 fn func_signature(func: &FuncMeta, export_name: Option<&str>, idx: usize) -> String {
     let name = func_name(export_name, idx);
     let params: Vec<String> = func.params
         .iter()
         .enumerate()
-        .map(|(i, ty)| format!("x{}<{}>", 9 + i, valtype_str(ty)))
+        .map(|(i, ty)| format!("{}{}<{}>", reg_prefix(ty), 9 + i, valtype_str(ty)))
         .collect();
     let results: Vec<String> = func.results
         .iter()
         .enumerate()
-        .map(|(i, ty)| format!("x{}<{}>", 9 + i, valtype_str(ty)))
+        .map(|(i, ty)| format!("{}{}<{}>", reg_prefix(ty), 9 + i, valtype_str(ty)))
         .collect();
     let result_part = match results.len() {
         0 => String::new(),
@@ -107,16 +115,33 @@ impl<'a> Codegen<'a> {
                     })
                     .collect();
 
+                // Filter source_ops to only include entries for
+                // marker-producing IR instructions (skip DefLabel,
+                // FuelConsume, FuelCheck — their code merges into
+                // surrounding regions).
+                use wust_codegen::ir::IrInst;
+                let filtered_source_ops: Vec<u32> = ir.insts.iter()
+                    .zip(ir.source_ops.iter())
+                    .filter(|(inst, _)| !matches!(inst,
+                        IrInst::DefLabel { .. } |
+                        IrInst::FuelConsume { .. } |
+                        IrInst::FuelCheck { .. }
+                    ))
+                    .map(|(_, &op)| op)
+                    .collect();
+
                 blocks.push(Block {
                     name: signatures[i].clone(),
                     code,
                     base_offset: snap.code_start * 4,
                     annotations: Some(BlockAnnotations {
                         markers,
-                        ir_inst_count: ir.insts.len(),
-                        source_ops: ir.source_ops.clone(),
+                        ir_inst_count: filtered_source_ops.len(),
+                        source_ops: filtered_source_ops,
                         op_labels,
                         label_offsets: snap.label_offsets.clone(),
+                        param_types: module.funcs[i].params.iter().map(valtype_str).collect(),
+                        result_types: module.funcs[i].results.iter().map(valtype_str).collect(),
                     }),
                 });
             },

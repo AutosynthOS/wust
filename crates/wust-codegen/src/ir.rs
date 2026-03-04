@@ -65,13 +65,11 @@ pub enum IrInst {
     DefLabel { label: Label, params: Vec<VReg> },
     /// Unconditional branch with block arguments.
     /// Args are values passed to the target block's params.
-    Br { label: Label, args: Vec<VReg> },
+    Br { label: Label },
     /// Branch if the condition register is zero.
-    /// Args are values passed to the target block's params.
-    BrIfZero { cond: VReg, label: Label, args: Vec<VReg> },
+    BrIfZero { cond: VReg, label: Label },
     /// Branch if the condition register is nonzero.
-    /// Args are values passed to the target block's params.
-    BrIfNonZero { cond: VReg, label: Label, args: Vec<VReg> },
+    BrIfNonZero { cond: VReg, label: Label },
     /// Store a value to a frame byte offset: `[x29 + offset]`.
     FrameStore { offset: u32, src: VReg },
     /// Load a value from a frame byte offset: `[x29 + offset]`.
@@ -87,12 +85,14 @@ pub enum IrInst {
     /// different operand stack depths.
     Call {
         func_idx: u32,
-        args: Vec<VReg>,
-        result: Option<VReg>,
+        /// (vreg, size) pairs for each argument.
+        args: Vec<(VReg, u8)>,
+        result: Option<(VReg, u8)>,
         frame_advance: u32,
     },
     /// Return from the function with the given result values.
-    Return { results: Vec<VReg> },
+    /// Each entry is (vreg, size) where size is 4 for i32/f32, 8 for i64/f64.
+    Return { results: Vec<(VReg, u8)> },
     /// Decrement fuel counter by `cost`. No suspend point — fuel can go
     /// negative between checkpoints.
     FuelConsume { cost: u32 },
@@ -120,7 +120,7 @@ impl IrInst {
             | IrInst::Unary { dst, .. }
             | IrInst::FrameLoad { dst, .. } => f(*dst),
             IrInst::Call { result, .. } => {
-                if let Some(r) = result {
+                if let Some((r, _)) = result {
                     f(*r);
                 }
             }
@@ -144,29 +144,22 @@ impl IrInst {
             }
             IrInst::Unary { src, .. } => f(*src),
             IrInst::LocalSet { src, .. } | IrInst::FrameStore { src, .. } => f(*src),
-            IrInst::BrIfZero { cond, args, .. } | IrInst::BrIfNonZero { cond, args, .. } => {
+            IrInst::BrIfZero { cond, .. } | IrInst::BrIfNonZero { cond, .. } => {
                 f(*cond);
-                for a in args {
-                    f(*a);
-                }
             }
-            IrInst::Br { args, .. } => {
-                for a in args {
-                    f(*a);
-                }
-            }
+            IrInst::Br { .. } => {}
             IrInst::FuelCheck { live_state } => {
                 for (_, vreg) in live_state {
                     f(*vreg);
                 }
             }
             IrInst::Call { args, .. } => {
-                for a in args {
+                for (a, _) in args {
                     f(*a);
                 }
             }
             IrInst::Return { results } => {
-                for r in results {
+                for (r, _) in results {
                     f(*r);
                 }
             }
@@ -275,19 +268,6 @@ impl std::fmt::Display for Label {
     }
 }
 
-/// Format a parenthesized argument list for branch instructions.
-fn fmt_args(f: &mut std::fmt::Formatter<'_>, args: &[VReg]) -> std::fmt::Result {
-    if !args.is_empty() {
-        write!(f, "(")?;
-        for (i, a) in args.iter().enumerate() {
-            if i > 0 { write!(f, ", ")?; }
-            write!(f, "{a}")?;
-        }
-        write!(f, ")")?;
-    }
-    Ok(())
-}
-
 impl std::fmt::Display for IrInst {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -314,18 +294,9 @@ impl std::fmt::Display for IrInst {
                 }
                 Ok(())
             }
-            IrInst::Br { label, args } => {
-                write!(f, "  br {label}")?;
-                fmt_args(f, args)
-            }
-            IrInst::BrIfZero { cond, label, args } => {
-                write!(f, "  br_if_zero {cond}, {label}")?;
-                fmt_args(f, args)
-            }
-            IrInst::BrIfNonZero { cond, label, args } => {
-                write!(f, "  br_if_nz {cond}, {label}")?;
-                fmt_args(f, args)
-            }
+            IrInst::Br { label } => write!(f, "  br {label}"),
+            IrInst::BrIfZero { cond, label } => write!(f, "  br_if_zero {cond}, {label}"),
+            IrInst::BrIfNonZero { cond, label } => write!(f, "  br_if_nz {cond}, {label}"),
             IrInst::FrameStore { offset, src } => write!(f, "  frame[@{offset}] = {src}"),
             IrInst::FrameLoad { dst, offset } => write!(f, "  {dst} = frame[@{offset}]"),
             IrInst::Call {
@@ -334,14 +305,14 @@ impl std::fmt::Display for IrInst {
                 result,
                 ..
             } => {
-                if let Some(r) = result {
+                if let Some((r, _)) = result {
                     write!(f, "  {r} = call {func_idx}")?;
                 } else {
                     write!(f, "  call {func_idx}")?;
                 }
                 if !args.is_empty() {
                     write!(f, "(")?;
-                    for (i, a) in args.iter().enumerate() {
+                    for (i, (a, _)) in args.iter().enumerate() {
                         if i > 0 {
                             write!(f, ", ")?;
                         }
@@ -353,7 +324,7 @@ impl std::fmt::Display for IrInst {
             }
             IrInst::Return { results } => {
                 write!(f, "  return")?;
-                for (i, r) in results.iter().enumerate() {
+                for (i, (r, _)) in results.iter().enumerate() {
                     if i == 0 {
                         write!(f, " {r}")?;
                     } else {

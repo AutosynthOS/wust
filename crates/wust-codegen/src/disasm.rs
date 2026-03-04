@@ -31,6 +31,10 @@ pub struct BlockAnnotations {
     pub op_labels: Vec<String>,
     /// Label index → word offset relative to this block's code start.
     pub label_offsets: Vec<Option<usize>>,
+    /// Parameter type names (e.g. ["i32", "i64"]) for annotating entry.
+    pub param_types: Vec<&'static str>,
+    /// Result type names (e.g. ["i32"]) for annotating ret instructions.
+    pub result_types: Vec<&'static str>,
 }
 
 /// Output of the codegen pipeline for a module.
@@ -176,14 +180,16 @@ struct TreeCtx<'a> {
     block: &'a Block,
     labels: &'a [(usize, String)],
     regions: Vec<Region>,
-    /// (source_ri, target_ri) for each forward conditional branch.
-    branches: Vec<(usize, usize)>,
+    /// (source_ri, branch_word_idx, target_ri) for each forward conditional branch.
+    branches: Vec<(usize, usize, usize)>,
     /// Per-function label map: word offset → label name (L0, L1, ...).
     local_labels: Vec<Option<String>>,
     /// word_idx → annotation string (source op label).
     ir_at: Vec<Option<String>>,
     /// Column where IR annotations start.
     ir_col: usize,
+    /// Formatted return annotation for ret instructions (e.g. "→ x9:i32, x10:i64").
+    ret_annotation: String,
 }
 
 impl<'a> TreeCtx<'a> {
@@ -200,7 +206,7 @@ impl<'a> TreeCtx<'a> {
             .map(|ri| {
                 branches
                     .iter()
-                    .filter(|&&(src, tgt)| ri > src && ri < tgt)
+                    .filter(|&&(src, _, tgt)| ri > src && ri < tgt)
                     .count()
             })
             .max()
@@ -210,6 +216,8 @@ impl<'a> TreeCtx<'a> {
         let asm_width = compute_asm_width(&block.code, &regions);
         let ir_col = 9 + 2 * max_depth + asm_width + 4;
 
+        let ret_annotation = format_ret_annotation(&ann.result_types);
+
         Self {
             block,
             labels,
@@ -218,6 +226,7 @@ impl<'a> TreeCtx<'a> {
             local_labels,
             ir_at,
             ir_col,
+            ret_annotation,
         }
     }
 }
@@ -233,16 +242,15 @@ fn render_tree(
     let mut ri = ri_start;
     while ri < ri_end {
         // Check if a conditional branch starts at this region.
-        if let Some(&(_, target)) = ctx.branches.iter().find(|&&(src, _)| src == ri) {
+        if let Some(&(_, branch_word_idx, target)) = ctx.branches.iter().find(|&&(src, _, _)| src == ri) {
             let region = &ctx.regions[ri];
 
-            // Render instructions before the branch (all except last word).
-            if region.end > region.start + 1 {
-                render_words(out, ctx, region.start, region.end - 1, depth);
+            // Render instructions before the branch.
+            if branch_word_idx > region.start {
+                render_words(out, ctx, region.start, branch_word_idx, depth);
             }
 
             // Show the branch instruction with ├─╮ connector.
-            let branch_word_idx = region.end - 1;
             let branch_word = ctx.block.code[branch_word_idx];
             let raw_asm = normalize_asm(&decode_instruction(branch_word));
 
@@ -255,6 +263,12 @@ fn render_tree(
             let ir_note = ctx.ir_at.get(branch_word_idx).and_then(|n| n.as_deref());
 
             emit_branch_open(out, branch_word_idx * 4, &asm, depth, ir_note, ctx.ir_col);
+
+            // Render any remaining words in this region after the branch
+            // (e.g., bare fuel consume) as part of the fall-through body.
+            if branch_word_idx + 1 < region.end {
+                render_words(out, ctx, branch_word_idx + 1, region.end, depth + 1);
+            }
 
             // Render fall-through body at depth+1.
             render_tree(out, ctx, ri + 1, target, depth + 1);
@@ -279,13 +293,13 @@ fn render_words(out: &mut String, ctx: &TreeCtx, start: usize, end: usize, depth
         // Fuel check: subs x21, x21, #N followed by b.le
         if wi + 1 < end && is_fuel_subs(word) && is_b_le(ctx.block.code[wi + 1]) {
             let asm = normalize_asm(&decode_instruction(word));
-            let ir = ctx.ir_at.get(wi).and_then(|n| n.as_deref());
+            let ir = ctx.ir_at.get(wi).and_then(|n| n.as_deref()).or(Some("fuel consume"));
             emit_line(out, wi * 4, &asm, depth, ir, ctx.ir_col);
 
             let b_le = ctx.block.code[wi + 1];
             let raw_b_le = normalize_asm(&decode_instruction(b_le));
             let b_le_asm = rewrite_branch_target(&raw_b_le, "suspend");
-            emit_branch_open(out, (wi + 1) * 4, &b_le_asm, depth, None, ctx.ir_col);
+            emit_branch_open(out, (wi + 1) * 4, &b_le_asm, depth, Some("fuel check"), ctx.ir_col);
 
             // Render the single-instruction cold stub (brk) inline.
             let cold_off = branch_word_offset(b_le).unwrap();
@@ -301,8 +315,14 @@ fn render_words(out: &mut String, ctx: &TreeCtx, start: usize, end: usize, depth
 
         // Normal instruction — resolve via global labels.
         let byte_off = ctx.block.base_offset + wi * 4;
-        let asm = resolve_asm(word, byte_off, ctx.labels);
-        let ir = ctx.ir_at.get(wi).and_then(|n| n.as_deref());
+        let mut asm = resolve_asm(word, byte_off, ctx.labels);
+
+        let ir = ctx.ir_at.get(wi).and_then(|n| n.as_deref())
+            .or_else(|| if asm.starts_with("ret") && !ctx.ret_annotation.is_empty() {
+                Some(ctx.ret_annotation.as_str())
+            } else {
+                None
+            });
         emit_line(out, wi * 4, &asm, depth, ir, ctx.ir_col);
         wi += 1;
     }
@@ -448,6 +468,27 @@ fn replace_at_word_boundary(s: &str, from: &str, to: &str) -> String {
     result
 }
 
+/// Format return annotation from result types, e.g. "→ w9<i32>" or "→ x9<i64>, w10<i32>".
+/// Uses w-reg names for 32-bit types, x-reg names for 64-bit types.
+fn format_ret_annotation(result_types: &[&str]) -> String {
+    if result_types.is_empty() {
+        return String::new();
+    }
+    let regs: Vec<String> = result_types
+        .iter()
+        .enumerate()
+        .map(|(i, ty)| {
+            let n = 9 + i;
+            let prefix = match *ty {
+                "i32" | "f32" => "w",
+                _ => "x",
+            };
+            format!("{prefix}{n}<{ty}>")
+        })
+        .collect();
+    format!("→ {}", regs.join(", "))
+}
+
 fn display_width(s: &str) -> usize { s.chars().count() }
 
 fn pad_to(s: &mut String, target_col: usize, fill: char) {
@@ -509,8 +550,7 @@ fn build_source_op_annotations(
 
         let label = ann.op_labels.get(source_op as usize).map(|s| s.as_str()).unwrap_or("");
         if !label.is_empty() {
-            let best = group_end - 1;
-            let word = body_regions[best].start;
+            let word = body_regions[i].start;
             if word < annotations.len() {
                 annotations[word] = Some(label.to_string());
             }
@@ -536,20 +576,32 @@ fn collect_regions(markers: &[usize], total_words: usize, max_regions: usize) ->
 }
 
 /// Find all forward conditional branches as (source_ri, target_ri) pairs.
-fn find_forward_branches(regions: &[Region], code: &[u32]) -> Vec<(usize, usize)> {
+fn find_forward_branches(regions: &[Region], code: &[u32]) -> Vec<(usize, usize, usize)> {
     let mut branches = Vec::new();
     for (ri, region) in regions.iter().enumerate() {
         if region.end == region.start { continue; }
-        let last_word = code[region.end - 1];
-        if !is_conditional_branch(last_word) { continue; }
-        let offset = match branch_word_offset(last_word) {
+        // Find the last conditional branch in the region (may not be the
+        // absolute last word if a bare fuel consume follows the branch).
+        let branch_wi = (region.start..region.end)
+            .rev()
+            .find(|&wi| is_conditional_branch(code[wi]));
+        let branch_wi = match branch_wi {
+            Some(wi) => wi,
+            None => continue,
+        };
+        let branch_word = code[branch_wi];
+        // Skip fuel check branches — they're rendered inline by render_words.
+        if is_b_le(branch_word) && branch_wi > 0 && is_fuel_subs(code[branch_wi - 1]) {
+            continue;
+        }
+        let offset = match branch_word_offset(branch_word) {
             Some(o) => o,
             None => continue,
         };
-        let target_word = (region.end as i64 - 1 + offset as i64) as usize;
+        let target_word = (branch_wi as i64 + offset as i64) as usize;
         if let Some(target_ri) = regions.iter().position(|r| r.start <= target_word && target_word < r.end) {
             if target_ri > ri {
-                branches.push((ri, target_ri));
+                branches.push((ri, branch_wi, target_ri));
             }
         }
     }

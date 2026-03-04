@@ -57,6 +57,11 @@ struct IrCompiler {
     /// Whether the register value differs from what's in the frame slot.
     /// When true, must store to frame before any suspend point.
     frame_dirty: Vec<bool>,
+    /// True after a Return or unconditional Br — subsequent code is dead
+    /// until the next DefLabel resets this.
+    unreachable: bool,
+    /// Byte sizes for each result (4 for i32/f32, 8 for i64/f64).
+    result_sizes: Vec<u8>,
 }
 
 impl IrCompiler {
@@ -66,11 +71,12 @@ impl IrCompiler {
         local_sizes: Box<[u8]>,
         operand_base_offset: u32,
         emit_fuel: bool,
+        result_sizes: Vec<u8>,
     ) -> Self {
         IrCompiler {
             insts: Vec::new(),
             source_ops: Vec::new(),
-            current_op: 0,
+            current_op: u32::MAX, // sentinel: prologue instructions have no wasm op
             vstack: Vec::new(),
             next_vreg: 0,
             next_label: 0,
@@ -84,6 +90,8 @@ impl IrCompiler {
             emit_fuel,
             local_vreg: vec![None; total_local_count as usize],
             frame_dirty: vec![false; total_local_count as usize],
+            unreachable: false,
+            result_sizes,
         }
     }
 
@@ -169,26 +177,6 @@ impl IrCompiler {
         }
     }
 
-    /// Collect current local VRegs as branch arguments.
-    /// For locals not currently tracked (None), load from frame first.
-    fn collect_local_args(&mut self) -> Vec<VReg> {
-        (0..self.total_local_count)
-            .map(|i| {
-                if let Some(v) = self.local_vreg[i as usize] {
-                    v
-                } else {
-                    let dst = self.fresh_vreg();
-                    let offset = self.local_byte_offsets[i as usize] as u32;
-                    let size = self.local_sizes[i as usize];
-                    self.emit(IrInst::LocalGet { dst, offset, size });
-                    self.local_vreg[i as usize] = Some(dst);
-                    self.frame_dirty[i as usize] = false;
-                    dst
-                }
-            })
-            .collect()
-    }
-
     /// Allocate fresh VRegs for block params (one per local).
     fn allocate_local_params(&mut self) -> Vec<VReg> {
         (0..self.total_local_count)
@@ -239,19 +227,28 @@ impl IrCompiler {
 
     fn emit_local_set(&mut self, idx: u32) {
         let src = self.vpop();
+        self.emit_local_set_vreg(idx, src);
+    }
+
+    /// Emit a LocalSet for a vreg that isn't on the vstack.
+    fn emit_local_set_vreg(&mut self, idx: u32, src: VReg) {
+        let offset = self.local_byte_offsets[idx as usize] as u32;
+        let size = self.local_sizes[idx as usize];
+        self.emit(IrInst::LocalSet { offset, src, size });
         self.local_vreg[idx as usize] = Some(src);
-        self.frame_dirty[idx as usize] = true;
+        self.frame_dirty[idx as usize] = false;
     }
 
     fn emit_return(&mut self, result_count: usize) {
         let mut results = Vec::with_capacity(result_count);
-        for _ in 0..result_count {
-            results.push(self.vpop());
+        for i in (0..result_count).rev() {
+            results.push((self.vpop(), self.result_sizes[i]));
         }
         results.reverse();
         self.emit(IrInst::Return { results });
         // Any fuel accrued after a return is dead code — discard it.
         self.pending_fuel = 0;
+        self.unreachable = true;
     }
 
     fn emit_br(&mut self, block_idx: u32) {
@@ -261,8 +258,9 @@ impl IrCompiler {
             .rposition(|b| b.block_idx == block_idx)
             .expect("branch target not on block stack");
         let label = self.block_stack[stack_idx].label;
-        let args = self.collect_local_args();
-        self.emit(IrInst::Br { label, args });
+        self.flush_dirty_locals();
+        self.emit(IrInst::Br { label });
+        self.unreachable = true;
     }
 
     /// Flush only the values above `depth` from the virtual stack.
@@ -320,12 +318,16 @@ pub(crate) fn compile_with(
         .map(|ty| (slot_size(*ty) * 4) as u8)
         .collect();
     let operand_base_offset = func.locals_size as u32 + wust_core::FRAME_HEADER_SIZE as u32;
+    let result_sizes: Vec<u8> = func.results.iter()
+        .map(|ty| (slot_size(*ty) * 4) as u8)
+        .collect();
     let mut c = IrCompiler::new(
         total_locals,
         func.local_byte_offsets.clone(),
         local_sizes,
         operand_base_offset,
         emit_fuel,
+        result_sizes,
     );
 
     // Params start in registers (x9, x10, ...) via ParamDef.
@@ -338,8 +340,10 @@ pub(crate) fn compile_with(
         c.frame_dirty[i as usize] = true;
     }
 
-    // Non-param locals start as zero. Track a zero VReg — dirty
-    // (frame stores deferred to first flush).
+    // Non-param locals start as zero. Track a zero VReg but keep
+    // them clean — stores are deferred to flush_dirty_locals() which
+    // runs before every suspend point and call. This avoids eagerly
+    // storing zeros at plain branch edges where nobody reads them.
     if total_locals > param_count {
         let v_zero = c.fresh_vreg();
         c.emit(IrInst::IConst {
@@ -348,7 +352,7 @@ pub(crate) fn compile_with(
         });
         for i in param_count..total_locals {
             c.local_vreg[i as usize] = Some(v_zero);
-            c.frame_dirty[i as usize] = true;
+            c.frame_dirty[i as usize] = false;
         }
     }
 
@@ -564,19 +568,15 @@ pub(crate) fn compile_with(
                 let val1 = c.vpop();
                 let else_label = c.fresh_label();
                 let end_label = c.fresh_label();
-                let args = c.collect_local_args();
+                c.flush_dirty_locals();
                 let spill_offset = c.operand_base_offset + c.vstack.len() as u32 * 8;
                 c.emit(IrInst::BrIfZero {
                     cond,
                     label: else_label,
-                    args: args.clone(),
                 });
                 c.emit(IrInst::FrameStore { offset: spill_offset, src: val1 });
-                let args2 = c.collect_local_args();
-                c.emit(IrInst::Br {
-                    label: end_label,
-                    args: args2,
-                });
+                c.flush_dirty_locals();
+                c.emit(IrInst::Br { label: end_label });
                 let params = c.allocate_local_params();
                 c.emit(IrInst::DefLabel {
                     label: else_label,
@@ -584,11 +584,8 @@ pub(crate) fn compile_with(
                 });
                 c.apply_local_params(&params);
                 c.emit(IrInst::FrameStore { offset: spill_offset, src: val2 });
-                let args3 = c.collect_local_args();
-                c.emit(IrInst::Br {
-                    label: end_label,
-                    args: args3,
-                });
+                c.flush_dirty_locals();
+                c.emit(IrInst::Br { label: end_label });
                 let params2 = c.allocate_local_params();
                 c.emit(IrInst::DefLabel {
                     label: end_label,
@@ -614,8 +611,8 @@ pub(crate) fn compile_with(
                 // No fuel flush at loop entry — fuel is checked at
                 // back-edges (Br to loop label) and after calls.
                 let label = c.fresh_label();
-                let args = c.collect_local_args();
-                c.emit(IrInst::Br { label, args });
+                c.flush_dirty_locals();
+                c.emit(IrInst::Br { label });
                 let params = c.allocate_local_params();
                 c.emit(IrInst::DefLabel {
                     label,
@@ -632,12 +629,10 @@ pub(crate) fn compile_with(
 
             OpCode::If => {
                 let cond_vreg = c.vpop();
-                let args = c.collect_local_args();
                 let label = c.fresh_label();
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
                     label,
-                    args,
                 });
                 c.block_stack.push(OpenBlock {
                     block_idx: imm,
@@ -652,18 +647,20 @@ pub(crate) fn compile_with(
                     let block = c.block_stack.last().expect("Else without If");
                     (block.vstack_depth, block.label)
                 };
-                c.flush_vstack_above(depth);
                 let end_label = c.fresh_label();
-                let args = c.collect_local_args();
-                c.emit(IrInst::Br {
-                    label: end_label,
-                    args,
-                });
+                if !c.unreachable {
+                    c.flush_vstack_above(depth);
+                    c.flush_dirty_locals();
+                    c.emit(IrInst::Br {
+                        label: end_label,
+                    });
+                }
                 let params = c.allocate_local_params();
                 c.emit(IrInst::DefLabel {
                     label: if_label,
                     params: params.clone(),
                 });
+                c.unreachable = false;
                 c.apply_local_params(&params);
                 c.block_stack.last_mut().unwrap().label = end_label;
             }
@@ -675,32 +672,47 @@ pub(crate) fn compile_with(
                 } else if let Some(block) = c.block_stack.pop() {
                     if block.kind == BlockKind::If {
                         let branch_results = c.vstack.len() - block.vstack_depth;
-                        c.flush_vstack_above(block.vstack_depth);
-                        let args = c.collect_local_args();
-                        c.emit(IrInst::Br {
-                            label: block.label,
-                            args,
-                        });
-                        let params = c.allocate_local_params();
-                        c.emit(IrInst::DefLabel {
-                            label: block.label,
-                            params: params.clone(),
-                        });
-                        c.apply_local_params(&params);
+                        let was_unreachable = c.unreachable;
+                        if !c.unreachable {
+                            c.flush_vstack_above(block.vstack_depth);
+                            c.flush_dirty_locals();
+                            c.emit(IrInst::Br {
+                                label: block.label,
+                            });
+                        }
+                        c.unreachable = false;
+                        if was_unreachable {
+                            // Single predecessor (the BrIfZero skip) — compiler
+                            // state from before the branch is still valid.
+                            c.emit(IrInst::DefLabel {
+                                label: block.label,
+                                params: vec![],
+                            });
+                        } else {
+                            // Multiple predecessors — need fresh params.
+                            let params = c.allocate_local_params();
+                            c.emit(IrInst::DefLabel {
+                                label: block.label,
+                                params: params.clone(),
+                            });
+                            c.apply_local_params(&params);
+                        }
                         if branch_results > 0 {
                             c.reload_from_stack(branch_results);
                         }
                     } else {
-                        let args = c.collect_local_args();
-                        c.emit(IrInst::Br {
-                            label: block.label,
-                            args,
-                        });
+                        if !c.unreachable {
+                            c.flush_dirty_locals();
+                            c.emit(IrInst::Br {
+                                label: block.label,
+                            });
+                        }
                         let params = c.allocate_local_params();
                         c.emit(IrInst::DefLabel {
                             label: block.label,
                             params: params.clone(),
                         });
+                        c.unreachable = false;
                         c.apply_local_params(&params);
                     }
                 }
@@ -721,11 +733,10 @@ pub(crate) fn compile_with(
             OpCode::BrIf => {
                 let cond_vreg = c.vpop();
                 let skip_label = c.fresh_label();
-                let args = c.collect_local_args();
+                c.flush_dirty_locals();
                 c.emit(IrInst::BrIfZero {
                     cond: cond_vreg,
                     label: skip_label,
-                    args: args.clone(),
                 });
                 let stack_idx = c
                     .block_stack
@@ -749,15 +760,17 @@ pub(crate) fn compile_with(
                 let param_count = callee.param_count();
                 let has_result = callee.result_count() > 0;
                 let mut args = Vec::with_capacity(param_count);
-                for _ in 0..param_count {
-                    args.push(c.vpop());
+                for i in (0..param_count).rev() {
+                    let size = (slot_size(callee.params[i]) * 4) as u8;
+                    args.push((c.vpop(), size));
                 }
                 args.reverse();
                 let spill_count = c.vstack.len();
                 c.flush_vstack_above(0);
                 c.flush_fuel();
                 let result = if has_result {
-                    Some(c.fresh_vreg())
+                    let size = (slot_size(callee.results[0]) * 4) as u8;
+                    Some((c.fresh_vreg(), size))
                 } else {
                     None
                 };
@@ -773,7 +786,7 @@ pub(crate) fn compile_with(
                 if spill_count > 0 {
                     c.reload_from_stack(spill_count);
                 }
-                if let Some(r) = result {
+                if let Some((r, _)) = result {
                     c.vpush(r);
                 }
             }
@@ -870,7 +883,6 @@ fn compile_fused_op(
 
             c.emit_local_get(local_idx);
             let lhs = c.vpop();
-            let args = c.collect_local_args();
             let cmp_dst = c.fresh_vreg();
             if konst >= 0 && konst < 4096 {
                 c.emit(IrInst::Alu {
@@ -894,7 +906,6 @@ fn compile_fused_op(
             c.emit(IrInst::BrIfZero {
                 cond: cmp_dst,
                 label,
-                args,
             });
             c.block_stack.push(OpenBlock {
                 block_idx,
@@ -911,15 +922,17 @@ fn compile_fused_op(
             let param_count = callee.param_count();
             let has_result = callee.result_count() > 0;
             let mut args = Vec::with_capacity(param_count);
-            for _ in 0..param_count {
-                args.push(c.vpop());
+            for i in (0..param_count).rev() {
+                let size = (slot_size(callee.params[i]) * 4) as u8;
+                args.push((c.vpop(), size));
             }
             args.reverse();
             let spill_count = c.vstack.len();
             c.flush_vstack_above(0);
             c.flush_fuel();
             let result = if has_result {
-                Some(c.fresh_vreg())
+                let size = (slot_size(callee.results[0]) * 4) as u8;
+                Some((c.fresh_vreg(), size))
             } else {
                 None
             };
@@ -934,7 +947,7 @@ fn compile_fused_op(
             if spill_count > 0 {
                 c.reload_from_stack(spill_count);
             }
-            if let Some(r) = result {
+            if let Some((r, _)) = result {
                 c.local_vreg[local_idx as usize] = Some(r);
                 c.frame_dirty[local_idx as usize] = true;
             }
@@ -946,13 +959,12 @@ fn compile_fused_op(
 
             c.emit_local_get(local_idx);
             let val = c.vpop();
-            let args = c.collect_local_args();
+            c.flush_dirty_locals();
 
             let label = c.fresh_label();
             c.emit(IrInst::BrIfNonZero {
                 cond: val,
                 label,
-                args,
             });
             c.block_stack.push(OpenBlock {
                 block_idx,
