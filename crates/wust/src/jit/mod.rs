@@ -188,7 +188,7 @@ impl JitModule {
                 // Load JIT state from context.
                 "mov x20, {ctx}",
                 "ldr x21, [x20, #{fuel}]",
-                "ldr x29, [x20, #{wasm_fp}]",
+                "ldr x29, [x20, #{fp}]",
                 "ldr x9,  [x20, #{fibre_sp}]",
                 // Save host SP, switch to fiber stack.
                 "mov x28, sp",
@@ -197,7 +197,7 @@ impl JitModule {
                 "blr {code}",
                 // Store JIT state back to context.
                 "str x21, [x20, #{fuel}]",
-                "str x29, [x20, #{wasm_fp}]",
+                "str x29, [x20, #{fp}]",
                 // Restore host SP from x28.
                 "mov sp, x28",
                 // Restore host callee-saved regs.
@@ -207,7 +207,7 @@ impl JitModule {
                 ctx = in(reg) ctx_ptr,
                 code = in(reg) trampoline_ptr,
                 fuel = const FUEL,
-                wasm_fp = const WASM_FP,
+                fp = const WASM_FP,
                 fibre_sp = const FIBRE_SP,
                 out("x9") _, out("x10") _, out("x11") _,
                 out("x12") _, out("x13") _, out("x14") _,

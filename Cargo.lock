@@ -2946,6 +2946,7 @@ dependencies = [
  "anyhow",
  "libc",
  "wasmparser 0.245.1",
+ "wat",
 ]
 
 [[package]]

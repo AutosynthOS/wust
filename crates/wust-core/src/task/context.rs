@@ -1,7 +1,7 @@
 use super::fibre_stack::FibreStackPointer;
 use super::wasm_stack::WasmFramePointer;
 
-/// Outcome of a JIT poll — did the function return normally or suspend?
+/// Outcome of a poll — did the function return normally or suspend?
 #[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
@@ -11,18 +11,19 @@ pub enum Outcome {
     Ready = 3,
 }
 
-/// Runtime context passed to JIT code via a pinned register (g.ctx = x20).
+/// Runtime context passed to execution engines.
 ///
 /// Layout is `#[repr(C)]` so generated code can access fields at
 /// known offsets.
 #[repr(C)]
 pub struct Context {
-    /// Set by JIT code: 0 = Return, 1 = Suspended.
+    /// Set by engine: 0 = Return, 1 = Suspended.
     pub outcome: Outcome,
     /// Remaining fuel for execution.
     pub fuel: i64,
-    /// Current wasm frame pointer. Owns the wasm stack mmap.
+    /// Frame pointer. Points to the current frame header `[func_idx: u32 | pc: u32]`.
+    /// Operands live above fp + FRAME_HEADER_SIZE. Locals live below fp.
     pub wasm_fp: WasmFramePointer,
-    /// Current fibre stack pointer. Owns the fibre stack mmap.
+    /// Native fiber stack pointer (for JIT use).
     pub fibre_sp: FibreStackPointer,
 }

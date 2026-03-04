@@ -38,6 +38,12 @@ impl InlineOp {
         (self.0 >> 8) as u32
     }
 
+    /// Read the immediate as a sign-extended i32 from the 24-bit field.
+    #[inline(always)]
+    pub fn immediate_i32(self) -> i32 {
+        ((self.0 >> 8) as i32) << 8 >> 8
+    }
+
     /// Raw u64 value (for debugging/dump).
     pub fn raw(self) -> u64 {
         self.0
@@ -99,6 +105,9 @@ impl InlineOp {
             OpCode::LocalGet => format!("local.get {imm}"),
             OpCode::LocalSet => format!("local.set {imm}"),
             OpCode::LocalTee => format!("local.tee {imm}"),
+            OpCode::LocalGetI32 | OpCode::LocalGetI64 => format!("{} @{imm}", op.wasm_name()),
+            OpCode::LocalSetI32 | OpCode::LocalSetI64 => format!("{} @{imm}", op.wasm_name()),
+            OpCode::LocalTeeI32 | OpCode::LocalTeeI64 => format!("{} @{imm}", op.wasm_name()),
             OpCode::GlobalGet => format!("global.get {imm}"),
             OpCode::GlobalSet => format!("global.set {imm}"),
             OpCode::Call => format!("call {imm}"),
@@ -369,6 +378,14 @@ pub enum OpCode {
     LocalGet,
     LocalSet,
     LocalTee,
+
+    /// Type-specialized local access. Immediate = byte offset from fp.
+    LocalGetI32,
+    LocalSetI32,
+    LocalTeeI32,
+    LocalGetI64,
+    LocalSetI64,
+    LocalTeeI64,
 
     GlobalGet,
     GlobalSet,

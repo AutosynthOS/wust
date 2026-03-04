@@ -6,7 +6,8 @@ mod wasm_stack;
 use wasmparser::ValType;
 
 use crate::module::ParsedModule;
-use crate::task::frame::WasmFrame;
+use crate::module::body::slot_size;
+use crate::task::frame::FrameHeader;
 use crate::value::Val;
 use crate::{FuncIdx, Instance};
 pub use context::{Context, Outcome};
@@ -35,23 +36,34 @@ impl Task {
         Self::setup_with_func_idx(instance, func_idx, args)
     }
 
-    /// Set up a new task for calling the function with the given args.
+    /// Set up a new task for calling the function at the given index.
+    ///
+    /// Stack layout after setup:
+    /// ```text
+    /// [FrameHeader][locals...]
+    /// ^fp                     ^sp (stack top)
+    /// ```
     pub fn setup_with_func_idx(
         instance: &Instance,
         func_idx: FuncIdx,
         args: &[Val],
     ) -> Result<Self, anyhow::Error> {
-        instance
-            .module()
+        let module = instance.module();
+        let func = module
             .funcs
             .get(*func_idx as usize)
             .ok_or_else(|| anyhow::anyhow!("function {func_idx} not found"))?;
 
-        let wasm_fp = WasmFramePointer::new(WasmFrame::from(func_idx, 0))?;
+        let mut wasm_fp = WasmFramePointer::new()?;
         let fibre_sp = FibreStackPointer::new()?;
+        let base = wasm_fp.base();
 
-        for (i, arg) in args.iter().enumerate() {
-            wasm_fp.write_local(i * 8, arg.to_raw());
+        unsafe {
+            // Write frame header at base (outermost: prev_fp_offset=0).
+            std::ptr::write(base as *mut FrameHeader, FrameHeader::new(func_idx, 0, 0));
+            let locals_base = base.add(FRAME_HEADER_SIZE);
+            write_locals(locals_base, func, args);
+            wasm_fp.ptr = base;
         }
 
         Ok(Self {
@@ -61,52 +73,80 @@ impl Task {
                 wasm_fp,
                 fibre_sp,
             },
-            module: instance.module().clone(),
+            module: module.clone(),
         })
     }
 
-    /// Reset the task for another call to the same function, reusing
-    /// existing stack allocations. Rewrites the frame header and args.
+    /// Reset the task for another call, reusing existing stack allocations.
     pub fn reset(&mut self, func_idx: FuncIdx, args: &[Val]) {
-        let frame = WasmFrame::from(func_idx, 0);
-        let wasm_fp = &mut self.context.wasm_fp;
-        // Reset fp to base of stack.
-        wasm_fp.ptr = wasm_fp.base();
+        let func = &self.module.funcs[*func_idx as usize];
+        let base = self.context.wasm_fp.base();
+
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                &frame as *const WasmFrame as *const u8,
-                wasm_fp.ptr,
-                std::mem::size_of::<WasmFrame>(),
-            );
-        }
-        for (i, arg) in args.iter().enumerate() {
-            wasm_fp.write_local(i * 8, arg.to_raw());
+            std::ptr::write(base as *mut FrameHeader, FrameHeader::new(func_idx, 0, 0));
+            let locals_base = base.add(FRAME_HEADER_SIZE);
+            write_locals(locals_base, func, args);
+            self.context.wasm_fp.ptr = base;
         }
         self.context.outcome = Outcome::Ready;
     }
 
-    /// Read results from the frame after `Outcome::Return`.
+    /// Read results after `Outcome::Return`.
+    ///
+    /// `wasm_fp.ptr` points at the outermost FrameHeader. Read func_idx,
+    /// then results sit on the operand stack after locals.
     pub fn results(&self) -> Vec<Val> {
         let wasm_fp = &self.context.wasm_fp;
         let func_idx = wasm_fp.frame().func_idx();
         let func = &self.module.funcs[*func_idx as usize];
-        func.results
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| {
-                let raw = wasm_fp.read_local(i * 8);
-                read_typed(raw, ty)
-            })
-            .collect()
+        let operand_base = unsafe {
+            wasm_fp
+                .ptr
+                .add(FRAME_HEADER_SIZE + func.locals_size_bytes() as usize)
+        };
+
+        let mut vals = Vec::new();
+        let mut offset = 0usize;
+        for ty in func.results.iter() {
+            vals.push(unsafe { read_compact(operand_base.add(offset), ty) });
+            offset += slot_size(*ty) as usize * 4;
+        }
+        vals
     }
 }
 
-fn read_typed(raw: u64, ty: &ValType) -> Val {
-    match ty {
-        ValType::I32 => Val::I32(raw as i32),
-        ValType::I64 => Val::I64(raw as i64),
-        ValType::F32 => Val::F32(f32::from_bits(raw as u32)),
-        ValType::F64 => Val::F64(f64::from_bits(raw)),
-        _ => todo!("return type {ty:?} not yet supported"),
+/// Write args into locals and zero the rest.
+unsafe fn write_locals(locals_base: *mut u8, func: &crate::module::FuncMeta, args: &[Val]) {
+    let total = func.locals_size_bytes() as usize;
+    unsafe { std::ptr::write_bytes(locals_base, 0, total) };
+    for (i, (arg, ty)) in args.iter().zip(func.params.iter()).enumerate() {
+        let offset = func.local_byte_offsets[i] as usize;
+        unsafe { write_compact(locals_base.add(offset), arg, ty) };
+    }
+}
+
+/// Write a Val to the stack in compact format (4 bytes for i32/f32, 8 for i64/f64).
+unsafe fn write_compact(dst: *mut u8, val: &Val, _ty: &ValType) {
+    unsafe {
+        match val {
+            Val::I32(v) => (dst as *mut i32).write_unaligned(*v),
+            Val::I64(v) => (dst as *mut i64).write_unaligned(*v),
+            Val::F32(v) => (dst as *mut u32).write_unaligned(v.to_bits()),
+            Val::F64(v) => (dst as *mut u64).write_unaligned(v.to_bits()),
+            _ => todo!("write_compact for {val:?}"),
+        }
+    }
+}
+
+/// Read a Val from the stack in compact format.
+unsafe fn read_compact(src: *const u8, ty: &ValType) -> Val {
+    unsafe {
+        match ty {
+            ValType::I32 => Val::I32((src as *const i32).read_unaligned()),
+            ValType::I64 => Val::I64((src as *const i64).read_unaligned()),
+            ValType::F32 => Val::F32(f32::from_bits((src as *const u32).read_unaligned())),
+            ValType::F64 => Val::F64(f64::from_bits((src as *const u64).read_unaligned())),
+            _ => todo!("read_compact for {ty:?}"),
+        }
     }
 }

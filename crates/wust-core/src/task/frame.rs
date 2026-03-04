@@ -1,25 +1,27 @@
 use crate::FuncIdx;
 
-/// Frame header size in bytes (2 slots).
-/// Slot 0 (+0): func_idx (u32) | resume_point (u32)
-/// Slot 1 (+8): reserved
-pub const FRAME_HEADER_SIZE: usize = size_of::<WasmFrame>();
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Frame header at the start of every call frame. `wasm_fp.ptr` points here.
+///
+/// Layout: `[func_idx: u32 | prev_resume_pc: u32 | prev_fp_offset: u32]`
+///
+/// `prev_fp_offset` is the byte distance back to the caller's FrameHeader.
+/// Zero means outermost frame (no caller).
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub struct WasmFrame {
+pub struct FrameHeader {
     func_idx: FuncIdx,
-    resume_point: ResumePoint,
-    /// Padding to match the JIT's 16-byte frame header ABI.
-    _reserved: u64,
+    prev_resume_pc: u32,
+    prev_fp_offset: u32,
 }
 
-impl WasmFrame {
-    pub fn from(func_idx: FuncIdx, resume_point: u32) -> Self {
+pub const FRAME_HEADER_SIZE: usize = size_of::<FrameHeader>();
+
+impl FrameHeader {
+    pub fn new(func_idx: FuncIdx, prev_resume_pc: u32, prev_fp_offset: u32) -> Self {
         Self {
             func_idx,
-            resume_point: ResumePoint(resume_point),
-            _reserved: 0,
+            prev_resume_pc,
+            prev_fp_offset,
         }
     }
 
@@ -28,13 +30,13 @@ impl WasmFrame {
         self.func_idx
     }
 
-    /// Read the resume point from the frame header.
     #[inline(always)]
-    pub fn resume_point(&self) -> ResumePoint {
-        self.resume_point
+    pub fn prev_resume_pc(&self) -> u32 {
+        self.prev_resume_pc
+    }
+
+    #[inline(always)]
+    pub fn prev_fp_offset(&self) -> u32 {
+        self.prev_fp_offset
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(transparent)]
-pub struct ResumePoint(u32);

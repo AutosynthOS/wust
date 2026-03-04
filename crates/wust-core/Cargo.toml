@@ -7,3 +7,6 @@ edition = "2024"
 wasmparser = "0.245"
 libc = "0.2"
 anyhow = "1"
+
+[dev-dependencies]
+wat = "1.245.1"

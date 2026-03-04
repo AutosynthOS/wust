@@ -7,8 +7,3 @@ use wust_core::{Outcome, Task};
 pub trait ModuleExecutor {
     fn poll(&self, task: &mut Task) -> Outcome;
 }
-
-/// Unpack func_idx from frame header slot 0.
-pub(crate) fn frame_func_idx(header: u64) -> u32 {
-    header as u32
-}

@@ -1,73 +1,74 @@
-use std::ptr;
-
 use crate::mmap::MmapRegion;
-use crate::task::frame::{FRAME_HEADER_SIZE, WasmFrame};
+use crate::task::frame::FrameHeader;
 
 const DEFAULT_STACK_PAGES: usize = 64;
 const GUARD_PAGES: usize = 1;
 
-/// Wasm operand/local stack with guard pages.
+/// Wasm frame pointer with backing stack allocation.
 ///
-/// Owns the backing mmap. The `ptr` field holds the current frame
-/// pointer. `repr(C)` so the JIT can load `ptr` at a known offset
-/// from the Context pointer.
+/// `ptr` points at the current `FrameHeader`. Locals are below it,
+/// operands are above it (after FRAME_HEADER_SIZE bytes).
+/// `repr(C)` so the JIT can load `ptr` at a known offset from the
+/// Context pointer.
 ///
 /// Layout:
 /// ```text
 /// [guard]  [usable ................]  [guard]
 ///  NONE     READ|WRITE                 NONE
-///           ^base (initial fp)
+///           ^base
 /// ```
 #[repr(C)]
 pub struct WasmFramePointer {
-    /// Current frame pointer. Points to the active frame header.
+    /// Points at the current `FrameHeader`.
     pub ptr: *mut u8,
     region: MmapRegion,
 }
 
 impl WasmFramePointer {
-    /// Allocate a new wasm stack and write the initial frame header.
-    pub fn new(frame: WasmFrame) -> Result<Self, anyhow::Error> {
+    /// Allocate a new wasm stack. Stack top starts at base.
+    pub fn new() -> Result<Self, anyhow::Error> {
         let region = MmapRegion::new(DEFAULT_STACK_PAGES, GUARD_PAGES)?;
         let base = region.base();
-        unsafe {
-            ptr::copy_nonoverlapping(
-                &frame as *const WasmFrame as *const u8,
-                base,
-                size_of::<WasmFrame>(),
-            );
-        }
         Ok(Self { ptr: base, region })
-    }
-
-    /// Read the current frame header.
-    #[inline(always)]
-    pub fn frame(&self) -> &WasmFrame {
-        unsafe { &*(self.ptr as *const WasmFrame) }
-    }
-
-    /// Write a u64 value at a slot offset (relative to frame header end).
-    #[inline(always)]
-    pub fn write_local(&self, offset: usize, val: u64) {
-        unsafe {
-            let dst = self.ptr.add(FRAME_HEADER_SIZE + offset) as *mut u64;
-            ptr::write(dst, val);
-        }
-    }
-
-    /// Read a u64 value at a slot offset (relative to frame header end).
-    #[inline(always)]
-    pub fn read_local(&self, offset: usize) -> u64 {
-        unsafe {
-            let src = self.ptr.add(FRAME_HEADER_SIZE + offset) as *const u64;
-            ptr::read(src)
-        }
     }
 
     /// Base pointer of the usable stack region.
     #[inline(always)]
     pub fn base(&self) -> *mut u8 {
         self.region.base()
+    }
+
+    /// Read the current frame header.
+    #[inline(always)]
+    pub fn frame(&self) -> &FrameHeader {
+        unsafe { &*(self.ptr as *const FrameHeader) }
+    }
+
+    /// Read an i32 at `byte_offset` from the current frame pointer.
+    #[inline(always)]
+    pub fn read_i32(&self, byte_offset: u32) -> i32 {
+        unsafe { (self.ptr.add(byte_offset as usize) as *const i32).read_unaligned() }
+    }
+
+    /// Write an i32 at `byte_offset` from the current frame pointer.
+    ///
+    /// Takes `&self` because writes go through the raw `ptr` field.
+    /// Safety is guaranteed by the mmap backing with guard pages.
+    #[inline(always)]
+    pub fn write_i32(&self, byte_offset: u32, val: i32) {
+        unsafe { (self.ptr.add(byte_offset as usize) as *mut i32).write_unaligned(val) }
+    }
+
+    /// Read an i64 at `byte_offset` from the current frame pointer.
+    #[inline(always)]
+    pub fn read_i64(&self, byte_offset: u32) -> i64 {
+        unsafe { (self.ptr.add(byte_offset as usize) as *const i64).read_unaligned() }
+    }
+
+    /// Write an i64 at `byte_offset` from the current frame pointer.
+    #[inline(always)]
+    pub fn write_i64(&self, byte_offset: u32, val: i64) {
+        unsafe { (self.ptr.add(byte_offset as usize) as *mut i64).write_unaligned(val) }
     }
 
     /// Guard page address ranges for trap detection.

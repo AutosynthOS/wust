@@ -89,11 +89,18 @@ impl ParsedModuleInner {
     }
 }
 
+/// Raw body data extracted from the code section, before full decoding.
+struct RawBody {
+    body_locals: Vec<wasmparser::ValType>,
+    raw_bytes: Box<[u8]>,
+    /// The FunctionBody range for re-reading operators during decode.
+    range: std::ops::Range<usize>,
+}
+
 struct ModuleBuilder<'a> {
     types: &'a wasmparser::types::Types,
     wasm_bytes: &'a [u8],
-    /// (decoded_body, raw_bytes, declared_locals) per code section entry.
-    bodies: Vec<(ParsedBody, Box<[u8]>, Vec<wasmparser::ValType>)>,
+    raw_bodies: Vec<RawBody>,
     exports: HashMap<String, FuncIdx>,
 }
 
@@ -102,14 +109,14 @@ impl<'a> ModuleBuilder<'a> {
         Self {
             types,
             wasm_bytes,
-            bodies: Vec::new(),
+            raw_bodies: Vec::new(),
             exports: HashMap::new(),
         }
     }
 
     fn process_payload(&mut self, payload: Payload) -> Result<(), anyhow::Error> {
         match payload {
-            Payload::CodeSectionEntry(body) => self.parse_body(body),
+            Payload::CodeSectionEntry(body) => self.collect_body(body),
             Payload::ExportSection(reader) => {
                 for export in reader {
                     let export = export?;
@@ -124,7 +131,9 @@ impl<'a> ModuleBuilder<'a> {
         }
     }
 
-    fn parse_body(&mut self, body: wasmparser::FunctionBody) -> Result<(), anyhow::Error> {
+    /// Collect raw body data without full decoding — we need param types
+    /// from the type section first, which are only available in build().
+    fn collect_body(&mut self, body: wasmparser::FunctionBody) -> Result<(), anyhow::Error> {
         let mut body_locals = Vec::new();
         for local in body.get_locals_reader()? {
             let (count, val_type) = local?;
@@ -133,52 +142,84 @@ impl<'a> ModuleBuilder<'a> {
             }
         }
 
-        // Extract raw operator bytes.
         let range = body.range();
         let operators_reader = body.get_operators_reader()?;
         let ops_offset = operators_reader.original_position();
         let raw_bytes = &self.wasm_bytes[ops_offset..range.end];
 
-        // Decode into InlineOp stream.
-        let types_ref = self.types.as_ref();
-        let decoded = ParsedBody::parse(&body, &types_ref)?;
-
-        self.bodies
-            .push((decoded, raw_bytes.to_vec().into_boxed_slice(), body_locals));
+        self.raw_bodies.push(RawBody {
+            body_locals,
+            raw_bytes: raw_bytes.to_vec().into_boxed_slice(),
+            range: range.start..range.end,
+        });
         Ok(())
     }
 
     fn build(mut self) -> ParsedModuleInner {
         let types_ref = self.types.as_ref();
         let total = types_ref.function_count();
-        let num_imported = total - self.bodies.len() as u32;
+        let num_imported = total - self.raw_bodies.len() as u32;
 
         let funcs = (0..total)
             .map(|idx| {
                 let core_type_id = types_ref.core_function_at(idx);
                 let func_type = types_ref[core_type_id].unwrap_func();
-                let params = func_type.params();
-
-                let (mut decoded, body_bytes, body_locals) = if idx < num_imported {
-                    (ParsedBody::import(), Box::new([]) as Box<[u8]>, vec![])
-                } else {
-                    std::mem::take(&mut self.bodies[(idx - num_imported) as usize])
-                };
-
+                let params: Box<[wasmparser::ValType]> = func_type.params().into();
                 let results: Box<[wasmparser::ValType]> = func_type.results().into();
 
-                // Patch function-level block (index 0) with result count.
-                let rc = results.len() as u32;
-                if !decoded.blocks.is_empty() {
-                    decoded.blocks[0].result_count = rc;
+                if idx < num_imported {
+                    let local_byte_offsets = FuncMeta::compute_local_offsets(&params, &[]);
+                    let locals_size = FuncMeta::compute_locals_size(&params, &[]);
+                    return FuncMeta {
+                        params,
+                        locals: Box::new([]),
+                        results,
+                        body: ParsedBody::import(),
+                        body_bytes: Box::new([]),
+                        local_byte_offsets,
+                        locals_size,
+                    };
                 }
 
+                let raw = std::mem::replace(
+                    &mut self.raw_bodies[(idx - num_imported) as usize],
+                    RawBody {
+                        body_locals: vec![],
+                        raw_bytes: Box::new([]),
+                        range: 0..0,
+                    },
+                );
+
+                // All local types: params followed by declared locals.
+                let all_local_types: Vec<wasmparser::ValType> = params
+                    .iter()
+                    .chain(raw.body_locals.iter())
+                    .copied()
+                    .collect();
+
+                // Single-pass decode: parse opcodes AND compute operand depth.
+                let reader = wasmparser::BinaryReader::new(
+                    &self.wasm_bytes[raw.range.start..raw.range.end],
+                    raw.range.start,
+                );
+                let body = wasmparser::FunctionBody::new(reader);
+                let locals_box: Box<[wasmparser::ValType]> = raw.body_locals.into();
+                let local_byte_offsets =
+                    FuncMeta::compute_local_offsets(&params, &locals_box);
+
+                let decoded = ParsedBody::parse(
+                    &body, &types_ref, &all_local_types, &results, &local_byte_offsets,
+                ).expect("body decode failed (already validated)");
+                let locals_size = FuncMeta::compute_locals_size(&params, &locals_box);
+
                 FuncMeta {
-                    params: params.into(),
-                    locals: body_locals.into(),
+                    params,
+                    locals: locals_box,
                     results,
                     body: decoded,
-                    body_bytes,
+                    body_bytes: raw.raw_bytes,
+                    local_byte_offsets,
+                    locals_size,
                 }
             })
             .collect();
