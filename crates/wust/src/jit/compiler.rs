@@ -1,5 +1,6 @@
 use wust_codegen::ir::{AluOp, IrFunction, IrInst, Label, Operand, UnaryOp, VReg};
 use wust_core::module::op::InlineOp;
+use wust_core::module::body::slot_size;
 use wust_core::{BlockKind, FuncMeta, OpCode};
 
 use crate::jit::fuse;
@@ -37,9 +38,14 @@ struct IrCompiler {
     block_stack: Vec<OpenBlock>,
     /// Maximum vstack depth seen during compilation.
     max_vstack_depth: usize,
-    /// Total number of locals (params + declared). Used to compute
-    /// frame slot indices for operand stack spills.
+    /// Total number of locals (params + declared).
     total_local_count: u32,
+    /// Byte offset from x29 for each local (x29 = base of locals).
+    local_byte_offsets: Box<[u16]>,
+    /// Size in bytes of each local (4 for i32/f32, 8 for i64/f64).
+    local_sizes: Box<[u8]>,
+    /// Byte offset from x29 where operands start (= locals_size + HEADER_SIZE).
+    operand_base_offset: u32,
     /// Accumulated fuel cost for the current basic block. Flushed as a
     /// single FuelCheck before branches, labels, calls, and returns.
     pending_fuel: u32,
@@ -54,7 +60,13 @@ struct IrCompiler {
 }
 
 impl IrCompiler {
-    fn new(total_local_count: u32, emit_fuel: bool) -> Self {
+    fn new(
+        total_local_count: u32,
+        local_byte_offsets: Box<[u16]>,
+        local_sizes: Box<[u8]>,
+        operand_base_offset: u32,
+        emit_fuel: bool,
+    ) -> Self {
         IrCompiler {
             insts: Vec::new(),
             source_ops: Vec::new(),
@@ -65,6 +77,9 @@ impl IrCompiler {
             block_stack: Vec::new(),
             max_vstack_depth: 0,
             total_local_count,
+            local_byte_offsets,
+            local_sizes,
+            operand_base_offset,
             pending_fuel: 0,
             emit_fuel,
             local_vreg: vec![None; total_local_count as usize],
@@ -144,7 +159,9 @@ impl IrCompiler {
         for idx in 0..self.total_local_count {
             if self.frame_dirty[idx as usize] {
                 if let Some(v) = self.local_vreg[idx as usize] {
-                    self.insts.push(IrInst::FrameStore { slot: idx, src: v });
+                    let offset = self.local_byte_offsets[idx as usize] as u32;
+                    let size = self.local_sizes[idx as usize];
+                    self.insts.push(IrInst::LocalSet { offset, src: v, size });
                     self.source_ops.push(self.current_op);
                     self.frame_dirty[idx as usize] = false;
                 }
@@ -161,7 +178,9 @@ impl IrCompiler {
                     v
                 } else {
                     let dst = self.fresh_vreg();
-                    self.emit(IrInst::LocalGet { dst, idx: i });
+                    let offset = self.local_byte_offsets[i as usize] as u32;
+                    let size = self.local_sizes[i as usize];
+                    self.emit(IrInst::LocalGet { dst, offset, size });
                     self.local_vreg[i as usize] = Some(dst);
                     self.frame_dirty[i as usize] = false;
                     dst
@@ -178,11 +197,11 @@ impl IrCompiler {
     }
 
     /// Update local_vreg tracking from DefLabel block params.
-    /// Marks all as dirty since canonical frame may not match.
+    /// Params are clean — the branch already stored values to frame.
     fn apply_local_params(&mut self, params: &[VReg]) {
         for (i, &v) in params.iter().enumerate() {
             self.local_vreg[i] = Some(v);
-            self.frame_dirty[i] = true;
+            self.frame_dirty[i] = false;
         }
     }
 
@@ -206,21 +225,20 @@ impl IrCompiler {
 
     fn emit_local_get(&mut self, idx: u32) {
         if let Some(v) = self.local_vreg[idx as usize] {
-            // Value already in a register — reuse it, emit nothing.
             self.vpush(v);
         } else {
-            // Value only in frame — load it.
             let dst = self.fresh_vreg();
-            self.emit(IrInst::LocalGet { dst, idx });
+            let offset = self.local_byte_offsets[idx as usize] as u32;
+            let size = self.local_sizes[idx as usize];
+            self.emit(IrInst::LocalGet { dst, offset, size });
             self.local_vreg[idx as usize] = Some(dst);
-            self.frame_dirty[idx as usize] = false; // just loaded from frame
+            self.frame_dirty[idx as usize] = false;
             self.vpush(dst);
         }
     }
 
     fn emit_local_set(&mut self, idx: u32) {
         let src = self.vpop();
-        // Track in register, defer frame store to next flush.
         self.local_vreg[idx as usize] = Some(src);
         self.frame_dirty[idx as usize] = true;
     }
@@ -252,11 +270,11 @@ impl IrCompiler {
     /// Used at if/else merge points: stores branch results to frame
     /// operand stack slots, then truncates vstack to the given depth.
     fn flush_vstack_above(&mut self, depth: usize) {
-        let base = self.total_local_count;
         let extras: Vec<VReg> = self.vstack.drain(depth..).collect();
         for (i, vreg) in extras.into_iter().enumerate() {
+            let offset = self.operand_base_offset + (depth as u32 + i as u32) * 8;
             self.emit(IrInst::FrameStore {
-                slot: base + depth as u32 + i as u32,
+                offset,
                 src: vreg,
             });
         }
@@ -269,13 +287,13 @@ impl IrCompiler {
     /// current vstack depth (i.e., the slot index where the flushed
     /// values start).
     fn reload_from_stack(&mut self, count: usize) {
-        let base = self.total_local_count;
         let depth = self.vstack.len() as u32;
         for i in 0..count {
             let dst = self.fresh_vreg();
+            let offset = self.operand_base_offset + (depth + i as u32) * 8;
             self.emit(IrInst::FrameLoad {
                 dst,
-                slot: base + depth + i as u32,
+                offset,
             });
             self.vstack.push(dst);
         }
@@ -298,7 +316,17 @@ pub(crate) fn compile_with(
 ) -> IrFunction {
     let total_locals = func.local_count() as u32;
     let param_count = func.param_count() as u32;
-    let mut c = IrCompiler::new(total_locals, emit_fuel);
+    let local_sizes: Box<[u8]> = func.params.iter().chain(func.locals.iter())
+        .map(|ty| (slot_size(*ty) * 4) as u8)
+        .collect();
+    let operand_base_offset = func.locals_size as u32 + wust_core::FRAME_HEADER_SIZE as u32;
+    let mut c = IrCompiler::new(
+        total_locals,
+        func.local_byte_offsets.clone(),
+        local_sizes,
+        operand_base_offset,
+        emit_fuel,
+    );
 
     // Params start in registers (x9, x10, ...) via ParamDef.
     // Track them as local VRegs — they're dirty (not yet in frame).
@@ -347,6 +375,40 @@ pub(crate) fn compile_with(
 
         let opcode = op.opcode();
         match opcode {
+            OpCode::DataStream => {
+                let data_offset = imm as usize;
+                let data = &func.body.data;
+                let actual_opcode: OpCode = unsafe { std::mem::transmute(data[data_offset]) };
+                let payload = &data[data_offset + 1..];
+                match actual_opcode {
+                    OpCode::I32Const => {
+                        let val = i32::from_le_bytes(payload[..4].try_into().unwrap());
+                        c.emit_i32_const(val);
+                    }
+                    OpCode::I64Const => {
+                        let val = i64::from_le_bytes(payload[..8].try_into().unwrap());
+                        let dst = c.fresh_vreg();
+                        c.emit(IrInst::IConst { dst, val });
+                        c.vpush(dst);
+                    }
+                    OpCode::F32Const => {
+                        let bits = u32::from_le_bytes(payload[..4].try_into().unwrap());
+                        let dst = c.fresh_vreg();
+                        c.emit(IrInst::IConst { dst, val: bits as i64 });
+                        c.vpush(dst);
+                    }
+                    OpCode::F64Const => {
+                        let bits = u64::from_le_bytes(payload[..8].try_into().unwrap());
+                        let dst = c.fresh_vreg();
+                        c.emit(IrInst::IConst { dst, val: bits as i64 });
+                        c.vpush(dst);
+                    }
+                    _ => {
+                        todo!("DataStream with opcode {:?}", actual_opcode);
+                    }
+                }
+            }
+
             OpCode::Nop => {}
 
             OpCode::Unreachable => {
@@ -371,19 +433,19 @@ pub(crate) fn compile_with(
                 c.vpush(dst);
             }
 
-            OpCode::LocalGet => {
-                c.emit_local_get(imm);
+            OpCode::LocalGetI32 => {
+                c.emit_local_get(op.local_index() as u32);
             }
 
-            OpCode::LocalSet => {
-                c.emit_local_set(imm);
+            OpCode::LocalSetI32 => {
+                c.emit_local_set(op.local_index() as u32);
             }
 
-            OpCode::LocalTee => {
+            OpCode::LocalTeeI32 => {
+                let idx = op.local_index() as usize;
                 let src = c.vpeek();
-                // Use local promotion — track in register, defer store.
-                c.local_vreg[imm as usize] = Some(src);
-                c.frame_dirty[imm as usize] = true;
+                c.local_vreg[idx] = Some(src);
+                c.frame_dirty[idx] = true;
             }
 
             OpCode::GlobalGet => {
@@ -503,13 +565,13 @@ pub(crate) fn compile_with(
                 let else_label = c.fresh_label();
                 let end_label = c.fresh_label();
                 let args = c.collect_local_args();
-                let slot = c.total_local_count + c.vstack.len() as u32;
+                let spill_offset = c.operand_base_offset + c.vstack.len() as u32 * 8;
                 c.emit(IrInst::BrIfZero {
                     cond,
                     label: else_label,
                     args: args.clone(),
                 });
-                c.emit(IrInst::FrameStore { slot, src: val1 });
+                c.emit(IrInst::FrameStore { offset: spill_offset, src: val1 });
                 let args2 = c.collect_local_args();
                 c.emit(IrInst::Br {
                     label: end_label,
@@ -521,7 +583,7 @@ pub(crate) fn compile_with(
                     params: params.clone(),
                 });
                 c.apply_local_params(&params);
-                c.emit(IrInst::FrameStore { slot, src: val2 });
+                c.emit(IrInst::FrameStore { offset: spill_offset, src: val2 });
                 let args3 = c.collect_local_args();
                 c.emit(IrInst::Br {
                     label: end_label,
@@ -534,7 +596,7 @@ pub(crate) fn compile_with(
                 });
                 c.apply_local_params(&params2);
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::FrameLoad { dst, slot });
+                c.emit(IrInst::FrameLoad { dst, offset: spill_offset });
                 c.vpush(dst);
             }
 
@@ -699,7 +761,7 @@ pub(crate) fn compile_with(
                 } else {
                     None
                 };
-                let frame_advance = (2 + c.total_local_count + spill_count as u32) * 8;
+                let frame_advance = c.operand_base_offset + spill_count as u32 * 8;
                 c.emit(IrInst::Call {
                     func_idx: imm,
                     args,
@@ -729,7 +791,10 @@ pub(crate) fn compile_with(
         param_count: func.param_count() as u32,
         total_local_count: func.local_count() as u32,
         max_operand_depth: c.max_vstack_depth as u32,
+        operand_base_offset: c.operand_base_offset,
         result_count: func.result_count() as u32,
+        local_byte_offsets: c.local_byte_offsets,
+        local_sizes: c.local_sizes,
     };
 
     eliminate_dead_load_store_pairs(&mut ir);
@@ -858,7 +923,7 @@ fn compile_fused_op(
             } else {
                 None
             };
-            let frame_advance = (2 + c.total_local_count + spill_count as u32) * 8;
+            let frame_advance = c.operand_base_offset + spill_count as u32 * 8;
             c.emit(IrInst::Call {
                 func_idx,
                 args,
@@ -921,15 +986,15 @@ fn eliminate_dead_load_store_pairs(ir: &mut IrFunction) {
         if let (
             IrInst::FrameLoad {
                 dst,
-                slot: load_slot,
+                offset: load_offset,
             },
             IrInst::FrameStore {
-                slot: store_slot,
+                offset: store_offset,
                 src,
             },
         ) = (&ir.insts[i], &ir.insts[i + 1])
         {
-            if load_slot == store_slot && dst == src {
+            if load_offset == store_offset && dst == src {
                 remove[i] = true;
                 remove[i + 1] = true;
             }
@@ -1031,19 +1096,13 @@ fn opcode_to_unary_op(op: OpCode) -> UnaryOp {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Compile a parsed wasm function into IR with fuel checks.
-    pub(crate) fn compile(func: &ParsedFunction, all_funcs: &[ParsedFunction]) -> IrFunction {
-        compile_with(func, all_funcs, true)
-    }
+    use wust_core::ParsedModule;
 
     /// Parse WAT, compile the first function to IR.
     fn compile_wat_ir(wat: &str) -> IrFunction {
         let wasm_bytes = wat::parse_str(wat).expect("failed to parse WAT");
-        let engine = crate::Engine::default();
-        let module =
-            crate::Module::from_bytes(&engine, &wasm_bytes).expect("failed to parse module");
-        compile(&module.funcs[0], &module.funcs)
+        let module = ParsedModule::new(&wasm_bytes).expect("failed to parse module");
+        compile_with(&module.funcs[0], &module.funcs, true)
     }
 
     #[test]

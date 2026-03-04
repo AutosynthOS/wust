@@ -63,6 +63,10 @@ impl FuncMeta {
         self.results.len()
     }
 
+    pub fn results_size(&self) -> u16 {
+        self.results.iter().map(|ty| slot_size(*ty) * 4).sum()
+    }
+
     /// Total number of locals (params + non-param locals).
     pub fn local_count(&self) -> usize {
         self.params.len() + self.locals.len()
@@ -75,7 +79,9 @@ impl FuncMeta {
 
     /// Compute total byte size of params + locals.
     pub fn compute_locals_size(params: &[ValType], locals: &[ValType]) -> u16 {
-        params.iter().chain(locals.iter())
+        params
+            .iter()
+            .chain(locals.iter())
             .map(|ty| slot_size(*ty) * 4)
             .sum()
     }

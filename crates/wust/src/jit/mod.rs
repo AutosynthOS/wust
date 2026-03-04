@@ -61,12 +61,24 @@ pub(crate) fn compile_all(
     let entry_trampolines: Vec<usize> = (0..func_count)
         .map(|i| {
             let func = &module.funcs[i];
-            lower_aarch64::emit_entry_trampoline(
-                &mut e,
-                func_body_starts[i],
-                func.param_count(),
-                func.results.len(),
-            )
+            {
+                let param_offsets: Vec<u16> = func.local_byte_offsets[..func.param_count()].to_vec();
+                // Results are written at wasm_fp.ptr (operand base, offset 0).
+                let mut result_offsets = Vec::with_capacity(func.result_count());
+                let mut off = 0u16;
+                for ty in func.results.iter() {
+                    result_offsets.push(off);
+                    off += wust_core::module::body::slot_size(*ty) * 4;
+                }
+                let locals_header_size = func.locals_size + wust_core::FRAME_HEADER_SIZE as u16;
+                lower_aarch64::emit_entry_trampoline(
+                    &mut e,
+                    func_body_starts[i],
+                    &param_offsets,
+                    &result_offsets,
+                    locals_header_size,
+                )
+            }
         })
         .collect();
 
@@ -221,7 +233,7 @@ impl JitModule {
 
 impl ModuleExecutor for JitModule {
     fn poll(&self, task: &mut Task) -> Outcome {
-        let func_idx = *task.context.wasm_fp.frame().func_idx() as usize;
+        let func_idx = *task.context.wasm_fp.frame().func_idx as usize;
         self.call_trampoline(task, func_idx)
     }
 }

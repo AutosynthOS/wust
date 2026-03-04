@@ -187,9 +187,6 @@ impl OpCode {
             // immediates
             Self::I32Const => "i32.const",
             Self::I64Const => "i64.const",
-            Self::LocalGet => "local.get",
-            Self::LocalSet => "local.set",
-            Self::LocalTee => "local.tee",
             Self::LocalGetI32 => "local.get.i32",
             Self::LocalSetI32 => "local.set.i32",
             Self::LocalTeeI32 => "local.tee.i32",

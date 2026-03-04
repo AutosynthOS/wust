@@ -257,6 +257,32 @@ pub fn run_test_subprocess_timed(name: &str, path: &Path, timeout: Duration) -> 
     }
 }
 
+/// Escape newlines and tabs so a protocol field stays on one line and
+/// doesn't collide with the tab delimiter.
+fn escape_protocol(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\n', "\\n").replace('\t', "\\t")
+}
+
+/// Reverse `escape_protocol`.
+fn unescape_protocol(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some(other) => { out.push('\\'); out.push(other); }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Parse the stdout protocol emitted by a child process.
 /// Each line: `PASS|FAIL <index> <label>\t<error>\t<line>\t<source>`
 pub fn parse_subprocess_output(stdout: &str) -> Vec<DirectiveResult> {
@@ -271,14 +297,14 @@ pub fn parse_subprocess_output(stdout: &str) -> Vec<DirectiveResult> {
             let parts: Vec<&str> = rest.splitn(4, '\t').collect();
             let label = parts.first().unwrap_or(&"").to_string();
             let error = parts.get(1).and_then(|s| {
-                if s.is_empty() { None } else { Some(s.to_string()) }
+                if s.is_empty() { None } else { Some(unescape_protocol(s)) }
             });
             let line_num = parts.get(2).and_then(|s| s.parse::<usize>().ok());
             let source = parts.get(3).and_then(|s| {
                 if s.is_empty() {
                     None
                 } else {
-                    Some(s.replace("\\n", "\n"))
+                    Some(unescape_protocol(s))
                 }
             });
             Some(DirectiveResult {
@@ -298,14 +324,9 @@ pub fn parse_subprocess_output(stdout: &str) -> Vec<DirectiveResult> {
 pub fn print_subprocess_results(results: &[DirectiveResult]) {
     for r in results {
         let status = if r.passed { "PASS" } else { "FAIL" };
-        let error = r.error.as_deref().unwrap_or("");
+        let error = escape_protocol(r.error.as_deref().unwrap_or(""));
         let line = r.line.map(|l| l.to_string()).unwrap_or_default();
-        // Escape newlines in source so the protocol stays one-line-per-result.
-        let source = r
-            .source
-            .as_deref()
-            .map(|s| s.replace('\n', "\\n"))
-            .unwrap_or_default();
+        let source = escape_protocol(r.source.as_deref().unwrap_or(""));
         println!("{status} {} {}\t{error}\t{line}\t{source}", r.index, r.label);
     }
 }

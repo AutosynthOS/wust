@@ -1,5 +1,5 @@
 use crate::mmap::MmapRegion;
-use crate::task::frame::FrameHeader;
+use crate::task::frame::{FRAME_HEADER_SIZE, FrameHeader};
 
 const DEFAULT_STACK_PAGES: usize = 64;
 const GUARD_PAGES: usize = 1;
@@ -38,37 +38,40 @@ impl WasmFramePointer {
         self.region.base()
     }
 
-    /// Read the current frame header.
+    /// Read the current frame header (located just before fp).
     #[inline(always)]
     pub fn frame(&self) -> &FrameHeader {
-        unsafe { &*(self.ptr as *const FrameHeader) }
+        unsafe { &*(self.ptr.sub(FRAME_HEADER_SIZE) as *const FrameHeader) }
     }
 
-    /// Read an i32 at `byte_offset` from the current frame pointer.
+    /// Mutable access to the current frame header.
+    #[inline(always)]
+    pub fn frame_mut(&mut self) -> &mut FrameHeader {
+        unsafe { &mut *(self.ptr.sub(FRAME_HEADER_SIZE) as *mut FrameHeader) }
+    }
+
+    /// Read an i32 at negative `byte_offset` from fp (locals are below fp).
     #[inline(always)]
     pub fn read_i32(&self, byte_offset: u32) -> i32 {
-        unsafe { (self.ptr.add(byte_offset as usize) as *const i32).read_unaligned() }
+        unsafe { (self.ptr.sub(byte_offset as usize) as *const i32).read_unaligned() }
     }
 
-    /// Write an i32 at `byte_offset` from the current frame pointer.
-    ///
-    /// Takes `&self` because writes go through the raw `ptr` field.
-    /// Safety is guaranteed by the mmap backing with guard pages.
+    /// Write an i32 at negative `byte_offset` from fp (locals are below fp).
     #[inline(always)]
     pub fn write_i32(&self, byte_offset: u32, val: i32) {
-        unsafe { (self.ptr.add(byte_offset as usize) as *mut i32).write_unaligned(val) }
+        unsafe { (self.ptr.sub(byte_offset as usize) as *mut i32).write_unaligned(val) }
     }
 
-    /// Read an i64 at `byte_offset` from the current frame pointer.
+    /// Read an i64 at negative `byte_offset` from fp (locals are below fp).
     #[inline(always)]
     pub fn read_i64(&self, byte_offset: u32) -> i64 {
-        unsafe { (self.ptr.add(byte_offset as usize) as *const i64).read_unaligned() }
+        unsafe { (self.ptr.sub(byte_offset as usize) as *const i64).read_unaligned() }
     }
 
-    /// Write an i64 at `byte_offset` from the current frame pointer.
+    /// Write an i64 at negative `byte_offset` from fp (locals are below fp).
     #[inline(always)]
     pub fn write_i64(&self, byte_offset: u32, val: i64) {
-        unsafe { (self.ptr.add(byte_offset as usize) as *mut i64).write_unaligned(val) }
+        unsafe { (self.ptr.sub(byte_offset as usize) as *mut i64).write_unaligned(val) }
     }
 
     /// Guard page address ranges for trap detection.

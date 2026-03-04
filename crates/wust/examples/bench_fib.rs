@@ -100,8 +100,11 @@ fn print_table(results: &[BenchResult], jit_ms: f64) {
     }
 }
 
-fn run_jit(jit: &JitModule, task: &mut Task, func_idx: FuncIdx, n: i32) -> i32 {
-    task.reset(func_idx, &[Val::I32(n)]);
+fn run_jit(jit: &JitModule, task: &mut Task, n: i32) -> i32 {
+    unsafe {
+        task.setup_root_call_frame(&[Val::I32(n)])
+            .unwrap_unchecked()
+    };
     task.context.fuel = i64::MAX;
     let _ = jit.poll(task);
     match task.results()[0] {
@@ -147,20 +150,16 @@ fn main() {
         BenchResult { name, ms }
     };
 
-    // Resolve export once, setup tasks once, reuse across iterations.
-    let func_idx = module
-        .resolve_export("fib")
-        .expect("export 'fib' not found");
     let mut task_fuel = instance.setup_call("fib", &[Val::I32(n)]).unwrap();
     let mut task_no_fuel = instance.setup_call("fib", &[Val::I32(n)]).unwrap();
 
     // Get expected value.
-    let expected = run_jit(&jit_no_fuel, &mut task_no_fuel, func_idx, n);
+    let expected = run_jit(&jit_no_fuel, &mut task_no_fuel, n);
 
     let jit_result = run(
         "wust jit (with fuel)",
         expected,
-        Box::new(|| run_jit(&jit_module, &mut task_fuel, func_idx, n)),
+        Box::new(|| run_jit(&jit_module, &mut task_fuel, n)),
     );
 
     let jit_ms = jit_result.ms;
@@ -170,7 +169,7 @@ fn main() {
         run(
             "wust jit (no fuel)",
             expected,
-            Box::new(|| run_jit(&jit_no_fuel, &mut task_no_fuel, func_idx, n)),
+            Box::new(|| run_jit(&jit_no_fuel, &mut task_no_fuel, n)),
         ),
         run(
             "wasmtime",

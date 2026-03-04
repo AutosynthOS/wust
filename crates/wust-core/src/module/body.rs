@@ -75,8 +75,9 @@ impl ParsedBody {
         local_types: &[ValType],
         result_types: &[ValType],
         local_byte_offsets: &[u16],
+        locals_size: u16,
     ) -> Result<Self, anyhow::Error> {
-        let mut d = BodyDecoder::new(types, local_types, result_types, local_byte_offsets);
+        let mut d = BodyDecoder::new(types, local_types, result_types, local_byte_offsets, locals_size);
         d.decode(reader)?;
         Ok(d.body)
     }
@@ -122,8 +123,10 @@ struct BodyDecoder<'a> {
     local_types: &'a [ValType],
     /// Function result types.
     result_types: &'a [ValType],
-    /// Byte offset of each local from the locals base (fp + FRAME_HEADER_SIZE).
+    /// Byte offset of each local from the locals base.
     local_byte_offsets: &'a [u16],
+    /// Total byte size of all locals (params + declared).
+    locals_size: u16,
     /// Type of each value on the operand stack.
     type_stack: Vec<ValType>,
     /// True after an unconditional branch (Br, Return, Unreachable).
@@ -137,6 +140,7 @@ impl<'a> BodyDecoder<'a> {
         local_types: &'a [ValType],
         result_types: &'a [ValType],
         local_byte_offsets: &'a [u16],
+        locals_size: u16,
     ) -> Self {
         Self {
             body: ParsedBody::default(),
@@ -145,6 +149,7 @@ impl<'a> BodyDecoder<'a> {
             local_types,
             result_types,
             local_byte_offsets,
+            locals_size,
             type_stack: Vec::new(),
             unreachable: false,
         }
@@ -389,37 +394,40 @@ impl<'a> BodyDecoder<'a> {
             Operator::LocalGet { local_index } => {
                 let ty = self.local_types[local_index as usize];
                 let fp_offset = FRAME_HEADER_SIZE as u32
-                    + self.local_byte_offsets[local_index as usize] as u32;
+                    + self.locals_size as u32
+                    - self.local_byte_offsets[local_index as usize] as u32;
                 let opcode = match slot_size(ty) {
                     1 => OpCode::LocalGetI32,
                     2 => OpCode::LocalGetI64,
                     _ => todo!("LocalGet for {ty:?}"),
                 };
-                self.emit_op(pack_imm_u(opcode, fp_offset));
+                self.emit_op(pack_local(opcode, fp_offset, local_index as u16));
                 self.push(ty);
             }
             Operator::LocalSet { local_index } => {
                 let ty = self.local_types[local_index as usize];
                 let fp_offset = FRAME_HEADER_SIZE as u32
-                    + self.local_byte_offsets[local_index as usize] as u32;
+                    + self.locals_size as u32
+                    - self.local_byte_offsets[local_index as usize] as u32;
                 let opcode = match slot_size(ty) {
                     1 => OpCode::LocalSetI32,
                     2 => OpCode::LocalSetI64,
                     _ => todo!("LocalSet for {ty:?}"),
                 };
-                self.emit_op(pack_imm_u(opcode, fp_offset));
+                self.emit_op(pack_local(opcode, fp_offset, local_index as u16));
                 self.pop();
             }
             Operator::LocalTee { local_index } => {
                 let ty = self.local_types[local_index as usize];
                 let fp_offset = FRAME_HEADER_SIZE as u32
-                    + self.local_byte_offsets[local_index as usize] as u32;
+                    + self.locals_size as u32
+                    - self.local_byte_offsets[local_index as usize] as u32;
                 let opcode = match slot_size(ty) {
                     1 => OpCode::LocalTeeI32,
                     2 => OpCode::LocalTeeI64,
                     _ => todo!("LocalTee for {ty:?}"),
                 };
-                self.emit_op(pack_imm_u(opcode, fp_offset));
+                self.emit_op(pack_local(opcode, fp_offset, local_index as u16));
             }
 
             // --- Globals ---

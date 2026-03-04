@@ -49,9 +49,13 @@ pub enum IrInst {
     /// The lowerer emits nothing — it just tells regalloc2 where the value is.
     ParamDef { dst: VReg, idx: u32 },
     /// Load a local variable into a virtual register.
-    LocalGet { dst: VReg, idx: u32 },
+    /// `offset` is the byte offset from the frame pointer (x29).
+    /// `size` is the value width in bytes (4 for i32/f32, 8 for i64/f64).
+    LocalGet { dst: VReg, offset: u32, size: u8 },
     /// Store a virtual register into a local variable.
-    LocalSet { idx: u32, src: VReg },
+    /// `offset` is the byte offset from the frame pointer (x29).
+    /// `size` is the value width in bytes (4 for i32/f32, 8 for i64/f64).
+    LocalSet { offset: u32, src: VReg, size: u8 },
     /// Binary ALU operation.
     Alu { op: AluOp, dst: VReg, lhs: VReg, rhs: Operand },
     /// Unary operation.
@@ -68,20 +72,17 @@ pub enum IrInst {
     /// Branch if the condition register is nonzero.
     /// Args are values passed to the target block's params.
     BrIfNonZero { cond: VReg, label: Label, args: Vec<VReg> },
-    /// Store a value to a frame slot: `[x29 + slot * 8]`.
-    ///
-    /// Slots 0..total_local_count are locals. Slots beyond that are
-    /// operand stack spill slots at control flow merge points.
-    FrameStore { slot: u32, src: VReg },
-    /// Load a value from a frame slot: `[x29 + slot * 8]`.
-    FrameLoad { dst: VReg, slot: u32 },
+    /// Store a value to a frame byte offset: `[x29 + offset]`.
+    FrameStore { offset: u32, src: VReg },
+    /// Load a value from a frame byte offset: `[x29 + offset]`.
+    FrameLoad { dst: VReg, offset: u32 },
     /// Call a function by index with register-passed arguments.
     ///
     /// Arguments are passed in x9, x10, ... (scratch registers).
     /// A single result (if any) is returned in x9.
     ///
     /// `frame_advance` is the byte offset to advance x29 before the
-    /// call: `(2 + total_local_count + spill_count) * 8`. This is a
+    /// call: `(total_local_count + spill_count) * 8`. This is a
     /// per-call-site constant — different call sites may have
     /// different operand stack depths.
     Call {
@@ -188,17 +189,23 @@ pub struct IrFunction {
     pub total_local_count: u32,
     /// Maximum operand stack depth during execution.
     pub max_operand_depth: u32,
+    /// Byte offset from x29 where operand spills begin.
+    /// Equals the compact locals size + frame header size.
+    pub operand_base_offset: u32,
     /// Number of result values.
     pub result_count: u32,
+    /// Byte offset from x29 for each local variable.
+    pub local_byte_offsets: Box<[u16]>,
+    /// Size in bytes of each local (4 for i32/f32, 8 for i64/f64).
+    pub local_sizes: Box<[u8]>,
 }
 
 impl IrFunction {
     /// Maximum frame size in bytes (for stack bounds checking).
     ///
-    /// Layout: [prev_fp][header][locals][operand stack spills]
-    /// Each slot is 8 bytes. prev_fp and header are 2 slots (16 bytes).
+    /// Layout from x29: [locals + header][operand spills (8 bytes each)]
     pub fn frame_size(&self) -> u32 {
-        (2 + self.total_local_count + self.max_operand_depth) * 8
+        self.operand_base_offset + self.max_operand_depth * 8
     }
 }
 
@@ -286,8 +293,8 @@ impl std::fmt::Display for IrInst {
         match self {
             IrInst::IConst { dst, val } => write!(f, "  {dst} = i32.const {val}"),
             IrInst::ParamDef { dst, idx } => write!(f, "  {dst} = param {idx}"),
-            IrInst::LocalGet { dst, idx } => write!(f, "  {dst} = local.get {idx}"),
-            IrInst::LocalSet { idx, src } => write!(f, "  local.set {idx}, {src}"),
+            IrInst::LocalGet { dst, offset, size } => write!(f, "  {dst} = local.get @{offset} (i{sz})", sz = size * 8),
+            IrInst::LocalSet { offset, src, size } => write!(f, "  local.set @{offset}, {src} (i{sz})", sz = size * 8),
             IrInst::Alu { op, dst, lhs, rhs } => {
                 match rhs {
                     Operand::Reg(r) => write!(f, "  {dst} = {op} {lhs}, {r}"),
@@ -319,8 +326,8 @@ impl std::fmt::Display for IrInst {
                 write!(f, "  br_if_nz {cond}, {label}")?;
                 fmt_args(f, args)
             }
-            IrInst::FrameStore { slot, src } => write!(f, "  frame[{slot}] = {src}"),
-            IrInst::FrameLoad { dst, slot } => write!(f, "  {dst} = frame[{slot}]"),
+            IrInst::FrameStore { offset, src } => write!(f, "  frame[@{offset}] = {src}"),
+            IrInst::FrameLoad { dst, offset } => write!(f, "  {dst} = frame[@{offset}]"),
             IrInst::Call {
                 func_idx,
                 args,

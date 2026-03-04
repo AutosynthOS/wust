@@ -62,3 +62,42 @@ fn recursive_fib() {
     );
     assert_eq!(results, vec![Val::I32(55)]);
 }
+
+#[test]
+fn bench_fib_30() {
+    let wat = r#"(module
+        (func $fib (export "f") (param $n i32) (result i32)
+            (if (i32.le_s (local.get $n) (i32.const 1))
+                (then (return (local.get $n)))
+            )
+            (i32.add
+                (call $fib (i32.sub (local.get $n) (i32.const 1)))
+                (call $fib (i32.sub (local.get $n) (i32.const 2)))
+            )
+        )
+    )"#;
+    let wasm = wat::parse_str(wat).expect("bad WAT");
+    let module = ParsedModule::new(&wasm).expect("parse failed");
+    let instance = Instance::new(&module);
+
+    // Warmup
+    for _ in 0..5 {
+        let mut task = Task::setup(&instance, "f", &[Val::I32(30)]).expect("setup failed");
+        Interpreter.poll(&mut task);
+    }
+
+    // Timed iterations
+    let start = std::time::Instant::now();
+    for _ in 0..10 {
+        let mut task = Task::setup(&instance, "f", &[Val::I32(30)]).expect("setup failed");
+        let outcome = Interpreter.poll(&mut task);
+        assert_eq!(outcome, Outcome::Return);
+        assert_eq!(task.results(), vec![Val::I32(832040)]);
+    }
+    let elapsed = start.elapsed();
+    eprintln!(
+        "fib(30) x10: {:.2}ms total, {:.2}ms/iter",
+        elapsed.as_secs_f64() * 1000.0,
+        elapsed.as_secs_f64() * 100.0,
+    );
+}

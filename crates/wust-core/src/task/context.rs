@@ -2,13 +2,13 @@ use super::fibre_stack::FibreStackPointer;
 use super::wasm_stack::WasmFramePointer;
 
 /// Outcome of a poll — did the function return normally or suspend?
-#[repr(u64)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    Return = 0,
-    Suspended = 1,
-    Running = 2,
-    Ready = 3,
+    Return,
+    Suspended,
+    Running,
+    Ready,
+    Call,
 }
 
 /// Runtime context passed to execution engines.

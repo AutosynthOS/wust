@@ -655,6 +655,24 @@ impl Emitter {
 
     // ---- Memory: single register load/store ----
 
+    /// `STR Wt, [Xn, #imm12*4]` — store 32-bit, unsigned offset.
+    pub fn str_w_uoff(&mut self, rt: Reg, rn: Reg, offset: u16) {
+        debug_assert!(offset % 4 == 0, "STR W offset must be 4-byte aligned");
+        let imm12 = (offset / 4) as u32;
+        debug_assert!(imm12 < 4096);
+        let inst = 0xB9000000 | imm12 << 10 | (rn.0 as u32 & 0x1F) << 5 | (rt.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
+    /// `LDR Wt, [Xn, #imm12*4]` — load 32-bit, unsigned offset.
+    pub fn ldr_w_uoff(&mut self, rt: Reg, rn: Reg, offset: u16) {
+        debug_assert!(offset % 4 == 0, "LDR W offset must be 4-byte aligned");
+        let imm12 = (offset / 4) as u32;
+        debug_assert!(imm12 < 4096);
+        let inst = 0xB9400000 | imm12 << 10 | (rn.0 as u32 & 0x1F) << 5 | (rt.0 as u32 & 0x1F);
+        self.code.push(inst);
+    }
+
     /// `STR Xt, [Xn, #imm12*8]` — store 64-bit, unsigned offset.
     pub fn str_x_uoff(&mut self, rt: Reg, rn: Reg, offset: u16) {
         debug_assert!(offset % 8 == 0, "STR offset must be 8-byte aligned");

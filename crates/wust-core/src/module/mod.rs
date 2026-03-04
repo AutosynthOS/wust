@@ -207,10 +207,10 @@ impl<'a> ModuleBuilder<'a> {
                 let local_byte_offsets =
                     FuncMeta::compute_local_offsets(&params, &locals_box);
 
-                let decoded = ParsedBody::parse(
-                    &body, &types_ref, &all_local_types, &results, &local_byte_offsets,
-                ).expect("body decode failed (already validated)");
                 let locals_size = FuncMeta::compute_locals_size(&params, &locals_box);
+                let decoded = ParsedBody::parse(
+                    &body, &types_ref, &all_local_types, &results, &local_byte_offsets, locals_size,
+                ).expect("body decode failed (already validated)");
 
                 FuncMeta {
                     params,

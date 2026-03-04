@@ -85,6 +85,18 @@ impl InlineOp {
     pub fn imm_u16_lo(self) -> u16 {
         (self.0 >> 8) as u16
     }
+
+    /// For LocalGetI32/etc: byte offset from fp (bits 8..40).
+    #[inline(always)]
+    pub fn local_byte_offset(self) -> u32 {
+        (self.0 >> 8) as u32
+    }
+
+    /// For LocalGetI32/etc: local index (bits 40..56).
+    #[inline(always)]
+    pub fn local_index(self) -> u16 {
+        (self.0 >> 40) as u16
+    }
 }
 
 impl InlineOp {
@@ -102,9 +114,6 @@ impl InlineOp {
                 let val = (imm as i32) << 8 >> 8;
                 format!("i64.const {val}")
             }
-            OpCode::LocalGet => format!("local.get {imm}"),
-            OpCode::LocalSet => format!("local.set {imm}"),
-            OpCode::LocalTee => format!("local.tee {imm}"),
             OpCode::LocalGetI32 | OpCode::LocalGetI64 => format!("{} @{imm}", op.wasm_name()),
             OpCode::LocalSetI32 | OpCode::LocalSetI64 => format!("{} @{imm}", op.wasm_name()),
             OpCode::LocalTeeI32 | OpCode::LocalTeeI64 => format!("{} @{imm}", op.wasm_name()),
@@ -147,6 +156,15 @@ pub fn pack_imm(opcode: OpCode, imm: i32) -> InlineOp {
 pub fn pack_imm_u(opcode: OpCode, imm: u32) -> InlineOp {
     debug_assert!(imm <= IMM24_MASK);
     InlineOp(((imm as u64) << 8) | (opcode as u64))
+}
+
+/// Pack a typed local access: byte_offset in bits[8..40], local_index in bits[40..56].
+pub fn pack_local(opcode: OpCode, byte_offset: u32, local_index: u16) -> InlineOp {
+    InlineOp(
+        (opcode as u64)
+            | ((byte_offset as u64) << 8)
+            | ((local_index as u64) << 40),
+    )
 }
 
 /// Pack opcode + u8 in bits[8..16] + i16 in bits[16..32].
@@ -374,10 +392,6 @@ pub enum OpCode {
     // --- Operations with immediates ---
     I32Const,
     I64Const,
-
-    LocalGet,
-    LocalSet,
-    LocalTee,
 
     /// Type-specialized local access. Immediate = byte offset from fp.
     LocalGetI32,

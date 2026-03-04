@@ -86,12 +86,12 @@ fn try_fuse_at(ops: &[InlineOp], i: usize, len: usize) -> Option<(InlineOp, usiz
     // 4-op: local.get + i32.const + i32.le_s + if
     if remaining >= 4 {
         let (o0, o1, o2, o3) = (ops[i], ops[i + 1], ops[i + 2], ops[i + 3]);
-        if o0.opcode() == OpCode::LocalGet
+        if o0.opcode() == OpCode::LocalGetI32
             && o1.opcode() == OpCode::I32Const
             && o2.opcode() == OpCode::I32LeS
             && o3.opcode() == OpCode::If
         {
-            let local = o0.immediate_u32();
+            let local = o0.local_index() as u32;
             let konst = (o1.immediate_u32() as i32) << 8 >> 8;
             let block = o3.immediate_u32();
             if local < 256 && konst >= i8::MIN as i32 && konst <= i8::MAX as i32 && block < 256 {
@@ -108,11 +108,11 @@ fn try_fuse_at(ops: &[InlineOp], i: usize, len: usize) -> Option<(InlineOp, usiz
         let (o0, o1, o2) = (ops[i], ops[i + 1], ops[i + 2]);
 
         // local.get + i32.const + i32.sub
-        if o0.opcode() == OpCode::LocalGet
+        if o0.opcode() == OpCode::LocalGetI32
             && o1.opcode() == OpCode::I32Const
             && o2.opcode() == OpCode::I32Sub
         {
-            let local = o0.immediate_u32();
+            let local = o0.local_index() as u32;
             let konst = (o1.immediate_u32() as i32) << 8 >> 8;
             if local < 256 && konst >= i16::MIN as i32 && konst <= i16::MAX as i32 {
                 return Some((
@@ -123,11 +123,11 @@ fn try_fuse_at(ops: &[InlineOp], i: usize, len: usize) -> Option<(InlineOp, usiz
         }
 
         // local.get + i32.const + i32.add
-        if o0.opcode() == OpCode::LocalGet
+        if o0.opcode() == OpCode::LocalGetI32
             && o1.opcode() == OpCode::I32Const
             && o2.opcode() == OpCode::I32Add
         {
-            let local = o0.immediate_u32();
+            let local = o0.local_index() as u32;
             let konst = (o1.immediate_u32() as i32) << 8 >> 8;
             if local < 256 && konst >= i16::MIN as i32 && konst <= i16::MAX as i32 {
                 return Some((
@@ -138,11 +138,11 @@ fn try_fuse_at(ops: &[InlineOp], i: usize, len: usize) -> Option<(InlineOp, usiz
         }
 
         // local.get + i32.eqz + if
-        if o0.opcode() == OpCode::LocalGet
+        if o0.opcode() == OpCode::LocalGetI32
             && o1.opcode() == OpCode::I32Eqz
             && o2.opcode() == OpCode::If
         {
-            let local = o0.immediate_u32();
+            let local = o0.local_index() as u32;
             let block = o2.immediate_u32();
             if local < 256 && block < 256 {
                 return Some((
@@ -153,12 +153,12 @@ fn try_fuse_at(ops: &[InlineOp], i: usize, len: usize) -> Option<(InlineOp, usiz
         }
 
         // local.get + local.get + i32.add
-        if o0.opcode() == OpCode::LocalGet
-            && o1.opcode() == OpCode::LocalGet
+        if o0.opcode() == OpCode::LocalGetI32
+            && o1.opcode() == OpCode::LocalGetI32
             && o2.opcode() == OpCode::I32Add
         {
-            let a = o0.immediate_u32();
-            let b = o1.immediate_u32();
+            let a = o0.local_index() as u32;
+            let b = o1.local_index() as u32;
             if a < 256 && b < 256 {
                 return Some((
                     pack_two_u8(LOCAL_GET_LOCAL_GET_ADD, a as u8, b as u8),
@@ -173,17 +173,17 @@ fn try_fuse_at(ops: &[InlineOp], i: usize, len: usize) -> Option<(InlineOp, usiz
         let (o0, o1) = (ops[i], ops[i + 1]);
 
         // call + local.set
-        if o0.opcode() == OpCode::Call && o1.opcode() == OpCode::LocalSet {
+        if o0.opcode() == OpCode::Call && o1.opcode() == OpCode::LocalSetI32 {
             let func = o0.immediate_u32();
-            let local = o1.immediate_u32();
+            let local = o1.local_index() as u32;
             if func < 65536 && local < 256 {
                 return Some((pack_u16_u8(CALL_LOCAL_SET, func as u16, local as u8), 2));
             }
         }
 
         // local.get + return
-        if o0.opcode() == OpCode::LocalGet && o1.opcode() == OpCode::Return {
-            let local = o0.immediate_u32();
+        if o0.opcode() == OpCode::LocalGetI32 && o1.opcode() == OpCode::Return {
+            let local = o0.local_index() as u32;
             if local < 256 {
                 return Some((pack_imm_u(LOCAL_GET_RETURN, local), 2));
             }

@@ -19,6 +19,7 @@ pub use wasm_stack::WasmFramePointer;
 /// serialization. Owns its own call stack, fiber stack, and context.
 pub struct Task {
     pub context: Context,
+    pub func_idx: FuncIdx,
     pub module: ParsedModule,
 }
 
@@ -49,46 +50,47 @@ impl Task {
         args: &[Val],
     ) -> Result<Self, anyhow::Error> {
         let module = instance.module();
-        let func = module
-            .funcs
-            .get(*func_idx as usize)
-            .ok_or_else(|| anyhow::anyhow!("function {func_idx} not found"))?;
 
-        let mut wasm_fp = WasmFramePointer::new()?;
-        let fibre_sp = FibreStackPointer::new()?;
-        let base = wasm_fp.base();
-
-        unsafe {
-            // Write frame header at base (outermost: prev_fp_offset=0).
-            std::ptr::write(base as *mut FrameHeader, FrameHeader::new(func_idx, 0, 0));
-            let locals_base = base.add(FRAME_HEADER_SIZE);
-            write_locals(locals_base, func, args);
-            wasm_fp.ptr = base;
-        }
-
-        Ok(Self {
+        let mut task = Self {
+            func_idx,
             context: Context {
                 outcome: Outcome::Ready,
                 fuel: 0,
-                wasm_fp,
-                fibre_sp,
+                wasm_fp: WasmFramePointer::new()?,
+                fibre_sp: FibreStackPointer::new()?,
             },
             module: module.clone(),
-        })
+        };
+
+        task.setup_root_call_frame(args)?;
+
+        Ok(task)
     }
 
-    /// Reset the task for another call, reusing existing stack allocations.
-    pub fn reset(&mut self, func_idx: FuncIdx, args: &[Val]) {
-        let func = &self.module.funcs[*func_idx as usize];
+    pub fn setup_root_call_frame(&mut self, args: &[Val]) -> Result<(), anyhow::Error> {
+        let func = self
+            .module
+            .funcs
+            .get(*self.func_idx as usize)
+            .ok_or_else(|| anyhow::anyhow!("function {} not found", self.func_idx))?;
         let base = self.context.wasm_fp.base();
-
         unsafe {
-            std::ptr::write(base as *mut FrameHeader, FrameHeader::new(func_idx, 0, 0));
-            let locals_base = base.add(FRAME_HEADER_SIZE);
+            // Layout: [locals][header] → fp points after header (= operand base).
+            let locals_base = base;
             write_locals(locals_base, func, args);
-            self.context.wasm_fp.ptr = base;
+            let header_ptr = base.add(func.locals_size as usize);
+            std::ptr::write(
+                header_ptr as *mut FrameHeader,
+                FrameHeader::new(
+                    self.func_idx,
+                    0,
+                    FRAME_HEADER_SIZE as u32 + func.locals_size as u32,
+                ),
+            );
+            self.context.wasm_fp.ptr = header_ptr.add(FRAME_HEADER_SIZE);
         }
-        self.context.outcome = Outcome::Ready;
+
+        Ok(())
     }
 
     /// Read results after `Outcome::Return`.
@@ -96,19 +98,11 @@ impl Task {
     /// `wasm_fp.ptr` points at the outermost FrameHeader. Read func_idx,
     /// then results sit on the operand stack after locals.
     pub fn results(&self) -> Vec<Val> {
-        let wasm_fp = &self.context.wasm_fp;
-        let func_idx = wasm_fp.frame().func_idx();
-        let func = &self.module.funcs[*func_idx as usize];
-        let operand_base = unsafe {
-            wasm_fp
-                .ptr
-                .add(FRAME_HEADER_SIZE + func.locals_size_bytes() as usize)
-        };
-
+        let func = &self.module.funcs[*self.func_idx as usize];
         let mut vals = Vec::new();
         let mut offset = 0usize;
         for ty in func.results.iter() {
-            vals.push(unsafe { read_compact(operand_base.add(offset), ty) });
+            vals.push(unsafe { read_compact(self.context.wasm_fp.ptr.add(offset), ty) });
             offset += slot_size(*ty) as usize * 4;
         }
         vals
