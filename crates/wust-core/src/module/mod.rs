@@ -175,7 +175,6 @@ impl<'a> ModuleBuilder<'a> {
                         locals: Box::new([]),
                         results,
                         body: ParsedBody::import(),
-                        body_bytes: Box::new([]),
                         local_byte_offsets,
                         locals_size,
                     };
@@ -204,20 +203,24 @@ impl<'a> ModuleBuilder<'a> {
                 );
                 let body = wasmparser::FunctionBody::new(reader);
                 let locals_box: Box<[wasmparser::ValType]> = raw.body_locals.into();
-                let local_byte_offsets =
-                    FuncMeta::compute_local_offsets(&params, &locals_box);
+                let local_byte_offsets = FuncMeta::compute_local_offsets(&params, &locals_box);
 
                 let locals_size = FuncMeta::compute_locals_size(&params, &locals_box);
                 let decoded = ParsedBody::parse(
-                    &body, &types_ref, &all_local_types, &results, &local_byte_offsets, locals_size,
-                ).expect("body decode failed (already validated)");
+                    &body,
+                    &types_ref,
+                    &all_local_types,
+                    &results,
+                    &local_byte_offsets,
+                    locals_size,
+                )
+                .expect("body decode failed (already validated)");
 
                 FuncMeta {
                     params,
                     locals: locals_box,
                     results,
                     body: decoded,
-                    body_bytes: raw.raw_bytes,
                     local_byte_offsets,
                     locals_size,
                 }

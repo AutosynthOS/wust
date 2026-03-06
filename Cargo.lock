@@ -118,6 +118,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "autosynth-codegen"
+version = "0.1.0"
+dependencies = [
+ "autosynth-isa",
+ "autosynth-isa-aarch64",
+]
+
+[[package]]
 name = "autosynth-isa"
 version = "0.1.0"
 
@@ -2959,8 +2967,11 @@ name = "wust-codegen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autosynth-codegen",
  "disarm64",
  "libc",
+ "wat",
+ "wust-core",
 ]
 
 [[package]]

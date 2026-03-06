@@ -35,9 +35,6 @@ pub struct FuncMeta {
     pub results: Box<[ValType]>,
     /// Decoded function body (InlineOp instruction stream).
     pub body: ParsedBody,
-    /// Raw WASM bytecode for the function body (code section bytes).
-    /// Empty for imported functions.
-    pub body_bytes: Box<[u8]>,
     /// Byte offset of each local (params + declared locals) from the
     /// locals base (`fp + FRAME_HEADER_SIZE`). Compact layout: i32/f32
     /// = 4 bytes, i64/f64 = 8 bytes, packed with no alignment padding.

@@ -3,7 +3,7 @@
 
 pub mod exec;
 mod instance;
-mod mmap;
+pub mod mmap;
 pub mod module;
 mod task;
 mod value;
@@ -14,3 +14,4 @@ pub use module::op::{InlineOp, OpCode};
 pub use module::{FuncIdx, FuncMeta, ModuleId, ParsedModule};
 pub use task::{Context, FRAME_HEADER_SIZE, FibreStackPointer, Outcome, Task, WasmFramePointer};
 pub use value::{Val, WasmArgs, WasmResults, WasmVal};
+pub use wasmparser::ValType;

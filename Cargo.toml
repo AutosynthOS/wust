@@ -8,6 +8,7 @@ members = [
     "crates/autosynth-isa-aarch64",
     "crates/autosynth-isa-riscv64",
     "crates/autosynth-isa-x86_64",
+    "crates/autosynth-codegen",
     "crates/plasma",
     "crates/plasma_hello",
 ]

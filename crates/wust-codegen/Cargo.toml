@@ -10,3 +10,8 @@ inspect = ["disarm64"]
 anyhow = "1"
 disarm64 = { version = "0.1", optional = true }
 libc = "0.2"
+wust-core = { path = "../wust-core" }
+autosynth-codegen = { path = "../autosynth-codegen" }
+
+[dev-dependencies]
+wat = "1.245.1"

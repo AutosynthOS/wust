@@ -37,13 +37,6 @@ impl Task {
         Self::setup_with_func_idx(instance, func_idx, args)
     }
 
-    /// Set up a new task for calling the function at the given index.
-    ///
-    /// Stack layout after setup:
-    /// ```text
-    /// [FrameHeader][locals...]
-    /// ^fp                     ^sp (stack top)
-    /// ```
     pub fn setup_with_func_idx(
         instance: &Instance,
         func_idx: FuncIdx,
@@ -66,7 +59,13 @@ impl Task {
 
         Ok(task)
     }
-
+    /// Set up a new task for calling the function at the given index.
+    ///
+    /// Stack layout after setup:
+    /// ```text
+    /// [locals][header][... operands ... ]
+    /// ^locals base    ^operand base     ^stack pointer
+    /// ```
     pub fn setup_root_call_frame(&mut self, args: &[Val]) -> Result<(), anyhow::Error> {
         let func = self
             .module

@@ -6,20 +6,19 @@ const GUARD_PAGES: usize = 1;
 
 /// Wasm frame pointer with backing stack allocation.
 ///
-/// `ptr` points at the current `FrameHeader`. Locals are below it,
-/// operands are above it (after FRAME_HEADER_SIZE bytes).
+/// `ptr` points past the current `FrameHeader` — at the operand base.
+/// Locals and header are below it, operands grow above it.
+///
+/// ```text
+/// [locals][FrameHeader][operands...]
+/// ^locals base         ^ptr (operand base)
+/// ```
+///
 /// `repr(C)` so the JIT can load `ptr` at a known offset from the
 /// Context pointer.
-///
-/// Layout:
-/// ```text
-/// [guard]  [usable ................]  [guard]
-///  NONE     READ|WRITE                 NONE
-///           ^base
-/// ```
 #[repr(C)]
 pub struct WasmFramePointer {
-    /// Points at the current `FrameHeader`.
+    /// Points past the current `FrameHeader` (= operand base).
     pub ptr: *mut u8,
     region: MmapRegion,
 }

@@ -77,7 +77,13 @@ impl ParsedBody {
         local_byte_offsets: &[u16],
         locals_size: u16,
     ) -> Result<Self, anyhow::Error> {
-        let mut d = BodyDecoder::new(types, local_types, result_types, local_byte_offsets, locals_size);
+        let mut d = BodyDecoder::new(
+            types,
+            local_types,
+            result_types,
+            local_byte_offsets,
+            locals_size,
+        );
         d.decode(reader)?;
         Ok(d.body)
     }
@@ -181,11 +187,7 @@ impl<'a> BodyDecoder<'a> {
 
     fn decode(&mut self, reader: &FunctionBody) -> Result<(), anyhow::Error> {
         // Implicit function-level block (index 0).
-        let func_block = self.open_block(
-            BlockKind::Function,
-            self.result_types.to_vec(),
-            vec![],
-        );
+        let func_block = self.open_block(BlockKind::Function, self.result_types.to_vec(), vec![]);
         self.block_stack.push(func_block);
 
         for op in reader.get_operators_reader()? {
@@ -224,10 +226,7 @@ impl<'a> BodyDecoder<'a> {
             BlockType::FuncType(idx) => {
                 let core_type_id = self.types.core_type_at_in_module(idx);
                 let func_type = self.types[core_type_id].unwrap_func();
-                (
-                    func_type.results().to_vec(),
-                    func_type.params().to_vec(),
-                )
+                (func_type.results().to_vec(), func_type.params().to_vec())
             }
         }
     }
@@ -275,8 +274,7 @@ impl<'a> BodyDecoder<'a> {
                 }
                 Operator::End => {
                     let entry = self.block_stack.pop().expect("end without block");
-                    self.body.blocks[entry.block_idx as usize].end_pc =
-                        self.body.ops.len() as u32;
+                    self.body.blocks[entry.block_idx as usize].end_pc = self.body.ops.len() as u32;
                     // Restore type stack to block base + results.
                     self.type_stack.truncate(entry.type_stack_height);
                     self.type_stack.extend_from_slice(&entry.result_types);
@@ -341,8 +339,7 @@ impl<'a> BodyDecoder<'a> {
             }
             Operator::End => {
                 let entry = self.block_stack.pop().expect("end without block");
-                self.body.blocks[entry.block_idx as usize].end_pc =
-                    self.body.ops.len() as u32;
+                self.body.blocks[entry.block_idx as usize].end_pc = self.body.ops.len() as u32;
                 self.emit_op(pack_imm_u(OpCode::End, entry.block_idx));
                 self.type_stack.truncate(entry.type_stack_height);
                 self.type_stack.extend_from_slice(&entry.result_types);
@@ -393,8 +390,7 @@ impl<'a> BodyDecoder<'a> {
             // --- Locals ---
             Operator::LocalGet { local_index } => {
                 let ty = self.local_types[local_index as usize];
-                let fp_offset = FRAME_HEADER_SIZE as u32
-                    + self.locals_size as u32
+                let fp_offset = FRAME_HEADER_SIZE as u32 + self.locals_size as u32
                     - self.local_byte_offsets[local_index as usize] as u32;
                 let opcode = match slot_size(ty) {
                     1 => OpCode::LocalGetI32,
@@ -406,8 +402,7 @@ impl<'a> BodyDecoder<'a> {
             }
             Operator::LocalSet { local_index } => {
                 let ty = self.local_types[local_index as usize];
-                let fp_offset = FRAME_HEADER_SIZE as u32
-                    + self.locals_size as u32
+                let fp_offset = FRAME_HEADER_SIZE as u32 + self.locals_size as u32
                     - self.local_byte_offsets[local_index as usize] as u32;
                 let opcode = match slot_size(ty) {
                     1 => OpCode::LocalSetI32,
@@ -419,8 +414,7 @@ impl<'a> BodyDecoder<'a> {
             }
             Operator::LocalTee { local_index } => {
                 let ty = self.local_types[local_index as usize];
-                let fp_offset = FRAME_HEADER_SIZE as u32
-                    + self.locals_size as u32
+                let fp_offset = FRAME_HEADER_SIZE as u32 + self.locals_size as u32
                     - self.local_byte_offsets[local_index as usize] as u32;
                 let opcode = match slot_size(ty) {
                     1 => OpCode::LocalTeeI32,
@@ -512,7 +506,9 @@ impl<'a> BodyDecoder<'a> {
             Operator::I32TruncSatF32U => self.emit_convert(OpCode::I32TruncSatF32U, ValType::I32),
             Operator::I32TruncSatF64S => self.emit_convert(OpCode::I32TruncSatF64S, ValType::I32),
             Operator::I32TruncSatF64U => self.emit_convert(OpCode::I32TruncSatF64U, ValType::I32),
-            Operator::I32ReinterpretF32 => self.emit_convert(OpCode::I32ReinterpretF32, ValType::I32),
+            Operator::I32ReinterpretF32 => {
+                self.emit_convert(OpCode::I32ReinterpretF32, ValType::I32)
+            }
 
             // --- i64 binary (pop 2 i64, push 1 i64) ---
             Operator::I64Add => self.emit_binary(OpCode::I64Add, ValType::I64),
@@ -565,7 +561,9 @@ impl<'a> BodyDecoder<'a> {
             Operator::I64TruncSatF32U => self.emit_convert(OpCode::I64TruncSatF32U, ValType::I64),
             Operator::I64TruncSatF64S => self.emit_convert(OpCode::I64TruncSatF64S, ValType::I64),
             Operator::I64TruncSatF64U => self.emit_convert(OpCode::I64TruncSatF64U, ValType::I64),
-            Operator::I64ReinterpretF64 => self.emit_convert(OpCode::I64ReinterpretF64, ValType::I64),
+            Operator::I64ReinterpretF64 => {
+                self.emit_convert(OpCode::I64ReinterpretF64, ValType::I64)
+            }
 
             // --- f32 binary (pop 2 f32, push 1 f32) ---
             Operator::F32Add => self.emit_binary(OpCode::F32Add, ValType::F32),
@@ -599,7 +597,9 @@ impl<'a> BodyDecoder<'a> {
             Operator::F32ConvertI64S => self.emit_convert(OpCode::F32ConvertI64S, ValType::F32),
             Operator::F32ConvertI64U => self.emit_convert(OpCode::F32ConvertI64U, ValType::F32),
             Operator::F32DemoteF64 => self.emit_convert(OpCode::F32DemoteF64, ValType::F32),
-            Operator::F32ReinterpretI32 => self.emit_convert(OpCode::F32ReinterpretI32, ValType::F32),
+            Operator::F32ReinterpretI32 => {
+                self.emit_convert(OpCode::F32ReinterpretI32, ValType::F32)
+            }
 
             // --- f64 binary (pop 2 f64, push 1 f64) ---
             Operator::F64Add => self.emit_binary(OpCode::F64Add, ValType::F64),
@@ -633,7 +633,9 @@ impl<'a> BodyDecoder<'a> {
             Operator::F64ConvertI64S => self.emit_convert(OpCode::F64ConvertI64S, ValType::F64),
             Operator::F64ConvertI64U => self.emit_convert(OpCode::F64ConvertI64U, ValType::F64),
             Operator::F64PromoteF32 => self.emit_convert(OpCode::F64PromoteF32, ValType::F64),
-            Operator::F64ReinterpretI64 => self.emit_convert(OpCode::F64ReinterpretI64, ValType::F64),
+            Operator::F64ReinterpretI64 => {
+                self.emit_convert(OpCode::F64ReinterpretI64, ValType::F64)
+            }
 
             // Unsupported opcodes trap cleanly.
             _ => {
@@ -722,26 +724,33 @@ mod tests {
         let module = ParsedModule::new(&wasm).expect("parse failed");
         let func_idx = module.exports.values().next().expect("no export");
         let meta = &module.funcs[**func_idx as usize];
-        let opcodes: Vec<OpCode> = meta.body.ops.iter().map(|op| {
-            if op.opcode() == OpCode::DataStream {
-                let offset = op.immediate_u32() as usize;
-                unsafe { std::mem::transmute::<u8, OpCode>(meta.body.data[offset]) }
-            } else {
-                op.opcode()
-            }
-        }).collect();
+        let opcodes: Vec<OpCode> = meta
+            .body
+            .ops
+            .iter()
+            .map(|op| {
+                if op.opcode() == OpCode::DataStream {
+                    let offset = op.immediate_u32() as usize;
+                    unsafe { std::mem::transmute::<u8, OpCode>(meta.body.data[offset]) }
+                } else {
+                    op.opcode()
+                }
+            })
+            .collect();
         (meta.body.operand_depth.clone(), opcodes)
     }
 
     #[test]
     fn depth_i32_add_two_consts() {
-        let (depths, ops) = depth_table(r#"
+        let (depths, ops) = depth_table(
+            r#"
             (module (func (export "f") (result i32)
                 i32.const 1
                 i32.const 2
                 i32.add
             ))
-        "#);
+        "#,
+        );
         assert_eq!(ops[0], OpCode::I32Const);
         assert_eq!(depths[0], 0);
         assert_eq!(depths[1], 1);
@@ -751,13 +760,15 @@ mod tests {
 
     #[test]
     fn depth_i64_consts() {
-        let (depths, _) = depth_table(r#"
+        let (depths, _) = depth_table(
+            r#"
             (module (func (export "f") (result i64)
                 i64.const 1
                 i64.const 2
                 i64.add
             ))
-        "#);
+        "#,
+        );
         assert_eq!(depths[0], 0);
         assert_eq!(depths[1], 2);
         assert_eq!(depths[2], 4);
@@ -766,25 +777,29 @@ mod tests {
 
     #[test]
     fn depth_local_get_i32() {
-        let (depths, _) = depth_table(r#"
+        let (depths, _) = depth_table(
+            r#"
             (module (func (export "f") (param i32) (result i32)
                 local.get 0
             ))
-        "#);
+        "#,
+        );
         assert_eq!(depths[0], 0);
         assert_eq!(depths[1], 1); // End
     }
 
     #[test]
     fn depth_mixed_types() {
-        let (depths, _) = depth_table(r#"
+        let (depths, _) = depth_table(
+            r#"
             (module (func (export "f")
                 i32.const 1
                 i64.const 2
                 drop
                 drop
             ))
-        "#);
+        "#,
+        );
         assert_eq!(depths[0], 0);
         assert_eq!(depths[1], 1);
         assert_eq!(depths[2], 3);
@@ -794,7 +809,8 @@ mod tests {
 
     #[test]
     fn depth_if_else() {
-        let (depths, ops) = depth_table(r#"
+        let (depths, ops) = depth_table(
+            r#"
             (module (func (export "f") (param i32) (result i32)
                 local.get 0
                 if (result i32)
@@ -803,7 +819,8 @@ mod tests {
                     i32.const 2
                 end
             ))
-        "#);
+        "#,
+        );
         assert_eq!(ops[0], OpCode::LocalGetI32);
         assert_eq!(depths[0], 0);
         assert_eq!(ops[1], OpCode::If);
@@ -822,7 +839,8 @@ mod tests {
 
     #[test]
     fn depth_call() {
-        let (depths, _) = depth_table(r#"
+        let (depths, _) = depth_table(
+            r#"
             (module
                 (func $add (param i32 i32) (result i32) local.get 0 local.get 1 i32.add)
                 (func (export "f") (result i32)
@@ -830,7 +848,8 @@ mod tests {
                     i32.const 4
                     call $add
                 ))
-        "#);
+        "#,
+        );
         assert_eq!(depths[0], 0);
         assert_eq!(depths[1], 1);
         assert_eq!(depths[2], 2);
@@ -839,12 +858,15 @@ mod tests {
 
     #[test]
     fn drop_encodes_slot_size() {
-        let wasm = wat::parse_str(r#"
+        let wasm = wat::parse_str(
+            r#"
             (module (func (export "f")
                 i64.const 42
                 drop
             ))
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         let module = ParsedModule::new(&wasm).unwrap();
         let func_idx = module.exports.values().next().unwrap();
         let meta = &module.funcs[**func_idx as usize];
