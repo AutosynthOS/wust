@@ -4,6 +4,10 @@ members = [
     "crates/wust",
     "crates/wust-core",
     "crates/wust-codegen",
+    "crates/autosynth-isa",
+    "crates/autosynth-isa-aarch64",
+    "crates/autosynth-isa-riscv64",
+    "crates/autosynth-isa-x86_64",
     "crates/plasma",
     "crates/plasma_hello",
 ]

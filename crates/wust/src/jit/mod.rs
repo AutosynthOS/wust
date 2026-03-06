@@ -6,7 +6,7 @@ pub(crate) mod tests;
 
 use wust_core::{Outcome, ParsedModule, Task};
 
-use crate::exec::ModuleExecutor;
+use wust_core::exec::ModuleExecutor;
 
 use wust_codegen::code_buffer::CodeBuffer;
 use wust_codegen::emit::{self, Emitter};
@@ -22,6 +22,8 @@ pub(crate) struct FuncSnapshot {
     pub(crate) markers_start: usize,
     /// Label index → word offset relative to function start.
     pub(crate) label_offsets: Vec<Option<usize>>,
+    /// Per-word annotations from the lowerer (word offset relative to function start → label).
+    pub(crate) word_labels: Vec<(usize, String)>,
 }
 
 /// Compile all functions in a module into a shared emitter.
@@ -53,6 +55,7 @@ pub(crate) fn compile_all(
             code_start,
             markers_start,
             label_offsets: result.label_offsets,
+            word_labels: result.word_labels,
         };
         on_func(i, &ir, &e, &snap);
     }
@@ -198,6 +201,7 @@ impl JitModule {
                 "stp x20, x21, [sp, #-16]!",
                 "stp x28, xzr, [sp, #-16]!",
                 // Load JIT state from context.
+                // x20 = context ptr, x21 = fuel, x29 = locals base (g.lb)
                 "mov x20, {ctx}",
                 "ldr x21, [x20, #{fuel}]",
                 "ldr x29, [x20, #{fp}]",
@@ -207,7 +211,7 @@ impl JitModule {
                 "mov sp, x9",
                 // Call the per-function trampoline.
                 "blr {code}",
-                // Store JIT state back to context.
+                // Store JIT state back to context (fuel + locals base).
                 "str x21, [x20, #{fuel}]",
                 "str x29, [x20, #{fp}]",
                 // Restore host SP from x28.
@@ -227,6 +231,11 @@ impl JitModule {
             );
         }
 
+        if task.context.fuel <= 0 {
+            task.context.outcome = Outcome::Suspended;
+        } else {
+            task.context.outcome = Outcome::Return;
+        }
         task.context.outcome
     }
 }

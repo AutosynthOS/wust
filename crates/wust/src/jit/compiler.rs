@@ -145,7 +145,7 @@ impl IrCompiler {
             self.emit(IrInst::FuelConsume {
                 cost: self.pending_fuel,
             });
-            self.emit(IrInst::FuelCheck { live_state: vec![] });
+            self.emit(IrInst::FuelCheck { live_state: vec![], resume_pc: self.current_op });
         }
         self.pending_fuel = 0;
     }
@@ -357,12 +357,12 @@ pub(crate) fn compile_with(
     }
 
     let result_count = func.result_count();
-    let (fused_ops, fused_blocks) = fuse::fuse(&func.body);
-    let ops = &fused_ops;
-    let blocks = &fused_blocks;
+    let fused = fuse::fuse(&func.body);
+    let ops = &fused.ops;
+    let blocks = &fused.blocks;
 
     for (op_idx, op) in ops.iter().enumerate() {
-        c.current_op = op_idx as u32;
+        c.current_op = fused.original_pc[op_idx];
         let raw = op.raw_opcode();
         let imm = op.immediate_u32();
 
@@ -780,6 +780,7 @@ pub(crate) fn compile_with(
                     args,
                     result,
                     frame_advance,
+                    callee_locals_size: callee.locals_size,
                 });
                 c.invalidate_locals();
                 // Reload spilled values back onto vstack.
@@ -942,6 +943,7 @@ fn compile_fused_op(
                 args,
                 result,
                 frame_advance,
+                callee_locals_size: callee.locals_size,
             });
             c.invalidate_locals();
             if spill_count > 0 {

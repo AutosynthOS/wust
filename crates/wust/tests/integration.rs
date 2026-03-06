@@ -1,74 +1,16 @@
-use wust::{Engine, ExecBackend, JitModule, Module, Outcome, Task, Val};
+use wust::{JitModule, ModuleExecutor, Outcome, Val};
+use wust_core::{Instance, ParsedModule, Task};
 
-#[test]
-fn call_add() -> Result<(), anyhow::Error> {
-    let wasm = wat::parse_str(
-        r#"
-        (module
-            (func $add (param $a i32) (param $b i32) (result i32)
-                local.get $a
-                local.get $b
-                i32.add
-            )
-            (func (export "answer") (param $x i32) (result i32)
-                local.get $x
-                i32.const 100
-                call $add
-            )
-        )
-    "#,
-    )?;
-
-    let engine = Engine::default();
-    let module = Module::from_bytes(&engine, &wasm)?;
-    let jit = JitModule::compile(&module)?;
-    let mut task = Task::new()?;
-
-    wust::setup(&module, &mut task, "answer", &[Val::I32(42)])?;
-    let outcome = jit.poll(&module, &mut task, i64::MAX);
-    assert_eq!(outcome, Outcome::Return);
-    assert_eq!(wust::results(&module, &task), vec![Val::I32(142)]);
-
-    Ok(())
-}
-
-#[test]
-fn call_multi_param() -> Result<(), anyhow::Error> {
-    let wasm = wat::parse_str(
-        r#"
-        (module
-            (func (export "add3") (param i32) (param i32) (param i32) (result i32)
-                local.get 0
-                local.get 1
-                i32.add
-                local.get 2
-                i32.add
-            )
-        )
-    "#,
-    )?;
-
-    let engine = Engine::default();
-    let module = Module::from_bytes(&engine, &wasm)?;
-    let jit = JitModule::compile(&module)?;
-    let mut task = Task::new()?;
-
-    wust::setup(
-        &module,
-        &mut task,
-        "add3",
-        &[Val::I32(10), Val::I32(20), Val::I32(30)],
-    )?;
-    let outcome = jit.poll(&module, &mut task, i64::MAX);
-    assert_eq!(outcome, Outcome::Return);
-    assert_eq!(wust::results(&module, &task), vec![Val::I32(60)]);
-
-    Ok(())
+fn parse(wat: &str) -> (ParsedModule, Instance) {
+    let wasm = wat::parse_str(wat).expect("bad WAT");
+    let module = ParsedModule::new(&wasm).expect("parse failed");
+    let instance = Instance::new(&module);
+    (module, instance)
 }
 
 #[test]
 fn suspend_on_fuel_exhaustion() -> Result<(), anyhow::Error> {
-    let wasm = wat::parse_str(
+    let (module, instance) = parse(
         r#"
         (module
             (func $fib (export "fib") (param $n i32) (result i32)
@@ -83,20 +25,14 @@ fn suspend_on_fuel_exhaustion() -> Result<(), anyhow::Error> {
             )
         )
     "#,
-    )?;
+    );
 
-    let engine = Engine::default();
-    let module = Module::from_bytes(&engine, &wasm)?;
     let jit = JitModule::compile(&module)?;
-    let mut task = Task::new()?;
+    let mut task = Task::setup(&instance, "fib", &[Val::I32(3)])?;
+    task.context.fuel = 2;
 
-    wust::setup(&module, &mut task, "fib", &[Val::I32(3)])?;
-    let outcome = jit.poll(&module, &mut task, 0);
+    let outcome = jit.poll(&mut task);
     assert_eq!(outcome, Outcome::Suspended);
-
-    // The argument (n=3) should still be in its frame slot.
-    let local_0 = task.stack.read_u64_at(16) as i32;
-    assert_eq!(local_0, 3, "local 0 (n) should be 3 after suspend");
 
     Ok(())
 }

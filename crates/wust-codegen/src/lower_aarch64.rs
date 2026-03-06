@@ -3,6 +3,9 @@ use crate::ir::{AluOp, IrFunction, IrInst, Label, Operand, UnaryOp, VReg};
 
 /// Physical scratch registers available for allocation (x9–x15).
 const SCRATCH_REGS: [Reg; 7] = [Reg(9), Reg(10), Reg(11), Reg(12), Reg(13), Reg(14), Reg(15)];
+// TODO: x0-x8 and x28 are all free scratch registers. x28 was previously
+// reserved for saved host SP (longjmp suspend), but suspend now unwinds via
+// normal returns so x28 is unused. Host SP belongs in the Context struct.
 
 /// Result of lowering a single function.
 pub struct LowerResult {
@@ -10,6 +13,8 @@ pub struct LowerResult {
     pub body_start: usize,
     /// Label index → word offset relative to `body_start`.
     pub label_offsets: Vec<Option<usize>>,
+    /// Per-word annotations: (word_offset_relative_to_body_start, label).
+    pub word_labels: Vec<(usize, String)>,
 }
 
 /// Word offsets of shared code regions within the code buffer.
@@ -29,7 +34,7 @@ enum ReloadSource {
     None,
     /// Re-emit a constant (from IConst).
     Const(i64),
-    /// Reload from a known frame slot: `[x29 + offset]` with the given width.
+    /// Reload from a known frame slot: `[g.lb + offset]` with the given width.
     Frame { offset: u16, size: u8 },
     /// Was spilled to a dynamically allocated frame slot during eviction.
     Spill { offset: u16 },
@@ -60,7 +65,7 @@ struct RegMap {
     reload_source: Vec<ReloadSource>,
     /// For each VReg: value size in bytes (4 for i32, 8 for i64). Default 8.
     vreg_size: Vec<u8>,
-    /// Next available spill slot offset from x29 (grows upward from frame_size).
+    /// Next available spill slot offset from g.lb (grows upward from frame_size).
     next_spill_offset: u16,
 }
 
@@ -251,6 +256,8 @@ pub fn lower_into(
         inst.for_each_use(|v| max_vreg = max_vreg.max(v.0 + 1));
     }
 
+    let mut word_labels: Vec<(usize, String)> = Vec::new();
+
     let mut regs = RegMap::new(max_vreg, ir.frame_size() as u16);
 
     // Label tracking.
@@ -263,6 +270,9 @@ pub fn lower_into(
 
     let mut pending_cmp: Option<PendingCmp> = None;
     let mut pending_fuel: Option<u32> = None;
+    /// After a Call, holds (offset_from_g_lb, prev_fp_value) for the
+    /// callee's header. Consumed by the next FuelCheck's cold stub.
+    let mut pending_callee_prev_fp: Option<(u16, u32)> = None;
     let mut lr_clobbered = false;
 
     // Precompute register hints: vregs used as call arg 0 or return
@@ -505,6 +515,7 @@ pub fn lower_into(
                 args,
                 result,
                 frame_advance,
+                callee_locals_size,
             } => {
                 // Move call arguments into x9, x10, ...
                 // We need to be careful about conflicts: if arg[i] is
@@ -529,11 +540,15 @@ pub fn lower_into(
                 regs.invalidate_all();
 
                 let advance = *frame_advance as u16;
-                // // TODO: write real header values. For now, dummy stores
-                // // to measure perf impact of 3 extra stores per call.
-                // e.str_w_uoff(Reg::X9, Reg::X29, advance);
-                // e.str_w_uoff(Reg::X9, Reg::X29, advance + 4);
-                // e.str_w_uoff(Reg::X9, Reg::X29, advance + 8);
+
+                // Stash callee's prev_fp info for the next fuel check's
+                // cold stub. prev_fp_offset is only needed on suspend, so
+                // we avoid writing it on the hot path entirely.
+                let header_off = advance + *callee_locals_size;
+                let prev_fp = advance as u32 + *callee_locals_size as u32 + 12
+                    - ir.operand_base_offset;
+                pending_callee_prev_fp = Some((header_off + 8, prev_fp));
+
                 e.add_x_imm(Reg::X29, Reg::X29, advance);
 
                 let target_word =
@@ -580,11 +595,12 @@ pub fn lower_into(
                 }
             }
 
-            IrInst::FuelCheck { .. } => {
+            IrInst::FuelCheck { resume_pc, .. } => {
+                let callee_fp = pending_callee_prev_fp.take();
                 if let Some(cost) = pending_fuel.take() {
-                    emit_fuel_check_with_cost(e, &mut fuel_sites, cost);
+                    emit_fuel_check_with_cost(e, &mut fuel_sites, cost, *resume_pc, callee_fp);
                 } else {
-                    emit_fuel_check_sign(e, &mut fuel_sites);
+                    emit_fuel_check_sign(e, &mut fuel_sites, *resume_pc, callee_fp);
                 }
                 lr_clobbered = true;
             }
@@ -603,18 +619,42 @@ pub fn lower_into(
         e.mark();
     }
 
-    // ---- Cold fuel-check stubs ----
-    let suspend_handler = e.offset();
-    e.brk(0xDEAD);
-    e.movz_x(Reg::X9, 1);
-    e.str_x_uoff(Reg::X9, Reg::X20, 0);
-    e.ldr_x_uoff(Reg::X9, Reg::X20, 8);
-    e.ldur_x(Reg::X30, Reg::X9, -16);
-    e.mov_sp_from(Reg::X28);
-    e.ret();
-
+    // ---- Cold fuel-check stubs (per-site) ----
+    // Each stub writes this function's own header (func_idx + resume_pc),
+    // then returns. For post-call sites, also writes prev_fp_offset into
+    // the callee's header (the caller is the only one who knows it).
+    //
+    // Header layout at [g.lb + locals_size]:
+    //   [func_idx(4) | resume_pc(4) | prev_fp_offset(4)]
+    let func_idx_offset = ir.operand_base_offset as u16 - 12;
+    let resume_pc_offset = ir.operand_base_offset as u16 - 8;
     for site in &fuel_sites {
-        e.patch_to(site.b_le_patch, suspend_handler);
+        let stub = e.offset();
+
+        let fi_label = format!("suspend: func_idx = {func_idx}");
+        word_labels.push((e.offset() - body_start, fi_label.clone()));
+        emit_i32_const_reg(e, Reg::X0, func_idx as i32);
+        word_labels.push((e.offset() - body_start, fi_label));
+        e.str_w_uoff(Reg::X0, Reg::X29, func_idx_offset);
+
+        let pc_label = format!("resume_pc = {}", site.resume_pc);
+        word_labels.push((e.offset() - body_start, pc_label.clone()));
+        emit_i32_const_reg(e, Reg::X0, site.resume_pc as i32);
+        word_labels.push((e.offset() - body_start, pc_label));
+        e.str_w_uoff(Reg::X0, Reg::X29, resume_pc_offset);
+
+        // Post-call: write callee's prev_fp_offset into the callee's header.
+        if let Some((offset, value)) = site.callee_prev_fp {
+            let pfp_label = format!("callee prev_fp_offset = {value}");
+            word_labels.push((e.offset() - body_start, pfp_label.clone()));
+            emit_i32_const_reg(e, Reg::X0, value as i32);
+            word_labels.push((e.offset() - body_start, pfp_label));
+            e.str_w_uoff(Reg::X0, Reg::X29, offset);
+        }
+
+        e.ldr_x_post(Reg::X30, Reg::SP, 16);
+        e.ret();
+        e.patch_to(site.b_le_patch, stub);
     }
 
     // Patch forward label branches.
@@ -632,6 +672,7 @@ pub fn lower_into(
     LowerResult {
         body_start,
         label_offsets: relative_label_offsets,
+        word_labels,
     }
 }
 
@@ -748,20 +789,38 @@ pub fn patch_jump_table(e: &mut Emitter, func_idx: u32, target_word: usize) {
 // Fuel check, constants, entry trampoline
 // ============================================================
 
-struct FuelCheckSite {
-    b_le_patch: PatchPoint,
+/// A fuel check site in the generated code, with metadata for cold stub emission.
+pub struct FuelCheckSite {
+    /// Patch point for the conditional branch to the cold stub.
+    pub b_le_patch: PatchPoint,
+    /// Wasm PC to write as resume_pc in the frame header.
+    pub resume_pc: u32,
+    /// If this fuel check follows a call, the callee's prev_fp_offset
+    /// needs writing on the cold path: (offset_from_g_lb, value).
+    pub callee_prev_fp: Option<(u16, u32)>,
 }
 
-fn emit_fuel_check_with_cost(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>, cost: u32) {
+fn emit_fuel_check_with_cost(
+    e: &mut Emitter,
+    fuel_sites: &mut Vec<FuelCheckSite>,
+    cost: u32,
+    resume_pc: u32,
+    callee_prev_fp: Option<(u16, u32)>,
+) {
     e.subs_x_imm(Reg::X21, Reg::X21, cost as u16);
     let b_le_patch = e.b_cond(Cond::LE);
-    fuel_sites.push(FuelCheckSite { b_le_patch });
+    fuel_sites.push(FuelCheckSite { b_le_patch, resume_pc, callee_prev_fp });
 }
 
-fn emit_fuel_check_sign(e: &mut Emitter, fuel_sites: &mut Vec<FuelCheckSite>) {
+fn emit_fuel_check_sign(
+    e: &mut Emitter,
+    fuel_sites: &mut Vec<FuelCheckSite>,
+    resume_pc: u32,
+    callee_prev_fp: Option<(u16, u32)>,
+) {
     e.cmp_x_imm(Reg::X21, 0);
     let b_le_patch = e.b_cond(Cond::LT);
-    fuel_sites.push(FuelCheckSite { b_le_patch });
+    fuel_sites.push(FuelCheckSite { b_le_patch, resume_pc, callee_prev_fp });
 }
 
 pub fn emit_entry_trampoline(
@@ -774,8 +833,16 @@ pub fn emit_entry_trampoline(
     let entry = e.offset();
 
     e.str_x_pre(Reg::X30, Reg::SP, -16);
+
+    // x29 arrives as wasm_fp.ptr (operand base, past header).
+    // Subtract locals_header_size to get g.lb (locals base), so all
+    // frame access uses positive unsigned offsets from g.lb.
+    //
+    //   [params][locals][header][operands...]
+    //   ^g.lb                   ^wasm_fp.ptr
     e.sub_x_imm(Reg::X29, Reg::X29, locals_header_size);
 
+    // Load params from canonical local slots into calling convention regs.
     for (i, &off) in param_offsets.iter().enumerate().take(7) {
         let reg = Reg(9 + i as u8);
         e.ldr_w_uoff(reg, Reg::X29, off);
@@ -784,8 +851,10 @@ pub fn emit_entry_trampoline(
     let offset = func_body_offset as i32 - e.offset() as i32;
     e.bl_offset(offset);
 
+    // Restore x29 to wasm_fp.ptr for result storage and host return.
     e.add_x_imm(Reg::X29, Reg::X29, locals_header_size);
 
+    // Store results from calling convention regs to operand base.
     for (i, &off) in result_offsets.iter().enumerate().take(7) {
         let reg = Reg(9 + i as u8);
         e.str_w_uoff(reg, Reg::X29, off);

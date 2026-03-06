@@ -17,7 +17,7 @@ pub enum Outcome {
 /// known offsets.
 #[repr(C)]
 pub struct Context {
-    /// Set by engine: 0 = Return, 1 = Suspended.
+    /// Set by engine
     pub outcome: Outcome,
     /// Remaining fuel for execution.
     pub fuel: i64,

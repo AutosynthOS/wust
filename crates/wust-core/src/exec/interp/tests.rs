@@ -6,6 +6,7 @@ fn run(wat: &str, args: &[Val]) -> Vec<Val> {
     let module = ParsedModule::new(&wasm).expect("parse failed");
     let instance = Instance::new(&module);
     let mut task = Task::setup(&instance, "f", args).expect("setup failed");
+    task.context.fuel = i64::MAX;
     let outcome = Interpreter.poll(&mut task);
     assert_eq!(outcome, Outcome::Return);
     task.results()
@@ -83,6 +84,7 @@ fn bench_fib_30() {
     // Warmup
     for _ in 0..5 {
         let mut task = Task::setup(&instance, "f", &[Val::I32(30)]).expect("setup failed");
+        task.context.fuel = i64::MAX;
         Interpreter.poll(&mut task);
     }
 
@@ -90,6 +92,7 @@ fn bench_fib_30() {
     let start = std::time::Instant::now();
     for _ in 0..10 {
         let mut task = Task::setup(&instance, "f", &[Val::I32(30)]).expect("setup failed");
+        task.context.fuel = i64::MAX;
         let outcome = Interpreter.poll(&mut task);
         assert_eq!(outcome, Outcome::Return);
         assert_eq!(task.results(), vec![Val::I32(832040)]);

@@ -35,6 +35,9 @@ pub struct BlockAnnotations {
     pub param_types: Vec<&'static str>,
     /// Result type names (e.g. ["i32"]) for annotating ret instructions.
     pub result_types: Vec<&'static str>,
+    /// Per-word annotations from the lowerer — overrides source-op based
+    /// annotations when present. Word offset (relative to block start) → label.
+    pub word_labels: Vec<(usize, String)>,
 }
 
 /// Output of the codegen pipeline for a module.
@@ -301,13 +304,20 @@ fn render_words(out: &mut String, ctx: &TreeCtx, start: usize, end: usize, depth
             let b_le_asm = rewrite_branch_target(&raw_b_le, "suspend");
             emit_branch_open(out, (wi + 1) * 4, &b_le_asm, depth, Some("fuel check"), ctx.ir_col);
 
-            // Render the single-instruction cold stub (brk) inline.
+            // Render the cold stub inline (all instructions up to ret).
             let cold_off = branch_word_offset(b_le).unwrap();
             let cold_start = ((wi + 1) as i64 + cold_off as i64) as usize;
-            let cold_word = ctx.block.code[cold_start];
-            let cold_byte_off = ctx.block.base_offset + cold_start * 4;
-            let cold_asm = resolve_asm(cold_word, cold_byte_off, ctx.labels);
-            emit_block_end_line(out, cold_start * 4, &cold_asm, depth + 1, Some("suspend"), ctx.ir_col);
+            let mut ci = cold_start;
+            while ci < ctx.block.code.len() {
+                let cw = ctx.block.code[ci];
+                let cold_byte_off = ctx.block.base_offset + ci * 4;
+                let cold_asm = resolve_asm(cw, cold_byte_off, ctx.labels);
+                let label = ctx.ir_at.get(ci).and_then(|n| n.as_deref());
+                emit_line(out, ci * 4, &cold_asm, depth + 1, label, ctx.ir_col);
+                if cw & 0xFFFF_FC1F == 0xD65F_0000 { break; }
+                ci += 1;
+            }
+            emit_header(out, depth + 1, "end", "╰─", None, ctx.ir_col);
 
             wi += 2;
             continue;
@@ -440,7 +450,7 @@ fn normalize_asm(s: &str) -> String {
 fn rename_registers(s: &str) -> String {
     let mut result = s.to_string();
     result = replace_at_word_boundary(&result, "x21", "g.fuel");
-    result = replace_at_word_boundary(&result, "x29", "g.fp");
+    result = replace_at_word_boundary(&result, "x29", "g.lb");
     result = replace_at_word_boundary(&result, "x20", "g.ctx");
     result = replace_at_word_boundary(&result, "x30", "g.lr");
     result = replace_at_word_boundary(&result, "sp", "g.sp");
@@ -557,6 +567,13 @@ fn build_source_op_annotations(
         }
 
         i = group_end;
+    }
+
+    // Apply lowerer-provided per-word labels (override source-op based).
+    for (word, label) in &ann.word_labels {
+        if *word < annotations.len() {
+            annotations[*word] = Some(label.clone());
+        }
     }
 
     annotations

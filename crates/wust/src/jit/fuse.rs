@@ -50,25 +50,38 @@ fn pack_imm_u(opcode: u8, imm: u32) -> InlineOp {
     InlineOp::from_raw(((imm as u64) << 8) | (opcode as u64))
 }
 
+/// Result of the peephole fusion pass.
+pub(crate) struct FuseResult {
+    pub ops: Vec<InlineOp>,
+    pub blocks: Vec<Block>,
+    /// For each fused op index, the original (unfused) PC of the last
+    /// instruction in the fused group. Used to write the correct wasm PC
+    /// into frame headers at suspend points.
+    pub original_pc: Vec<u32>,
+}
+
 /// Run the peephole fusion pass on a parsed body.
 ///
-/// Returns a new ops vec with fused opcodes and remapped blocks.
-pub(crate) fn fuse(body: &ParsedBody) -> (Vec<InlineOp>, Vec<Block>) {
+/// Returns fused ops, remapped blocks, and a reverse PC map (fused → original).
+pub(crate) fn fuse(body: &ParsedBody) -> FuseResult {
     let old_ops = &body.ops;
     let len = old_ops.len();
     let mut new_ops = Vec::with_capacity(len);
+    let mut original_pc = Vec::with_capacity(len);
     let mut pc_map: Vec<u32> = vec![0; len + 1];
     let mut i = 0;
 
     while i < len {
         pc_map[i] = new_ops.len() as u32;
         if let Some((op, consumed)) = try_fuse_at(old_ops, i, len) {
+            original_pc.push((i + consumed - 1) as u32);
             new_ops.push(op);
             for j in 1..consumed {
                 pc_map[i + j] = pc_map[i];
             }
             i += consumed;
         } else {
+            original_pc.push(i as u32);
             new_ops.push(old_ops[i]);
             i += 1;
         }
@@ -77,7 +90,7 @@ pub(crate) fn fuse(body: &ParsedBody) -> (Vec<InlineOp>, Vec<Block>) {
 
     let mut blocks = body.blocks.clone();
     remap_blocks(&mut blocks, &pc_map);
-    (new_ops, blocks)
+    FuseResult { ops: new_ops, blocks, original_pc }
 }
 
 fn try_fuse_at(ops: &[InlineOp], i: usize, len: usize) -> Option<(InlineOp, usize)> {

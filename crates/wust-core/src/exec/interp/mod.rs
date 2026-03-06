@@ -20,6 +20,7 @@ pub struct Interpreter;
 impl ModuleExecutor for Interpreter {
     fn poll(&self, task: &mut Task) -> Outcome {
         let funcs = &task.module.funcs;
+        let fuel = &mut task.context.fuel;
         let wasm_fp = &mut task.context.wasm_fp;
         let base = wasm_fp.base();
 
@@ -37,6 +38,7 @@ impl ModuleExecutor for Interpreter {
                 #[cfg(debug_assertions)]
                 depths: func.body.operand_depth.as_ptr(),
                 funcs,
+                fuel,
             };
 
             match step(&mut stack, pc) {
@@ -71,6 +73,7 @@ struct StackMachine<'a> {
     #[cfg(debug_assertions)]
     depths: *const u16,
     funcs: &'a [FuncMeta],
+    fuel: &'a mut i64,
 }
 
 impl StackMachine<'_> {
@@ -175,6 +178,15 @@ fn step(m: &mut StackMachine, pc: u32) -> Outcome {
         unsafe { *m.depths.add(pc as usize) } as usize * 4,
         "sp drift at pc={pc}"
     );
+
+    // Fuel check: decrement and suspend if exhausted.
+    // Use < 0 so fuel=1 executes one instruction before suspending:
+    // fuel=1 → decrement to 0 → execute → next step → decrement to -1 → suspend.
+    *m.fuel -= 1;
+    if *m.fuel < 0 {
+        m.wasm_fp.frame_mut().resume_pc = pc;
+        return Outcome::Suspended;
+    }
 
     let op = unsafe { *m.ops.add(pc as usize) };
 

@@ -107,8 +107,8 @@ impl<'a> Codegen<'a> {
                     .iter()
                     .map(|m| m - snap.code_start)
                     .collect();
-                let (fused_ops, _) = crate::jit::fuse::fuse(&module.funcs[i].body);
-                let op_labels: Vec<String> = fused_ops.iter()
+                let fused = crate::jit::fuse::fuse(&module.funcs[i].body);
+                let op_labels: Vec<String> = fused.ops.iter()
                     .map(|op| {
                         crate::jit::fuse::display_label(*op)
                             .unwrap_or_else(|| op.display_label())
@@ -142,6 +142,7 @@ impl<'a> Codegen<'a> {
                         label_offsets: snap.label_offsets.clone(),
                         param_types: module.funcs[i].params.iter().map(valtype_str).collect(),
                         result_types: module.funcs[i].results.iter().map(valtype_str).collect(),
+                        word_labels: snap.word_labels.clone(),
                     }),
                 });
             },

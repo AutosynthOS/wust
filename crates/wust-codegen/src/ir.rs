@@ -49,11 +49,11 @@ pub enum IrInst {
     /// The lowerer emits nothing — it just tells regalloc2 where the value is.
     ParamDef { dst: VReg, idx: u32 },
     /// Load a local variable into a virtual register.
-    /// `offset` is the byte offset from the frame pointer (x29).
+    /// `offset` is the byte offset from the locals base register (x29/g.lb).
     /// `size` is the value width in bytes (4 for i32/f32, 8 for i64/f64).
     LocalGet { dst: VReg, offset: u32, size: u8 },
     /// Store a virtual register into a local variable.
-    /// `offset` is the byte offset from the frame pointer (x29).
+    /// `offset` is the byte offset from the locals base register (x29/g.lb).
     /// `size` is the value width in bytes (4 for i32/f32, 8 for i64/f64).
     LocalSet { offset: u32, src: VReg, size: u8 },
     /// Binary ALU operation.
@@ -89,6 +89,9 @@ pub enum IrInst {
         args: Vec<(VReg, u8)>,
         result: Option<(VReg, u8)>,
         frame_advance: u32,
+        /// Callee's locals_size (bytes). Used to compute the callee's
+        /// frame header offset for writing func_idx/resume_pc/prev_fp.
+        callee_locals_size: u16,
     },
     /// Return from the function with the given result values.
     /// Each entry is (vreg, size) where size is 4 for i32/f32, 8 for i64/f64.
@@ -104,7 +107,11 @@ pub enum IrInst {
     /// that must be materialized to the frame on the cold suspend path.
     /// On the hot path these VRegs stay in registers; regalloc2 keeps
     /// them live because they appear as uses.
-    FuelCheck { live_state: Vec<(u32, VReg)> },
+    FuelCheck {
+        live_state: Vec<(u32, VReg)>,
+        /// Wasm PC to write as resume_pc on suspend.
+        resume_pc: u32,
+    },
     /// Trap (unreachable instruction).
     Trap,
 }
@@ -148,7 +155,7 @@ impl IrInst {
                 f(*cond);
             }
             IrInst::Br { .. } => {}
-            IrInst::FuelCheck { live_state } => {
+            IrInst::FuelCheck { live_state, .. } => {
                 for (_, vreg) in live_state {
                     f(*vreg);
                 }
@@ -334,7 +341,7 @@ impl std::fmt::Display for IrInst {
                 Ok(())
             }
             IrInst::FuelConsume { cost } => write!(f, "  fuel_consume {cost}"),
-            IrInst::FuelCheck { live_state } => {
+            IrInst::FuelCheck { live_state, .. } => {
                 write!(f, "  fuel_check")?;
                 if !live_state.is_empty() {
                     write!(f, " [")?;
