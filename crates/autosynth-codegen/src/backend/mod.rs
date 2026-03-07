@@ -6,10 +6,6 @@
 
 /// AArch64 (ARM64) backend implementation.
 pub mod aarch64;
-/// RISC-V 64-bit (RV64I) backend implementation.
-pub mod riscv64;
-/// x86_64 (AMD64) backend implementation.
-pub mod x86;
 
 use crate::CodegenError;
 use crate::ir::Register;

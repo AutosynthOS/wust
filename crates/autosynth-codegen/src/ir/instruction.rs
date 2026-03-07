@@ -7,11 +7,52 @@ use crate::ir::function::FunctionIdx;
 use super::{Register, VReg, VRegDef};
 use super::block::BlockId;
 
+/// An operand in an IR instruction — register or inline immediate.
+///
+/// Unlike [`Register`], an `Operand` can carry a constant value directly.
+/// Constants never enter the register cache and never need a stack slot —
+/// the lowerer emits them as immediates or rematerializes them as needed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Operand {
+    /// A virtual register — has a canonical stack slot, goes through the cache.
+    VReg(VReg),
+    /// A physical register — already assigned (fuel, frame pointer, etc.).
+    PReg(u8),
+    /// An inline 32-bit constant.
+    Imm32(i32),
+    /// An inline 64-bit constant.
+    Imm64(i64),
+}
+
+impl fmt::Display for Operand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Operand::VReg(v) => write!(f, "{v}"),
+            Operand::PReg(n) => write!(f, "r{n}"),
+            Operand::Imm32(n) => write!(f, "#{n}"),
+            Operand::Imm64(n) => write!(f, "#{n}"),
+        }
+    }
+}
+
+impl From<VReg> for Operand {
+    fn from(v: VReg) -> Self { Operand::VReg(v) }
+}
+
+impl From<Register> for Operand {
+    fn from(r: Register) -> Self {
+        match r {
+            Register::Phys(n) => Operand::PReg(n),
+            Register::Virtual(id) => Operand::VReg(VReg(id)),
+        }
+    }
+}
+
 /// An IR instruction in the function's instruction stream.
 ///
-/// Instructions operate on [`Register`] operands (physical or virtual).
-/// The backend lowerer resolves virtual registers through the register cache,
-/// folding constants into immediates where possible.
+/// Instructions operate on [`Operand`]s — virtual registers, physical
+/// registers, or inline immediates. The backend lowerer resolves virtual
+/// registers through the register cache and emits immediates directly.
 #[derive(Debug, Clone)]
 pub enum IrInst {
     /// Push a value onto a virtual stack.
@@ -20,24 +61,16 @@ pub enum IrInst {
     /// Pop a value from a virtual stack.
     StackPop { def: VRegDef },
 
-    /// Arithmetic: dst = lhs op rhs.
+    /// Arithmetic, logic, or comparison: dst = lhs op rhs.
     ///
-    /// Operands can be virtual or physical registers. The lowerer
-    /// checks VRegDef values to fold constants into immediates.
+    /// For comparison ops (Eq, Ne, LtS, etc.), the result lives in CPU
+    /// flags — `dst` is typically the zero register (PReg). The subsequent
+    /// [`BrIf`](IrInst::BrIf) consumes the flags via a condition code.
     Alu {
         op: AluOp,
         dst: Register,
-        lhs: Register,
-        rhs: Register,
-    },
-
-    /// Comparison: sets flags from (lhs op rhs). The dst register is a
-    /// placeholder — the result lives in CPU flags, consumed by BrIf.
-    Cmp {
-        op: CmpOp,
-        dst: Register,
-        lhs: Register,
-        rhs: Register,
+        lhs: Operand,
+        rhs: Operand,
     },
 
     /// Conditional branch — if cond is truthy, goto block_if, else goto block_else.
@@ -68,50 +101,37 @@ pub enum IrInst {
     },
 
     /// Return from function.
-    Return { values: Vec<VReg> },
+    ///
+    /// When `flush` is true, the lowerer stores all dirty registers to
+    /// their canonical slots before the `ret`. Used on suspend/unwind
+    /// paths where the interpreter needs to read the frame state.
+    Return { values: Vec<VReg>, flush: bool },
 }
 
-/// Arithmetic and bitwise operations for [`IrInst::Alu`].
+/// Operations for [`IrInst::Alu`].
 ///
-/// Each variant maps to a corresponding machine instruction (e.g. `add`,
-/// `sub`, `and`) during lowering. The backend selects register-register
-/// or register-immediate forms based on operand analysis.
+/// Covers arithmetic, logic, shifts, and comparisons. The backend selects
+/// register-register or register-immediate forms based on operand analysis.
+/// Comparison ops emit flag-setting instructions (e.g. `subs`) whose
+/// condition codes are consumed by [`IrInst::BrIf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AluOp {
+    // --- Arithmetic ---
     Add,
     Sub,
     Mul,
+
+    // --- Bitwise logic ---
     And,
     Or,
     Xor,
+
+    // --- Shifts ---
     Shl,
     ShrS,
     ShrU,
-}
 
-impl fmt::Display for AluOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            AluOp::Add => write!(f, "add"),
-            AluOp::Sub => write!(f, "sub"),
-            AluOp::Mul => write!(f, "mul"),
-            AluOp::And => write!(f, "and"),
-            AluOp::Or => write!(f, "or"),
-            AluOp::Xor => write!(f, "xor"),
-            AluOp::Shl => write!(f, "shl"),
-            AluOp::ShrS => write!(f, "shr_s"),
-            AluOp::ShrU => write!(f, "shr_u"),
-        }
-    }
-}
-
-/// Comparison operations for [`IrInst::Cmp`].
-///
-/// The `S` suffix denotes signed comparisons, `U` denotes unsigned.
-/// The lowerer emits a flag-setting instruction (e.g. `subs`) and the
-/// subsequent [`IrInst::BrIf`] consumes the flags via a condition code.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CmpOp {
+    // --- Comparisons (flag-setting, result usually discarded) ---
     Eq,
     Ne,
     LtS,
@@ -124,19 +144,41 @@ pub enum CmpOp {
     GeU,
 }
 
-impl fmt::Display for CmpOp {
+impl AluOp {
+    /// True if this op is a comparison (sets flags, result typically discarded).
+    pub fn is_comparison(self) -> bool {
+        matches!(self, Self::Eq | Self::Ne
+            | Self::LtS | Self::LtU | Self::GtS | Self::GtU
+            | Self::LeS | Self::LeU | Self::GeS | Self::GeU)
+    }
+}
+
+impl fmt::Display for AluOp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            CmpOp::Eq => write!(f, "eq"),
-            CmpOp::Ne => write!(f, "ne"),
-            CmpOp::LtS => write!(f, "lt_s"),
-            CmpOp::LtU => write!(f, "lt_u"),
-            CmpOp::GtS => write!(f, "gt_s"),
-            CmpOp::GtU => write!(f, "gt_u"),
-            CmpOp::LeS => write!(f, "le_s"),
-            CmpOp::LeU => write!(f, "le_u"),
-            CmpOp::GeS => write!(f, "ge_s"),
-            CmpOp::GeU => write!(f, "ge_u"),
+            // Arithmetic
+            AluOp::Add => write!(f, "add"),
+            AluOp::Sub => write!(f, "sub"),
+            AluOp::Mul => write!(f, "mul"),
+            // Bitwise logic
+            AluOp::And => write!(f, "and"),
+            AluOp::Or => write!(f, "or"),
+            AluOp::Xor => write!(f, "xor"),
+            // Shifts
+            AluOp::Shl => write!(f, "shl"),
+            AluOp::ShrS => write!(f, "shr_s"),
+            AluOp::ShrU => write!(f, "shr_u"),
+            // Comparisons
+            AluOp::Eq => write!(f, "eq"),
+            AluOp::Ne => write!(f, "ne"),
+            AluOp::LtS => write!(f, "lt_s"),
+            AluOp::LtU => write!(f, "lt_u"),
+            AluOp::GtS => write!(f, "gt_s"),
+            AluOp::GtU => write!(f, "gt_u"),
+            AluOp::LeS => write!(f, "le_s"),
+            AluOp::LeU => write!(f, "le_u"),
+            AluOp::GeS => write!(f, "ge_s"),
+            AluOp::GeU => write!(f, "ge_u"),
         }
     }
 }

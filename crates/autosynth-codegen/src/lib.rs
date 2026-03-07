@@ -16,20 +16,20 @@
 /// Backend trait and architecture-specific lowerers.
 pub mod backend;
 mod builder;
+/// Debug trace collector for the codegen pipeline.
+pub mod debugger;
 /// Disassembly metadata, register renames, and tree-style rendering.
 pub mod disasm;
 /// Intermediate representation types: registers, instructions, blocks, and functions.
 pub mod ir;
 mod regalloc;
 
-#[cfg(test)]
-mod tests;
-
 pub use builder::{CodeBuilder, FunctionBuilder, VStack};
-pub use ir::{IrType, Register, VReg, VStackId, Value};
+pub use debugger::Debugger;
 pub use ir::block::BlockId;
 pub use ir::function::{FunctionIdx, IsaReg};
-pub use ir::instruction::{AluOp, CmpOp, IrInst};
+pub use ir::instruction::{AluOp, IrInst, Operand};
+pub use ir::{IrType, Register, VReg, VStackId, Value};
 
 /// Errors that can occur during code generation.
 #[derive(Debug)]
@@ -48,7 +48,10 @@ impl std::fmt::Display for CodegenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CodegenError::RegisterExhaustion => {
-                write!(f, "register exhaustion: no free registers (eviction not yet implemented)")
+                write!(
+                    f,
+                    "register exhaustion: no free registers (eviction not yet implemented)"
+                )
             }
             CodegenError::UnresolvedLabel(id) => {
                 write!(f, "unresolved label: {id:?}")

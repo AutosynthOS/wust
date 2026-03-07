@@ -90,7 +90,7 @@ pub enum Value {
     /// Function parameter at the given index.
     Param(usize),
     /// A constant integer value.
-    Const(i64),
+    ConstI64(i64),
     /// A constant i32 value.
     ConstI32(i32),
     /// The value of another VReg.
@@ -115,16 +115,21 @@ pub struct CanonSlot {
 /// Metadata for a virtual register definition.
 ///
 /// Each VReg has a unique id, an IR type that determines its width,
-/// a canonical stack slot where it can be spilled/loaded, and a value
-/// that describes how it was produced (constant, parameter, ALU result, etc.).
+/// an optional canonical stack slot, and a value that describes how
+/// it was produced (constant, parameter, ALU result, etc.).
+///
+/// When `slot` is `None`, the VReg is a **temp** — it has no canonical
+/// memory location and cannot be spilled. Temps must be either consumed
+/// immediately (e.g. a comparison result feeding the next `BrIf`) or
+/// rematerializable from their `value` (e.g. a constant).
 #[derive(Debug, Clone, Copy)]
 pub struct VRegDef {
     /// The unique virtual register identifier.
     pub id: VReg,
     /// The IR type (determines register width and slot size).
     pub ty: IrType,
-    /// Canonical memory location on a virtual stack.
-    pub slot: CanonSlot,
+    /// Canonical memory location on a virtual stack, or `None` for temps.
+    pub slot: Option<CanonSlot>,
     /// How this value was produced.
     pub value: Value,
 }

@@ -63,70 +63,34 @@ const WAT: &str = r#"
 //      ╰─ end
 
 #[test]
-fn fib_ir_dump() -> anyhow::Result<()> {
-    use autosynth_codegen::ir::instruction::IrInst;
-
-    let bytes = wat::parse_str(WAT)?;
-    let module = wust_core::ParsedModule::new(&bytes)?;
-    let jit = wust_codegen::JitModule::new(module)?;
-    let ir = jit.ir();
-
-    for (i, func) in ir.functions().iter().enumerate() {
-        eprintln!("=== function {i} ===");
-        for block in &func.blocks {
-            eprintln!("\n  {:?}:", block.id);
-            eprintln!("    params:     {:?}", block.params);
-            eprintln!("    successors: {:?}", block.successors);
-            for inst in &block.instructions {
-                match inst {
-                    IrInst::StackPush { def } =>
-                        eprintln!("    push {:?}({:?}) = {:?}", def.id, def.ty, def.value),
-                    IrInst::StackPop { def } =>
-                        eprintln!("    pop  {:?}({:?})", def.id, def.ty),
-                    IrInst::Alu { op, dst, lhs, rhs } =>
-                        eprintln!("    {dst:?} = {op:?} {lhs:?}, {rhs:?}"),
-                    IrInst::Cmp { op, dst, lhs, rhs } =>
-                        eprintln!("    {dst:?} = {op:?} {lhs:?}, {rhs:?}"),
-                    IrInst::BrIf { cond, block_if, block_else } =>
-                        eprintln!("    brif {cond:?} → {block_if:?} / {block_else:?}"),
-                    IrInst::Branch { target } =>
-                        eprintln!("    br {target:?}"),
-                    IrInst::Call { func_idx, .. } =>
-                        eprintln!("    call {func_idx:?}"),
-                    IrInst::Return { values } =>
-                        eprintln!("    return {values:?}"),
-                }
-            }
-            eprintln!("    results:    {:?}", block.results);
-        }
-    }
-    Ok(())
-}
-
-#[test]
 fn fib_lower() -> anyhow::Result<()> {
-    use autosynth_codegen::backend::BackendEmitter;
+    use autosynth_codegen::CodeBuilder;
+    use autosynth_codegen::Debugger;
     use autosynth_codegen::backend::aarch64::Aarch64Backend;
 
     let bytes = wat::parse_str(WAT)?;
     let module = wust_core::ParsedModule::new(&bytes)?;
-    let jit = wust_codegen::JitModule::new(module)?;
-    let ir = jit.ir();
+    let mut debugger = Debugger::new();
+    debugger.signature = "fib<0>(i32) -> (i32)".into();
+    debugger.globals = vec![
+        ("g.lb".into(), "x29".into()),
+        ("g.lr".into(), "x30".into()),
+        ("g.fuel".into(), "x0".into()),
+        ("g.ctx".into(), "x1".into()),
+        ("g.sp".into(), "x28".into()),
+    ];
+
+    let mut cb = CodeBuilder::new();
+    cb.attach_debugger(debugger);
 
     let mut backend = Aarch64Backend::new();
-    // Reserve the same registers as JitModule::compile_func
-    use autosynth_codegen::ir::function::IsaReg;
-    backend.use_isa_reg("lbp", IsaReg::FramePointer);
-    backend.use_isa_reg("lr", IsaReg::ReturnAddress);
-    backend.use_isa_reg("fuel", IsaReg::Define64(0));
-    backend.use_isa_reg("ctx", IsaReg::Define64(1));
-    backend.use_isa_reg("fsp", IsaReg::StackPointer);
+    wust_codegen::JitModule::compile_func(&mut cb, &mut backend, 0, &module.funcs)?;
 
-    let func = &ir.functions()[0];
-    let (code, disasm) = backend.lower_with_disasm(func)?;
+    let mut debugger = cb.take_debugger();
+    let ir_func = &cb.functions()[0];
+    let (code, _) = backend.lower_with_disasm(ir_func, debugger.as_mut())?;
 
-    eprintln!("\n=== lowered fib ({} bytes, {} instructions) ===", code.len(), code.len() / 4);
-    eprintln!("{}", disasm.render(None));
+    eprintln!("\n{}", debugger.unwrap().render());
 
     assert!(!code.is_empty(), "lowerer produced no code");
     Ok(())

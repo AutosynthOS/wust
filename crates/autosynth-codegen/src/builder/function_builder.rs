@@ -10,6 +10,8 @@ use crate::ir::{CanonSlot, IrType, Register, VReg, VRegDef, VStackId, Value};
 /// A virtual stack is anchored to a base register plus a byte offset.
 /// All slot addresses within the stack are computed relative to this anchor.
 pub struct VStack {
+    /// Display label for this vstack (used as a debug column header).
+    pub label: &'static str,
     /// The register that serves as the base address for this stack.
     pub base: Register,
     /// Byte offset from the base register to the start of the stack.
@@ -19,23 +21,26 @@ pub struct VStack {
 /// Incrementally builds an [`IRFunction`] by managing virtual stacks, blocks,
 /// and VReg allocation.
 ///
-/// The builder tracks virtual register definitions, use/def chains per block,
-/// and virtual stack depths. At [`build()`](Self::build) time, it analyzes
-/// control flow to compute block params (live-in) and results (live-out),
-/// then pushes the finalized function into a [`CodeBuilder`].
+/// Holds a mutable reference to the [`CodeBuilder`], so debug recording
+/// happens automatically on every [`emit`](Self::emit) call. Debug forwarding
+/// methods like [`begin_op`](Self::begin_op) and [`mark_block_start`](Self::mark_block_start)
+/// are no-ops when no debugger is attached to the CodeBuilder.
 ///
 /// # Usage pattern
 ///
 /// ```text
-/// let mut f = FunctionBuilder::new();
-/// let operands = f.define_vstack(VStack { base, offset: 0 });
+/// let mut f = FunctionBuilder::new(&mut code_builder);
+/// let operands = f.define_vstack(VStack { label: "operands", base, offset: 0 });
 /// f.entry_block(BlockId::Entry);
 /// f.push_i32(operands, Value::ConstI32(42));
 /// let val = f.pop_i32(operands);
-/// f.emit(IrInst::Return { values: vec![val] });
-/// f.build(&mut code_builder);
+/// f.emit(IrInst::Return { values: vec![val], flush: false });
+/// f.build();
 /// ```
-pub struct FunctionBuilder {
+pub struct FunctionBuilder<'a> {
+    /// The code builder that collects finalized functions and holds the debugger.
+    cb: &'a mut CodeBuilder,
+
     /// VReg definitions, indexed by VReg id.
     vreg_defs: Vec<VRegDef>,
     next_vreg: u32,
@@ -51,10 +56,11 @@ pub struct FunctionBuilder {
     next_gen_id: u32,
 }
 
-impl FunctionBuilder {
-    /// Create an empty function builder with no blocks, stacks, or VRegs.
-    pub fn new() -> Self {
+impl<'a> FunctionBuilder<'a> {
+    /// Create an empty function builder linked to a [`CodeBuilder`].
+    pub fn new(cb: &'a mut CodeBuilder) -> Self {
         Self {
+            cb,
             vreg_defs: Vec::new(),
             next_vreg: 0,
             vstacks: Vec::new(),
@@ -67,6 +73,7 @@ impl FunctionBuilder {
     /// Register a new virtual stack anchored to a register + offset.
     pub fn define_vstack(&mut self, vstack: VStack) -> VStackId {
         let id = VStackId(self.vstacks.len() as u32);
+        self.cb.add_column(vstack.label);
         self.vstacks.push(VStackDef {
             id,
             base: vstack.base,
@@ -145,7 +152,7 @@ impl FunctionBuilder {
     /// when the caller emits an ALU or Cmp instruction targeting it.
     pub fn push_i32_vreg(&mut self, vstack: VStackId) -> VReg {
         // Value::Const(0) is a placeholder — the emit will define the actual value
-        self.push_typed(vstack, IrType::I32, Value::Const(0))
+        self.push_typed(vstack, IrType::I32, Value::ConstI64(0))
     }
 
     /// Pop the top i32 from a vstack, returning the VReg that was there.
@@ -177,7 +184,10 @@ impl FunctionBuilder {
     }
 
     /// Switch to a block — creates the block builder if it doesn't exist.
+    ///
+    /// Automatically records a block boundary in the debugger (if attached).
     pub fn switch_to_block(&mut self, block: BlockId) {
+        self.cb.mark_block_start(block);
         let idx = self.ensure_block(block);
         self.current_block = Some(idx);
     }
@@ -209,12 +219,9 @@ impl FunctionBuilder {
         self.blocks[idx].id
     }
 
-    /// Attach a debug label to the current position.
-    pub fn label(&mut self, _name: &str) {
-        // TODO: store labels for debug/disassembly
-    }
-
     /// Emit an IR instruction into the currently active block.
+    ///
+    /// Automatically records the emission into the debugger (if attached).
     ///
     /// # Panics
     ///
@@ -222,6 +229,7 @@ impl FunctionBuilder {
     pub fn emit(&mut self, inst: IrInst) {
         let idx = self.current_block.expect("emit: no active block");
         self.blocks[idx].push(inst);
+        self.cb.record_ir_emit();
     }
 
     /// Get the VRegDef for a given VReg.
@@ -229,39 +237,105 @@ impl FunctionBuilder {
         self.vreg_defs[vreg.0 as usize]
     }
 
+    // --- Debug forwarding (no-op when no debugger attached) ---
+
+    /// Open a new source operation group in the debugger.
+    ///
+    /// Automatically snapshots every vstack's current state into its
+    /// corresponding debug column.
+    pub fn begin_op(&mut self, pc: &str, label: &str) {
+        self.cb.begin_op(pc, label);
+        for (i, vs) in self.vstacks.iter().enumerate() {
+            let snapshot = format_vstack_snapshot(vs);
+            self.cb.set_column(i, &snapshot);
+        }
+    }
+
     /// Finalize — analyze control flow and produce the IRFunction.
     ///
-    /// Computes block params (VRegs used but not defined in the block —
-    /// they must come from predecessors) and results (VRegs defined in
-    /// the block that successors might need).
-    pub fn build(self, cb: &mut CodeBuilder) {
-        let blocks = self.blocks.into_iter().map(|bb| {
-            let successors = extract_successors(&bb.instructions);
+    /// Two-pass liveness analysis:
+    /// 1. Params = VRegs used in a block but not defined there (live-in).
+    /// 2. Results = VRegs defined in a block that appear in any successor's
+    ///    params (live-out). A def that no successor needs is dead and not
+    ///    included in results.
+    pub fn build(self) {
+        // Pass 1: compute params and successors for each block.
+        let block_ids: Vec<BlockId> = self.blocks.iter().map(|bb| bb.id).collect();
+        let proto_blocks: Vec<_> = self
+            .blocks
+            .into_iter()
+            .enumerate()
+            .map(|(i, bb)| {
+                let mut successors = extract_successors(&bb.instructions);
 
-            // Params = VRegs used in this block that weren't defined here (deduplicated).
-            let mut params = Vec::new();
-            for &u in &bb.uses {
-                if !bb.defs.contains(&u) && !params.contains(&u) {
-                    params.push(u);
+                // Implicit fallthrough: if no terminator, the next block is the successor.
+                if successors.is_empty() && !is_terminator(bb.instructions.last()) {
+                    if let Some(&next_id) = block_ids.get(i + 1) {
+                        successors.push(next_id);
+                    }
                 }
-            }
 
-            // Results = VRegs defined in this block (deduplicated).
-            let mut results = Vec::new();
-            for &d in &bb.defs {
-                if !results.contains(&d) {
-                    results.push(d);
+                let mut params = Vec::new();
+                for &u in &bb.uses {
+                    if !bb.defs.contains(&u) && !params.contains(&u) {
+                        params.push(u);
+                    }
                 }
-            }
 
-            IrBlock {
-                id: bb.id,
-                params,
-                results,
-                successors,
-                instructions: bb.instructions,
-            }
-        }).collect();
+                (bb.id, bb.defs, bb.instructions, params, successors)
+            })
+            .collect();
+
+        // Pass 2: compute results — a def is live-out only if a successor
+        // block has it in its params (i.e., actually needs it).
+        let all_params: Vec<Vec<VReg>> = proto_blocks
+            .iter()
+            .map(|(_, _, _, p, _)| p.clone())
+            .collect();
+        let all_ids: Vec<BlockId> = proto_blocks.iter().map(|(id, _, _, _, _)| *id).collect();
+
+        let blocks = proto_blocks
+            .into_iter()
+            .map(|(id, defs, instructions, params, successors)| {
+                // Results = values this block passes to successors OR returns.
+                let mut results = Vec::new();
+
+                // 1. Values (defs or pass-through params) needed by successors.
+                let available: Vec<VReg> = defs.iter().chain(params.iter()).copied().collect();
+                for &v in &available {
+                    if results.contains(&v) {
+                        continue;
+                    }
+                    let needed = successors.iter().any(|succ_id| {
+                        if let Some(idx) = all_ids.iter().position(|id| id == succ_id) {
+                            all_params[idx].contains(&v)
+                        } else {
+                            false
+                        }
+                    });
+                    if needed {
+                        results.push(v);
+                    }
+                }
+
+                // 2. Return values — the block's output to the caller.
+                if let Some(IrInst::Return { values, .. }) = instructions.last() {
+                    for &v in values {
+                        if !results.contains(&v) {
+                            results.push(v);
+                        }
+                    }
+                }
+
+                IrBlock {
+                    id,
+                    params,
+                    results,
+                    successors,
+                    instructions,
+                }
+            })
+            .collect();
 
         let func = IRFunction {
             vstacks: self.vstacks,
@@ -269,7 +343,7 @@ impl FunctionBuilder {
             blocks,
         };
 
-        cb.push_function(func);
+        self.cb.push_function(func);
     }
 
     // --- internal helpers ---
@@ -292,9 +366,27 @@ impl FunctionBuilder {
         self.vreg_defs.push(VRegDef {
             id,
             ty,
-            slot,
+            slot: Some(slot),
             value,
         });
+        id
+    }
+
+    /// Allocate a temp VReg with no canonical stack slot.
+    ///
+    /// Temps cannot be spilled — they must be consumed immediately
+    /// (e.g. a comparison result feeding the next `BrIf`) or be
+    /// rematerializable from a constant value.
+    pub fn alloc_temp(&mut self, ty: IrType, value: Value) -> VReg {
+        let id = VReg(self.next_vreg);
+        self.next_vreg += 1;
+        self.vreg_defs.push(VRegDef {
+            id,
+            ty,
+            slot: None,
+            value,
+        });
+        self.record_def(id);
         id
     }
 
@@ -347,8 +439,7 @@ impl FunctionBuilder {
         let vs = &mut self.vstacks[vstack.0 as usize];
         assert!(vs.depth > 0, "pop: vstack is empty");
         vs.depth -= 1;
-        let vreg = vs.slots[vs.depth as usize]
-            .expect("pop: slot not defined");
+        let vreg = vs.slots[vs.depth as usize].expect("pop: slot not defined");
         self.record_use(vreg);
         let def = self.vreg_defs[vreg.0 as usize];
         self.emit(IrInst::StackPop { def });
@@ -359,7 +450,11 @@ impl FunctionBuilder {
 /// Extract successor block IDs from the last instruction in a block.
 fn extract_successors(instructions: &[IrInst]) -> Vec<BlockId> {
     match instructions.last() {
-        Some(IrInst::BrIf { block_if, block_else, .. }) => {
+        Some(IrInst::BrIf {
+            block_if,
+            block_else,
+            ..
+        }) => {
             vec![*block_if, *block_else]
         }
         Some(IrInst::Branch { target }) => {
@@ -370,10 +465,30 @@ fn extract_successors(instructions: &[IrInst]) -> Vec<BlockId> {
     }
 }
 
+/// Check if an instruction is a block terminator (no fallthrough).
+fn is_terminator(inst: Option<&IrInst>) -> bool {
+    matches!(
+        inst,
+        Some(IrInst::BrIf { .. } | IrInst::Branch { .. } | IrInst::Return { .. })
+    )
+}
+
 fn ir_type_size(ty: IrType) -> u8 {
     match ty {
         IrType::I32 | IrType::F32 => 4,
         IrType::I64 | IrType::F64 => 8,
         IrType::V128 => 16,
     }
+}
+
+/// Format a vstack's current slots as a space-separated list of VReg names.
+fn format_vstack_snapshot(vs: &VStackDef) -> String {
+    let mut parts = Vec::new();
+    for slot in vs.slots.iter().take(vs.depth as usize) {
+        match slot {
+            Some(vreg) => parts.push(format!("{vreg}")),
+            None => parts.push("_".into()),
+        }
+    }
+    parts.join(" ")
 }

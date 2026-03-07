@@ -1,11 +1,13 @@
+use autosynth_codegen::backend::BackendEmitter;
+use autosynth_codegen::backend::aarch64::Aarch64Backend;
 use autosynth_codegen::{
-    AluOp, BlockId, CmpOp, CodeBuilder, FunctionBuilder, FunctionIdx, IrInst, IrType, IsaReg,
+    AluOp, BlockId, CodeBuilder, FunctionBuilder, FunctionIdx, IrInst, IrType, IsaReg, Operand,
     VStack, Value,
 };
-use autosynth_codegen::backend::aarch64::Aarch64Backend;
-use autosynth_codegen::backend::BackendEmitter;
 use wust_core::exec::ModuleExecutor;
-use wust_core::{FRAME_HEADER_SIZE, FuncMeta, OpCode, Outcome, ParsedModule, Task, ValType, slot_size};
+use wust_core::{
+    FRAME_HEADER_SIZE, FuncMeta, OpCode, Outcome, ParsedModule, Task, ValType, slot_size,
+};
 
 use crate::CodeBuffer;
 
@@ -41,9 +43,9 @@ impl JitModule {
         let mut all_code: Vec<u8> = Vec::new();
         let mut trampoline_offsets: Vec<usize> = Vec::new();
 
-        for func in module.funcs.iter() {
+        for (func_idx, func) in module.funcs.iter().enumerate() {
             let mut backend = Aarch64Backend::new();
-            Self::compile_func(&mut compiler, &mut backend, func, &module.funcs)?;
+            Self::compile_func(&mut compiler, &mut backend, func_idx as i32, &module.funcs)?;
 
             let ir_func = &compiler.functions()[compiler.functions().len() - 1];
             let body_bytes = backend.lower(ir_func)?;
@@ -71,12 +73,23 @@ impl JitModule {
         &self.compiler
     }
 
-    fn compile_func(cb: &mut CodeBuilder, backend: &mut Aarch64Backend, func: &FuncMeta, all_funcs: &[FuncMeta]) -> anyhow::Result<()> {
-        let mut f = FunctionBuilder::new();
+    /// Compile a single WASM function into autosynth IR.
+    ///
+    /// If a [`Debugger`](autosynth_codegen::Debugger) is attached to `cb`,
+    /// source-level annotations are recorded automatically.
+    pub fn compile_func(
+        cb: &mut CodeBuilder,
+        backend: &mut Aarch64Backend,
+        func_idx: i32,
+        all_funcs: &[FuncMeta],
+    ) -> anyhow::Result<()> {
+        let func = &all_funcs[func_idx as usize];
+
+        let mut f = FunctionBuilder::new(cb);
 
         let lbp = backend.use_isa_reg("lbp", IsaReg::FramePointer);
         let lr = backend.use_isa_reg("lr", IsaReg::ReturnAddress);
-        let _fuel = backend.use_isa_reg("fuel", IsaReg::Define64(0));
+        let fuel = backend.use_isa_reg("fuel", IsaReg::Define64(0));
         let _ctx = backend.use_isa_reg("ctx", IsaReg::Define64(1));
         let fsp = backend.use_isa_reg("fsp", IsaReg::StackPointer);
 
@@ -85,17 +98,24 @@ impl JitModule {
         // [param0, param1, local_2, ...][frame header][operands]
         // ^ lbp
         let locals = f.define_vstack(VStack {
+            label: "locals",
             base: lbp,
             offset: 0,
         });
         let operands = f.define_vstack(VStack {
+            label: "operands",
             base: lbp,
             offset: func.locals_size as u32 + FRAME_HEADER_SIZE as u32,
         });
         let fibre = f.define_vstack(VStack {
+            label: "fibre",
             base: fsp,
             offset: 0,
         });
+
+        // Prologue — entry block must be active before defining slots
+        // so that params and locals are recorded as defs of the entry block.
+        f.entry_block(BlockId::Entry);
 
         // Declare parameters
         for (i, param) in func.params.iter().enumerate() {
@@ -108,22 +128,34 @@ impl JitModule {
                 locals,
                 i + func.params.len(),
                 valtype_to_ir(&local),
-                Value::Const(0),
+                Value::ConstI64(0),
             );
         }
-
-        // Prologue
-        f.entry_block(BlockId::Entry);
-        f.label("prologue");
+        f.begin_op("--", "prologue");
         let lr_vreg = f.push_i64(fibre, Value::Reg(lr));
+
+        let _header_offset = func.locals_size as u32;
+
         f.switch_to_block(BlockId::User(0));
+
+        // Fuel tracking: accumulate cost per opcode, flush before calls.
+        let mut pending_fuel: u32 = 0;
 
         // Main compilation loop
         let mut pc = 0;
         loop {
-            debug_assert!(pc < func.body.ops.len(), "pc {pc} out of bounds (len={})", func.body.ops.len());
+            debug_assert!(
+                pc < func.body.ops.len(),
+                "pc {pc} out of bounds (len={})",
+                func.body.ops.len()
+            );
             let inline_op = unsafe { func.body.ops.get_unchecked(pc) };
             let op = inline_op.opcode();
+
+            f.begin_op(&pc.to_string(), &format!("{op}"));
+
+            // Accrue fuel cost for this opcode.
+            pending_fuel += op.fuel_cost();
 
             match op {
                 OpCode::I32Const => {
@@ -168,8 +200,8 @@ impl JitModule {
                     let rhs = f.pop_i32(operands);
                     let lhs = f.pop_i32(operands);
                     let dst = f.push_i32_vreg(operands);
-                    f.emit(IrInst::Cmp {
-                        op: CmpOp::LeS,
+                    f.emit(IrInst::Alu {
+                        op: AluOp::LeS,
                         dst: dst.into(),
                         lhs: lhs.into(),
                         rhs: rhs.into(),
@@ -179,8 +211,6 @@ impl JitModule {
                 OpCode::If => {
                     let block_idx = inline_op.immediate_u32();
                     let cond = f.pop_i32(operands);
-                    // Then-path enters the if-block body.
-                    // Else/continuation starts after the end — at User(pc after end).
                     let then_block = BlockId::User(pc as u32 + 1);
                     let end_pc = func.body.blocks[block_idx as usize].end_pc;
                     let cont_block = BlockId::User(end_pc);
@@ -207,29 +237,30 @@ impl JitModule {
                 OpCode::End => {
                     let block_idx = inline_op.immediate_u32();
                     if block_idx == 0 {
-                        // Function-level end — emit implicit return.
                         let values = if f.stack_depth(operands) > 0 {
                             vec![f.pop_i32(operands)]
                         } else {
                             vec![]
                         };
-                        // Always emit a fibre pop for lr restoration.
-                        // The depth counter may be wrong due to an earlier
-                        // explicit Return in a different control-flow path
-                        // decrementing it, so we emit the pop unconditionally
-                        // using the saved lr VReg from prologue.
-                        f.emit(IrInst::StackPop { def: f.vreg_def(lr_vreg) });
-                        f.emit(IrInst::Return { values });
+                        f.emit(IrInst::StackPop {
+                            def: f.vreg_def(lr_vreg),
+                        });
+                        f.emit(IrInst::Return {
+                            values,
+                            flush: false,
+                        });
                         break;
                     }
-                    // Non-function end — continuation block starts at this PC.
                     f.switch_to_block(BlockId::User(pc as u32));
                 }
 
                 OpCode::Return => {
                     let val = f.pop_i32(operands);
                     f.pop_i64(fibre);
-                    f.emit(IrInst::Return { values: vec![val] });
+                    f.emit(IrInst::Return {
+                        values: vec![val],
+                        flush: false,
+                    });
                 }
 
                 OpCode::Call => {
@@ -240,21 +271,15 @@ impl JitModule {
                     let callee = &all_funcs[callee_idx as usize];
                     let frame_advance = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
 
-                    // Pop call arguments from the operand stack (in reverse order).
                     let mut args: Vec<_> = (0..callee.param_count())
                         .map(|_| f.pop_i32(operands))
                         .collect();
                     args.reverse();
 
-                    // Allocate VRegs for return values (one per callee result).
-                    // The Call lowerer binds these to calling convention regs.
                     let result_vregs: Vec<_> = (0..callee.result_count())
                         .map(|_| f.push_i32_vreg(operands))
                         .collect();
 
-                    // The Call instruction handles frame advance/restore internally
-                    // to ensure dirty registers are flushed BEFORE the frame pointer
-                    // moves, keeping canonical slot stores at the right addresses.
                     f.emit(IrInst::Call {
                         func_idx: FunctionIdx::User(callee_idx as u32),
                         args,
@@ -262,10 +287,42 @@ impl JitModule {
                         frame_advance,
                     });
 
-                    // TODO: Call is a suspend point — split the block
-                    // once suspend/resume is wired up. For now, keep
-                    // the instructions in the same block so the
-                    // register cache preserves result bindings.
+                    f.begin_op("--", "fuel consume");
+
+                    f.emit(IrInst::Alu {
+                        op: AluOp::Sub,
+                        dst: fuel,
+                        lhs: Operand::from(fuel),
+                        rhs: Operand::Imm32(pending_fuel as i32),
+                    });
+                    pending_fuel = 0;
+
+                    f.begin_op("--", "fuel check");
+
+                    let fuel_cond = f.alloc_temp(IrType::I32, Value::ConstI64(0));
+                    f.emit(IrInst::Alu {
+                        op: AluOp::LeS,
+                        dst: fuel_cond.into(),
+                        lhs: Operand::from(fuel),
+                        rhs: Operand::Imm32(0),
+                    });
+
+                    let suspend_block = f.gen_block();
+                    let cont_block = BlockId::User(pc as u32);
+
+                    f.emit(IrInst::BrIf {
+                        cond: fuel_cond,
+                        block_if: suspend_block,
+                        block_else: cont_block,
+                    });
+
+                    f.switch_to_block(suspend_block);
+                    f.begin_op("--", "return to caller");
+                    f.emit(IrInst::Return {
+                        values: Vec::new(),
+                        flush: false,
+                    });
+                    f.switch_to_block(cont_block);
                 }
 
                 _ => todo!("unhandled opcode: {:?}", op),
@@ -274,7 +331,7 @@ impl JitModule {
             pc += 1;
         }
 
-        f.build(cb);
+        f.build();
         Ok(())
     }
 }
@@ -314,7 +371,11 @@ fn emit_entry_trampoline(func: &FuncMeta, body_size: usize) -> Vec<u8> {
     words.push(encode_sub_imm_x(29, 29, locals_header_size));
 
     // Load parameters from local slots into calling convention regs (x9, x10, ...)
-    for (i, &off) in func.local_byte_offsets[..func.param_count()].iter().enumerate().take(7) {
+    for (i, &off) in func.local_byte_offsets[..func.param_count()]
+        .iter()
+        .enumerate()
+        .take(7)
+    {
         // ldr w(9+i), [x29, #off]  — 32-bit unsigned offset load
         words.push(encode_ldr_w_uoff(9 + i as u32, 29, off as u32));
     }
@@ -352,8 +413,12 @@ fn emit_entry_trampoline(func: &FuncMeta, body_size: usize) -> Vec<u8> {
     // ret x30
     words.push(encode_ret(30));
 
-    debug_assert_eq!(words.len(), total_trampoline,
-        "trampoline size mismatch: predicted {total_trampoline}, got {}", words.len());
+    debug_assert_eq!(
+        words.len(),
+        total_trampoline,
+        "trampoline size mismatch: predicted {total_trampoline}, got {}",
+        words.len()
+    );
 
     let mut bytes = Vec::with_capacity(words.len() * 4);
     for word in words {
@@ -390,7 +455,10 @@ fn encode_add_imm_x(rd: u32, rn: u32, imm12: u32) -> u32 {
 
 /// `ldr Wt, [Xn, #uimm12*4]` (32-bit unsigned offset)
 fn encode_ldr_w_uoff(rt: u32, rn: u32, byte_offset: u32) -> u32 {
-    debug_assert!(byte_offset % 4 == 0, "offset must be 4-byte aligned: {byte_offset}");
+    debug_assert!(
+        byte_offset % 4 == 0,
+        "offset must be 4-byte aligned: {byte_offset}"
+    );
     let scaled = byte_offset / 4;
     debug_assert!(scaled < 4096, "scaled offset out of range: {scaled}");
     0xB9400000 | (scaled << 10) | (rn << 5) | rt
@@ -398,7 +466,10 @@ fn encode_ldr_w_uoff(rt: u32, rn: u32, byte_offset: u32) -> u32 {
 
 /// `str Wt, [Xn, #uimm12*4]` (32-bit unsigned offset)
 fn encode_str_w_uoff(rt: u32, rn: u32, byte_offset: u32) -> u32 {
-    debug_assert!(byte_offset % 4 == 0, "offset must be 4-byte aligned: {byte_offset}");
+    debug_assert!(
+        byte_offset % 4 == 0,
+        "offset must be 4-byte aligned: {byte_offset}"
+    );
     let scaled = byte_offset / 4;
     debug_assert!(scaled < 4096, "scaled offset out of range: {scaled}");
     0xB9000000 | (scaled << 10) | (rn << 5) | rt
@@ -433,13 +504,14 @@ impl ModuleExecutor for JitModule {
 /// Call the JIT entry trampoline with the appropriate register setup.
 ///
 /// Register convention on entry to trampoline:
+/// - x0  = fuel counter (g.fuel)
 /// - x29 = wasm_fp.ptr (operand base, past header)
 /// - x28 = fibre stack pointer
-/// - fuel and ctx are not used by the lowered code (no fuel checks)
 ///
 /// The trampoline converts x29 to locals base, loads params,
 /// calls the function body, stores results, and returns.
 fn call_trampoline(trampoline_ptr: *const u8, ctx: &mut wust_core::Context) -> Outcome {
+    const FUEL: usize = std::mem::offset_of!(wust_core::Context, fuel);
     const WASM_FP: usize = std::mem::offset_of!(wust_core::Context, wasm_fp);
     const FIBRE_SP: usize = std::mem::offset_of!(wust_core::Context, fibre_sp);
 
@@ -460,17 +532,19 @@ fn call_trampoline(trampoline_ptr: *const u8, ctx: &mut wust_core::Context) -> O
             "str {ctx}, [sp, #-16]!",
 
             // Load JIT state from context.
+            "ldr x0, [{ctx}, #{fuel}]",
             "ldr x29, [{ctx}, #{fp}]",
             "ldr x28, [{ctx}, #{fibre_sp}]",
 
             // Call the entry trampoline.
             "blr {code}",
 
-            // After JIT returns, x29 = wasm_fp and x28 = fibre_sp.
-            // Use x0 as scratch to reload ctx (x0 is caller-saved, safe here).
-            "ldr x0, [sp], #16",
-            "str x29, [x0, #{fp}]",
-            "str x28, [x0, #{fibre_sp}]",
+            // After JIT returns, x0 = fuel, x29 = wasm_fp, x28 = fibre_sp.
+            // Reload ctx pointer from stack, then store JIT state back.
+            "ldr x1, [sp], #16",
+            "str x0, [x1, #{fuel}]",
+            "str x29, [x1, #{fp}]",
+            "str x28, [x1, #{fibre_sp}]",
 
             // Restore host callee-saved registers.
             "ldp x20, x19, [sp], #16",
@@ -482,6 +556,7 @@ fn call_trampoline(trampoline_ptr: *const u8, ctx: &mut wust_core::Context) -> O
 
             ctx = in(reg) ctx_ptr,
             code = in(reg) trampoline_ptr,
+            fuel = const FUEL,
             fp = const WASM_FP,
             fibre_sp = const FIBRE_SP,
             // Clobbers: all caller-saved registers the JIT might use.
