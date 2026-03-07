@@ -108,6 +108,41 @@ pub enum IrInst {
     Return { values: Vec<VReg>, flush: bool },
 }
 
+impl fmt::Display for IrInst {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrInst::StackPush { def } => {
+                write!(f, "push {} = {}", def.id, def.value)
+            }
+            IrInst::StackPop { def } => {
+                write!(f, "pop {}", def.id)
+            }
+            IrInst::Alu { op, dst, lhs, rhs } => {
+                write!(f, "{dst} = {op} {lhs}, {rhs}")
+            }
+            IrInst::BrIf { cond, block_if, block_else } => {
+                write!(f, "br_if {cond} then {block_if} else {block_else}")
+            }
+            IrInst::Branch { target } => {
+                write!(f, "br {target}")
+            }
+            IrInst::Call { func_idx, args, results, frame_advance } => {
+                let args_s: Vec<String> = args.iter().map(|a| format!("{a}")).collect();
+                let res_s: Vec<String> = results.iter().map(|r| format!("{r}")).collect();
+                write!(f, "call {func_idx}({}) → ({}) fp+{frame_advance}", args_s.join(", "), res_s.join(", "))
+            }
+            IrInst::Return { values, flush } => {
+                let vals: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
+                if *flush {
+                    write!(f, "ret {} flush", vals.join(", "))
+                } else {
+                    write!(f, "ret {}", vals.join(", "))
+                }
+            }
+        }
+    }
+}
+
 /// Operations for [`IrInst::Alu`].
 ///
 /// Covers arithmetic, logic, shifts, and comparisons. The backend selects

@@ -39,9 +39,9 @@ pub trait Aarch64Inst {
 
 /// Wrapper that bridges `Aarch64Inst` → `Instruction`.
 #[derive(Debug, Clone, Copy)]
-pub struct Aarch64Instruction<T: Aarch64Inst>(pub T);
+pub struct InstAdapter<T: Aarch64Inst>(pub T);
 
-impl<T: Aarch64Inst> Instruction for Aarch64Instruction<T> {
+impl<T: Aarch64Inst> Instruction for InstAdapter<T> {
     fn encode(&self, buf: &mut [u8]) -> Result<usize, EncodeError> {
         if buf.len() < 4 {
             return Err(EncodeError);
@@ -52,8 +52,94 @@ impl<T: Aarch64Inst> Instruction for Aarch64Instruction<T> {
     }
 }
 
-impl<T: Aarch64Inst> From<T> for Aarch64Instruction<T> {
+impl<T: Aarch64Inst> From<T> for InstAdapter<T> {
     fn from(inst: T) -> Self {
-        Aarch64Instruction(inst)
+        InstAdapter(inst)
     }
+}
+
+/// Unified enum of all AArch64 instructions.
+///
+/// Stores the instruction AST without encoding, so it can be
+/// re-rendered or inspected after emission.
+#[derive(Debug, Clone, Copy)]
+pub enum Aarch64Instruction {
+    AddImm(AddImm),
+    AddReg(AddReg),
+    BCond(BCond),
+    Bl(Bl),
+    LdrPost(LdrPost),
+    LdrUoff(LdrUoff),
+    Movz(Movz),
+    OrrReg(OrrReg),
+    Ret(Ret),
+    StrPre(StrPre),
+    StrUoff(StrUoff),
+    SubImm(SubImm),
+    SubReg(SubReg),
+    SubsImm(SubsImm),
+    SubsReg(SubsReg),
+}
+
+impl core::fmt::Display for Aarch64Instruction {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::AddImm(i) => write!(f, "{i}"),
+            Self::AddReg(i) => write!(f, "{i}"),
+            Self::BCond(i) => write!(f, "{i}"),
+            Self::Bl(i) => write!(f, "{i}"),
+            Self::LdrPost(i) => write!(f, "{i}"),
+            Self::LdrUoff(i) => write!(f, "{i}"),
+            Self::Movz(i) => write!(f, "{i}"),
+            Self::OrrReg(i) => write!(f, "{i}"),
+            Self::Ret(i) => write!(f, "{i}"),
+            Self::StrPre(i) => write!(f, "{i}"),
+            Self::StrUoff(i) => write!(f, "{i}"),
+            Self::SubImm(i) => write!(f, "{i}"),
+            Self::SubReg(i) => write!(f, "{i}"),
+            Self::SubsImm(i) => write!(f, "{i}"),
+            Self::SubsReg(i) => write!(f, "{i}"),
+        }
+    }
+}
+
+impl Aarch64Inst for Aarch64Instruction {
+    fn encode_word(&self) -> u32 {
+        match self {
+            Self::AddImm(i) => i.encode_word(),
+            Self::AddReg(i) => i.encode_word(),
+            Self::BCond(i) => i.encode_word(),
+            Self::Bl(i) => i.encode_word(),
+            Self::LdrPost(i) => i.encode_word(),
+            Self::LdrUoff(i) => i.encode_word(),
+            Self::Movz(i) => i.encode_word(),
+            Self::OrrReg(i) => i.encode_word(),
+            Self::Ret(i) => i.encode_word(),
+            Self::StrPre(i) => i.encode_word(),
+            Self::StrUoff(i) => i.encode_word(),
+            Self::SubImm(i) => i.encode_word(),
+            Self::SubReg(i) => i.encode_word(),
+            Self::SubsImm(i) => i.encode_word(),
+            Self::SubsReg(i) => i.encode_word(),
+        }
+    }
+}
+
+macro_rules! impl_from_inst {
+    ($($variant:ident($ty:ty)),* $(,)?) => {
+        $(
+            impl From<$ty> for Aarch64Instruction {
+                fn from(inst: $ty) -> Self {
+                    Aarch64Instruction::$variant(inst)
+                }
+            }
+        )*
+    };
+}
+
+impl_from_inst! {
+    AddImm(AddImm), AddReg(AddReg), BCond(BCond), Bl(Bl),
+    LdrPost(LdrPost), LdrUoff(LdrUoff), Movz(Movz), OrrReg(OrrReg),
+    Ret(Ret), StrPre(StrPre), StrUoff(StrUoff), SubImm(SubImm),
+    SubReg(SubReg), SubsImm(SubsImm), SubsReg(SubsReg),
 }

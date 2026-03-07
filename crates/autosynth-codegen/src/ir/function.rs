@@ -2,13 +2,21 @@
 //! stack definitions, and the finalized [`IRFunction`].
 
 use super::block::IrBlock;
-use super::{Register, VReg, VRegDef, VStackId};
+use super::{Register, VRegDef, VStackId};
 
 /// Index identifying a function in the compilation unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionIdx {
     /// A user-defined function, indexed by its position in the module.
     User(u32),
+}
+
+impl std::fmt::Display for FunctionIdx {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FunctionIdx::User(n) => write!(f, "fn{n}"),
+        }
+    }
 }
 
 /// Architecture-abstract register role, resolved to a physical register by
@@ -30,18 +38,20 @@ pub enum IsaReg {
     Define64(i8),
 }
 
-/// Definition of a virtual stack — anchored to a register + offset.
+/// Immutable configuration of a virtual stack — anchored to a register + offset.
+///
+/// This is the part of a vstack that never changes: which register it's
+/// relative to and where it starts. The mutable state (depth, slot
+/// assignments) lives on [`BlockBuilder`](crate::builder::block_builder::BlockBuilder).
 #[derive(Debug)]
-pub struct VStackDef {
+pub struct VStackConfig {
     pub id: VStackId,
+    /// Display label for this stack (e.g. "locals", "operands").
+    pub label: &'static str,
     /// The register this stack is relative to (always Phys in practice).
     pub base: Register,
     /// Byte offset from the base register to the start of this stack.
     pub base_offset: u32,
-    /// Final stack depth (number of slots).
-    pub depth: u32,
-    /// Slot definitions (index → VReg).
-    pub slots: Vec<Option<VReg>>,
 }
 
 /// A complete IR function — the finalized output of FunctionBuilder.
@@ -50,8 +60,8 @@ pub struct VStackDef {
 /// Blocks have their params, results, and successors computed.
 #[derive(Debug)]
 pub struct IRFunction {
-    /// All virtual stacks defined for this function.
-    pub vstacks: Vec<VStackDef>,
+    /// Virtual stack configurations (base register + offset per vstack).
+    pub vstacks: Vec<VStackConfig>,
     /// All VReg definitions, indexed by VReg id.
     pub vreg_defs: Vec<VRegDef>,
     /// All blocks with analyzed control flow.

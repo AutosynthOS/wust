@@ -95,12 +95,11 @@ impl RegCache {
             s.binding.map_or(false, |b| b.vreg == src)
         })?;
         let reg = slot.reg;
-        // SAFETY: the find predicate above filters on binding.is_some(), so unwrap is safe.
-        let dirty = slot.binding.unwrap().dirty;
         // Rebind the register to the new VReg (the old one is consumed).
-        // SAFETY: `reg` came from self.slots, so it must exist in self.slots.
+        // Always dirty: the new VReg has a different canonical slot than the
+        // source, so the register value hasn't been stored there yet.
         let slot = self.slots.iter_mut().find(|s| s.reg == reg).unwrap();
-        slot.binding = Some(Binding { vreg: dst, dirty });
+        slot.binding = Some(Binding { vreg: dst, dirty: true });
         Some(reg)
     }
 
@@ -267,6 +266,22 @@ mod tests {
         // After invalidate, ensure needs a load again
         let result = cache.ensure(VReg(0)).unwrap();
         assert!(result.needs_load);
+    }
+
+    #[test]
+    fn alias_always_dirty() {
+        // Regression: alias must mark the new binding dirty even if the
+        // source was clean (loaded from memory). The new VReg has a
+        // different canonical slot that hasn't been written yet.
+        let mut cache = RegCache::new(&pool());
+        let result = cache.ensure(VReg(0)).unwrap();
+        assert!(result.needs_load); // v0 loaded from memory → clean
+        assert!(cache.flush_dirty().is_empty()); // v0 is clean
+
+        cache.alias(VReg(1), VReg(0)).unwrap();
+        let dirty = cache.flush_dirty();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].1, VReg(1)); // v1 must be dirty
     }
 
     #[test]

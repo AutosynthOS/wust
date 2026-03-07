@@ -9,7 +9,7 @@ use crate::reg::*;
 
 fn check_asm<I: Aarch64Inst + Copy + core::fmt::Display>(inst: &I, expected: &str) {
     let mut buf = [0u8; 4];
-    let wrapped = Aarch64Instruction(*inst);
+    let wrapped = InstAdapter(*inst);
     let n = wrapped.encode(&mut buf).expect("encode failed");
     assert_eq!(n, 4);
     assert_eq!(format!("{inst}"), expected);

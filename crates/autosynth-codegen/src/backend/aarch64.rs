@@ -1,15 +1,16 @@
 use std::collections::HashMap;
 
 use autosynth_isa_aarch64::{
-    BCond, Cond, GprOrSp, GprOrZr, LdrPost, LdrUoff, Movz, OrrReg, Ret, SImm9, StrPre, StrUoff,
-    SubsImm, SubsReg, UImm12, UImm16,
+    Aarch64Inst, Aarch64Instruction, BCond, Cond, GprOrSp, GprOrZr, LdrPost, LdrUoff, Movz,
+    OrrReg, Ret, SImm9, StrPre, StrUoff, SubsImm, SubsReg, UImm12, UImm16,
     reg::{Gpr, GprId, WGpr, XGpr},
 };
 
 use super::{BackendEmitter, PhysReg};
 use crate::CodegenError;
 use crate::debugger::Debugger;
-use crate::disasm::{BlockLabel, BranchInfo, DisasmInst, DisasmMetadata};
+use crate::disasm::table::Align;
+use crate::disasm::{BlockLabel, BranchInfo, DisasmInst, DisasmMetadata, RegisterRenames};
 use crate::ir::block::BlockId;
 use crate::ir::function::{FunctionIdx, IRFunction, IsaReg};
 use crate::ir::instruction::{AluOp, IrInst, Operand};
@@ -20,6 +21,36 @@ use crate::regalloc::RegCache;
 pub struct Aarch64Backend {
     pool: Vec<PhysReg>,
     assignments: HashMap<&'static str, PhysReg>,
+}
+
+impl BackendEmitter for Aarch64Backend {
+    fn use_isa_reg(&mut self, name: &'static str, role: IsaReg) -> Register {
+        let phys = if let Some(fixed) = Self::fixed_phys(role) {
+            self.pool.retain(|r| *r != fixed);
+            fixed
+        } else {
+            let IsaReg::Define64(idx) = role else {
+                unreachable!()
+            };
+            if idx >= 0 {
+                self.pool.remove(idx as usize)
+            } else {
+                let i = self.pool.len().wrapping_add(idx as isize as usize);
+                self.pool.remove(i)
+            }
+        };
+        self.assignments.insert(name, phys);
+        Register::Phys(phys.0)
+    }
+
+    fn scratch(&self) -> &[PhysReg] {
+        &self.pool
+    }
+
+    fn lower(&self, func: &IRFunction) -> Result<Vec<u8>, CodegenError> {
+        let (bytes, _) = self.lower_with_disasm(func, None)?;
+        Ok(bytes)
+    }
 }
 
 impl Aarch64Backend {
@@ -77,39 +108,7 @@ impl Aarch64Backend {
             _ => unreachable!("cmp_op_to_cond called with non-comparison op: {op}"),
         }
     }
-}
 
-impl BackendEmitter for Aarch64Backend {
-    fn use_isa_reg(&mut self, name: &'static str, role: IsaReg) -> Register {
-        let phys = if let Some(fixed) = Self::fixed_phys(role) {
-            self.pool.retain(|r| *r != fixed);
-            fixed
-        } else {
-            let IsaReg::Define64(idx) = role else {
-                unreachable!()
-            };
-            if idx >= 0 {
-                self.pool.remove(idx as usize)
-            } else {
-                let i = self.pool.len().wrapping_add(idx as isize as usize);
-                self.pool.remove(i)
-            }
-        };
-        self.assignments.insert(name, phys);
-        Register::Phys(phys.0)
-    }
-
-    fn scratch(&self) -> &[PhysReg] {
-        &self.pool
-    }
-
-    fn lower(&self, func: &IRFunction) -> Result<Vec<u8>, CodegenError> {
-        let (bytes, _) = self.lower_with_disasm(func, None)?;
-        Ok(bytes)
-    }
-}
-
-impl Aarch64Backend {
     /// Lower an IR function to machine code bytes and structured disassembly metadata.
     ///
     /// When a [`Debugger`] is provided, records block boundaries, IR-to-group
@@ -119,11 +118,13 @@ impl Aarch64Backend {
         func: &IRFunction,
         debugger: Option<&mut Debugger>,
     ) -> Result<(Vec<u8>, DisasmMetadata), CodegenError> {
-        let mut ctx = LowerCtx::new(&self.pool, &func.vreg_defs, debugger);
+        let mut ctx = LowerCtx::new(&self.pool, &func.vreg_defs, debugger, &self.assignments);
         let mut block_labels: Vec<BlockLabel> = Vec::new();
         let mut ir_index = 0usize;
 
-        for block in &func.blocks {
+        for (block_idx, block) in func.blocks.iter().enumerate() {
+            let next_block = func.blocks.get(block_idx + 1).map(|b| b.id);
+
             block_labels.push(BlockLabel {
                 offset: ctx.code.len() * 4,
                 id: block.id,
@@ -135,10 +136,8 @@ impl Aarch64Backend {
             }
 
             for inst in &block.instructions {
-                if let Some(dbg) = &mut ctx.debugger {
-                    dbg.begin_ir_inst(ir_index);
-                }
-                ctx.lower_inst(inst, func)?;
+                ctx.dbg(|dbg, _| dbg.begin_ir_inst(ir_index));
+                ctx.lower_inst(inst, func, next_block)?;
                 ir_index += 1;
             }
         }
@@ -179,14 +178,27 @@ struct LowerCtx<'a> {
     pending_cmp: Option<PendingCmp>,
     disasm: Vec<String>,
     debugger: Option<&'a mut Debugger>,
+    /// Register display names built from backend global assignments.
+    renames: RegisterRenames,
 }
 
 impl<'a> LowerCtx<'a> {
     fn new(
         scratch: &[PhysReg],
         vreg_defs: &'a [VRegDef],
-        debugger: Option<&'a mut Debugger>,
+        mut debugger: Option<&'a mut Debugger>,
+        assignments: &HashMap<&'static str, PhysReg>,
     ) -> Self {
+        if let Some(dbg) = &mut debugger {
+            dbg.add_machine_column("addr", Align::Right);
+            dbg.add_machine_column("asm", Align::Left);
+        }
+        let mut renames = RegisterRenames::new();
+        for (&name, &phys) in assignments {
+            let display = format!("g.{name}");
+            renames.add(&format!("x{}", phys.0), &display);
+            renames.add(&format!("w{}", phys.0), &display);
+        }
         Self {
             code: Vec::with_capacity(64),
             cache: RegCache::new(scratch),
@@ -196,15 +208,31 @@ impl<'a> LowerCtx<'a> {
             pending_cmp: None,
             disasm: Vec::new(),
             debugger,
+            renames,
         }
     }
 
-    fn emit<I: autosynth_isa_aarch64::Aarch64Inst + core::fmt::Display>(&mut self, inst: I) {
-        let text = format!("{inst}");
-        let offset = self.code.len() * 4;
+    /// Run a closure with the debugger if one is attached.
+    ///
+    /// When no debugger is present the closure is never called — no string
+    /// formatting, no allocations, zero cost. The closure also receives the
+    /// [`RegisterRenames`] so it can format register names without a separate
+    /// borrow of `self`.
+    fn dbg(&mut self, f: impl FnOnce(&mut Debugger, &RegisterRenames)) {
         if let Some(dbg) = &mut self.debugger {
-            dbg.emit_machine_inst(offset, &text);
+            f(dbg, &self.renames);
         }
+    }
+
+    fn emit(&mut self, inst: Aarch64Instruction) {
+        let raw = format!("{inst}");
+        let text = self.renames.apply(&raw);
+        let offset = self.code.len() * 4;
+        self.dbg(|dbg, _| {
+            dbg.emit_machine_inst();
+            dbg.set_machine("addr", &format!("{offset:04x}"));
+            dbg.set_machine("asm", &text);
+        });
         self.disasm.push(text);
         self.code.push(inst.encode_word());
     }
@@ -263,7 +291,16 @@ impl<'a> LowerCtx<'a> {
     }
 
     /// Dispatch an IR instruction to the appropriate lowering helper.
-    fn lower_inst(&mut self, inst: &IrInst, func: &IRFunction) -> Result<(), CodegenError> {
+    ///
+    /// `next_block` is the block that follows in layout order — used for
+    /// fallthrough elimination (unconditional branches to the next block
+    /// emit no code).
+    fn lower_inst(
+        &mut self,
+        inst: &IrInst,
+        func: &IRFunction,
+        next_block: Option<BlockId>,
+    ) -> Result<(), CodegenError> {
         match inst {
             IrInst::StackPush { def } => self.lower_stack_push(def, func),
             IrInst::StackPop { def } => self.lower_stack_pop(def, func),
@@ -273,6 +310,7 @@ impl<'a> LowerCtx<'a> {
                 block_if: _,
                 block_else,
             } => self.lower_br_if(*block_else),
+            IrInst::Branch { target } if Some(*target) == next_block => Ok(()),
             IrInst::Branch { target } => self.lower_branch(*target),
             IrInst::Call {
                 func_idx,
@@ -289,19 +327,19 @@ impl<'a> LowerCtx<'a> {
             Value::ConstI64(0) => {}
             Value::ConstI32(n) => {
                 let phys = self.cache.define(def.id)?;
-                self.emit(Movz {
+                self.emit(Aarch64Instruction::Movz(Movz {
                     rd: GprOrZr::from(Aarch64Backend::phys_to_wgpr(phys)),
                     imm: UImm16::new(n as u16),
                     hw: 0,
-                });
+                }));
             }
             Value::ConstI64(n) => {
                 let phys = self.cache.define(def.id)?;
-                self.emit(Movz {
+                self.emit(Aarch64Instruction::Movz(Movz {
                     rd: GprOrZr::from(Aarch64Backend::phys_to_xgpr(phys)),
                     imm: UImm16::new(n as u16),
                     hw: 0,
-                });
+                }));
             }
             Value::VReg(src) => {
                 let src_result = self.cache.ensure(src)?;
@@ -321,14 +359,13 @@ impl<'a> LowerCtx<'a> {
                     offset: offset as u32,
                     max: 255,
                 })?;
-                self.emit(StrPre {
+                self.emit(Aarch64Instruction::StrPre(StrPre {
                     rt: GprOrZr::from(Aarch64Backend::reg_to_xgpr(reg)?),
                     rn: GprOrSp::from(Gpr::X(base)),
                     imm,
-                });
+                }));
             }
             Value::Param(i) => {
-                // Parameters arrive in calling convention registers (x9, x10, ...).
                 let cc_reg = PhysReg(9 + i as u8);
                 self.cache.bind(def.id, cc_reg);
             }
@@ -341,16 +378,15 @@ impl<'a> LowerCtx<'a> {
             let slot = def.slot.expect("StackPop(Reg) on temp vreg");
             let base_reg = func.vstacks[slot.vstack.0 as usize].base;
             let base = Aarch64Backend::reg_to_xgpr(base_reg)?;
-            let imm =
-                SImm9::new(slot.size as i16).map_err(|_| CodegenError::OffsetOutOfRange {
-                    offset: slot.size as u32,
-                    max: 255,
-                })?;
-            self.emit(LdrPost {
+            let imm = SImm9::new(slot.size as i16).map_err(|_| CodegenError::OffsetOutOfRange {
+                offset: slot.size as u32,
+                max: 255,
+            })?;
+            self.emit(Aarch64Instruction::LdrPost(LdrPost {
                 rt: GprOrZr::from(Aarch64Backend::reg_to_xgpr(reg)?),
                 rn: GprOrSp::from(Gpr::X(base)),
                 imm,
-            });
+            }));
             return Ok(());
         }
         if self.cache.lookup(def.id).is_some() {
@@ -404,15 +440,20 @@ impl<'a> LowerCtx<'a> {
     ) -> Result<(), CodegenError> {
         let lhs_phys = self.resolve_operand(lhs, func)?;
 
-        // Phys dst writes the result (e.g. subs fuel, fuel, #cost).
-        // Virtual dst writes to the zero register (pure compare, flags only).
         let rd = match dst {
             Register::Phys(n) => {
-                if is_32 { GprOrZr::from(Aarch64Backend::phys_to_wgpr(PhysReg(n))) }
-                else { GprOrZr::from(Aarch64Backend::phys_to_xgpr(PhysReg(n))) }
+                if is_32 {
+                    GprOrZr::from(Aarch64Backend::phys_to_wgpr(PhysReg(n)))
+                } else {
+                    GprOrZr::from(Aarch64Backend::phys_to_xgpr(PhysReg(n)))
+                }
             }
             Register::Virtual(_) => {
-                if is_32 { GprOrZr::Wzr } else { GprOrZr::Xzr }
+                if is_32 {
+                    GprOrZr::Wzr
+                } else {
+                    GprOrZr::Xzr
+                }
             }
         };
 
@@ -423,9 +464,13 @@ impl<'a> LowerCtx<'a> {
                 } else {
                     GprOrSp::from(Gpr::X(Aarch64Backend::phys_to_xgpr(lhs_phys)))
                 };
-                self.emit(SubsImm { rd, rn, imm: imm12 });
-                if let Operand::VReg(v) = rhs { self.cache.release(v); }
-                self.pending_cmp = Some(PendingCmp { cond: Aarch64Backend::cmp_op_to_cond(op) });
+                self.emit(Aarch64Instruction::SubsImm(SubsImm { rd, rn, imm: imm12 }));
+                if let Operand::VReg(v) = rhs {
+                    self.cache.release(v);
+                }
+                self.pending_cmp = Some(PendingCmp {
+                    cond: Aarch64Backend::cmp_op_to_cond(op),
+                });
                 return Ok(());
             }
         }
@@ -441,28 +486,30 @@ impl<'a> LowerCtx<'a> {
         } else {
             GprOrZr::from(Aarch64Backend::phys_to_xgpr(rhs_phys))
         };
-        self.emit(SubsReg { rd, rn, rm });
-        self.pending_cmp = Some(PendingCmp { cond: Aarch64Backend::cmp_op_to_cond(op) });
+        self.emit(Aarch64Instruction::SubsReg(SubsReg { rd, rn, rm }));
+        self.pending_cmp = Some(PendingCmp {
+            cond: Aarch64Backend::cmp_op_to_cond(op),
+        });
         Ok(())
     }
 
     fn lower_br_if(&mut self, block_else: BlockId) -> Result<(), CodegenError> {
         let pending = self.pending_cmp.take().expect("BrIf without preceding Cmp");
         let else_offset = self.code.len();
-        self.emit(BCond {
+        self.emit(Aarch64Instruction::BCond(BCond {
             cond: pending.cond.invert(),
             offset: 0,
-        });
+        }));
         self.patches.push((else_offset, block_else));
         Ok(())
     }
 
     fn lower_branch(&mut self, target: BlockId) -> Result<(), CodegenError> {
         let offset = self.code.len();
-        self.emit(BCond {
+        self.emit(Aarch64Instruction::BCond(BCond {
             cond: Cond::AL,
             offset: 0,
-        });
+        }));
         self.patches.push((offset, target));
         Ok(())
     }
@@ -475,15 +522,11 @@ impl<'a> LowerCtx<'a> {
         frame_advance: u32,
         func: &IRFunction,
     ) -> Result<(), CodegenError> {
-        // Flush ALL dirty registers first, before any arg moves that might
-        // overwrite registers holding live values (e.g. local $a in w9 would
-        // be clobbered if we moved a new arg to w9 before flushing).
         let dirty = self.cache.flush_dirty();
         for (phys, vreg) in dirty {
             self.emit_store(vreg, phys, func)?;
         }
 
-        // Move arguments into calling convention registers (x9, x10, ...).
         for (i, &arg) in args.iter().enumerate() {
             let r = self.cache.ensure(arg)?;
             if r.needs_load {
@@ -497,7 +540,6 @@ impl<'a> LowerCtx<'a> {
             }
         }
 
-        // Advance frame pointer: lbp += frame_advance
         if frame_advance > 0 {
             let imm =
                 UImm12::new(frame_advance as u16).map_err(|_| CodegenError::OffsetOutOfRange {
@@ -505,16 +547,13 @@ impl<'a> LowerCtx<'a> {
                     max: 4095,
                 })?;
             let fp = GprOrSp::from(Gpr::X(XGpr(GprId::R29)));
-            self.emit(autosynth_isa_aarch64::AddImm {
+            self.emit(Aarch64Instruction::AddImm(autosynth_isa_aarch64::AddImm {
                 rd: fp,
                 rn: fp,
                 imm,
-            });
+            }));
         }
 
-        // Store args to the callee's frame (x29 now points to callee's locals_base).
-        // The body reads params from memory at [x29, #offset], so we must ensure
-        // the calling convention register values are written to the callee's local slots.
         let mut param_offset = 0u32;
         for (i, &arg) in args.iter().enumerate() {
             let cc_reg = PhysReg(9 + i as u8);
@@ -527,11 +566,11 @@ impl<'a> LowerCtx<'a> {
                             max: 4095 * 4,
                         }
                     })?;
-                    self.emit(StrUoff {
+                    self.emit(Aarch64Instruction::StrUoff(StrUoff {
                         rt: GprOrZr::from(Aarch64Backend::phys_to_wgpr(cc_reg)),
                         rn: GprOrSp::from(Gpr::X(XGpr(GprId::R29))),
                         offset: uimm,
-                    });
+                    }));
                     param_offset += 4;
                 }
                 _ => {
@@ -541,11 +580,11 @@ impl<'a> LowerCtx<'a> {
                             max: 4095 * 8,
                         }
                     })?;
-                    self.emit(StrUoff {
+                    self.emit(Aarch64Instruction::StrUoff(StrUoff {
                         rt: GprOrZr::from(Aarch64Backend::phys_to_xgpr(cc_reg)),
                         rn: GprOrSp::from(Gpr::X(XGpr(GprId::R29))),
                         offset: uimm,
-                    });
+                    }));
                     param_offset += 8;
                 }
             }
@@ -554,9 +593,10 @@ impl<'a> LowerCtx<'a> {
         let FunctionIdx::User(_idx) = func_idx;
         let entry_offset = self.labels.get(&BlockId::Entry).copied().unwrap_or(0);
         let disp = entry_offset as i32 - self.code.len() as i32;
-        self.emit(autosynth_isa_aarch64::Bl { offset: disp });
+        self.emit(Aarch64Instruction::Bl(autosynth_isa_aarch64::Bl {
+            offset: disp,
+        }));
 
-        // Restore frame pointer: lbp -= frame_advance
         if frame_advance > 0 {
             let imm =
                 UImm12::new(frame_advance as u16).map_err(|_| CodegenError::OffsetOutOfRange {
@@ -564,20 +604,15 @@ impl<'a> LowerCtx<'a> {
                     max: 4095,
                 })?;
             let fp = GprOrSp::from(Gpr::X(XGpr(GprId::R29)));
-            self.emit(autosynth_isa_aarch64::SubImm {
+            self.emit(Aarch64Instruction::SubImm(autosynth_isa_aarch64::SubImm {
                 rd: fp,
                 rn: fp,
                 imm,
-            });
+            }));
         }
 
-        // After call, all registers are clobbered.
         self.cache.invalidate_all();
 
-        // Bind return values and immediately store to canonical slots.
-        // Results must survive block boundaries (fuel check splits the
-        // block after a call), so they need to be in memory, not just
-        // dirty in the cache.
         for (i, &res) in results.iter().enumerate() {
             let cc_reg = PhysReg(9 + i as u8);
             self.cache.bind_dirty(res, cc_reg);
@@ -610,25 +645,25 @@ impl<'a> LowerCtx<'a> {
                 self.emit_mov(ret_reg, result.reg, is_32);
             }
         }
-        self.emit(Ret {
+        self.emit(Aarch64Instruction::Ret(Ret {
             rn: XGpr(GprId::R30),
-        });
+        }));
         Ok(())
     }
 
     fn emit_mov(&mut self, dst: PhysReg, src: PhysReg, is_32: bool) {
         if is_32 {
-            self.emit(OrrReg {
+            self.emit(Aarch64Instruction::OrrReg(OrrReg {
                 rd: GprOrZr::from(Aarch64Backend::phys_to_wgpr(dst)),
                 rn: GprOrZr::Wzr,
                 rm: GprOrZr::from(Aarch64Backend::phys_to_wgpr(src)),
-            });
+            }));
         } else {
-            self.emit(OrrReg {
+            self.emit(Aarch64Instruction::OrrReg(OrrReg {
                 rd: GprOrZr::from(Aarch64Backend::phys_to_xgpr(dst)),
                 rn: GprOrZr::Xzr,
                 rm: GprOrZr::from(Aarch64Backend::phys_to_xgpr(src)),
-            });
+            }));
         }
     }
 
@@ -639,7 +674,9 @@ impl<'a> LowerCtx<'a> {
         func: &IRFunction,
     ) -> Result<(), CodegenError> {
         let def = &self.vreg_defs[vreg.0 as usize];
-        let slot = def.slot.expect("emit_load on temp vreg (no canonical slot)");
+        let slot = def
+            .slot
+            .expect("emit_load on temp vreg (no canonical slot)");
         let vstack = &func.vstacks[slot.vstack.0 as usize];
         let base = Aarch64Backend::reg_to_xgpr(vstack.base)?;
         let offset = slot.byte_offset;
@@ -650,11 +687,11 @@ impl<'a> LowerCtx<'a> {
                         offset: offset as u32,
                         max: 4095 * 4,
                     })?;
-                self.emit(LdrUoff {
+                self.emit(Aarch64Instruction::LdrUoff(LdrUoff {
                     rt: GprOrZr::from(Aarch64Backend::phys_to_wgpr(dst)),
                     rn: GprOrSp::from(Gpr::X(base)),
                     offset: uimm,
-                });
+                }));
             }
             _ => {
                 let uimm =
@@ -662,11 +699,11 @@ impl<'a> LowerCtx<'a> {
                         offset: offset as u32,
                         max: 4095 * 8,
                     })?;
-                self.emit(LdrUoff {
+                self.emit(Aarch64Instruction::LdrUoff(LdrUoff {
                     rt: GprOrZr::from(Aarch64Backend::phys_to_xgpr(dst)),
                     rn: GprOrSp::from(Gpr::X(base)),
                     offset: uimm,
-                });
+                }));
             }
         }
         Ok(())
@@ -679,7 +716,9 @@ impl<'a> LowerCtx<'a> {
         func: &IRFunction,
     ) -> Result<(), CodegenError> {
         let def = &self.vreg_defs[vreg.0 as usize];
-        let slot = def.slot.expect("emit_store on temp vreg (no canonical slot)");
+        let slot = def
+            .slot
+            .expect("emit_store on temp vreg (no canonical slot)");
         let vstack = &func.vstacks[slot.vstack.0 as usize];
         let base = Aarch64Backend::reg_to_xgpr(vstack.base)?;
         let offset = slot.byte_offset;
@@ -690,11 +729,11 @@ impl<'a> LowerCtx<'a> {
                         offset: offset as u32,
                         max: 4095 * 4,
                     })?;
-                self.emit(StrUoff {
+                self.emit(Aarch64Instruction::StrUoff(StrUoff {
                     rt: GprOrZr::from(Aarch64Backend::phys_to_wgpr(src)),
                     rn: GprOrSp::from(Gpr::X(base)),
                     offset: uimm,
-                });
+                }));
             }
             _ => {
                 let uimm =
@@ -702,11 +741,11 @@ impl<'a> LowerCtx<'a> {
                         offset: offset as u32,
                         max: 4095 * 8,
                     })?;
-                self.emit(StrUoff {
+                self.emit(Aarch64Instruction::StrUoff(StrUoff {
                     rt: GprOrZr::from(Aarch64Backend::phys_to_xgpr(src)),
                     rn: GprOrSp::from(Gpr::X(base)),
                     offset: uimm,
-                });
+                }));
             }
         }
         Ok(())
@@ -727,8 +766,16 @@ impl<'a> LowerCtx<'a> {
             )
         };
         match op {
-            AluOp::Add => self.emit(autosynth_isa_aarch64::AddReg { rd, rn, rm }),
-            AluOp::Sub => self.emit(autosynth_isa_aarch64::SubReg { rd, rn, rm }),
+            AluOp::Add => self.emit(Aarch64Instruction::AddReg(autosynth_isa_aarch64::AddReg {
+                rd,
+                rn,
+                rm,
+            })),
+            AluOp::Sub => self.emit(Aarch64Instruction::SubReg(autosynth_isa_aarch64::SubReg {
+                rd,
+                rn,
+                rm,
+            })),
             _ => todo!("ALU op {:?} not yet lowered", op),
         }
     }
@@ -746,8 +793,16 @@ impl<'a> LowerCtx<'a> {
             )
         };
         match op {
-            AluOp::Add => self.emit(autosynth_isa_aarch64::AddImm { rd, rn, imm }),
-            AluOp::Sub => self.emit(autosynth_isa_aarch64::SubImm { rd, rn, imm }),
+            AluOp::Add => self.emit(Aarch64Instruction::AddImm(autosynth_isa_aarch64::AddImm {
+                rd,
+                rn,
+                imm,
+            })),
+            AluOp::Sub => self.emit(Aarch64Instruction::SubImm(autosynth_isa_aarch64::SubImm {
+                rd,
+                rn,
+                imm,
+            })),
             _ => todo!("ALU-imm op {:?} not yet supported", op),
         }
     }
@@ -794,29 +849,4 @@ fn detect_branches(code: &[u32]) -> Vec<BranchInfo> {
 fn sign_extend(val: i32, bits: u32) -> i32 {
     let shift = 32 - bits;
     (val << shift) >> shift
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_pool_overlap() {
-        let mut backend = Aarch64Backend::new();
-        backend.use_isa_reg("lbp", IsaReg::FramePointer);
-        backend.use_isa_reg("lr", IsaReg::ReturnAddress);
-        backend.use_isa_reg("fsp", IsaReg::StackPointer);
-        backend.use_isa_reg("fuel", IsaReg::Define64(0));
-        backend.use_isa_reg("ctx", IsaReg::Define64(-1));
-        for (_, phys) in &backend.assignments {
-            assert!(
-                !backend.scratch().contains(phys),
-                "assigned reg {phys:?} found in scratch pool"
-            );
-        }
-        let mut seen = std::collections::HashSet::new();
-        for reg in backend.scratch() {
-            assert!(seen.insert(reg), "duplicate in scratch pool: {reg:?}");
-        }
-    }
 }

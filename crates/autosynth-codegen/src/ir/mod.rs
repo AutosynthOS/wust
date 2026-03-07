@@ -59,6 +59,18 @@ impl fmt::Display for VReg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VStackId(pub u32);
 
+/// Mutable vstack state — depth and slot assignments.
+///
+/// This is the per-block part of a vstack. It gets cloned at block
+/// boundaries (branches snapshot it onto target blocks).
+#[derive(Debug, Clone)]
+pub struct VStackMut {
+    /// Current stack depth (number of occupied slots).
+    pub depth: u32,
+    /// Slot assignments (index → VReg).
+    pub slots: Vec<Option<VReg>>,
+}
+
 /// IR-level value type, determining register width and memory layout.
 ///
 /// Used to select between 32-bit and 64-bit instructions during lowering,
@@ -97,6 +109,18 @@ pub enum Value {
     VReg(VReg),
     /// The current value of a register (physical or virtual).
     Reg(Register),
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Param(i) => write!(f, "param({i})"),
+            Value::ConstI64(n) => write!(f, "#{n}"),
+            Value::ConstI32(n) => write!(f, "#{n}"),
+            Value::VReg(v) => write!(f, "{v}"),
+            Value::Reg(r) => write!(f, "{r}"),
+        }
+    }
 }
 
 /// Canonical memory location for a VReg — where it lives on the stack.

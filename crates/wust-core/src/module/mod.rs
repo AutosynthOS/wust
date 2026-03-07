@@ -92,7 +92,6 @@ impl ParsedModuleInner {
 /// Raw body data extracted from the code section, before full decoding.
 struct RawBody {
     body_locals: Vec<wasmparser::ValType>,
-    raw_bytes: Box<[u8]>,
     /// The FunctionBody range for re-reading operators during decode.
     range: std::ops::Range<usize>,
 }
@@ -143,13 +142,9 @@ impl<'a> ModuleBuilder<'a> {
         }
 
         let range = body.range();
-        let operators_reader = body.get_operators_reader()?;
-        let ops_offset = operators_reader.original_position();
-        let raw_bytes = &self.wasm_bytes[ops_offset..range.end];
 
         self.raw_bodies.push(RawBody {
             body_locals,
-            raw_bytes: raw_bytes.to_vec().into_boxed_slice(),
             range: range.start..range.end,
         });
         Ok(())
@@ -184,7 +179,6 @@ impl<'a> ModuleBuilder<'a> {
                     &mut self.raw_bodies[(idx - num_imported) as usize],
                     RawBody {
                         body_locals: vec![],
-                        raw_bytes: Box::new([]),
                         range: 0..0,
                     },
                 );

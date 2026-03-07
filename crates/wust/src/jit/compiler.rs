@@ -1,6 +1,6 @@
 use wust_codegen::ir::{AluOp, IrFunction, IrInst, Label, Operand, UnaryOp, VReg};
-use wust_core::module::op::InlineOp;
 use wust_core::module::body::slot_size;
+use wust_core::module::op::InlineOp;
 use wust_core::{BlockKind, FuncMeta, OpCode};
 
 use crate::jit::fuse;
@@ -145,7 +145,10 @@ impl IrCompiler {
             self.emit(IrInst::FuelConsume {
                 cost: self.pending_fuel,
             });
-            self.emit(IrInst::FuelCheck { live_state: vec![], resume_pc: self.current_op });
+            self.emit(IrInst::FuelCheck {
+                live_state: vec![],
+                resume_pc: self.current_op,
+            });
         }
         self.pending_fuel = 0;
     }
@@ -169,7 +172,11 @@ impl IrCompiler {
                 if let Some(v) = self.local_vreg[idx as usize] {
                     let offset = self.local_byte_offsets[idx as usize] as u32;
                     let size = self.local_sizes[idx as usize];
-                    self.insts.push(IrInst::LocalSet { offset, src: v, size });
+                    self.insts.push(IrInst::LocalSet {
+                        offset,
+                        src: v,
+                        size,
+                    });
                     self.source_ops.push(self.current_op);
                     self.frame_dirty[idx as usize] = false;
                 }
@@ -271,10 +278,7 @@ impl IrCompiler {
         let extras: Vec<VReg> = self.vstack.drain(depth..).collect();
         for (i, vreg) in extras.into_iter().enumerate() {
             let offset = self.operand_base_offset + (depth as u32 + i as u32) * 8;
-            self.emit(IrInst::FrameStore {
-                offset,
-                src: vreg,
-            });
+            self.emit(IrInst::FrameStore { offset, src: vreg });
         }
     }
 
@@ -289,10 +293,7 @@ impl IrCompiler {
         for i in 0..count {
             let dst = self.fresh_vreg();
             let offset = self.operand_base_offset + (depth + i as u32) * 8;
-            self.emit(IrInst::FrameLoad {
-                dst,
-                offset,
-            });
+            self.emit(IrInst::FrameLoad { dst, offset });
             self.vstack.push(dst);
         }
     }
@@ -307,18 +308,19 @@ impl IrCompiler {
 /// Fuel costs are accumulated per basic block and emitted as a single
 /// FuelCheck before branches, labels, calls, and returns. This avoids
 /// redundant checks between adjacent opcodes.
-pub(crate) fn compile_with(
-    func: &FuncMeta,
-    all_funcs: &[FuncMeta],
-    emit_fuel: bool,
-) -> IrFunction {
+pub(crate) fn compile_with(func: &FuncMeta, all_funcs: &[FuncMeta], emit_fuel: bool) -> IrFunction {
     let total_locals = func.local_count() as u32;
     let param_count = func.param_count() as u32;
-    let local_sizes: Box<[u8]> = func.params.iter().chain(func.locals.iter())
+    let local_sizes: Box<[u8]> = func
+        .params
+        .iter()
+        .chain(func.locals.iter())
         .map(|ty| (slot_size(*ty) * 4) as u8)
         .collect();
     let operand_base_offset = func.locals_size as u32 + wust_core::FRAME_HEADER_SIZE as u32;
-    let result_sizes: Vec<u8> = func.results.iter()
+    let result_sizes: Vec<u8> = func
+        .results
+        .iter()
         .map(|ty| (slot_size(*ty) * 4) as u8)
         .collect();
     let mut c = IrCompiler::new(
@@ -398,13 +400,19 @@ pub(crate) fn compile_with(
                     OpCode::F32Const => {
                         let bits = u32::from_le_bytes(payload[..4].try_into().unwrap());
                         let dst = c.fresh_vreg();
-                        c.emit(IrInst::IConst { dst, val: bits as i64 });
+                        c.emit(IrInst::IConst {
+                            dst,
+                            val: bits as i64,
+                        });
                         c.vpush(dst);
                     }
                     OpCode::F64Const => {
                         let bits = u64::from_le_bytes(payload[..8].try_into().unwrap());
                         let dst = c.fresh_vreg();
-                        c.emit(IrInst::IConst { dst, val: bits as i64 });
+                        c.emit(IrInst::IConst {
+                            dst,
+                            val: bits as i64,
+                        });
                         c.vpush(dst);
                     }
                     _ => {
@@ -574,7 +582,10 @@ pub(crate) fn compile_with(
                     cond,
                     label: else_label,
                 });
-                c.emit(IrInst::FrameStore { offset: spill_offset, src: val1 });
+                c.emit(IrInst::FrameStore {
+                    offset: spill_offset,
+                    src: val1,
+                });
                 c.flush_dirty_locals();
                 c.emit(IrInst::Br { label: end_label });
                 let params = c.allocate_local_params();
@@ -583,7 +594,10 @@ pub(crate) fn compile_with(
                     params: params.clone(),
                 });
                 c.apply_local_params(&params);
-                c.emit(IrInst::FrameStore { offset: spill_offset, src: val2 });
+                c.emit(IrInst::FrameStore {
+                    offset: spill_offset,
+                    src: val2,
+                });
                 c.flush_dirty_locals();
                 c.emit(IrInst::Br { label: end_label });
                 let params2 = c.allocate_local_params();
@@ -593,7 +607,10 @@ pub(crate) fn compile_with(
                 });
                 c.apply_local_params(&params2);
                 let dst = c.fresh_vreg();
-                c.emit(IrInst::FrameLoad { dst, offset: spill_offset });
+                c.emit(IrInst::FrameLoad {
+                    dst,
+                    offset: spill_offset,
+                });
                 c.vpush(dst);
             }
 
@@ -651,9 +668,7 @@ pub(crate) fn compile_with(
                 if !c.unreachable {
                     c.flush_vstack_above(depth);
                     c.flush_dirty_locals();
-                    c.emit(IrInst::Br {
-                        label: end_label,
-                    });
+                    c.emit(IrInst::Br { label: end_label });
                 }
                 let params = c.allocate_local_params();
                 c.emit(IrInst::DefLabel {
@@ -676,9 +691,7 @@ pub(crate) fn compile_with(
                         if !c.unreachable {
                             c.flush_vstack_above(block.vstack_depth);
                             c.flush_dirty_locals();
-                            c.emit(IrInst::Br {
-                                label: block.label,
-                            });
+                            c.emit(IrInst::Br { label: block.label });
                         }
                         c.unreachable = false;
                         if was_unreachable {
@@ -703,9 +716,7 @@ pub(crate) fn compile_with(
                     } else {
                         if !c.unreachable {
                             c.flush_dirty_locals();
-                            c.emit(IrInst::Br {
-                                label: block.label,
-                            });
+                            c.emit(IrInst::Br { label: block.label });
                         }
                         let params = c.allocate_local_params();
                         c.emit(IrInst::DefLabel {
@@ -834,7 +845,12 @@ fn compile_fused_op(
             let rhs = c.vpop();
             let lhs = c.vpop();
             let dst = c.fresh_vreg();
-            c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Reg(rhs) });
+            c.emit(IrInst::Alu {
+                op: AluOp::I32Add,
+                dst,
+                lhs,
+                rhs: Operand::Reg(rhs),
+            });
             c.vpush(dst);
         }
 
@@ -845,11 +861,21 @@ fn compile_fused_op(
             let lhs = c.vpop();
             let dst = c.fresh_vreg();
             if konst >= 0 && konst < 4096 {
-                c.emit(IrInst::Alu { op: AluOp::I32Sub, dst, lhs, rhs: Operand::Imm(konst as i64) });
+                c.emit(IrInst::Alu {
+                    op: AluOp::I32Sub,
+                    dst,
+                    lhs,
+                    rhs: Operand::Imm(konst as i64),
+                });
             } else {
                 c.emit_i32_const(konst);
                 let rhs = c.vpop();
-                c.emit(IrInst::Alu { op: AluOp::I32Sub, dst, lhs, rhs: Operand::Reg(rhs) });
+                c.emit(IrInst::Alu {
+                    op: AluOp::I32Sub,
+                    dst,
+                    lhs,
+                    rhs: Operand::Reg(rhs),
+                });
             }
             c.vpush(dst);
         }
@@ -861,11 +887,21 @@ fn compile_fused_op(
             let lhs = c.vpop();
             let dst = c.fresh_vreg();
             if konst >= 0 && konst < 4096 {
-                c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Imm(konst as i64) });
+                c.emit(IrInst::Alu {
+                    op: AluOp::I32Add,
+                    dst,
+                    lhs,
+                    rhs: Operand::Imm(konst as i64),
+                });
             } else {
                 c.emit_i32_const(konst);
                 let rhs = c.vpop();
-                c.emit(IrInst::Alu { op: AluOp::I32Add, dst, lhs, rhs: Operand::Reg(rhs) });
+                c.emit(IrInst::Alu {
+                    op: AluOp::I32Add,
+                    dst,
+                    lhs,
+                    rhs: Operand::Reg(rhs),
+                });
             }
             c.vpush(dst);
         }
@@ -964,10 +1000,7 @@ fn compile_fused_op(
             c.flush_dirty_locals();
 
             let label = c.fresh_label();
-            c.emit(IrInst::BrIfNonZero {
-                cond: val,
-                label,
-            });
+            c.emit(IrInst::BrIfNonZero { cond: val, label });
             c.block_stack.push(OpenBlock {
                 block_idx,
                 kind: blocks[block_idx as usize].kind,

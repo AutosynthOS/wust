@@ -20,7 +20,7 @@ use crate::CodeBuffer;
 /// Implements [`ModuleExecutor`] so the runtime can call into JIT code
 /// via [`poll`](ModuleExecutor::poll).
 pub struct JitModule {
-    module: ParsedModule,
+    _module: ParsedModule,
     compiler: CodeBuilder,
     page: CodeBuffer,
     /// Byte offset of each function's entry trampoline within the code page.
@@ -50,7 +50,7 @@ impl JitModule {
             let ir_func = &compiler.functions()[compiler.functions().len() - 1];
             let body_bytes = backend.lower(ir_func)?;
 
-            let trampoline_bytes = emit_entry_trampoline(func, body_bytes.len());
+            let trampoline_bytes = emit_entry_trampoline(func);
 
             let trampoline_offset = all_code.len();
             trampoline_offsets.push(trampoline_offset);
@@ -61,7 +61,7 @@ impl JitModule {
         page.flash(&all_code)?;
 
         Ok(JitModule {
-            module,
+            _module: module,
             compiler,
             page,
             trampoline_offsets,
@@ -93,17 +93,21 @@ impl JitModule {
         let _ctx = backend.use_isa_reg("ctx", IsaReg::Define64(1));
         let fsp = backend.use_isa_reg("fsp", IsaReg::StackPointer);
 
+        // Entry block must be active before defining vstacks,
+        // since vstack state lives on the block.
+        f.entry_block(BlockId::Entry);
+
         // Virtual stacks anchored to physical registers
         //
         // [param0, param1, local_2, ...][frame header][operands]
         // ^ lbp
         let locals = f.define_vstack(VStack {
-            label: "locals",
+            label: "local",
             base: lbp,
             offset: 0,
         });
         let operands = f.define_vstack(VStack {
-            label: "operands",
+            label: "ops",
             base: lbp,
             offset: func.locals_size as u32 + FRAME_HEADER_SIZE as u32,
         });
@@ -113,15 +117,16 @@ impl JitModule {
             offset: 0,
         });
 
-        // Prologue — entry block must be active before defining slots
-        // so that params and locals are recorded as defs of the entry block.
-        f.entry_block(BlockId::Entry);
+        // "operation" column registered after all vstacks so it appears rightmost.
+        f.finish_entry();
 
         // Declare parameters
+        f.begin_op("--", "params_start");
         for (i, param) in func.params.iter().enumerate() {
             f.define_slot(locals, i, valtype_to_ir(param), Value::Param(i));
         }
 
+        f.begin_op("--", "locals_start");
         // Declare zero-initialized locals
         for (i, local) in func.locals.iter().enumerate() {
             f.define_slot(
@@ -131,12 +136,13 @@ impl JitModule {
                 Value::ConstI64(0),
             );
         }
+
         f.begin_op("--", "prologue");
-        let lr_vreg = f.push_i64(fibre, Value::Reg(lr));
+        f.push_i64(fibre, Value::Reg(lr));
 
-        let _header_offset = func.locals_size as u32;
-
-        f.switch_to_block(BlockId::User(0));
+        // Finalize entry block, branch to first user block.
+        f.br(BlockId::User(0));
+        f.start_block(BlockId::User(0));
 
         // Fuel tracking: accumulate cost per opcode, flush before calls.
         let mut pending_fuel: u32 = 0;
@@ -214,12 +220,8 @@ impl JitModule {
                     let then_block = BlockId::User(pc as u32 + 1);
                     let end_pc = func.body.blocks[block_idx as usize].end_pc;
                     let cont_block = BlockId::User(end_pc);
-                    f.emit(IrInst::BrIf {
-                        cond,
-                        block_if: then_block,
-                        block_else: cont_block,
-                    });
-                    f.switch_to_block(then_block);
+                    f.br_if(cond, then_block, cont_block);
+                    f.start_block(then_block);
                 }
                 OpCode::BrIf => {
                     let block_idx = inline_op.immediate_u32();
@@ -227,40 +229,33 @@ impl JitModule {
                     let target = BlockId::User(target_block.end_pc);
                     let cont = BlockId::User(pc as u32 + 1);
                     let cond = f.pop_i32(operands);
-                    f.emit(IrInst::BrIf {
-                        cond,
-                        block_if: target,
-                        block_else: cont,
-                    });
-                    f.switch_to_block(cont);
+                    f.br_if(cond, target, cont);
+                    f.start_block(cont);
                 }
                 OpCode::End => {
                     let block_idx = inline_op.immediate_u32();
                     if block_idx == 0 {
+                        // Function end — pop return value and fibre LR, then return.
                         let values = if f.stack_depth(operands) > 0 {
                             vec![f.pop_i32(operands)]
                         } else {
                             vec![]
                         };
-                        f.emit(IrInst::StackPop {
-                            def: f.vreg_def(lr_vreg),
-                        });
-                        f.emit(IrInst::Return {
-                            values,
-                            flush: false,
-                        });
+                        f.pop_i64(fibre);
+                        f.ret(values, false);
                         break;
                     }
-                    f.switch_to_block(BlockId::User(pc as u32));
+                    // Wasm block end — finalize current block if not already done.
+                    if !f.is_finalized() {
+                        f.br(BlockId::User(pc as u32));
+                    }
+                    f.start_block(BlockId::User(pc as u32));
                 }
 
                 OpCode::Return => {
                     let val = f.pop_i32(operands);
                     f.pop_i64(fibre);
-                    f.emit(IrInst::Return {
-                        values: vec![val],
-                        flush: false,
-                    });
+                    f.ret(vec![val], false);
                 }
 
                 OpCode::Call => {
@@ -287,42 +282,28 @@ impl JitModule {
                         frame_advance,
                     });
 
-                    f.begin_op("--", "fuel consume");
-
+                    // Fused subtract-and-compare: subs fuel, fuel, #N
+                    // LeS makes the backend emit `subs` (flag-setting subtract).
+                    // Using `fuel` (physical register) as dst writes the result
+                    // back to fuel while setting flags for the LE condition.
+                    let fuel_cond = f.alloc_temp(IrType::I32, Value::ConstI64(0));
                     f.emit(IrInst::Alu {
-                        op: AluOp::Sub,
+                        op: AluOp::LeS,
                         dst: fuel,
                         lhs: Operand::from(fuel),
                         rhs: Operand::Imm32(pending_fuel as i32),
                     });
                     pending_fuel = 0;
 
-                    f.begin_op("--", "fuel check");
-
-                    let fuel_cond = f.alloc_temp(IrType::I32, Value::ConstI64(0));
-                    f.emit(IrInst::Alu {
-                        op: AluOp::LeS,
-                        dst: fuel_cond.into(),
-                        lhs: Operand::from(fuel),
-                        rhs: Operand::Imm32(0),
-                    });
-
                     let suspend_block = f.gen_block();
                     let cont_block = BlockId::User(pc as u32);
 
-                    f.emit(IrInst::BrIf {
-                        cond: fuel_cond,
-                        block_if: suspend_block,
-                        block_else: cont_block,
-                    });
+                    f.br_if(fuel_cond, suspend_block, cont_block);
 
-                    f.switch_to_block(suspend_block);
-                    f.begin_op("--", "return to caller");
-                    f.emit(IrInst::Return {
-                        values: Vec::new(),
-                        flush: false,
-                    });
-                    f.switch_to_block(cont_block);
+                    f.start_block(suspend_block);
+                    f.ret(Vec::new(), false);
+
+                    f.start_block(cont_block);
                 }
 
                 _ => todo!("unhandled opcode: {:?}", op),
@@ -360,7 +341,7 @@ fn valtype_to_ir(ty: &ValType) -> IrType {
 /// 6. Store results from x9+ to operand base
 /// 7. Restore lr from fibre stack
 /// 8. ret
-fn emit_entry_trampoline(func: &FuncMeta, body_size: usize) -> Vec<u8> {
+fn emit_entry_trampoline(func: &FuncMeta) -> Vec<u8> {
     let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
     let mut words: Vec<u32> = Vec::with_capacity(16);
 
@@ -382,14 +363,6 @@ fn emit_entry_trampoline(func: &FuncMeta, body_size: usize) -> Vec<u8> {
 
     // bl to function body — offset in words from this instruction
     // Body starts right after the trampoline.
-    let remaining_trampoline_words = 3 + func.result_count().min(7); // add + str*results + ldr_post + ret
-    let bl_to_body = (remaining_trampoline_words + 1) as i32; // +1 because bl is current instruction
-    // Actually: body is at (trampoline_total_words) from start,
-    // bl is at (words.len()) from start, so offset = trampoline_total_words - words.len()
-    let trampoline_total_words = words.len() + 1 + 1 + func.result_count().min(7) + 1 + 1;
-    // bl offset = trampoline_total_words - (words.len() + 1) + 1... no.
-    // bl at word index W. Body starts at word index T (= total trampoline words).
-    // Offset = T - W (in words).
     let bl_word_idx = words.len();
     // Total trampoline size = bl_word_idx + 1 (bl) + 1 (add) + results (str) + 1 (ldr_post) + 1 (ret)
     let total_trampoline = bl_word_idx + 1 + 1 + func.result_count().min(7) + 1 + 1;

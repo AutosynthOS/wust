@@ -25,9 +25,9 @@ pub enum BlockId {
 impl fmt::Display for BlockId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BlockId::Entry => write!(f, "Entry"),
-            BlockId::User(n) => write!(f, "L{n}"),
-            BlockId::Gen(n) => write!(f, "Gen({n})"),
+            BlockId::Entry => write!(f, "E0"),
+            BlockId::User(n) => write!(f, "U{n}"),
+            BlockId::Gen(n) => write!(f, "G{n}"),
         }
     }
 }

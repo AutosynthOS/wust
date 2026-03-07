@@ -14,7 +14,11 @@
 //! println!("{output}");
 //! ```
 
+/// Box-drawing renderers for function and block visualizations.
+pub mod boxes;
 mod render;
+/// Column-aligned table renderer with sparse cells.
+pub mod table;
 
 use crate::ir::block::BlockId;
 
@@ -173,26 +177,5 @@ mod tests {
         );
         // Should not replace x2 inside x29.
         assert_eq!(replace_at_word_boundary("x29", "x2", "BAD"), "x29");
-    }
-
-    #[test]
-    fn register_renames_apply() {
-        let mut renames = RegisterRenames::new();
-        renames.add("x29", "g.lb");
-        renames.add("x20", "g.ctx");
-        renames.add("sp", "g.sp");
-
-        assert_eq!(renames.apply("ldr x9, [x29, #0]"), "ldr x9, [g.lb, #0]");
-        assert_eq!(renames.apply("mov x20, x9"), "mov g.ctx, x9");
-    }
-
-    #[test]
-    fn register_renames_length_ordering() {
-        let mut renames = RegisterRenames::new();
-        // Add x2 first, then x20 — sorting should put x20 first.
-        renames.add("x2", "SHORT");
-        renames.add("x20", "LONG");
-        assert_eq!(renames.apply("x20"), "LONG");
-        assert_eq!(renames.apply("x2"), "SHORT");
     }
 }

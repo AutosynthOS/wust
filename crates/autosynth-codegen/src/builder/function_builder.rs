@@ -1,9 +1,10 @@
 use super::block_builder::BlockBuilder;
 use super::code_builder::CodeBuilder;
+use crate::disasm::table::Align;
 use crate::ir::block::{BlockId, IrBlock};
-use crate::ir::function::{IRFunction, VStackDef};
+use crate::ir::function::{IRFunction, VStackConfig};
 use crate::ir::instruction::IrInst;
-use crate::ir::{CanonSlot, IrType, Register, VReg, VRegDef, VStackId, Value};
+use crate::ir::{CanonSlot, IrType, Register, VReg, VRegDef, VStackId, VStackMut, Value};
 
 /// Configuration for creating a virtual stack.
 ///
@@ -21,22 +22,11 @@ pub struct VStack {
 /// Incrementally builds an [`IRFunction`] by managing virtual stacks, blocks,
 /// and VReg allocation.
 ///
-/// Holds a mutable reference to the [`CodeBuilder`], so debug recording
-/// happens automatically on every [`emit`](Self::emit) call. Debug forwarding
-/// methods like [`begin_op`](Self::begin_op) and [`mark_block_start`](Self::mark_block_start)
-/// are no-ops when no debugger is attached to the CodeBuilder.
-///
-/// # Usage pattern
-///
-/// ```text
-/// let mut f = FunctionBuilder::new(&mut code_builder);
-/// let operands = f.define_vstack(VStack { label: "operands", base, offset: 0 });
-/// f.entry_block(BlockId::Entry);
-/// f.push_i32(operands, Value::ConstI32(42));
-/// let val = f.pop_i32(operands);
-/// f.emit(IrInst::Return { values: vec![val], flush: false });
-/// f.build();
-/// ```
+/// Vstack configuration (label, base register, offset) is immutable and
+/// function-scoped. Vstack mutable state (depth, slot assignments) lives
+/// on each [`BlockBuilder`]. Branch methods (`br`, `br_if`) clone the
+/// current block's vstack state onto target blocks, and `start_block`
+/// activates a block whose state was set by a prior branch.
 pub struct FunctionBuilder<'a> {
     /// The code builder that collects finalized functions and holds the debugger.
     cb: &'a mut CodeBuilder,
@@ -45,8 +35,8 @@ pub struct FunctionBuilder<'a> {
     vreg_defs: Vec<VRegDef>,
     next_vreg: u32,
 
-    /// Virtual stack state (shared across all blocks).
-    vstacks: Vec<VStackDef>,
+    /// Immutable vstack configurations (label, base, offset).
+    vstack_configs: Vec<VStackConfig>,
 
     /// All block builders, indexed by position.
     blocks: Vec<BlockBuilder>,
@@ -58,12 +48,19 @@ pub struct FunctionBuilder<'a> {
 
 impl<'a> FunctionBuilder<'a> {
     /// Create an empty function builder linked to a [`CodeBuilder`].
+    ///
+    /// Automatically registers the standard source columns (pc, label).
     pub fn new(cb: &'a mut CodeBuilder) -> Self {
+        cb.dbg(|dbg| {
+            dbg.add_source_column("pc", Align::Right);
+            dbg.add_source_column("label", Align::Left);
+        });
+
         Self {
             cb,
             vreg_defs: Vec::new(),
             next_vreg: 0,
-            vstacks: Vec::new(),
+            vstack_configs: Vec::new(),
             blocks: Vec::new(),
             current_block: None,
             next_gen_id: 0,
@@ -71,30 +68,37 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     /// Register a new virtual stack anchored to a register + offset.
+    ///
+    /// Also initializes empty vstack state on the current block.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no block is active (call `entry_block` first).
     pub fn define_vstack(&mut self, vstack: VStack) -> VStackId {
-        let id = VStackId(self.vstacks.len() as u32);
-        self.cb.add_column(vstack.label);
-        self.vstacks.push(VStackDef {
+        let id = VStackId(self.vstack_configs.len() as u32);
+        self.cb
+            .dbg(|dbg| dbg.add_source_column(vstack.label, Align::Left));
+        self.vstack_configs.push(VStackConfig {
             id,
+            label: vstack.label,
             base: vstack.base,
             base_offset: vstack.offset,
-            depth: 0,
-            slots: Vec::new(),
         });
+        // Initialize empty state on the current block.
+        let idx = self.current_block.expect("define_vstack: no active block");
+        self.blocks[idx]
+            .vstack_state
+            .push(VStackMut { depth: 0, slots: Vec::new() });
         id
     }
 
     /// Pre-define a slot in a vstack at a specific index.
-    ///
-    /// Used for declaring function parameters and zero-initialized locals
-    /// before entering any block, or for writing to an existing slot
-    /// (e.g. `local.set`) when inside an active block.
     pub fn define_slot(&mut self, vstack: VStackId, index: usize, ty: IrType, value: Value) {
         let size = ir_type_size(ty);
-        let base_offset = self.vstacks[vstack.0 as usize].base_offset;
+        let base_offset = self.vstack_configs[vstack.0 as usize].base_offset;
 
-        // Grow the slot table if needed
-        let vs = &mut self.vstacks[vstack.0 as usize];
+        // Grow the slot table if needed.
+        let vs = self.vstack_mut(vstack);
         while vs.slots.len() <= index {
             vs.slots.push(None);
         }
@@ -107,7 +111,6 @@ impl<'a> FunctionBuilder<'a> {
             size,
         };
 
-        // If value references another VReg, record a use of the source.
         if let Value::VReg(src) = value {
             self.record_use(src);
         }
@@ -116,15 +119,17 @@ impl<'a> FunctionBuilder<'a> {
         self.record_def(vreg);
 
         // Emit a StackPush when inside an active block (local.set).
-        // No-op for initial declarations (no active block yet).
         if self.current_block.is_some() {
+            let label = self.vstack_configs[vstack.0 as usize].label;
             let def = self.vreg_defs[vreg.0 as usize];
             self.emit(IrInst::StackPush { def });
+            let op = format!("{label}[{index}] ← {vreg}");
+            self.cb.dbg(|dbg| dbg.set_source("operation", &op));
         }
 
-        self.vstacks[vstack.0 as usize].slots[index] = Some(vreg);
+        self.vstack_mut(vstack).slots[index] = Some(vreg);
 
-        let vs = &mut self.vstacks[vstack.0 as usize];
+        let vs = self.vstack_mut(vstack);
         if vs.depth <= index as u32 {
             vs.depth = index as u32 + 1;
         }
@@ -147,11 +152,7 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     /// Allocate a new i32 destination VReg on the vstack for an instruction result.
-    ///
-    /// The returned VReg is a placeholder — the actual value is defined
-    /// when the caller emits an ALU or Cmp instruction targeting it.
     pub fn push_i32_vreg(&mut self, vstack: VStackId) -> VReg {
-        // Value::Const(0) is a placeholder — the emit will define the actual value
         self.push_typed(vstack, IrType::I32, Value::ConstI64(0))
     }
 
@@ -169,10 +170,9 @@ impl<'a> FunctionBuilder<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if the slot at `index` was never defined via [`define_slot`](Self::define_slot)
-    /// or [`push_typed`](Self::push_typed).
+    /// Panics if the slot at `index` was never defined.
     pub fn get_slot(&mut self, vstack: VStackId, index: usize) -> VReg {
-        let vs = &self.vstacks[vstack.0 as usize];
+        let vs = self.vstack_ref(vstack);
         let vreg = vs.slots[index].expect("get_slot: slot not defined");
         self.record_use(vreg);
         vreg
@@ -180,28 +180,90 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Get the current operand stack depth of a vstack.
     pub fn stack_depth(&self, vstack: VStackId) -> u32 {
-        self.vstacks[vstack.0 as usize].depth
+        self.vstack_ref(vstack).depth
     }
 
-    /// Switch to a block — creates the block builder if it doesn't exist.
+    // --- Block lifecycle ---
+
+    /// Set the entry block and register the "operation" source column.
     ///
-    /// Automatically records a block boundary in the debugger (if attached).
-    pub fn switch_to_block(&mut self, block: BlockId) {
-        self.cb.mark_block_start(block);
+    /// Must be called before `define_vstack` since vstacks initialize
+    /// state on the current block.
+    pub fn entry_block(&mut self, block: BlockId) {
         let idx = self.ensure_block(block);
         self.current_block = Some(idx);
+        self.cb.dbg(|dbg| dbg.mark_block_start(block));
     }
 
-    /// Set the entry block.
-    pub fn entry_block(&mut self, block: BlockId) {
-        self.switch_to_block(block);
+    /// Finish vstack definitions and register the "operation" column.
+    ///
+    /// Call this after all `define_vstack` calls and before emitting
+    /// instructions, so the operation column appears rightmost.
+    pub fn finish_entry(&mut self) {
+        self.cb
+            .dbg(|dbg| dbg.add_source_column("operation", Align::Left));
+    }
+
+    /// Start writing a block whose vstack state was set by a prior branch.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no branch has targeted this block (vstack state is empty).
+    pub fn start_block(&mut self, block: BlockId) {
+        let idx = self.ensure_block(block);
+        assert!(
+            !self.blocks[idx].vstack_state.is_empty(),
+            "start_block({block}): no vstack state — was this block targeted by a branch?"
+        );
+        self.current_block = Some(idx);
+        self.cb.dbg(|dbg| dbg.mark_block_start(block));
+    }
+
+    /// Unconditional branch — finalizes the current block.
+    ///
+    /// Clones the current block's vstack state onto the target block
+    /// and marks the current block as finalized.
+    pub fn br(&mut self, target: BlockId) {
+        self.emit(IrInst::Branch { target });
+        self.snapshot_vstack_onto(target);
+        let idx = self.current_block.expect("br: no active block");
+        self.blocks[idx].successors.push(target);
+        self.blocks[idx].finalized = true;
+        self.current_block = None;
+    }
+
+    /// Conditional branch — finalizes the current block.
+    ///
+    /// Clones the current block's vstack state onto both target blocks.
+    pub fn br_if(&mut self, cond: VReg, block_if: BlockId, block_else: BlockId) {
+        self.emit(IrInst::BrIf {
+            cond,
+            block_if,
+            block_else,
+        });
+        self.snapshot_vstack_onto(block_if);
+        self.snapshot_vstack_onto(block_else);
+        let idx = self.current_block.expect("br_if: no active block");
+        self.blocks[idx].successors.push(block_if);
+        self.blocks[idx].successors.push(block_else);
+        self.blocks[idx].finalized = true;
+        self.current_block = None;
+    }
+
+    /// Return — finalizes the current block (no successors).
+    pub fn ret(&mut self, values: Vec<VReg>, flush: bool) {
+        self.emit(IrInst::Return { values, flush });
+        let idx = self.current_block.expect("ret: no active block");
+        self.blocks[idx].finalized = true;
+        self.current_block = None;
+    }
+
+    /// Whether the current block has been finalized by a br/br_if/ret.
+    pub fn is_finalized(&self) -> bool {
+        self.current_block.is_none()
     }
 
     /// Create a generated block with an auto-incremented ID.
-    ///
-    /// Returns a [`BlockId::Gen`] that can be used as a branch target.
-    /// Useful for codegen-internal blocks (cold paths, stubs, trampolines)
-    /// that have no corresponding source-level position.
     pub fn gen_block(&mut self) -> BlockId {
         let id = BlockId::Gen(self.next_gen_id);
         self.next_gen_id += 1;
@@ -213,7 +275,7 @@ impl<'a> FunctionBuilder<'a> {
     ///
     /// # Panics
     ///
-    /// Panics if no block has been activated via [`switch_to_block`](Self::switch_to_block).
+    /// Panics if no block has been activated.
     pub fn current_block(&self) -> BlockId {
         let idx = self.current_block.expect("no active block");
         self.blocks[idx].id
@@ -221,15 +283,19 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Emit an IR instruction into the currently active block.
     ///
-    /// Automatically records the emission into the debugger (if attached).
+    /// Creates a debugger group for the instruction so the backend can
+    /// attach machine-level annotations to it.
     ///
     /// # Panics
     ///
-    /// Panics if no block is active.
+    /// Panics if no block is active or if the block is finalized.
     pub fn emit(&mut self, inst: IrInst) {
         let idx = self.current_block.expect("emit: no active block");
+        self.cb.dbg(|dbg| {
+            dbg.record_ir_emit();
+            dbg.set_source("operation", &format!("{inst}"));
+        });
         self.blocks[idx].push(inst);
-        self.cb.record_ir_emit();
     }
 
     /// Get the VRegDef for a given VReg.
@@ -237,39 +303,57 @@ impl<'a> FunctionBuilder<'a> {
         self.vreg_defs[vreg.0 as usize]
     }
 
-    // --- Debug forwarding (no-op when no debugger attached) ---
+    // --- Debug helpers ---
 
-    /// Open a new source operation group in the debugger.
+    /// Open a new source operation group with pc and label.
     ///
-    /// Automatically snapshots every vstack's current state into its
-    /// corresponding debug column.
+    /// Snapshots every vstack's current state into its debug column.
     pub fn begin_op(&mut self, pc: &str, label: &str) {
-        self.cb.begin_op(pc, label);
-        for (i, vs) in self.vstacks.iter().enumerate() {
-            let snapshot = format_vstack_snapshot(vs);
-            self.cb.set_column(i, &snapshot);
-        }
+        let idx = self.current_block;
+        let snapshots: Vec<(&str, String)> = self
+            .vstack_configs
+            .iter()
+            .enumerate()
+            .map(|(i, cfg)| {
+                let state = idx.map(|b| &self.blocks[b].vstack_state[i]);
+                (cfg.label, format_vstack_snapshot(state))
+            })
+            .collect();
+        self.cb.dbg(|dbg| {
+            dbg.set_pending("pc", pc);
+            dbg.set_pending("label", label);
+            for (label, snapshot) in &snapshots {
+                dbg.set_pending(label, snapshot);
+            }
+        });
+    }
+
+    /// Allocate a temp VReg with no canonical stack slot.
+    pub fn alloc_temp(&mut self, ty: IrType, value: Value) -> VReg {
+        let id = VReg(self.next_vreg);
+        self.next_vreg += 1;
+        self.vreg_defs.push(VRegDef {
+            id,
+            ty,
+            slot: None,
+            value,
+        });
+        self.record_def(id);
+        id
     }
 
     /// Finalize — analyze control flow and produce the IRFunction.
-    ///
-    /// Two-pass liveness analysis:
-    /// 1. Params = VRegs used in a block but not defined there (live-in).
-    /// 2. Results = VRegs defined in a block that appear in any successor's
-    ///    params (live-out). A def that no successor needs is dead and not
-    ///    included in results.
     pub fn build(self) {
-        // Pass 1: compute params and successors for each block.
         let block_ids: Vec<BlockId> = self.blocks.iter().map(|bb| bb.id).collect();
         let proto_blocks: Vec<_> = self
             .blocks
             .into_iter()
             .enumerate()
             .map(|(i, bb)| {
-                let mut successors = extract_successors(&bb.instructions);
+                let mut successors = bb.successors;
 
-                // Implicit fallthrough: if no terminator, the next block is the successor.
-                if successors.is_empty() && !is_terminator(bb.instructions.last()) {
+                // Implicit fallthrough for non-finalized blocks.
+                if successors.is_empty() && !bb.finalized {
                     if let Some(&next_id) = block_ids.get(i + 1) {
                         successors.push(next_id);
                     }
@@ -286,8 +370,6 @@ impl<'a> FunctionBuilder<'a> {
             })
             .collect();
 
-        // Pass 2: compute results — a def is live-out only if a successor
-        // block has it in its params (i.e., actually needs it).
         let all_params: Vec<Vec<VReg>> = proto_blocks
             .iter()
             .map(|(_, _, _, p, _)| p.clone())
@@ -297,10 +379,8 @@ impl<'a> FunctionBuilder<'a> {
         let blocks = proto_blocks
             .into_iter()
             .map(|(id, defs, instructions, params, successors)| {
-                // Results = values this block passes to successors OR returns.
                 let mut results = Vec::new();
 
-                // 1. Values (defs or pass-through params) needed by successors.
                 let available: Vec<VReg> = defs.iter().chain(params.iter()).copied().collect();
                 for &v in &available {
                     if results.contains(&v) {
@@ -318,7 +398,6 @@ impl<'a> FunctionBuilder<'a> {
                     }
                 }
 
-                // 2. Return values — the block's output to the caller.
                 if let Some(IrInst::Return { values, .. }) = instructions.last() {
                     for &v in values {
                         if !results.contains(&v) {
@@ -338,7 +417,7 @@ impl<'a> FunctionBuilder<'a> {
             .collect();
 
         let func = IRFunction {
-            vstacks: self.vstacks,
+            vstacks: self.vstack_configs,
             vreg_defs: self.vreg_defs,
             blocks,
         };
@@ -347,6 +426,31 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     // --- internal helpers ---
+
+    /// Get a mutable reference to vstack state on the current block.
+    fn vstack_mut(&mut self, vstack: VStackId) -> &mut VStackMut {
+        let idx = self.current_block.expect("vstack_mut: no active block");
+        &mut self.blocks[idx].vstack_state[vstack.0 as usize]
+    }
+
+    /// Get a shared reference to vstack state on the current block.
+    fn vstack_ref(&self, vstack: VStackId) -> &VStackMut {
+        let idx = self.current_block.expect("vstack_ref: no active block");
+        &self.blocks[idx].vstack_state[vstack.0 as usize]
+    }
+
+    /// Clone the current block's vstack state onto a target block.
+    ///
+    /// If the target already has vstack state (from another incoming edge),
+    /// this is a no-op — wasm guarantees balanced stacks, so the states match.
+    fn snapshot_vstack_onto(&mut self, target: BlockId) {
+        let src_idx = self.current_block.expect("snapshot: no active block");
+        let dst_idx = self.ensure_block(target);
+        if self.blocks[dst_idx].vstack_state.is_empty() {
+            let state = self.blocks[src_idx].vstack_state.clone();
+            self.blocks[dst_idx].vstack_state = state;
+        }
+    }
 
     fn record_def(&mut self, vreg: VReg) {
         if let Some(idx) = self.current_block {
@@ -372,24 +476,6 @@ impl<'a> FunctionBuilder<'a> {
         id
     }
 
-    /// Allocate a temp VReg with no canonical stack slot.
-    ///
-    /// Temps cannot be spilled — they must be consumed immediately
-    /// (e.g. a comparison result feeding the next `BrIf`) or be
-    /// rematerializable from a constant value.
-    pub fn alloc_temp(&mut self, ty: IrType, value: Value) -> VReg {
-        let id = VReg(self.next_vreg);
-        self.next_vreg += 1;
-        self.vreg_defs.push(VRegDef {
-            id,
-            ty,
-            slot: None,
-            value,
-        });
-        self.record_def(id);
-        id
-    }
-
     fn ensure_block(&mut self, id: BlockId) -> usize {
         if let Some(idx) = self.blocks.iter().position(|b| b.id == id) {
             idx
@@ -400,10 +486,14 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     fn push_typed(&mut self, vstack: VStackId, ty: IrType, value: Value) -> VReg {
-        let vs = &self.vstacks[vstack.0 as usize];
+        let cfg = &self.vstack_configs[vstack.0 as usize];
+        let label = cfg.label;
+        let base_offset = cfg.base_offset;
+
+        let vs = self.vstack_ref(vstack);
         let index = vs.depth;
         let size = ir_type_size(ty);
-        let byte_offset = vs.base_offset + index * (size as u32);
+        let byte_offset = base_offset + index * (size as u32);
 
         let slot = CanonSlot {
             vstack,
@@ -412,7 +502,6 @@ impl<'a> FunctionBuilder<'a> {
             size,
         };
 
-        // If the value references another VReg, record a use of the source.
         if let Value::VReg(src) = value {
             self.record_use(src);
         }
@@ -422,8 +511,10 @@ impl<'a> FunctionBuilder<'a> {
 
         let def = self.vreg_defs[vreg.0 as usize];
         self.emit(IrInst::StackPush { def });
+        let op = format!("{label}.push {vreg} = {value}");
+        self.cb.dbg(|dbg| dbg.set_source("operation", &op));
 
-        let vs = &mut self.vstacks[vstack.0 as usize];
+        let vs = self.vstack_mut(vstack);
         let idx = index as usize;
         if idx < vs.slots.len() {
             vs.slots[idx] = Some(vreg);
@@ -436,41 +527,18 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     fn pop(&mut self, vstack: VStackId) -> VReg {
-        let vs = &mut self.vstacks[vstack.0 as usize];
-        assert!(vs.depth > 0, "pop: vstack is empty");
+        let label = self.vstack_configs[vstack.0 as usize].label;
+        let vs = self.vstack_mut(vstack);
+        assert!(vs.depth > 0, "pop: vstack '{label}' is empty");
         vs.depth -= 1;
         let vreg = vs.slots[vs.depth as usize].expect("pop: slot not defined");
         self.record_use(vreg);
         let def = self.vreg_defs[vreg.0 as usize];
         self.emit(IrInst::StackPop { def });
+        let op = format!("{label}.pop {vreg}");
+        self.cb.dbg(|dbg| dbg.set_source("operation", &op));
         vreg
     }
-}
-
-/// Extract successor block IDs from the last instruction in a block.
-fn extract_successors(instructions: &[IrInst]) -> Vec<BlockId> {
-    match instructions.last() {
-        Some(IrInst::BrIf {
-            block_if,
-            block_else,
-            ..
-        }) => {
-            vec![*block_if, *block_else]
-        }
-        Some(IrInst::Branch { target }) => {
-            vec![*target]
-        }
-        Some(IrInst::Return { .. }) => Vec::new(),
-        _ => Vec::new(), // fallthrough or no terminator yet
-    }
-}
-
-/// Check if an instruction is a block terminator (no fallthrough).
-fn is_terminator(inst: Option<&IrInst>) -> bool {
-    matches!(
-        inst,
-        Some(IrInst::BrIf { .. } | IrInst::Branch { .. } | IrInst::Return { .. })
-    )
 }
 
 fn ir_type_size(ty: IrType) -> u8 {
@@ -482,7 +550,8 @@ fn ir_type_size(ty: IrType) -> u8 {
 }
 
 /// Format a vstack's current slots as a space-separated list of VReg names.
-fn format_vstack_snapshot(vs: &VStackDef) -> String {
+fn format_vstack_snapshot(vs: Option<&VStackMut>) -> String {
+    let Some(vs) = vs else { return String::new() };
     let mut parts = Vec::new();
     for slot in vs.slots.iter().take(vs.depth as usize) {
         match slot {
