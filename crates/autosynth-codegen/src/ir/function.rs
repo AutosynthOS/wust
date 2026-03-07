@@ -1,19 +1,28 @@
+//! Function-level IR types: function indices, ISA register roles, virtual
+//! stack definitions, and the finalized [`IRFunction`].
+
 use super::block::IrBlock;
 use super::{Register, VReg, VRegDef, VStackId};
 
+/// Index identifying a function in the compilation unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionIdx {
+    /// A user-defined function, indexed by its position in the module.
     User(u32),
 }
 
-/// Arch-abstract register role — resolved to a physical register by the backend.
+/// Architecture-abstract register role, resolved to a physical register by
+/// the backend via [`BackendEmitter::use_isa_reg`](crate::backend::BackendEmitter::use_isa_reg).
+///
+/// The caller uses this to declare named registers with specific architectural
+/// roles without knowing the target platform's register numbering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IsaReg {
-    /// The platform's frame pointer register.
+    /// The platform's frame pointer register (e.g. x29 on aarch64).
     FramePointer,
-    /// The platform's stack pointer register.
+    /// The platform's stack pointer register (e.g. x28 as software SP on aarch64).
     StackPointer,
-    /// The platform's return address / link register.
+    /// The platform's return address / link register (e.g. x30 on aarch64).
     ReturnAddress,
     /// A general-purpose 64-bit register, auto-allocated from the remaining pool.
     /// Positive indexes allocate from the start (0, 1, 2...),

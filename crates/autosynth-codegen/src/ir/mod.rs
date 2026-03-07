@@ -1,6 +1,17 @@
+//! Intermediate representation types for the codegen pipeline.
+//!
+//! The IR is structured as:
+//! - [`Register`] — physical or virtual register operand.
+//! - [`VReg`] / [`VRegDef`] — virtual registers with type, canonical slot, and value provenance.
+//! - [`IrType`] — width-aware IR-level types (i32, i64, f32, f64, v128).
+//! - [`Value`] — the source of a virtual register's value (param, constant, another VReg, etc.).
+//! - [`CanonSlot`] — the canonical memory location on a virtual stack where a VReg lives.
+
 pub mod block;
 pub mod function;
 pub mod instruction;
+
+use std::fmt;
 
 use crate::backend::PhysReg;
 
@@ -11,6 +22,15 @@ pub enum Register {
     Phys(u8),
     /// A virtual register, to be resolved by the register allocator.
     Virtual(u32),
+}
+
+impl fmt::Display for Register {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Register::Phys(n) => write!(f, "r{n}"),
+            Register::Virtual(n) => write!(f, "v{n}"),
+        }
+    }
 }
 
 impl From<PhysReg> for Register {
@@ -29,11 +49,20 @@ impl From<VReg> for Register {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VReg(pub u32);
 
+impl fmt::Display for VReg {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "v{}", self.0)
+    }
+}
+
 /// Index into the function builder's vstack table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VStackId(pub u32);
 
-/// IR-level type.
+/// IR-level value type, determining register width and memory layout.
+///
+/// Used to select between 32-bit and 64-bit instructions during lowering,
+/// and to compute slot sizes in virtual stacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IrType {
     I32,
@@ -41,6 +70,18 @@ pub enum IrType {
     F32,
     F64,
     V128,
+}
+
+impl fmt::Display for IrType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrType::I32 => write!(f, "i32"),
+            IrType::I64 => write!(f, "i64"),
+            IrType::F32 => write!(f, "f32"),
+            IrType::F64 => write!(f, "f64"),
+            IrType::V128 => write!(f, "v128"),
+        }
+    }
 }
 
 /// The source/value of a VStack slot.
@@ -71,11 +112,19 @@ pub struct CanonSlot {
     pub size: u8,
 }
 
-/// Metadata for a VReg definition.
+/// Metadata for a virtual register definition.
+///
+/// Each VReg has a unique id, an IR type that determines its width,
+/// a canonical stack slot where it can be spilled/loaded, and a value
+/// that describes how it was produced (constant, parameter, ALU result, etc.).
 #[derive(Debug, Clone, Copy)]
 pub struct VRegDef {
+    /// The unique virtual register identifier.
     pub id: VReg,
+    /// The IR type (determines register width and slot size).
     pub ty: IrType,
+    /// Canonical memory location on a virtual stack.
     pub slot: CanonSlot,
+    /// How this value was produced.
     pub value: Value,
 }

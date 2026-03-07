@@ -425,6 +425,77 @@ fn sw_encoding() {
     assert_eq!(word, 0x00A12023);
 }
 
+// ---- Slt ----
+
+#[test]
+fn slt_a0_a1_a2() {
+    let inst = Slt { rd: Gpr::A0, rs1: Gpr::A1, rs2: Gpr::A2 };
+    check_asm(&inst, "slt a0, a1, a2");
+}
+
+#[test]
+fn slt_encoding() {
+    // SLT a0, a1, a2: funct7=0, rs2=12, rs1=11, funct3=2, rd=10, opcode=0x33
+    // 0000000 01100 01011 010 01010 0110011
+    let inst = Slt { rd: Gpr::A0, rs1: Gpr::A1, rs2: Gpr::A2 };
+    let word = inst.encode_word();
+    assert_eq!(word, 0x00C5A533);
+}
+
+// ---- Sltu ----
+
+#[test]
+fn sltu_a0_a1_a2() {
+    let inst = Sltu { rd: Gpr::A0, rs1: Gpr::A1, rs2: Gpr::A2 };
+    check_asm(&inst, "sltu a0, a1, a2");
+}
+
+#[test]
+fn sltu_encoding() {
+    // SLTU a0, a1, a2: funct7=0, rs2=12, rs1=11, funct3=3, rd=10, opcode=0x33
+    // 0000000 01100 01011 011 01010 0110011
+    let inst = Sltu { rd: Gpr::A0, rs1: Gpr::A1, rs2: Gpr::A2 };
+    let word = inst.encode_word();
+    assert_eq!(word, 0x00C5B533);
+}
+
+// ---- Bltu ----
+
+#[test]
+fn bltu_a0_a1_32() {
+    let inst = Bltu { rs1: Gpr::A0, rs2: Gpr::A1, imm: BImm13::new(32).unwrap() };
+    check_asm(&inst, "bltu a0, a1, 32");
+}
+
+#[test]
+fn bltu_encoding() {
+    // BLTU a0, a1, 16: opcode=0x63, funct3=6
+    // B-type with offset=16, rs1=10, rs2=11
+    let inst = Bltu { rs1: Gpr::A0, rs2: Gpr::A1, imm: BImm13::new(16).unwrap() };
+    let word = inst.encode_word();
+    // Same bit pattern as BEQ encoding test but with funct3=6
+    // imm bits: 12=0, 11=0, 10:5=000000, 4:1=1000
+    // 0|000000 01011 01010 110 1000|0 1100011
+    assert_eq!(word, 0x00B56863);
+}
+
+// ---- Bgeu ----
+
+#[test]
+fn bgeu_a0_a1_64() {
+    let inst = Bgeu { rs1: Gpr::A0, rs2: Gpr::A1, imm: BImm13::new(64).unwrap() };
+    check_asm(&inst, "bgeu a0, a1, 64");
+}
+
+#[test]
+fn bgeu_encoding() {
+    // BGEU a0, a1, 16: opcode=0x63, funct3=7
+    let inst = Bgeu { rs1: Gpr::A0, rs2: Gpr::A1, imm: BImm13::new(16).unwrap() };
+    let word = inst.encode_word();
+    // 0|000000 01011 01010 111 1000|0 1100011
+    assert_eq!(word, 0x00B57863);
+}
+
 // ---- Encode buffer too small ----
 
 #[test]

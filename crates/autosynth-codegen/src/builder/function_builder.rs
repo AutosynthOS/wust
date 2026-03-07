@@ -6,11 +6,35 @@ use crate::ir::instruction::IrInst;
 use crate::ir::{CanonSlot, IrType, Register, VReg, VRegDef, VStackId, Value};
 
 /// Configuration for creating a virtual stack.
+///
+/// A virtual stack is anchored to a base register plus a byte offset.
+/// All slot addresses within the stack are computed relative to this anchor.
 pub struct VStack {
+    /// The register that serves as the base address for this stack.
     pub base: Register,
+    /// Byte offset from the base register to the start of the stack.
     pub offset: u32,
 }
 
+/// Incrementally builds an [`IRFunction`] by managing virtual stacks, blocks,
+/// and VReg allocation.
+///
+/// The builder tracks virtual register definitions, use/def chains per block,
+/// and virtual stack depths. At [`build()`](Self::build) time, it analyzes
+/// control flow to compute block params (live-in) and results (live-out),
+/// then pushes the finalized function into a [`CodeBuilder`].
+///
+/// # Usage pattern
+///
+/// ```text
+/// let mut f = FunctionBuilder::new();
+/// let operands = f.define_vstack(VStack { base, offset: 0 });
+/// f.entry_block(BlockId::Entry);
+/// f.push_i32(operands, Value::ConstI32(42));
+/// let val = f.pop_i32(operands);
+/// f.emit(IrInst::Return { values: vec![val] });
+/// f.build(&mut code_builder);
+/// ```
 pub struct FunctionBuilder {
     /// VReg definitions, indexed by VReg id.
     vreg_defs: Vec<VRegDef>,
@@ -28,6 +52,7 @@ pub struct FunctionBuilder {
 }
 
 impl FunctionBuilder {
+    /// Create an empty function builder with no blocks, stacks, or VRegs.
     pub fn new() -> Self {
         Self {
             vreg_defs: Vec::new(),
@@ -52,7 +77,11 @@ impl FunctionBuilder {
         id
     }
 
-    /// Pre-define a slot in a vstack (e.g. for function params, zero-init locals).
+    /// Pre-define a slot in a vstack at a specific index.
+    ///
+    /// Used for declaring function parameters and zero-initialized locals
+    /// before entering any block, or for writing to an existing slot
+    /// (e.g. `local.set`) when inside an active block.
     pub fn define_slot(&mut self, vstack: VStackId, index: usize, ty: IrType, value: Value) {
         let size = ir_type_size(ty);
         let base_offset = self.vstacks[vstack.0 as usize].base_offset;
@@ -110,7 +139,10 @@ impl FunctionBuilder {
         self.push_typed(vstack, src_def.ty, Value::VReg(src))
     }
 
-    /// Allocate a new destination VReg on the vstack — for instruction results.
+    /// Allocate a new i32 destination VReg on the vstack for an instruction result.
+    ///
+    /// The returned VReg is a placeholder — the actual value is defined
+    /// when the caller emits an ALU or Cmp instruction targeting it.
     pub fn push_i32_vreg(&mut self, vstack: VStackId) -> VReg {
         // Value::Const(0) is a placeholder — the emit will define the actual value
         self.push_typed(vstack, IrType::I32, Value::Const(0))
@@ -127,6 +159,11 @@ impl FunctionBuilder {
     }
 
     /// Read a slot from a vstack by index (non-consuming, e.g. local.get).
+    ///
+    /// # Panics
+    ///
+    /// Panics if the slot at `index` was never defined via [`define_slot`](Self::define_slot)
+    /// or [`push_typed`](Self::push_typed).
     pub fn get_slot(&mut self, vstack: VStackId, index: usize) -> VReg {
         let vs = &self.vstacks[vstack.0 as usize];
         let vreg = vs.slots[index].expect("get_slot: slot not defined");
@@ -150,7 +187,11 @@ impl FunctionBuilder {
         self.switch_to_block(block);
     }
 
-    /// Create a generated block (for suspend stubs, cold paths, etc.).
+    /// Create a generated block with an auto-incremented ID.
+    ///
+    /// Returns a [`BlockId::Gen`] that can be used as a branch target.
+    /// Useful for codegen-internal blocks (cold paths, stubs, trampolines)
+    /// that have no corresponding source-level position.
     pub fn gen_block(&mut self) -> BlockId {
         let id = BlockId::Gen(self.next_gen_id);
         self.next_gen_id += 1;
@@ -158,7 +199,11 @@ impl FunctionBuilder {
         id
     }
 
-    /// Get the currently active block.
+    /// Get the currently active block's ID.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no block has been activated via [`switch_to_block`](Self::switch_to_block).
     pub fn current_block(&self) -> BlockId {
         let idx = self.current_block.expect("no active block");
         self.blocks[idx].id
@@ -169,10 +214,19 @@ impl FunctionBuilder {
         // TODO: store labels for debug/disassembly
     }
 
-    /// Emit an IR instruction into the current block.
+    /// Emit an IR instruction into the currently active block.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no block is active.
     pub fn emit(&mut self, inst: IrInst) {
         let idx = self.current_block.expect("emit: no active block");
         self.blocks[idx].push(inst);
+    }
+
+    /// Get the VRegDef for a given VReg.
+    pub fn vreg_def(&self, vreg: VReg) -> VRegDef {
+        self.vreg_defs[vreg.0 as usize]
     }
 
     /// Finalize — analyze control flow and produce the IRFunction.

@@ -1,7 +1,7 @@
 use wasmparser::ValType;
 
-use wust_core::{FuncMeta, ParsedModule};
 use crate::jit::compile_all;
+use wust_core::{FuncMeta, ParsedModule};
 
 use wust_codegen::disasm::{Block, BlockAnnotations, CodegenOutput};
 
@@ -35,12 +35,14 @@ fn reg_prefix(ty: &ValType) -> &'static str {
 
 fn func_signature(func: &FuncMeta, export_name: Option<&str>, idx: usize) -> String {
     let name = func_name(export_name, idx);
-    let params: Vec<String> = func.params
+    let params: Vec<String> = func
+        .params
         .iter()
         .enumerate()
         .map(|(i, ty)| format!("{}{}<{}>", reg_prefix(ty), 9 + i, valtype_str(ty)))
         .collect();
-    let results: Vec<String> = func.results
+    let results: Vec<String> = func
+        .results
         .iter()
         .enumerate()
         .map(|(i, ty)| format!("{}{}<{}>", reg_prefix(ty), 9 + i, valtype_str(ty)))
@@ -95,11 +97,8 @@ impl<'a> Codegen<'a> {
         let mut func_body_starts: Vec<usize> = Vec::new();
 
         let module = self.module;
-        let (e, shared, trampolines) = compile_all(
-            module,
-            self.emit_fuel,
-            true,
-            |i, ir, emitter, snap| {
+        let (e, shared, trampolines) =
+            compile_all(module, self.emit_fuel, true, |i, ir, emitter, snap| {
                 func_body_starts.push(snap.code_start);
 
                 let code = emitter.code()[snap.code_start..].to_vec();
@@ -108,10 +107,11 @@ impl<'a> Codegen<'a> {
                     .map(|m| m - snap.code_start)
                     .collect();
                 let fused = crate::jit::fuse::fuse(&module.funcs[i].body);
-                let op_labels: Vec<String> = fused.ops.iter()
+                let op_labels: Vec<String> = fused
+                    .ops
+                    .iter()
                     .map(|op| {
-                        crate::jit::fuse::display_label(*op)
-                            .unwrap_or_else(|| op.display_label())
+                        crate::jit::fuse::display_label(*op).unwrap_or_else(|| op.display_label())
                     })
                     .collect();
 
@@ -120,13 +120,18 @@ impl<'a> Codegen<'a> {
                 // FuelConsume, FuelCheck — their code merges into
                 // surrounding regions).
                 use wust_codegen::ir::IrInst;
-                let filtered_source_ops: Vec<u32> = ir.insts.iter()
+                let filtered_source_ops: Vec<u32> = ir
+                    .insts
+                    .iter()
                     .zip(ir.source_ops.iter())
-                    .filter(|(inst, _)| !matches!(inst,
-                        IrInst::DefLabel { .. } |
-                        IrInst::FuelConsume { .. } |
-                        IrInst::FuelCheck { .. }
-                    ))
+                    .filter(|(inst, _)| {
+                        !matches!(
+                            inst,
+                            IrInst::DefLabel { .. }
+                                | IrInst::FuelConsume { .. }
+                                | IrInst::FuelCheck { .. }
+                        )
+                    })
                     .map(|(_, &op)| op)
                     .collect();
 
@@ -145,8 +150,7 @@ impl<'a> Codegen<'a> {
                         word_labels: snap.word_labels.clone(),
                     }),
                 });
-            },
-        );
+            });
 
         let full_code = e.code();
 

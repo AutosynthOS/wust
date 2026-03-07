@@ -91,7 +91,7 @@ fn fib_ir_dump() -> anyhow::Result<()> {
                         eprintln!("    brif {cond:?} → {block_if:?} / {block_else:?}"),
                     IrInst::Branch { target } =>
                         eprintln!("    br {target:?}"),
-                    IrInst::Call { func_idx } =>
+                    IrInst::Call { func_idx, .. } =>
                         eprintln!("    call {func_idx:?}"),
                     IrInst::Return { values } =>
                         eprintln!("    return {values:?}"),
@@ -123,12 +123,41 @@ fn fib_lower() -> anyhow::Result<()> {
     backend.use_isa_reg("fsp", IsaReg::StackPointer);
 
     let func = &ir.functions()[0];
-    let (code, disasm) = backend.lower_with_disasm(func);
+    let (code, disasm) = backend.lower_with_disasm(func)?;
 
     eprintln!("\n=== lowered fib ({} bytes, {} instructions) ===", code.len(), code.len() / 4);
-    eprintln!("{disasm}");
+    eprintln!("{}", disasm.render(None));
 
     assert!(!code.is_empty(), "lowerer produced no code");
+    Ok(())
+}
+
+#[test]
+fn fib_jit_base_case() -> anyhow::Result<()> {
+    use wust_core::exec::ModuleExecutor;
+
+    let bytes = wat::parse_str(WAT)?;
+    let module = wust_core::ParsedModule::new(&bytes)?;
+    let instance = wust_core::Instance::new(&module);
+
+    let jit = wust_codegen::JitModule::new(module.clone())?;
+
+    // fib(1) = 1, base case (no recursion)
+    let mut task = wust_core::Task::setup(&instance, "fib", &[wust_core::Val::I32(1)])?;
+    task.context.fuel = i64::MAX;
+    let outcome = jit.poll(&mut task);
+    assert_eq!(outcome, wust_core::Outcome::Return);
+    let results = task.results();
+    assert_eq!(results, vec![wust_core::Val::I32(1)]);
+
+    // fib(2) = 1, one level of recursion
+    let mut task = wust_core::Task::setup(&instance, "fib", &[wust_core::Val::I32(2)])?;
+    task.context.fuel = i64::MAX;
+    let outcome = jit.poll(&mut task);
+    assert_eq!(outcome, wust_core::Outcome::Return);
+    let results = task.results();
+    assert_eq!(results, vec![wust_core::Val::I32(1)]);
+
     Ok(())
 }
 

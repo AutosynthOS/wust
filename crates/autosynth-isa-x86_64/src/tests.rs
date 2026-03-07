@@ -499,6 +499,96 @@ fn mov_store_rsp_base() {
     check_asm(&inst, "mov [rsp + 16], ecx", &[0x89, 0x4C, 0x24, 0x10]);
 }
 
+// ---- AddRegImm ----
+
+#[test]
+fn add_reg_imm8_32() {
+    // add eax, 1 => 83 C0 01
+    let inst = AddRegImm {
+        dst: Gpr32::RAX.into(),
+        imm: Imm32::new(1),
+    };
+    check_asm(&inst, "add eax, 1", &[0x83, 0xC0, 0x01]);
+}
+
+#[test]
+fn add_reg_imm8_64() {
+    // add rax, 1 => REX.W(48) 83 C0 01
+    let inst = AddRegImm {
+        dst: Gpr64::RAX.into(),
+        imm: Imm32::new(1),
+    };
+    check_asm(&inst, "add rax, 1", &[0x48, 0x83, 0xC0, 0x01]);
+}
+
+#[test]
+fn add_reg_imm32_32() {
+    // add eax, 1000 => 81 C0 E8 03 00 00
+    let inst = AddRegImm {
+        dst: Gpr32::RAX.into(),
+        imm: Imm32::new(1000),
+    };
+    check_asm(&inst, "add eax, 1000", &[0x81, 0xC0, 0xE8, 0x03, 0x00, 0x00]);
+}
+
+#[test]
+fn add_reg_imm8_extended() {
+    // add r8d, 1 => REX.B(41) 83 C0 01
+    let inst = AddRegImm {
+        dst: Gpr32::R8.into(),
+        imm: Imm32::new(1),
+    };
+    check_asm(&inst, "add r8d, 1", &[0x41, 0x83, 0xC0, 0x01]);
+}
+
+// ---- CmpRegReg ----
+
+#[test]
+fn cmp_reg_reg_32() {
+    // cmp eax, ecx => 39 C8
+    let inst = CmpRegReg {
+        lhs: Gpr32::RAX.into(),
+        rhs: Gpr32::RCX.into(),
+    };
+    check_asm(&inst, "cmp eax, ecx", &[0x39, 0xC8]);
+}
+
+#[test]
+fn cmp_reg_reg_64() {
+    // cmp rax, rcx => REX.W(48) 39 C8
+    let inst = CmpRegReg {
+        lhs: Gpr64::RAX.into(),
+        rhs: Gpr64::RCX.into(),
+    };
+    check_asm(&inst, "cmp rax, rcx", &[0x48, 0x39, 0xC8]);
+}
+
+#[test]
+fn cmp_reg_reg_extended() {
+    // cmp r8d, r9d => REX(45) 39 C8
+    let inst = CmpRegReg {
+        lhs: Gpr32::R8.into(),
+        rhs: Gpr32::R9.into(),
+    };
+    check_asm(&inst, "cmp r8d, r9d", &[0x45, 0x39, 0xC8]);
+}
+
+// ---- JmpRel32 ----
+
+#[test]
+fn jmp_rel32_positive() {
+    // jmp +100 => E9 64 00 00 00
+    let inst = JmpRel32 { offset: 100 };
+    check_asm(&inst, "jmp 100", &[0xE9, 0x64, 0x00, 0x00, 0x00]);
+}
+
+#[test]
+fn jmp_rel32_negative() {
+    // jmp -42 => E9 D6 FF FF FF
+    let inst = JmpRel32 { offset: -42 };
+    check_asm(&inst, "jmp -42", &[0xE9, 0xD6, 0xFF, 0xFF, 0xFF]);
+}
+
 // ---- Immediate validation ----
 
 #[test]

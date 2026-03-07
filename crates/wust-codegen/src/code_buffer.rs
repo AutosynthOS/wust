@@ -18,7 +18,10 @@ pub struct CodeBuffer {
 }
 
 impl CodeBuffer {
-    /// Allocate a code buffer with default sizing.
+    /// Allocate a code buffer with default sizing (128 MB reserved, 64 KB committed).
+    ///
+    /// Reserves virtual address space with no access, then commits an
+    /// initial region as read-write for code emission.
     pub fn new() -> Result<Self, anyhow::Error> {
         let page_size = page_size();
         let initial_commit = INITIAL_COMMIT_PAGES * page_size;
@@ -33,7 +36,12 @@ impl CodeBuffer {
         })
     }
 
-    /// Write compiled code bytes into the buffer, ensure capacity, and finalize.
+    /// Write compiled code bytes into the buffer, growing if needed, then
+    /// finalize the region as executable.
+    ///
+    /// If the buffer was previously finalized, it is reopened for writing
+    /// first. After writing, the region is set to execute-only and the
+    /// instruction cache is invalidated.
     pub fn flash(&mut self, code: &[u8]) -> anyhow::Result<()> {
         if self.finalized {
             self.reopen()?;

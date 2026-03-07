@@ -123,6 +123,8 @@ version = "0.1.0"
 dependencies = [
  "autosynth-isa",
  "autosynth-isa-aarch64",
+ "autosynth-isa-riscv64",
+ "autosynth-isa-x86_64",
 ]
 
 [[package]]

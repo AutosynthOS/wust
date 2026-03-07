@@ -1,14 +1,16 @@
+use crate::CodegenError;
 use crate::backend::PhysReg;
 use crate::ir::VReg;
 
 /// A write-back register cache over canonical stack slots.
 ///
-/// Registers are a cache — values live canonically on the wasm stack,
-/// and the regcache tracks which values are currently in physical registers
-/// and whether the register value is newer than what's in memory (dirty).
+/// Values live canonically in memory (virtual stack slots). The regcache
+/// tracks which values are currently mirrored in physical registers and
+/// whether the register copy is newer than memory (dirty).
 ///
-/// The regcache never emits instructions. It returns decisions that the
-/// lowerer interprets to emit loads, stores, and moves.
+/// The regcache never emits instructions itself. It returns decisions
+/// (e.g. "needs load", "dirty pairs to flush") that the backend lowerer
+/// interprets to emit the appropriate loads, stores, and moves.
 pub struct RegCache {
     /// Per physical register: what VReg is cached, and is it dirty?
     slots: Vec<RegSlot>,
@@ -27,10 +29,13 @@ struct Binding {
     dirty: bool,
 }
 
-/// Result of `ensure` — tells the lowerer whether a load is needed.
+/// Result of [`RegCache::ensure`] — tells the lowerer which physical register
+/// holds the value and whether a load from the canonical slot is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnsureResult {
+    /// The physical register assigned to the VReg.
     pub reg: PhysReg,
+    /// If `true`, the lowerer must emit a load from the VReg's canonical slot.
     pub needs_load: bool,
 }
 
@@ -44,25 +49,33 @@ impl RegCache {
         Self { slots }
     }
 
-    /// Allocate a register for a new value (e.g. instruction result).
-    /// Marks the register as dirty (value exists only in register, not yet stored).
-    pub fn define(&mut self, vreg: VReg) -> PhysReg {
+    /// Allocate a register for a newly defined value (e.g. ALU result).
+    ///
+    /// If the VReg is already bound, reuses the same register. Otherwise
+    /// picks the first free slot. Marks the register as dirty (the value
+    /// exists only in the register, not yet stored to canonical memory).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodegenError::RegisterExhaustion`] if no free registers
+    /// remain (eviction is not yet implemented).
+    pub fn define(&mut self, vreg: VReg) -> Result<PhysReg, CodegenError> {
         // Check if already bound
         if let Some(slot) = self.slots.iter_mut().find(|s| {
             s.binding.map_or(false, |b| b.vreg == vreg)
         }) {
             slot.binding = Some(Binding { vreg, dirty: true });
-            return slot.reg;
+            return Ok(slot.reg);
         }
 
         // Find a free slot
         if let Some(slot) = self.slots.iter_mut().find(|s| s.binding.is_none()) {
             slot.binding = Some(Binding { vreg, dirty: true });
-            return slot.reg;
+            return Ok(slot.reg);
         }
 
         // TODO: eviction
-        panic!("regcache: no free registers (eviction not yet implemented)");
+        Err(CodegenError::RegisterExhaustion)
     }
 
     /// Check if a VReg is currently cached. Returns the register if so.
@@ -82,40 +95,86 @@ impl RegCache {
             s.binding.map_or(false, |b| b.vreg == src)
         })?;
         let reg = slot.reg;
+        // SAFETY: the find predicate above filters on binding.is_some(), so unwrap is safe.
         let dirty = slot.binding.unwrap().dirty;
         // Rebind the register to the new VReg (the old one is consumed).
+        // SAFETY: `reg` came from self.slots, so it must exist in self.slots.
         let slot = self.slots.iter_mut().find(|s| s.reg == reg).unwrap();
         slot.binding = Some(Binding { vreg: dst, dirty });
         Some(reg)
     }
 
-    /// Ensure a VReg is in a register. Returns the register and whether
-    /// the lowerer needs to emit a load from the canonical stack slot.
-    pub fn ensure(&mut self, vreg: VReg) -> EnsureResult {
+    /// Bind a VReg to a specific physical register (clean — already in the register).
+    ///
+    /// Used when a value arrives in a known register (e.g., function parameters
+    /// in calling convention registers). The VReg is marked clean since no
+    /// store to memory is needed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `phys` is not in the scratch pool.
+    pub fn bind(&mut self, vreg: VReg, phys: PhysReg) {
+        self.bind_impl(vreg, phys, false);
+    }
+
+    /// Bind a VReg to a specific physical register and mark it dirty.
+    ///
+    /// Used when a value materializes in a register but has never been
+    /// stored to its canonical memory slot (e.g., a function call return
+    /// value that arrives in a calling convention register).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `phys` is not in the scratch pool.
+    pub fn bind_dirty(&mut self, vreg: VReg, phys: PhysReg) {
+        self.bind_impl(vreg, phys, true);
+    }
+
+    fn bind_impl(&mut self, vreg: VReg, phys: PhysReg, dirty: bool) {
+        let slot = self.slots.iter_mut().find(|s| s.reg == phys)
+            .unwrap_or_else(|| panic!("bind: register {phys:?} not in scratch pool"));
+        slot.binding = Some(Binding { vreg, dirty });
+    }
+
+    /// Ensure a VReg is in a physical register, allocating one if necessary.
+    ///
+    /// If the VReg is already cached, returns the register with `needs_load = false`.
+    /// Otherwise picks a free register and returns `needs_load = true` so
+    /// the lowerer can emit a load from the canonical stack slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CodegenError::RegisterExhaustion`] if no free registers
+    /// remain (eviction is not yet implemented).
+    pub fn ensure(&mut self, vreg: VReg) -> Result<EnsureResult, CodegenError> {
         // Already cached?
         if let Some(slot) = self.slots.iter().find(|s| {
             s.binding.map_or(false, |b| b.vreg == vreg)
         }) {
-            return EnsureResult {
+            return Ok(EnsureResult {
                 reg: slot.reg,
                 needs_load: false,
-            };
+            });
         }
 
         // Need to load — find a free slot
         if let Some(slot) = self.slots.iter_mut().find(|s| s.binding.is_none()) {
             slot.binding = Some(Binding { vreg, dirty: false });
-            return EnsureResult {
+            return Ok(EnsureResult {
                 reg: slot.reg,
                 needs_load: true,
-            };
+            });
         }
 
         // TODO: eviction
-        panic!("regcache: no free registers (eviction not yet implemented)");
+        Err(CodegenError::RegisterExhaustion)
     }
 
-    /// Return all dirty (reg, vreg) pairs that need storing.
+    /// Return all dirty (physical register, VReg) pairs whose register
+    /// values are newer than memory and need to be stored back.
+    ///
+    /// Typically called before a function call or block exit to ensure
+    /// all values are materialized to their canonical stack slots.
     pub fn flush_dirty(&self) -> Vec<(PhysReg, VReg)> {
         self.slots
             .iter()
@@ -127,7 +186,10 @@ impl RegCache {
             .collect()
     }
 
-    /// Release a VReg from the cache (e.g. after constant folding consumed it).
+    /// Release a VReg from the cache, freeing its physical register.
+    ///
+    /// Used when a VReg's value was consumed without needing the register
+    /// (e.g. a constant was folded into an immediate operand).
     pub fn release(&mut self, vreg: VReg) {
         if let Some(slot) = self.slots.iter_mut().find(|s| {
             s.binding.map_or(false, |b| b.vreg == vreg)
@@ -136,7 +198,11 @@ impl RegCache {
         }
     }
 
-    /// Invalidate all register bindings (e.g. after a call clobbers all scratch regs).
+    /// Invalidate all register bindings, marking every slot as free.
+    ///
+    /// Called when register contents become unreliable (e.g. after a
+    /// function call that may clobber all scratch registers, or at a
+    /// block boundary with unknown predecessors).
     pub fn invalidate_all(&mut self) {
         for slot in &mut self.slots {
             slot.binding = None;
@@ -155,15 +221,15 @@ mod tests {
     #[test]
     fn define_returns_first_free() {
         let mut cache = RegCache::new(&pool());
-        let reg = cache.define(VReg(0));
+        let reg = cache.define(VReg(0)).unwrap();
         assert_eq!(reg, PhysReg(0));
     }
 
     #[test]
     fn define_then_ensure_no_load() {
         let mut cache = RegCache::new(&pool());
-        let defined = cache.define(VReg(0));
-        let result = cache.ensure(VReg(0));
+        let defined = cache.define(VReg(0)).unwrap();
+        let result = cache.ensure(VReg(0)).unwrap();
         assert_eq!(result.reg, defined);
         assert!(!result.needs_load);
     }
@@ -171,14 +237,14 @@ mod tests {
     #[test]
     fn ensure_uncached_needs_load() {
         let mut cache = RegCache::new(&pool());
-        let result = cache.ensure(VReg(0));
+        let result = cache.ensure(VReg(0)).unwrap();
         assert!(result.needs_load);
     }
 
     #[test]
     fn define_is_dirty() {
         let mut cache = RegCache::new(&pool());
-        cache.define(VReg(0));
+        cache.define(VReg(0)).unwrap();
         let dirty = cache.flush_dirty();
         assert_eq!(dirty, vec![(PhysReg(0), VReg(0))]);
     }
@@ -186,7 +252,7 @@ mod tests {
     #[test]
     fn ensure_load_is_clean() {
         let mut cache = RegCache::new(&pool());
-        cache.ensure(VReg(0));
+        cache.ensure(VReg(0)).unwrap();
         let dirty = cache.flush_dirty();
         assert!(dirty.is_empty());
     }
@@ -194,21 +260,21 @@ mod tests {
     #[test]
     fn invalidate_clears_all() {
         let mut cache = RegCache::new(&pool());
-        cache.define(VReg(0));
-        cache.define(VReg(1));
+        cache.define(VReg(0)).unwrap();
+        cache.define(VReg(1)).unwrap();
         cache.invalidate_all();
 
         // After invalidate, ensure needs a load again
-        let result = cache.ensure(VReg(0));
+        let result = cache.ensure(VReg(0)).unwrap();
         assert!(result.needs_load);
     }
 
     #[test]
     fn multiple_defines_use_different_regs() {
         let mut cache = RegCache::new(&pool());
-        let r0 = cache.define(VReg(0));
-        let r1 = cache.define(VReg(1));
-        let r2 = cache.define(VReg(2));
+        let r0 = cache.define(VReg(0)).unwrap();
+        let r1 = cache.define(VReg(1)).unwrap();
+        let r2 = cache.define(VReg(2)).unwrap();
         assert_ne!(r0, r1);
         assert_ne!(r1, r2);
         assert_ne!(r0, r2);

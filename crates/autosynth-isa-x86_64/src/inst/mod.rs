@@ -1,7 +1,10 @@
+mod add_imm;
 mod add_reg;
 mod call_rel;
 mod cmp_imm;
+mod cmp_reg;
 mod jcc;
+mod jmp_rel;
 mod mov_imm;
 mod mov_load;
 mod mov_reg;
@@ -12,10 +15,13 @@ mod ret;
 mod sub_imm;
 mod sub_reg;
 
+pub use add_imm::AddRegImm;
 pub use add_reg::AddRegReg;
 pub use call_rel::CallRel32;
 pub use cmp_imm::CmpRegImm;
+pub use cmp_reg::CmpRegReg;
 pub use jcc::Jcc;
+pub use jmp_rel::JmpRel32;
 pub use mov_imm::MovRegImm;
 pub use mov_load::MovLoad;
 pub use mov_reg::MovRegReg;
