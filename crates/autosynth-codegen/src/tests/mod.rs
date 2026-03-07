@@ -19,9 +19,9 @@ fn block_params_from_use_def() {
     let dst = f.push_i32_vreg(operands);
     f.emit(IrInst::Alu {
         op: AluOp::Add,
-        dst,
-        lhs,
-        rhs,
+        dst: dst.into(),
+        lhs: lhs.into(),
+        rhs: rhs.into(),
     });
 
     let mut cb = CodeBuilder::new();

@@ -1,6 +1,6 @@
 use crate::ir::function::FunctionIdx;
 
-use super::{VReg, VRegDef};
+use super::{Register, VReg, VRegDef};
 use super::block::BlockId;
 
 /// An IR instruction in the function's instruction stream.
@@ -12,20 +12,24 @@ pub enum IrInst {
     /// Pop a value from a virtual stack.
     StackPop { def: VRegDef },
 
-    /// Arithmetic: dst = lhs op rhs
+    /// Arithmetic: dst = lhs op rhs.
+    ///
+    /// Operands can be virtual or physical registers. The lowerer
+    /// checks VRegDef values to fold constants into immediates.
     Alu {
         op: AluOp,
-        dst: VReg,
-        lhs: VReg,
-        rhs: VReg,
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
     },
 
-    /// Comparison: dst = (lhs op rhs) ? 1 : 0
+    /// Comparison: sets flags from (lhs op rhs). The dst register is a
+    /// placeholder — the result lives in CPU flags, consumed by BrIf.
     Cmp {
         op: CmpOp,
-        dst: VReg,
-        lhs: VReg,
-        rhs: VReg,
+        dst: Register,
+        lhs: Register,
+        rhs: Register,
     },
 
     /// Conditional branch — if cond is truthy, goto block_if, else goto block_else.
@@ -38,7 +42,9 @@ pub enum IrInst {
     /// Unconditional branch.
     Branch { target: BlockId },
 
-    /// Function call.
+    /// Function call (branch-and-link to another function).
+    ///
+    /// The lowerer flushes dirty registers before and invalidates after.
     Call {
         func_idx: FunctionIdx,
     },

@@ -116,9 +116,9 @@ impl JitModule {
                     let dst = f.push_i32_vreg(operands);
                     f.emit(IrInst::Alu {
                         op: AluOp::Add,
-                        dst,
-                        lhs,
-                        rhs,
+                        dst: dst.into(),
+                        lhs: lhs.into(),
+                        rhs: rhs.into(),
                     });
                 }
                 OpCode::I32Sub => {
@@ -127,9 +127,9 @@ impl JitModule {
                     let dst = f.push_i32_vreg(operands);
                     f.emit(IrInst::Alu {
                         op: AluOp::Sub,
-                        dst,
-                        lhs,
-                        rhs,
+                        dst: dst.into(),
+                        lhs: lhs.into(),
+                        rhs: rhs.into(),
                     });
                 }
 
@@ -139,9 +139,9 @@ impl JitModule {
                     let dst = f.push_i32_vreg(operands);
                     f.emit(IrInst::Cmp {
                         op: CmpOp::LeS,
-                        dst,
-                        lhs,
-                        rhs,
+                        dst: dst.into(),
+                        lhs: lhs.into(),
+                        rhs: rhs.into(),
                     });
                 }
 
@@ -174,12 +174,22 @@ impl JitModule {
                     f.switch_to_block(cont);
                 }
                 OpCode::End => {
-                    // Continuation block starts at this PC.
                     let block_idx = inline_op.immediate_u32();
-                    f.switch_to_block(BlockId::User(pc as u32));
                     if block_idx == 0 {
+                        // Function-level end — emit implicit return.
+                        let values = if f.stack_depth(operands) > 0 {
+                            vec![f.pop_i32(operands)]
+                        } else {
+                            vec![]
+                        };
+                        if f.stack_depth(fibre) > 0 {
+                            f.pop_i64(fibre);
+                        }
+                        f.emit(IrInst::Return { values });
                         break;
                     }
+                    // Non-function end — continuation block starts at this PC.
+                    f.switch_to_block(BlockId::User(pc as u32));
                 }
 
                 OpCode::Return => {
@@ -193,9 +203,29 @@ impl JitModule {
                     if func_idx.is_negative() {
                         todo!("call to negative index function");
                     }
+                    let frame_advance = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
+                    let frame_size_vreg = f.push_i32(operands, Value::Const(frame_advance as i64));
+
+                    // Frame advance: lbp += frame_size
+                    f.emit(IrInst::Alu {
+                        op: AluOp::Add,
+                        dst: lbp,
+                        lhs: lbp,
+                        rhs: frame_size_vreg.into(),
+                    });
                     f.emit(IrInst::Call {
                         func_idx: FunctionIdx::User(func_idx as u32),
                     });
+                    // Frame restore: lbp -= frame_size
+                    f.emit(IrInst::Alu {
+                        op: AluOp::Sub,
+                        dst: lbp,
+                        lhs: lbp,
+                        rhs: frame_size_vreg.into(),
+                    });
+                    // Call is a suspend point — split the block.
+                    // Continuation starts at the next PC.
+                    f.switch_to_block(BlockId::User(pc as u32 + 1));
                 }
 
                 _ => todo!("unhandled opcode: {:?}", op),

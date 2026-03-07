@@ -9,7 +9,7 @@ use autosynth_isa_aarch64::{
 
 use super::{BackendEmitter, PhysReg};
 use crate::ir::block::BlockId;
-use crate::ir::function::{IRFunction, IsaReg};
+use crate::ir::function::{FunctionIdx, IRFunction, IsaReg};
 use crate::ir::instruction::{AluOp, CmpOp, IrInst};
 use crate::ir::{IrType, Register, VReg, Value};
 use crate::regalloc::RegCache;
@@ -205,6 +205,61 @@ impl<'a> LowerCtx<'a> {
         out
     }
 
+    /// Resolve a Register to a PhysReg, emitting a load if needed.
+    ///
+    /// - Physical registers pass through directly.
+    /// - Virtual registers go through the regcache (ensure + optional load).
+    fn resolve(&mut self, reg: Register, func: &IRFunction) -> PhysReg {
+        match reg {
+            Register::Phys(n) => PhysReg(n),
+            Register::Virtual(id) => {
+                let vreg = VReg(id);
+                let result = self.cache.ensure(vreg);
+                if result.needs_load {
+                    self.emit_load(vreg, result.reg, func);
+                }
+                result.reg
+            }
+        }
+    }
+
+    /// Define a Register in the regcache, returning the PhysReg.
+    ///
+    /// Physical registers pass through. Virtual registers get defined.
+    fn resolve_dst(&mut self, reg: Register) -> PhysReg {
+        match reg {
+            Register::Phys(n) => PhysReg(n),
+            Register::Virtual(id) => self.cache.define(VReg(id)),
+        }
+    }
+
+    /// Get the IR type for a Register (only meaningful for virtual registers).
+    fn reg_type(&self, reg: Register) -> IrType {
+        match reg {
+            Register::Phys(_) => IrType::I64, // physical regs default to 64-bit
+            Register::Virtual(id) => self.vreg_defs[id as usize].ty,
+        }
+    }
+
+    /// Try to extract a constant value from a Register.
+    ///
+    /// Returns the constant if the Register is a VReg with a known
+    /// constant value (ConstI32, Const). Returns None for physical
+    /// registers or VRegs with non-constant values.
+    fn try_const(&self, reg: Register) -> Option<i64> {
+        match reg {
+            Register::Phys(_) => None,
+            Register::Virtual(id) => {
+                let def = &self.vreg_defs[id as usize];
+                match def.value {
+                    Value::ConstI32(n) => Some(n as i64),
+                    Value::Const(n) => Some(n),
+                    _ => None,
+                }
+            }
+        }
+    }
+
     fn lower_inst(&mut self, inst: &IrInst, func: &IRFunction) {
         match inst {
             IrInst::StackPush { def } => {
@@ -287,48 +342,45 @@ impl<'a> LowerCtx<'a> {
             }
 
             IrInst::Alu { op, dst, lhs, rhs } => {
-                let lhs_result = self.cache.ensure(*lhs);
-                if lhs_result.needs_load {
-                    self.emit_load(*lhs, lhs_result.reg, func);
-                }
-                let rhs_result = self.cache.ensure(*rhs);
-                if rhs_result.needs_load {
-                    self.emit_load(*rhs, rhs_result.reg, func);
-                }
-                let dst_phys = self.cache.define(*dst);
+                let lhs_phys = self.resolve(*lhs, func);
+                let dst_phys = self.resolve_dst(*dst);
+                let is_32 = matches!(self.reg_type(*lhs), IrType::I32 | IrType::F32);
 
-                let lhs_ty = self.vreg_defs[lhs.0 as usize].ty;
-                let is_32 = matches!(lhs_ty, IrType::I32 | IrType::F32);
+                // Try to fold rhs into an immediate.
+                if let Some(imm) = self.try_const(*rhs) {
+                    if let Ok(imm12) = UImm12::new(imm as u16) {
+                        self.emit_alu_imm(*op, dst_phys, lhs_phys, imm12, is_32);
+                        // Release the constant VReg — it was folded, not loaded.
+                        if let Register::Virtual(id) = rhs {
+                            self.cache.release(VReg(*id));
+                        }
+                        return;
+                    }
+                }
 
-                self.emit_alu(*op, dst_phys, lhs_result.reg, rhs_result.reg, is_32);
+                let rhs_phys = self.resolve(*rhs, func);
+                self.emit_alu(*op, dst_phys, lhs_phys, rhs_phys, is_32);
             }
 
             IrInst::Cmp { op, dst: _, lhs, rhs } => {
                 // Emit subs wzr/xzr, lhs, rhs to set flags.
-                // Don't define dst in regcache — BrIf will use the condition code.
-                let lhs_result = self.cache.ensure(*lhs);
-                if lhs_result.needs_load {
-                    self.emit_load(*lhs, lhs_result.reg, func);
-                }
-                let rhs_result = self.cache.ensure(*rhs);
-                if rhs_result.needs_load {
-                    self.emit_load(*rhs, rhs_result.reg, func);
-                }
+                // Don't define dst in regcache — BrIf uses the condition code.
+                let lhs_phys = self.resolve(*lhs, func);
+                let rhs_phys = self.resolve(*rhs, func);
 
-                let lhs_ty = self.vreg_defs[lhs.0 as usize].ty;
-                let is_32 = matches!(lhs_ty, IrType::I32 | IrType::F32);
+                let is_32 = matches!(self.reg_type(*lhs), IrType::I32 | IrType::F32);
 
                 if is_32 {
                     self.emit(SubsReg {
                         rd: GprOrZr::Wzr,
-                        rn: GprOrZr::from(Aarch64Backend::phys_to_wgpr(lhs_result.reg)),
-                        rm: GprOrZr::from(Aarch64Backend::phys_to_wgpr(rhs_result.reg)),
+                        rn: GprOrZr::from(Aarch64Backend::phys_to_wgpr(lhs_phys)),
+                        rm: GprOrZr::from(Aarch64Backend::phys_to_wgpr(rhs_phys)),
                     });
                 } else {
                     self.emit(SubsReg {
                         rd: GprOrZr::Xzr,
-                        rn: GprOrZr::from(Aarch64Backend::phys_to_xgpr(lhs_result.reg)),
-                        rm: GprOrZr::from(Aarch64Backend::phys_to_xgpr(rhs_result.reg)),
+                        rn: GprOrZr::from(Aarch64Backend::phys_to_xgpr(lhs_phys)),
+                        rm: GprOrZr::from(Aarch64Backend::phys_to_xgpr(rhs_phys)),
                     });
                 }
 
@@ -397,10 +449,23 @@ impl<'a> LowerCtx<'a> {
                 });
             }
 
-            IrInst::Call { func_idx: _ } => {
-                // TODO: flush dirty regs, fuel check, frame advance, bl, restore
-                // For now, emit a placeholder nop.
-                self.emit_raw(0xD503201F, "nop  ; TODO: call stub");
+            IrInst::Call { func_idx } => {
+                // Flush all dirty registers to canonical slots before the call.
+                let dirty = self.cache.flush_dirty();
+                for (phys, vreg) in dirty {
+                    self.emit_store(vreg, phys, func);
+                }
+
+                // Emit bl to the target function.
+                // For now, only recursive calls (bl back to entry).
+                let FunctionIdx::User(_idx) = func_idx;
+                let entry_offset = self.labels.get(&BlockId::Entry)
+                    .copied()
+                    .unwrap_or(0);
+                let disp = entry_offset as i32 - self.code.len() as i32;
+                self.emit(autosynth_isa_aarch64::Bl { offset: disp });
+
+                // Invalidate all scratch regs — call clobbers everything.
                 self.cache.invalidate_all();
             }
         }
@@ -435,6 +500,31 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    /// Emit a store to a VReg's canonical stack slot.
+    fn emit_store(&mut self, vreg: VReg, src: PhysReg, func: &IRFunction) {
+        let def = &self.vreg_defs[vreg.0 as usize];
+        let vstack = &func.vstacks[def.slot.vstack.0 as usize];
+        let base = Aarch64Backend::reg_to_xgpr(vstack.base);
+        let offset = def.slot.byte_offset;
+
+        match def.ty {
+            IrType::I32 | IrType::F32 => {
+                self.emit(StrUoff {
+                    rt: GprOrZr::from(Aarch64Backend::phys_to_wgpr(src)),
+                    rn: GprOrSp::from(Gpr::X(base)),
+                    offset: UImm12::new(offset as u16 / 4).expect("store offset out of range"),
+                });
+            }
+            _ => {
+                self.emit(StrUoff {
+                    rt: GprOrZr::from(Aarch64Backend::phys_to_xgpr(src)),
+                    rn: GprOrSp::from(Gpr::X(base)),
+                    offset: UImm12::new(offset as u16 / 8).expect("store offset out of range"),
+                });
+            }
+        }
+    }
+
     /// Emit an ALU instruction.
     fn emit_alu(&mut self, op: AluOp, dst: PhysReg, lhs: PhysReg, rhs: PhysReg, is_32: bool) {
         let (rd, rn, rm) = if is_32 {
@@ -460,6 +550,34 @@ impl<'a> LowerCtx<'a> {
             }
             _ => {
                 todo!("ALU op {:?} not yet lowered", op);
+            }
+        }
+    }
+
+    /// Emit an ALU-immediate instruction (add/sub with 12-bit immediate).
+    fn emit_alu_imm(&mut self, op: AluOp, dst: PhysReg, src: PhysReg, imm: UImm12, is_32: bool) {
+        // For add/sub immediate, the destination is GprOrSp (allows SP).
+        let (rd, rn) = if is_32 {
+            (
+                GprOrSp::from(Aarch64Backend::phys_to_wgpr(dst)),
+                GprOrSp::from(Aarch64Backend::phys_to_wgpr(src)),
+            )
+        } else {
+            (
+                GprOrSp::from(Gpr::X(Aarch64Backend::phys_to_xgpr(dst))),
+                GprOrSp::from(Gpr::X(Aarch64Backend::phys_to_xgpr(src))),
+            )
+        };
+
+        match op {
+            AluOp::Add => {
+                self.emit(autosynth_isa_aarch64::AddImm { rd, rn, imm });
+            }
+            AluOp::Sub => {
+                self.emit(autosynth_isa_aarch64::SubImm { rd, rn, imm });
+            }
+            _ => {
+                todo!("ALU-imm op {:?} not yet supported", op);
             }
         }
     }

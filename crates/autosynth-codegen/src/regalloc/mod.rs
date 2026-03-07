@@ -127,6 +127,15 @@ impl RegCache {
             .collect()
     }
 
+    /// Release a VReg from the cache (e.g. after constant folding consumed it).
+    pub fn release(&mut self, vreg: VReg) {
+        if let Some(slot) = self.slots.iter_mut().find(|s| {
+            s.binding.map_or(false, |b| b.vreg == vreg)
+        }) {
+            slot.binding = None;
+        }
+    }
+
     /// Invalidate all register bindings (e.g. after a call clobbers all scratch regs).
     pub fn invalidate_all(&mut self) {
         for slot in &mut self.slots {
