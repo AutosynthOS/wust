@@ -71,7 +71,21 @@ impl FunctionBuilder {
             size,
         };
 
+        // If value references another VReg, record a use of the source.
+        if let Value::VReg(src) = value {
+            self.record_use(src);
+        }
+
         let vreg = self.alloc_vreg(ty, slot, value);
+        self.record_def(vreg);
+
+        // Emit a StackPush when inside an active block (local.set).
+        // No-op for initial declarations (no active block yet).
+        if self.current_block.is_some() {
+            let def = self.vreg_defs[vreg.0 as usize];
+            self.emit(IrInst::StackPush { def });
+        }
+
         self.vstacks[vstack.0 as usize].slots[index] = Some(vreg);
 
         let vs = &mut self.vstacks[vstack.0 as usize];
@@ -170,14 +184,21 @@ impl FunctionBuilder {
         let blocks = self.blocks.into_iter().map(|bb| {
             let successors = extract_successors(&bb.instructions);
 
-            // Params = VRegs used in this block that weren't defined here.
-            let params = bb.uses.iter()
-                .filter(|u| !bb.defs.contains(u))
-                .copied()
-                .collect();
+            // Params = VRegs used in this block that weren't defined here (deduplicated).
+            let mut params = Vec::new();
+            for &u in &bb.uses {
+                if !bb.defs.contains(&u) && !params.contains(&u) {
+                    params.push(u);
+                }
+            }
 
-            // Results = VRegs defined in this block (available for successors).
-            let results = bb.defs.clone();
+            // Results = VRegs defined in this block (deduplicated).
+            let mut results = Vec::new();
+            for &d in &bb.defs {
+                if !results.contains(&d) {
+                    results.push(d);
+                }
+            }
 
             IrBlock {
                 id: bb.id,
@@ -257,7 +278,12 @@ impl FunctionBuilder {
         self.emit(IrInst::StackPush { def });
 
         let vs = &mut self.vstacks[vstack.0 as usize];
-        vs.slots.push(Some(vreg));
+        let idx = index as usize;
+        if idx < vs.slots.len() {
+            vs.slots[idx] = Some(vreg);
+        } else {
+            vs.slots.push(Some(vreg));
+        }
         vs.depth += 1;
 
         vreg

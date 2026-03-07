@@ -65,6 +65,30 @@ impl RegCache {
         panic!("regcache: no free registers (eviction not yet implemented)");
     }
 
+    /// Check if a VReg is currently cached. Returns the register if so.
+    pub fn lookup(&self, vreg: VReg) -> Option<PhysReg> {
+        self.slots
+            .iter()
+            .find(|s| s.binding.map_or(false, |b| b.vreg == vreg))
+            .map(|s| s.reg)
+    }
+
+    /// Alias a new VReg to the same register as an existing VReg.
+    ///
+    /// The new VReg shares the same physical register — no move needed.
+    /// Returns the physical register, or `None` if `src` isn't cached.
+    pub fn alias(&mut self, dst: VReg, src: VReg) -> Option<PhysReg> {
+        let slot = self.slots.iter().find(|s| {
+            s.binding.map_or(false, |b| b.vreg == src)
+        })?;
+        let reg = slot.reg;
+        let dirty = slot.binding.unwrap().dirty;
+        // Rebind the register to the new VReg (the old one is consumed).
+        let slot = self.slots.iter_mut().find(|s| s.reg == reg).unwrap();
+        slot.binding = Some(Binding { vreg: dst, dirty });
+        Some(reg)
+    }
+
     /// Ensure a VReg is in a register. Returns the register and whether
     /// the lowerer needs to emit a load from the canonical stack slot.
     pub fn ensure(&mut self, vreg: VReg) -> EnsureResult {

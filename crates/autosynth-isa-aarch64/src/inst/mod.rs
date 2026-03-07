@@ -12,6 +12,7 @@ mod str_uoff;
 mod sub_imm;
 mod sub_reg;
 mod subs_imm;
+mod subs_reg;
 
 pub use add_imm::AddImm;
 pub use add_reg::AddReg;
@@ -27,6 +28,7 @@ pub use str_uoff::StrUoff;
 pub use sub_imm::SubImm;
 pub use sub_reg::SubReg;
 pub use subs_imm::SubsImm;
+pub use subs_reg::SubsReg;
 
 use autosynth_isa::{EncodeError, Instruction};
 

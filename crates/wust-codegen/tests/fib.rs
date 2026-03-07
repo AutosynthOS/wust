@@ -104,6 +104,35 @@ fn fib_ir_dump() -> anyhow::Result<()> {
 }
 
 #[test]
+fn fib_lower() -> anyhow::Result<()> {
+    use autosynth_codegen::backend::BackendEmitter;
+    use autosynth_codegen::backend::aarch64::Aarch64Backend;
+
+    let bytes = wat::parse_str(WAT)?;
+    let module = wust_core::ParsedModule::new(&bytes)?;
+    let jit = wust_codegen::JitModule::new(module)?;
+    let ir = jit.ir();
+
+    let mut backend = Aarch64Backend::new();
+    // Reserve the same registers as JitModule::compile_func
+    use autosynth_codegen::ir::function::IsaReg;
+    backend.use_isa_reg("lbp", IsaReg::FramePointer);
+    backend.use_isa_reg("lr", IsaReg::ReturnAddress);
+    backend.use_isa_reg("fuel", IsaReg::Define64(0));
+    backend.use_isa_reg("ctx", IsaReg::Define64(1));
+    backend.use_isa_reg("fsp", IsaReg::StackPointer);
+
+    let func = &ir.functions()[0];
+    let (code, disasm) = backend.lower_with_disasm(func);
+
+    eprintln!("\n=== lowered fib ({} bytes, {} instructions) ===", code.len(), code.len() / 4);
+    eprintln!("{disasm}");
+
+    assert!(!code.is_empty(), "lowerer produced no code");
+    Ok(())
+}
+
+#[test]
 fn fib_jit() -> anyhow::Result<()> {
     use wust_core::exec::ModuleExecutor;
 
