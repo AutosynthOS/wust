@@ -28,8 +28,9 @@ pub use builder::{CodeBuilder, FunctionBuilder, VStack};
 pub use debugger::Debugger;
 pub use ir::block::BlockId;
 pub use ir::function::{FunctionIdx, IsaReg};
-pub use ir::instruction::{AluOp, IrInst, Operand};
-pub use ir::{IrType, Register, VReg, VStackId, Value};
+pub use ir::instruction::{AluOp, CompOp, IrInst, Operand};
+pub use autosynth_isa::Width;
+pub use ir::{Register, VReg, VStackId, Value};
 
 /// Errors that can occur during code generation.
 #[derive(Debug)]

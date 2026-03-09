@@ -1,36 +1,9 @@
 //! Basic blocks and block identifiers.
 
-use std::fmt;
+pub use autosynth_ir::BlockId;
 
 use super::VReg;
 use super::instruction::IrInst;
-
-/// Identifies a basic block within a function.
-///
-/// Block IDs are used as branch targets and label keys. The three
-/// variants distinguish between the function entry, caller-defined
-/// blocks (typically keyed by source program counter), and
-/// codegen-generated blocks (cold paths, stubs, etc.).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum BlockId {
-    /// Function entry / prologue block.
-    Entry,
-    /// Caller-defined block, keyed by a source-level index (e.g. program counter).
-    User(u32),
-    /// Generated block (suspend stubs, cold paths, trampolines).
-    /// Uses a monotonic counter with no corresponding source-level position.
-    Gen(u32),
-}
-
-impl fmt::Display for BlockId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            BlockId::Entry => write!(f, "E0"),
-            BlockId::User(n) => write!(f, "U{n}"),
-            BlockId::Gen(n) => write!(f, "G{n}"),
-        }
-    }
-}
 
 /// A basic block in the IR.
 ///

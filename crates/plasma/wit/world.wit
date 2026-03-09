@@ -17,3 +17,8 @@ world plasma {
     /// Returns 0 on success, 1 on error.
     export eval: func(ptr: u32, len: u32) -> s32;
 }
+
+
+world terminal {
+    export run(cmd: string) -> string
+}

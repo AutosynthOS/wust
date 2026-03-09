@@ -1,8 +1,8 @@
 use autosynth_codegen::backend::BackendEmitter;
 use autosynth_codegen::backend::aarch64::Aarch64Backend;
 use autosynth_codegen::{
-    AluOp, BlockId, CodeBuilder, FunctionBuilder, FunctionIdx, IrInst, IrType, IsaReg, Operand,
-    VStack, Value,
+    AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, IsaReg,
+    Operand, Register, VStack, Value, Width,
 };
 use wust_core::exec::ModuleExecutor;
 use wust_core::{
@@ -123,7 +123,7 @@ impl JitModule {
         // Declare parameters
         f.begin_op("--", "params_start");
         for (i, param) in func.params.iter().enumerate() {
-            f.define_slot(locals, i, valtype_to_ir(param), Value::Param(i));
+            f.define_slot(locals, i, valtype_to_width(param), Value::Param(i));
         }
 
         f.begin_op("--", "locals_start");
@@ -132,13 +132,13 @@ impl JitModule {
             f.define_slot(
                 locals,
                 i + func.params.len(),
-                valtype_to_ir(&local),
+                valtype_to_width(&local),
                 Value::ConstI64(0),
             );
         }
 
         f.begin_op("--", "prologue");
-        f.push_i64(fibre, Value::Reg(lr));
+        f.push(fibre, Width::W64, Value::Reg(lr));
 
         // Finalize entry block, branch to first user block.
         f.br(BlockId::User(0));
@@ -165,58 +165,62 @@ impl JitModule {
 
             match op {
                 OpCode::I32Const => {
-                    f.push_i32(operands, Value::ConstI32(inline_op.immediate_i32()));
+                    f.push(
+                        operands,
+                        Width::W32,
+                        Value::ConstI32(inline_op.immediate_i32()),
+                    );
                 }
 
                 OpCode::LocalGetI32 => {
                     let idx = inline_op.local_index();
                     let src = f.get_slot(locals, idx as usize);
-                    f.push_vreg(operands, src);
+                    f.push(operands, Width::W32, Value::VReg(src));
                 }
                 OpCode::LocalSetI32 => {
                     let idx = inline_op.local_index();
-                    let val = f.pop_i32(operands);
-                    f.define_slot(locals, idx as usize, IrType::I32, Value::VReg(val));
+                    let val = f.pop(operands, Width::W32);
+                    f.define_slot(locals, idx as usize, Width::W32, Value::VReg(val));
                 }
 
                 OpCode::I32Add => {
-                    let rhs = f.pop_i32(operands);
-                    let lhs = f.pop_i32(operands);
-                    let dst = f.push_i32_vreg(operands);
+                    let rhs = f.pop(operands, Width::W32);
+                    let lhs = f.pop(operands, Width::W32);
+                    let dst = f.push_dst(operands, Width::W32);
                     f.emit(IrInst::Alu {
                         op: AluOp::Add,
-                        dst: dst.into(),
-                        lhs: lhs.into(),
-                        rhs: rhs.into(),
+                        dst: Register::VReg(dst, Width::W32),
+                        lhs: Operand::VReg(lhs, Width::W32),
+                        rhs: Operand::VReg(rhs, Width::W32),
                     });
                 }
                 OpCode::I32Sub => {
-                    let rhs = f.pop_i32(operands);
-                    let lhs = f.pop_i32(operands);
-                    let dst = f.push_i32_vreg(operands);
+                    let rhs = f.pop(operands, Width::W32);
+                    let lhs = f.pop(operands, Width::W32);
+                    let dst = f.push_dst(operands, Width::W32);
                     f.emit(IrInst::Alu {
                         op: AluOp::Sub,
-                        dst: dst.into(),
-                        lhs: lhs.into(),
-                        rhs: rhs.into(),
+                        dst: Register::VReg(dst, Width::W32),
+                        lhs: Operand::VReg(lhs, Width::W32),
+                        rhs: Operand::VReg(rhs, Width::W32),
                     });
                 }
 
                 OpCode::I32LeS => {
-                    let rhs = f.pop_i32(operands);
-                    let lhs = f.pop_i32(operands);
-                    let dst = f.push_i32_vreg(operands);
+                    let rhs = f.pop(operands, Width::W32);
+                    let lhs = f.pop(operands, Width::W32);
+                    let dst = f.push_dst(operands, Width::W32);
                     f.emit(IrInst::Alu {
-                        op: AluOp::LeS,
-                        dst: dst.into(),
-                        lhs: lhs.into(),
-                        rhs: rhs.into(),
+                        op: AluOp::Comp(CompOp::LeS),
+                        dst: Register::VReg(dst, Width::W32),
+                        lhs: Operand::VReg(lhs, Width::W32),
+                        rhs: Operand::VReg(rhs, Width::W32),
                     });
                 }
 
                 OpCode::If => {
                     let block_idx = inline_op.immediate_u32();
-                    let cond = f.pop_i32(operands);
+                    let cond = f.pop(operands, Width::W32);
                     let then_block = BlockId::User(pc as u32 + 1);
                     let end_pc = func.body.blocks[block_idx as usize].end_pc;
                     let cont_block = BlockId::User(end_pc);
@@ -228,7 +232,7 @@ impl JitModule {
                     let target_block = &func.body.blocks[block_idx as usize];
                     let target = BlockId::User(target_block.end_pc);
                     let cont = BlockId::User(pc as u32 + 1);
-                    let cond = f.pop_i32(operands);
+                    let cond = f.pop(operands, Width::W32);
                     f.br_if(cond, target, cont);
                     f.start_block(cont);
                 }
@@ -237,11 +241,11 @@ impl JitModule {
                     if block_idx == 0 {
                         // Function end — pop return value and fibre LR, then return.
                         let values = if f.stack_depth(operands) > 0 {
-                            vec![f.pop_i32(operands)]
+                            vec![f.pop(operands, Width::W32)]
                         } else {
                             vec![]
                         };
-                        f.pop_i64(fibre);
+                        f.pop(fibre, Width::W64);
                         f.ret(values, false);
                         break;
                     }
@@ -253,8 +257,8 @@ impl JitModule {
                 }
 
                 OpCode::Return => {
-                    let val = f.pop_i32(operands);
-                    f.pop_i64(fibre);
+                    let val = f.pop(operands, Width::W32);
+                    f.pop(fibre, Width::W64);
                     f.ret(vec![val], false);
                 }
 
@@ -267,12 +271,12 @@ impl JitModule {
                     let frame_advance = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
 
                     let mut args: Vec<_> = (0..callee.param_count())
-                        .map(|_| f.pop_i32(operands))
+                        .map(|_| f.pop(operands, Width::W32))
                         .collect();
                     args.reverse();
 
                     let result_vregs: Vec<_> = (0..callee.result_count())
-                        .map(|_| f.push_i32_vreg(operands))
+                        .map(|_| f.push_dst(operands, Width::W32))
                         .collect();
 
                     f.emit(IrInst::Call {
@@ -286,9 +290,9 @@ impl JitModule {
                     // LeS makes the backend emit `subs` (flag-setting subtract).
                     // Using `fuel` (physical register) as dst writes the result
                     // back to fuel while setting flags for the LE condition.
-                    let fuel_cond = f.alloc_temp(IrType::I32, Value::ConstI64(0));
+                    let fuel_cond = f.alloc_temp(Width::W32, Value::ConstI64(0));
                     f.emit(IrInst::Alu {
-                        op: AluOp::LeS,
+                        op: AluOp::Comp(CompOp::LeS),
                         dst: fuel,
                         lhs: Operand::from(fuel),
                         rhs: Operand::Imm32(pending_fuel as i32),
@@ -317,14 +321,14 @@ impl JitModule {
     }
 }
 
-fn valtype_to_ir(ty: &ValType) -> IrType {
+fn valtype_to_width(ty: &ValType) -> Width {
     match ty {
-        ValType::I32 => IrType::I32,
-        ValType::I64 => IrType::I64,
-        ValType::F32 => IrType::F32,
-        ValType::F64 => IrType::F64,
-        ValType::V128 => IrType::V128,
-        ValType::Ref(_) => todo!(),
+        ValType::I32 => Width::W32,
+        ValType::I64 => Width::W64,
+        ValType::F32 => todo!("F32: needs float register class"),
+        ValType::F64 => todo!("F64: needs float register class"),
+        ValType::V128 => todo!("V128: needs vector register class"),
+        ValType::Ref(_) => todo!("Ref types not yet supported"),
     }
 }
 

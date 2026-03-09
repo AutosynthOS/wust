@@ -1,23 +1,10 @@
-//! Function-level IR types: function indices, ISA register roles, virtual
-//! stack definitions, and the finalized [`IRFunction`].
+//! Function-level IR types: ISA register roles, virtual stack definitions,
+//! and the finalized [`IRFunction`].
+
+pub use autosynth_ir::FunctionIdx;
 
 use super::block::IrBlock;
 use super::{Register, VRegDef, VStackId};
-
-/// Index identifying a function in the compilation unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FunctionIdx {
-    /// A user-defined function, indexed by its position in the module.
-    User(u32),
-}
-
-impl std::fmt::Display for FunctionIdx {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            FunctionIdx::User(n) => write!(f, "fn{n}"),
-        }
-    }
-}
 
 /// Architecture-abstract register role, resolved to a physical register by
 /// the backend via [`BackendEmitter::use_isa_reg`](crate::backend::BackendEmitter::use_isa_reg).

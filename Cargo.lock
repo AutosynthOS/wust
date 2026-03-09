@@ -118,13 +118,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
+name = "autosynth-backend"
+version = "0.1.0"
+dependencies = [
+ "autosynth-ir",
+ "autosynth-isa",
+ "autosynth-lower",
+ "smallvec",
+]
+
+[[package]]
+name = "autosynth-backend-aarch64"
+version = "0.1.0"
+dependencies = [
+ "autosynth-backend",
+ "autosynth-ir",
+ "autosynth-isa",
+ "autosynth-isa-aarch64",
+ "autosynth-lower",
+ "smallvec",
+]
+
+[[package]]
 name = "autosynth-codegen"
 version = "0.1.0"
 dependencies = [
+ "autosynth-ir",
  "autosynth-isa",
  "autosynth-isa-aarch64",
  "autosynth-isa-riscv64",
  "autosynth-isa-x86_64",
+]
+
+[[package]]
+name = "autosynth-ir"
+version = "0.1.0"
+dependencies = [
+ "autosynth-isa",
 ]
 
 [[package]]
@@ -150,6 +180,25 @@ name = "autosynth-isa-x86_64"
 version = "0.1.0"
 dependencies = [
  "autosynth-isa",
+]
+
+[[package]]
+name = "autosynth-lower"
+version = "0.1.0"
+dependencies = [
+ "autosynth-ir",
+ "autosynth-isa",
+]
+
+[[package]]
+name = "autosynth-orchestrator"
+version = "0.1.0"
+dependencies = [
+ "autosynth-backend",
+ "autosynth-ir",
+ "autosynth-isa",
+ "autosynth-lower",
+ "smallvec",
 ]
 
 [[package]]

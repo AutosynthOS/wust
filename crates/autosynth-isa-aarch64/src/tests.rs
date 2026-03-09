@@ -22,7 +22,7 @@ fn add_imm_x64() {
     let inst = AddImm {
         rd: XGpr::R29.into(),
         rn: XGpr::R29.into(),
-        imm: UImm12::new(24).unwrap(),
+        imm: UImm12::try_from(24_i32).unwrap(),
     };
     check_asm(&inst, "add x29, x29, #24");
 }
@@ -32,7 +32,7 @@ fn add_imm_w32_sp() {
     let inst = AddImm {
         rd: WGpr::R0.into(),
         rn: GprOrSp::Sp,
-        imm: UImm12::new(16).unwrap(),
+        imm: UImm12::try_from(16_i32).unwrap(),
     };
     check_asm(&inst, "add w0, sp, #16");
 }
@@ -65,7 +65,7 @@ fn sub_reg_x64_with_zr() {
 fn movz_w32() {
     let inst = Movz {
         rd: WGpr::R0.into(),
-        imm: UImm16::new(42),
+        imm: UImm16::try_from(42_u16).unwrap(),
         hw: 0,
     };
     check_asm(&inst, "movz w0, #42");
@@ -75,7 +75,7 @@ fn movz_w32() {
 fn movz_x64_shifted() {
     let inst = Movz {
         rd: XGpr::R9.into(),
-        imm: UImm16::new(0xABCD),
+        imm: UImm16::try_from(0xABCD_u16).unwrap(),
         hw: 1,
     };
     check_asm(&inst, "movz x9, #43981, lsl #16");
@@ -88,7 +88,7 @@ fn ldr_uoff_w32() {
     let inst = LdrUoff {
         rt: WGpr::R9.into(),
         rn: XGpr::R29.into(),
-        offset: UImm12::new(2).unwrap(),
+        offset: UImm12::try_from(2_i32).unwrap(),
     };
     check_asm(&inst, "ldr w9, [x29, #8]");
 }
@@ -98,7 +98,7 @@ fn ldr_uoff_x64_from_sp() {
     let inst = LdrUoff {
         rt: XGpr::R0.into(),
         rn: GprOrSp::Sp,
-        offset: UImm12::new(2).unwrap(),
+        offset: UImm12::try_from(2_i32).unwrap(),
     };
     check_asm(&inst, "ldr x0, [sp, #16]");
 }
@@ -110,7 +110,7 @@ fn str_uoff_w32() {
     let inst = StrUoff {
         rt: WGpr::R10.into(),
         rn: XGpr::R29.into(),
-        offset: UImm12::new(1).unwrap(),
+        offset: UImm12::try_from(1_i32).unwrap(),
     };
     check_asm(&inst, "str w10, [x29, #4]");
 }
@@ -163,7 +163,7 @@ fn ldr_post_x64() {
     let inst = LdrPost {
         rt: XGpr::R30.into(),
         rn: GprOrSp::Sp,
-        imm: SImm9::new(16).unwrap(),
+        imm: SImm9::try_from(16_i32).unwrap(),
     };
     check_asm(&inst, "ldr x30, [sp], #16");
 }
@@ -175,7 +175,7 @@ fn sub_imm_w32() {
     let inst = SubImm {
         rd: WGpr::R12.into(),
         rn: WGpr::R9.into(),
-        imm: UImm12::new(1).unwrap(),
+        imm: UImm12::try_from(1_i32).unwrap(),
     };
     check_asm(&inst, "sub w12, w9, #1");
 }
@@ -185,7 +185,7 @@ fn sub_imm_x64() {
     let inst = SubImm {
         rd: XGpr::R29.into(),
         rn: XGpr::R29.into(),
-        imm: UImm12::new(24).unwrap(),
+        imm: UImm12::try_from(24_i32).unwrap(),
     };
     check_asm(&inst, "sub x29, x29, #24");
 }
@@ -197,7 +197,7 @@ fn subs_imm_cmp_w32() {
     let inst = SubsImm {
         rd: GprOrZr::Wzr,
         rn: WGpr::R9.into(),
-        imm: UImm12::new(1).unwrap(),
+        imm: UImm12::try_from(1_i32).unwrap(),
     };
     check_asm(&inst, "subs wzr, w9, #1");
 }
@@ -207,7 +207,7 @@ fn subs_imm_x64() {
     let inst = SubsImm {
         rd: GprOrZr::Xzr,
         rn: XGpr::R9.into(),
-        imm: UImm12::new(1).unwrap(),
+        imm: UImm12::try_from(1_i32).unwrap(),
     };
     check_asm(&inst, "subs xzr, x9, #1");
 }
@@ -263,7 +263,7 @@ fn str_pre_x64() {
     let inst = StrPre {
         rt: XGpr::R30.into(),
         rn: GprOrSp::Sp,
-        imm: SImm9::new(-16).unwrap(),
+        imm: SImm9::try_from(-16_i32).unwrap(),
     };
     check_asm(&inst, "str x30, [sp, #-16]!");
 }
@@ -273,7 +273,7 @@ fn str_pre_w32() {
     let inst = StrPre {
         rt: WGpr::R10.into(),
         rn: XGpr::R29.into(),
-        imm: SImm9::new(-4).unwrap(),
+        imm: SImm9::try_from(-4_i32).unwrap(),
     };
     check_asm(&inst, "str w10, [x29, #-4]!");
 }
@@ -282,15 +282,15 @@ fn str_pre_w32() {
 
 #[test]
 fn uimm12_range() {
-    assert!(UImm12::new(4096).is_err());
-    assert!(UImm12::new(4095).is_ok());
-    assert!(UImm12::new(0).is_ok());
+    assert!(UImm12::try_from(4096_i32).is_err());
+    assert!(UImm12::try_from(4095_i32).is_ok());
+    assert!(UImm12::try_from(0_i32).is_ok());
 }
 
 #[test]
 fn simm9_range() {
-    assert!(SImm9::new(-257).is_err());
-    assert!(SImm9::new(256).is_err());
-    assert!(SImm9::new(-256).is_ok());
-    assert!(SImm9::new(255).is_ok());
+    assert!(SImm9::try_from(-257_i32).is_err());
+    assert!(SImm9::try_from(256_i32).is_err());
+    assert!(SImm9::try_from(-256_i32).is_ok());
+    assert!(SImm9::try_from(255_i32).is_ok());
 }

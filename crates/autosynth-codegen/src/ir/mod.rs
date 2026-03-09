@@ -1,11 +1,10 @@
 //! Intermediate representation types for the codegen pipeline.
 //!
-//! The IR is structured as:
-//! - [`Register`] — physical or virtual register operand.
-//! - [`VReg`] / [`VRegDef`] — virtual registers with type, canonical slot, and value provenance.
-//! - [`IrType`] — width-aware IR-level types (i32, i64, f32, f64, v128).
-//! - [`Value`] — the source of a virtual register's value (param, constant, another VReg, etc.).
-//! - [`CanonSlot`] — the canonical memory location on a virtual stack where a VReg lives.
+//! Core instruction types (`IrInst`, `AluOp`, `Operand`, `Register`, `VReg`,
+//! `BlockId`, `FunctionIdx`) are re-exported from [`autosynth_ir`].
+//!
+//! Types specific to this crate's codegen pipeline (`VRegDef`, `CanonSlot`,
+//! `Value`, `VStackId`, `VStackMut`) are defined here.
 
 pub mod block;
 pub mod function;
@@ -13,47 +12,10 @@ pub mod instruction;
 
 use std::fmt;
 
-use crate::backend::PhysReg;
+use autosynth_isa::Width;
 
-/// A register operand — either already resolved to hardware or virtual (needs regalloc).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Register {
-    /// A physical register, already assigned by the backend.
-    Phys(u8),
-    /// A virtual register, to be resolved by the register allocator.
-    Virtual(u32),
-}
-
-impl fmt::Display for Register {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Register::Phys(n) => write!(f, "r{n}"),
-            Register::Virtual(n) => write!(f, "v{n}"),
-        }
-    }
-}
-
-impl From<PhysReg> for Register {
-    fn from(p: PhysReg) -> Self {
-        Register::Phys(p.0)
-    }
-}
-
-impl From<VReg> for Register {
-    fn from(v: VReg) -> Self {
-        Register::Virtual(v.0)
-    }
-}
-
-/// Virtual register — an SSA value with a known type and canonical stack location.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VReg(pub u32);
-
-impl fmt::Display for VReg {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", self.0)
-    }
-}
+// Re-export core IR types from autosynth-ir.
+pub use autosynth_ir::{AluOp, BlockId, FunctionIdx, Operand, Register, VReg};
 
 /// Index into the function builder's vstack table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,34 +33,12 @@ pub struct VStackMut {
     pub slots: Vec<Option<VReg>>,
 }
 
-/// IR-level value type, determining register width and memory layout.
-///
-/// Used to select between 32-bit and 64-bit instructions during lowering,
-/// and to compute slot sizes in virtual stacks.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IrType {
-    I32,
-    I64,
-    F32,
-    F64,
-    V128,
-}
-
-impl fmt::Display for IrType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            IrType::I32 => write!(f, "i32"),
-            IrType::I64 => write!(f, "i64"),
-            IrType::F32 => write!(f, "f32"),
-            IrType::F64 => write!(f, "f64"),
-            IrType::V128 => write!(f, "v128"),
-        }
-    }
-}
-
 /// The source/value of a VStack slot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Value {
+    /// An instruction destination — value comes from the instruction
+    /// that writes to this VReg (e.g. ALU result, call return).
+    Destination,
     /// Function parameter at the given index.
     Param(usize),
     /// A constant integer value.
@@ -114,6 +54,7 @@ pub enum Value {
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Value::Destination => write!(f, "dst"),
             Value::Param(i) => write!(f, "param({i})"),
             Value::ConstI64(n) => write!(f, "#{n}"),
             Value::ConstI32(n) => write!(f, "#{n}"),
@@ -138,9 +79,9 @@ pub struct CanonSlot {
 
 /// Metadata for a virtual register definition.
 ///
-/// Each VReg has a unique id, an IR type that determines its width,
-/// an optional canonical stack slot, and a value that describes how
-/// it was produced (constant, parameter, ALU result, etc.).
+/// Each VReg has a unique id, a width that determines register size and
+/// memory layout, an optional canonical stack slot, and a value that
+/// describes how it was produced (constant, parameter, ALU result, etc.).
 ///
 /// When `slot` is `None`, the VReg is a **temp** — it has no canonical
 /// memory location and cannot be spilled. Temps must be either consumed
@@ -150,10 +91,14 @@ pub struct CanonSlot {
 pub struct VRegDef {
     /// The unique virtual register identifier.
     pub id: VReg,
-    /// The IR type (determines register width and slot size).
-    pub ty: IrType,
+    /// Register width (W32 or W64) — determines instruction width and slot size.
+    pub width: Width,
     /// Canonical memory location on a virtual stack, or `None` for temps.
     pub slot: Option<CanonSlot>,
     /// How this value was produced.
     pub value: Value,
+    /// Whether this value can be cheaply recomputed (e.g. `movz` for constants)
+    /// instead of spilled to memory. Rematerializable values can be evicted
+    /// without a store and re-emitted on next use.
+    pub remat: bool,
 }

@@ -6,7 +6,8 @@ use autosynth_isa_aarch64::{
     reg::{Gpr, GprId, WGpr, XGpr},
 };
 
-use super::{BackendEmitter, PhysReg};
+use super::BackendEmitter;
+use autosynth_isa::PReg;
 use crate::CodegenError;
 use crate::debugger::Debugger;
 use crate::disasm::table::Align;
@@ -14,13 +15,15 @@ use crate::disasm::{BlockLabel, BranchInfo, DisasmInst, DisasmMetadata, Register
 use crate::ir::block::BlockId;
 use crate::ir::function::{FunctionIdx, IRFunction, IsaReg};
 use crate::ir::instruction::{AluOp, IrInst, Operand};
-use crate::ir::{IrType, Register, VReg, VRegDef, Value};
+use autosynth_ir::CompOp;
+use autosynth_isa::Width;
+use crate::ir::{Register, VReg, VRegDef, Value};
 use crate::regalloc::RegCache;
 
 /// AArch64 backend: manages the ARM64 register pool and lowers IR to native machine code.
 pub struct Aarch64Backend {
-    pool: Vec<PhysReg>,
-    assignments: HashMap<&'static str, PhysReg>,
+    pool: Vec<PReg>,
+    assignments: HashMap<&'static str, PReg>,
 }
 
 impl BackendEmitter for Aarch64Backend {
@@ -40,10 +43,10 @@ impl BackendEmitter for Aarch64Backend {
             }
         };
         self.assignments.insert(name, phys);
-        Register::Phys(phys.0)
+        Register::PReg(phys, Width::W64)
     }
 
-    fn scratch(&self) -> &[PhysReg] {
+    fn scratch(&self) -> &[PReg] {
         &self.pool
     }
 
@@ -56,7 +59,7 @@ impl BackendEmitter for Aarch64Backend {
 impl Aarch64Backend {
     /// Create a new AArch64 backend with the full general-purpose register pool.
     pub fn new() -> Self {
-        let pool = (0u8..=30).filter(|&r| r != 18).map(PhysReg).collect();
+        let pool = (0u8..=30).filter(|&r| r != 18).map(PReg).collect();
         Self {
             pool,
             assignments: HashMap::new(),
@@ -64,47 +67,49 @@ impl Aarch64Backend {
     }
 
     /// Look up a named register that was previously reserved.
-    pub fn get(&self, name: &str) -> PhysReg {
+    pub fn get(&self, name: &str) -> PReg {
         self.assignments[name]
     }
 
-    fn fixed_phys(role: IsaReg) -> Option<PhysReg> {
+    fn fixed_phys(role: IsaReg) -> Option<PReg> {
         match role {
-            IsaReg::FramePointer => Some(PhysReg(29)),
-            IsaReg::StackPointer => Some(PhysReg(28)),
-            IsaReg::ReturnAddress => Some(PhysReg(30)),
+            IsaReg::FramePointer => Some(PReg(29)),
+            IsaReg::StackPointer => Some(PReg(28)),
+            IsaReg::ReturnAddress => Some(PReg(30)),
             IsaReg::Define64(_) => None,
         }
     }
 
-    fn phys_to_wgpr(reg: PhysReg) -> WGpr {
+    fn phys_to_wgpr(reg: PReg) -> WGpr {
         WGpr(GprId::from_index(reg.0))
     }
-    fn phys_to_xgpr(reg: PhysReg) -> XGpr {
+    fn phys_to_xgpr(reg: PReg) -> XGpr {
         XGpr(GprId::from_index(reg.0))
     }
 
     fn reg_to_xgpr(reg: Register) -> Result<XGpr, CodegenError> {
         match reg {
-            Register::Phys(n) => Ok(XGpr(GprId::from_index(n))),
-            Register::Virtual(v) => Err(CodegenError::InvalidRegister(format!(
-                "virtual register v{v} in lowering (expected physical)"
+            Register::PReg(p, _) => Ok(XGpr(GprId::from_index(p.0))),
+            Register::VReg(v, _) => Err(CodegenError::InvalidRegister(format!(
+                "virtual register {v} in lowering (expected physical)"
             ))),
         }
     }
 
     fn cmp_op_to_cond(op: AluOp) -> Cond {
         match op {
-            AluOp::Eq => Cond::EQ,
-            AluOp::Ne => Cond::NE,
-            AluOp::LtS => Cond::LT,
-            AluOp::LtU => Cond::CC,
-            AluOp::GtS => Cond::GT,
-            AluOp::GtU => Cond::HI,
-            AluOp::LeS => Cond::LE,
-            AluOp::LeU => Cond::LS,
-            AluOp::GeS => Cond::GE,
-            AluOp::GeU => Cond::CS,
+            AluOp::Comp(c) => match c {
+                CompOp::Eq => Cond::EQ,
+                CompOp::Ne => Cond::NE,
+                CompOp::LtS => Cond::LT,
+                CompOp::LtU => Cond::CC,
+                CompOp::GtS => Cond::GT,
+                CompOp::GtU => Cond::HI,
+                CompOp::LeS => Cond::LE,
+                CompOp::LeU => Cond::LS,
+                CompOp::GeS => Cond::GE,
+                CompOp::GeU => Cond::CS,
+            },
             _ => unreachable!("cmp_op_to_cond called with non-comparison op: {op}"),
         }
     }
@@ -184,10 +189,10 @@ struct LowerCtx<'a> {
 
 impl<'a> LowerCtx<'a> {
     fn new(
-        scratch: &[PhysReg],
+        scratch: &[PReg],
         vreg_defs: &'a [VRegDef],
         mut debugger: Option<&'a mut Debugger>,
-        assignments: &HashMap<&'static str, PhysReg>,
+        assignments: &HashMap<&'static str, PReg>,
     ) -> Self {
         if let Some(dbg) = &mut debugger {
             dbg.add_machine_column("addr", Align::Right);
@@ -237,13 +242,18 @@ impl<'a> LowerCtx<'a> {
         self.code.push(inst.encode_word());
     }
 
-    fn resolve_operand(&mut self, op: Operand, func: &IRFunction) -> Result<PhysReg, CodegenError> {
+    fn resolve_operand(&mut self, op: Operand, func: &IRFunction) -> Result<PReg, CodegenError> {
         match op {
-            Operand::PReg(n) => Ok(PhysReg(n)),
-            Operand::VReg(vreg) => {
-                let result = self.cache.ensure(vreg)?;
+            Operand::PReg(p, _) => Ok(p),
+            Operand::VReg(vreg, _) => {
+                let result = self.cache.ensure(vreg, self.vreg_defs)?;
+                if let Some(evicted) = result.evicted {
+                    if evicted.needs_store {
+                        self.emit_store(evicted.vreg, evicted.reg, func)?;
+                    }
+                }
                 if result.needs_load {
-                    self.emit_load(vreg, result.reg, func)?;
+                    self.emit_load_or_remat(vreg, result.reg, func)?;
                 }
                 Ok(result.reg)
             }
@@ -253,19 +263,18 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    fn resolve_dst(&mut self, reg: Register) -> Result<PhysReg, CodegenError> {
+    fn resolve_dst(&mut self, reg: Register, func: &IRFunction) -> Result<PReg, CodegenError> {
         match reg {
-            Register::Phys(n) => Ok(PhysReg(n)),
-            Register::Virtual(id) => self.cache.define(VReg(id)),
-        }
-    }
-
-    fn operand_type(&self, op: Operand) -> IrType {
-        match op {
-            Operand::PReg(_) => IrType::I64,
-            Operand::VReg(vreg) => self.vreg_defs[vreg.0 as usize].ty,
-            Operand::Imm32(_) => IrType::I32,
-            Operand::Imm64(_) => IrType::I64,
+            Register::PReg(p, _) => Ok(p),
+            Register::VReg(v, _) => {
+                let result = self.cache.define(v, self.vreg_defs)?;
+                if let Some(evicted) = result.evicted {
+                    if evicted.needs_store {
+                        self.emit_store(evicted.vreg, evicted.reg, func)?;
+                    }
+                }
+                Ok(result.reg)
+            }
         }
     }
 
@@ -273,12 +282,12 @@ impl<'a> LowerCtx<'a> {
         match op {
             Operand::Imm32(n) => Some(n as i64),
             Operand::Imm64(n) => Some(n),
-            Operand::VReg(vreg) => match self.vreg_defs[vreg.0 as usize].value {
+            Operand::VReg(vreg, _) => match self.vreg_defs[vreg.0 as usize].value {
                 Value::ConstI32(n) => Some(n as i64),
                 Value::ConstI64(n) => Some(n),
                 _ => None,
             },
-            Operand::PReg(_) => None,
+            Operand::PReg(_, _) => None,
         }
     }
 
@@ -302,8 +311,6 @@ impl<'a> LowerCtx<'a> {
         next_block: Option<BlockId>,
     ) -> Result<(), CodegenError> {
         match inst {
-            IrInst::StackPush { def } => self.lower_stack_push(def, func),
-            IrInst::StackPop { def } => self.lower_stack_pop(def, func),
             IrInst::Alu { op, dst, lhs, rhs } => self.lower_alu(*op, *dst, *lhs, *rhs, func),
             IrInst::BrIf {
                 cond: _,
@@ -318,33 +325,65 @@ impl<'a> LowerCtx<'a> {
                 results,
                 frame_advance,
             } => self.lower_call(func_idx, args, results, *frame_advance, func),
+            IrInst::Load { dst, .. } => {
+                let vreg = match dst {
+                    Register::VReg(v, _) => *v,
+                    Register::PReg(_, _) => {
+                        return Err(CodegenError::InvalidRegister(
+                            "Load dst must be a VReg".into(),
+                        ))
+                    }
+                };
+                let def = &self.vreg_defs[vreg.0 as usize];
+                self.lower_stack_pop(def, func)
+            }
+            IrInst::Store { src, .. } => {
+                let vreg = match src {
+                    Operand::VReg(v, _) => *v,
+                    _ => {
+                        return Err(CodegenError::InvalidRegister(
+                            "Store src must be a VReg".into(),
+                        ))
+                    }
+                };
+                let def = &self.vreg_defs[vreg.0 as usize];
+                self.lower_stack_push(def, func)
+            }
             IrInst::Return { values, flush } => self.lower_return(values, *flush, func),
         }
     }
 
     fn lower_stack_push(&mut self, def: &VRegDef, func: &IRFunction) -> Result<(), CodegenError> {
         match def.value {
+            Value::Destination => {}
             Value::ConstI64(0) => {}
             Value::ConstI32(n) => {
-                let phys = self.cache.define(def.id)?;
-                self.emit(Aarch64Instruction::Movz(Movz {
-                    rd: GprOrZr::from(Aarch64Backend::phys_to_wgpr(phys)),
-                    imm: UImm16::new(n as u16),
-                    hw: 0,
-                }));
+                let result = self.cache.define(def.id, self.vreg_defs)?;
+                if let Some(evicted) = result.evicted {
+                    if evicted.needs_store {
+                        self.emit_store(evicted.vreg, evicted.reg, func)?;
+                    }
+                }
+                self.emit_i32_const(result.reg, n);
             }
             Value::ConstI64(n) => {
-                let phys = self.cache.define(def.id)?;
-                self.emit(Aarch64Instruction::Movz(Movz {
-                    rd: GprOrZr::from(Aarch64Backend::phys_to_xgpr(phys)),
-                    imm: UImm16::new(n as u16),
-                    hw: 0,
-                }));
+                let result = self.cache.define(def.id, self.vreg_defs)?;
+                if let Some(evicted) = result.evicted {
+                    if evicted.needs_store {
+                        self.emit_store(evicted.vreg, evicted.reg, func)?;
+                    }
+                }
+                self.emit_i64_const(result.reg, n);
             }
             Value::VReg(src) => {
-                let src_result = self.cache.ensure(src)?;
+                let src_result = self.cache.ensure(src, self.vreg_defs)?;
+                if let Some(evicted) = src_result.evicted {
+                    if evicted.needs_store {
+                        self.emit_store(evicted.vreg, evicted.reg, func)?;
+                    }
+                }
                 if src_result.needs_load {
-                    self.emit_load(src, src_result.reg, func)?;
+                    self.emit_load_or_remat(src, src_result.reg, func)?;
                 }
                 self.cache
                     .alias(def.id, src)
@@ -354,8 +393,8 @@ impl<'a> LowerCtx<'a> {
                 let slot = def.slot.expect("StackPush(Reg) on temp vreg");
                 let base_reg = func.vstacks[slot.vstack.0 as usize].base;
                 let base = Aarch64Backend::reg_to_xgpr(base_reg)?;
-                let offset = -(slot.size as i16);
-                let imm = SImm9::new(offset).map_err(|_| CodegenError::OffsetOutOfRange {
+                let offset = -(slot.size as i32);
+                let imm = SImm9::try_from(offset).map_err(|_| CodegenError::OffsetOutOfRange {
                     offset: offset as u32,
                     max: 255,
                 })?;
@@ -366,7 +405,7 @@ impl<'a> LowerCtx<'a> {
                 }));
             }
             Value::Param(i) => {
-                let cc_reg = PhysReg(9 + i as u8);
+                let cc_reg = PReg(9 + i as u8);
                 self.cache.bind(def.id, cc_reg);
             }
         }
@@ -378,7 +417,7 @@ impl<'a> LowerCtx<'a> {
             let slot = def.slot.expect("StackPop(Reg) on temp vreg");
             let base_reg = func.vstacks[slot.vstack.0 as usize].base;
             let base = Aarch64Backend::reg_to_xgpr(base_reg)?;
-            let imm = SImm9::new(slot.size as i16).map_err(|_| CodegenError::OffsetOutOfRange {
+            let imm = SImm9::try_from(slot.size as i32).map_err(|_| CodegenError::OffsetOutOfRange {
                 offset: slot.size as u32,
                 max: 255,
             })?;
@@ -390,9 +429,9 @@ impl<'a> LowerCtx<'a> {
             return Ok(());
         }
         if self.cache.lookup(def.id).is_some() {
-            let result = self.cache.ensure(def.id)?;
+            let result = self.cache.ensure(def.id, self.vreg_defs)?;
             if result.needs_load {
-                self.emit_load(def.id, result.reg, func)?;
+                self.emit_load_or_remat(def.id, result.reg, func)?;
             }
         }
         Ok(())
@@ -406,19 +445,19 @@ impl<'a> LowerCtx<'a> {
         rhs: Operand,
         func: &IRFunction,
     ) -> Result<(), CodegenError> {
-        let is_32 = matches!(self.operand_type(lhs), IrType::I32 | IrType::F32);
+        let is_32 = matches!(lhs.width(), Width::W32);
 
-        if op.is_comparison() {
+        if let AluOp::Comp(_) = op {
             return self.lower_cmp(op, dst, lhs, rhs, is_32, func);
         }
 
         let lhs_phys = self.resolve_operand(lhs, func)?;
-        let dst_phys = self.resolve_dst(dst)?;
+        let dst_phys = self.resolve_dst(dst, func)?;
 
         if let Some(imm) = self.try_imm(rhs) {
-            if let Ok(imm12) = UImm12::new(imm as u16) {
+            if let Ok(imm12) = UImm12::try_from(imm) {
                 self.emit_alu_imm(op, dst_phys, lhs_phys, imm12, is_32);
-                if let Operand::VReg(v) = rhs {
+                if let Operand::VReg(v, _) = rhs {
                     self.cache.release(v);
                 }
                 return Ok(());
@@ -441,14 +480,14 @@ impl<'a> LowerCtx<'a> {
         let lhs_phys = self.resolve_operand(lhs, func)?;
 
         let rd = match dst {
-            Register::Phys(n) => {
+            Register::PReg(p, _) => {
                 if is_32 {
-                    GprOrZr::from(Aarch64Backend::phys_to_wgpr(PhysReg(n)))
+                    GprOrZr::from(Aarch64Backend::phys_to_wgpr(p))
                 } else {
-                    GprOrZr::from(Aarch64Backend::phys_to_xgpr(PhysReg(n)))
+                    GprOrZr::from(Aarch64Backend::phys_to_xgpr(p))
                 }
             }
-            Register::Virtual(_) => {
+            Register::VReg(_, _) => {
                 if is_32 {
                     GprOrZr::Wzr
                 } else {
@@ -458,14 +497,14 @@ impl<'a> LowerCtx<'a> {
         };
 
         if let Some(imm) = self.try_imm(rhs) {
-            if let Ok(imm12) = UImm12::new(imm as u16) {
+            if let Ok(imm12) = UImm12::try_from(imm) {
                 let rn = if is_32 {
                     GprOrSp::from(Aarch64Backend::phys_to_wgpr(lhs_phys))
                 } else {
                     GprOrSp::from(Gpr::X(Aarch64Backend::phys_to_xgpr(lhs_phys)))
                 };
                 self.emit(Aarch64Instruction::SubsImm(SubsImm { rd, rn, imm: imm12 }));
-                if let Operand::VReg(v) = rhs {
+                if let Operand::VReg(v, _) = rhs {
                     self.cache.release(v);
                 }
                 self.pending_cmp = Some(PendingCmp {
@@ -528,21 +567,25 @@ impl<'a> LowerCtx<'a> {
         }
 
         for (i, &arg) in args.iter().enumerate() {
-            let r = self.cache.ensure(arg)?;
-            if r.needs_load {
-                self.emit_load(arg, r.reg, func)?;
+            let r = self.cache.ensure(arg, self.vreg_defs)?;
+            if let Some(evicted) = r.evicted {
+                if evicted.needs_store {
+                    self.emit_store(evicted.vreg, evicted.reg, func)?;
+                }
             }
-            let cc_reg = PhysReg(9 + i as u8);
+            if r.needs_load {
+                self.emit_load_or_remat(arg, r.reg, func)?;
+            }
+            let cc_reg = PReg(9 + i as u8);
             if r.reg != cc_reg {
-                let ty = self.vreg_defs[arg.0 as usize].ty;
-                let is_32 = matches!(ty, IrType::I32 | IrType::F32);
+                let is_32 = matches!(self.vreg_defs[arg.0 as usize].width, Width::W32);
                 self.emit_mov(cc_reg, r.reg, is_32);
             }
         }
 
         if frame_advance > 0 {
             let imm =
-                UImm12::new(frame_advance as u16).map_err(|_| CodegenError::OffsetOutOfRange {
+                UImm12::try_from(frame_advance).map_err(|_| CodegenError::OffsetOutOfRange {
                     offset: frame_advance,
                     max: 4095,
                 })?;
@@ -556,11 +599,10 @@ impl<'a> LowerCtx<'a> {
 
         let mut param_offset = 0u32;
         for (i, &arg) in args.iter().enumerate() {
-            let cc_reg = PhysReg(9 + i as u8);
-            let ty = self.vreg_defs[arg.0 as usize].ty;
-            match ty {
-                IrType::I32 | IrType::F32 => {
-                    let uimm = UImm12::new(param_offset as u16 / 4).map_err(|_| {
+            let cc_reg = PReg(9 + i as u8);
+            match self.vreg_defs[arg.0 as usize].width {
+                Width::W32 => {
+                    let uimm = UImm12::try_from(param_offset / 4).map_err(|_| {
                         CodegenError::OffsetOutOfRange {
                             offset: param_offset,
                             max: 4095 * 4,
@@ -573,8 +615,8 @@ impl<'a> LowerCtx<'a> {
                     }));
                     param_offset += 4;
                 }
-                _ => {
-                    let uimm = UImm12::new(param_offset as u16 / 8).map_err(|_| {
+                Width::W64 => {
+                    let uimm = UImm12::try_from(param_offset / 8).map_err(|_| {
                         CodegenError::OffsetOutOfRange {
                             offset: param_offset,
                             max: 4095 * 8,
@@ -599,7 +641,7 @@ impl<'a> LowerCtx<'a> {
 
         if frame_advance > 0 {
             let imm =
-                UImm12::new(frame_advance as u16).map_err(|_| CodegenError::OffsetOutOfRange {
+                UImm12::try_from(frame_advance).map_err(|_| CodegenError::OffsetOutOfRange {
                     offset: frame_advance,
                     max: 4095,
                 })?;
@@ -614,7 +656,7 @@ impl<'a> LowerCtx<'a> {
         self.cache.invalidate_all();
 
         for (i, &res) in results.iter().enumerate() {
-            let cc_reg = PhysReg(9 + i as u8);
+            let cc_reg = PReg(9 + i as u8);
             self.cache.bind_dirty(res, cc_reg);
             self.emit_store(res, cc_reg, func)?;
         }
@@ -634,14 +676,18 @@ impl<'a> LowerCtx<'a> {
             }
         }
         for (i, &vreg) in values.iter().enumerate() {
-            let result = self.cache.ensure(vreg)?;
-            if result.needs_load {
-                self.emit_load(vreg, result.reg, func)?;
+            let result = self.cache.ensure(vreg, self.vreg_defs)?;
+            if let Some(evicted) = result.evicted {
+                if evicted.needs_store {
+                    self.emit_store(evicted.vreg, evicted.reg, func)?;
+                }
             }
-            let ret_reg = PhysReg(9 + i as u8);
+            if result.needs_load {
+                self.emit_load_or_remat(vreg, result.reg, func)?;
+            }
+            let ret_reg = PReg(9 + i as u8);
             if result.reg != ret_reg {
-                let ty = self.vreg_defs[vreg.0 as usize].ty;
-                let is_32 = matches!(ty, IrType::I32 | IrType::F32);
+                let is_32 = matches!(self.vreg_defs[vreg.0 as usize].width, Width::W32);
                 self.emit_mov(ret_reg, result.reg, is_32);
             }
         }
@@ -651,7 +697,7 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-    fn emit_mov(&mut self, dst: PhysReg, src: PhysReg, is_32: bool) {
+    fn emit_mov(&mut self, dst: PReg, src: PReg, is_32: bool) {
         if is_32 {
             self.emit(Aarch64Instruction::OrrReg(OrrReg {
                 rd: GprOrZr::from(Aarch64Backend::phys_to_wgpr(dst)),
@@ -667,10 +713,91 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
+    /// Load or rematerialize a VReg into a physical register.
+    ///
+    /// If the VReg is rematerializable (constant), emits `movz` instead
+    /// of loading from memory — 1 cycle, no cache pressure.
+    fn emit_load_or_remat(
+        &mut self,
+        vreg: VReg,
+        dst: PReg,
+        func: &IRFunction,
+    ) -> Result<(), CodegenError> {
+        let def = &self.vreg_defs[vreg.0 as usize];
+        if def.remat {
+            return self.emit_remat(def, dst);
+        }
+        self.emit_load(vreg, dst, func)
+    }
+
+    /// Emit a `movz` to rematerialize a constant value.
+    fn emit_remat(&mut self, def: &VRegDef, dst: PReg) -> Result<(), CodegenError> {
+        match def.value {
+            Value::ConstI32(n) => self.emit_i32_const(dst, n),
+            Value::ConstI64(n) => self.emit_i64_const(dst, n),
+            _ => unreachable!("emit_remat on non-constant value"),
+        }
+        Ok(())
+    }
+
+    /// Emit instructions to materialize an i32 constant into a register.
+    ///
+    /// Uses `movz` for values 0–65535. Larger values use `movz` + `movk`
+    /// to build the full 32-bit value in two halfwords.
+    fn emit_i32_const(&mut self, dst: PReg, n: i32) {
+        let val = n as u32;
+        let lo = (val & 0xFFFF) as u16;
+        let hi = (val >> 16) as u16;
+        let rd = GprOrZr::from(Aarch64Backend::phys_to_wgpr(dst));
+        self.emit(Aarch64Instruction::Movz(Movz {
+            rd,
+            imm: UImm16::try_from(lo).unwrap(),
+            hw: 0,
+        }));
+        if hi != 0 {
+            self.emit(Aarch64Instruction::Movk(autosynth_isa_aarch64::Movk {
+                rd,
+                imm: UImm16::try_from(hi).unwrap(),
+                hw: 1,
+            }));
+        }
+    }
+
+    /// Emit instructions to materialize an i64 constant into a register.
+    ///
+    /// Uses `movz` for the lowest non-zero halfword, then `movk` for each
+    /// additional non-zero halfword. Up to 4 instructions for a full 64-bit value.
+    fn emit_i64_const(&mut self, dst: PReg, n: i64) {
+        let val = n as u64;
+        let rd = GprOrZr::from(Aarch64Backend::phys_to_xgpr(dst));
+        let halfwords: [u16; 4] = [
+            (val & 0xFFFF) as u16,
+            ((val >> 16) & 0xFFFF) as u16,
+            ((val >> 32) & 0xFFFF) as u16,
+            ((val >> 48) & 0xFFFF) as u16,
+        ];
+        // Find the first non-zero halfword (or hw0 if all zero).
+        let first_nz = halfwords.iter().position(|&h| h != 0).unwrap_or(0);
+        self.emit(Aarch64Instruction::Movz(Movz {
+            rd,
+            imm: UImm16::try_from(halfwords[first_nz]).unwrap(),
+            hw: first_nz as u8,
+        }));
+        for (i, &hw) in halfwords.iter().enumerate() {
+            if i != first_nz && hw != 0 {
+                self.emit(Aarch64Instruction::Movk(autosynth_isa_aarch64::Movk {
+                    rd,
+                    imm: UImm16::try_from(hw).unwrap(),
+                    hw: i as u8,
+                }));
+            }
+        }
+    }
+
     fn emit_load(
         &mut self,
         vreg: VReg,
-        dst: PhysReg,
+        dst: PReg,
         func: &IRFunction,
     ) -> Result<(), CodegenError> {
         let def = &self.vreg_defs[vreg.0 as usize];
@@ -680,10 +807,10 @@ impl<'a> LowerCtx<'a> {
         let vstack = &func.vstacks[slot.vstack.0 as usize];
         let base = Aarch64Backend::reg_to_xgpr(vstack.base)?;
         let offset = slot.byte_offset;
-        match def.ty {
-            IrType::I32 | IrType::F32 => {
+        match def.width {
+            Width::W32 => {
                 let uimm =
-                    UImm12::new(offset as u16 / 4).map_err(|_| CodegenError::OffsetOutOfRange {
+                    UImm12::try_from(offset / 4).map_err(|_| CodegenError::OffsetOutOfRange {
                         offset: offset as u32,
                         max: 4095 * 4,
                     })?;
@@ -693,9 +820,9 @@ impl<'a> LowerCtx<'a> {
                     offset: uimm,
                 }));
             }
-            _ => {
+            Width::W64 => {
                 let uimm =
-                    UImm12::new(offset as u16 / 8).map_err(|_| CodegenError::OffsetOutOfRange {
+                    UImm12::try_from(offset / 8).map_err(|_| CodegenError::OffsetOutOfRange {
                         offset: offset as u32,
                         max: 4095 * 8,
                     })?;
@@ -712,7 +839,7 @@ impl<'a> LowerCtx<'a> {
     fn emit_store(
         &mut self,
         vreg: VReg,
-        src: PhysReg,
+        src: PReg,
         func: &IRFunction,
     ) -> Result<(), CodegenError> {
         let def = &self.vreg_defs[vreg.0 as usize];
@@ -722,10 +849,10 @@ impl<'a> LowerCtx<'a> {
         let vstack = &func.vstacks[slot.vstack.0 as usize];
         let base = Aarch64Backend::reg_to_xgpr(vstack.base)?;
         let offset = slot.byte_offset;
-        match def.ty {
-            IrType::I32 | IrType::F32 => {
+        match def.width {
+            Width::W32 => {
                 let uimm =
-                    UImm12::new(offset as u16 / 4).map_err(|_| CodegenError::OffsetOutOfRange {
+                    UImm12::try_from(offset / 4).map_err(|_| CodegenError::OffsetOutOfRange {
                         offset: offset as u32,
                         max: 4095 * 4,
                     })?;
@@ -735,9 +862,9 @@ impl<'a> LowerCtx<'a> {
                     offset: uimm,
                 }));
             }
-            _ => {
+            Width::W64 => {
                 let uimm =
-                    UImm12::new(offset as u16 / 8).map_err(|_| CodegenError::OffsetOutOfRange {
+                    UImm12::try_from(offset / 8).map_err(|_| CodegenError::OffsetOutOfRange {
                         offset: offset as u32,
                         max: 4095 * 8,
                     })?;
@@ -751,7 +878,7 @@ impl<'a> LowerCtx<'a> {
         Ok(())
     }
 
-    fn emit_alu_reg(&mut self, op: AluOp, dst: PhysReg, lhs: PhysReg, rhs: PhysReg, is_32: bool) {
+    fn emit_alu_reg(&mut self, op: AluOp, dst: PReg, lhs: PReg, rhs: PReg, is_32: bool) {
         let (rd, rn, rm) = if is_32 {
             (
                 GprOrZr::from(Aarch64Backend::phys_to_wgpr(dst)),
@@ -780,7 +907,7 @@ impl<'a> LowerCtx<'a> {
         }
     }
 
-    fn emit_alu_imm(&mut self, op: AluOp, dst: PhysReg, src: PhysReg, imm: UImm12, is_32: bool) {
+    fn emit_alu_imm(&mut self, op: AluOp, dst: PReg, src: PReg, imm: UImm12, is_32: bool) {
         let (rd, rn) = if is_32 {
             (
                 GprOrSp::from(Aarch64Backend::phys_to_wgpr(dst)),

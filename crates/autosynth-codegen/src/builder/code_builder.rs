@@ -55,7 +55,7 @@ impl CodeBuilder {
                     .iter()
                     .map(|vreg| {
                         let def = &func.vreg_defs[vreg.0 as usize];
-                        format!("{}<{}>", vreg, def.ty)
+                        format!("{}<{}>", vreg, def.width)
                     })
                     .collect();
                 let results: Vec<String> = block
@@ -63,7 +63,7 @@ impl CodeBuilder {
                     .iter()
                     .map(|vreg| {
                         let def = &func.vreg_defs[vreg.0 as usize];
-                        format!("{}<{}>", vreg, def.ty)
+                        format!("{}<{}>", vreg, def.width)
                     })
                     .collect();
                 dbg.set_block_meta(block.id, params, results);

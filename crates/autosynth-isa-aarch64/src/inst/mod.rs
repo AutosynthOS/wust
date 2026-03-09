@@ -4,6 +4,7 @@ mod b_cond;
 mod bl;
 mod ldr_post;
 mod ldr_uoff;
+mod movk;
 mod movz;
 mod orr_reg;
 mod ret;
@@ -20,6 +21,7 @@ pub use b_cond::BCond;
 pub use bl::Bl;
 pub use ldr_post::LdrPost;
 pub use ldr_uoff::LdrUoff;
+pub use movk::Movk;
 pub use movz::Movz;
 pub use orr_reg::OrrReg;
 pub use ret::Ret;
@@ -70,6 +72,7 @@ pub enum Aarch64Instruction {
     Bl(Bl),
     LdrPost(LdrPost),
     LdrUoff(LdrUoff),
+    Movk(Movk),
     Movz(Movz),
     OrrReg(OrrReg),
     Ret(Ret),
@@ -90,6 +93,7 @@ impl core::fmt::Display for Aarch64Instruction {
             Self::Bl(i) => write!(f, "{i}"),
             Self::LdrPost(i) => write!(f, "{i}"),
             Self::LdrUoff(i) => write!(f, "{i}"),
+            Self::Movk(i) => write!(f, "{i}"),
             Self::Movz(i) => write!(f, "{i}"),
             Self::OrrReg(i) => write!(f, "{i}"),
             Self::Ret(i) => write!(f, "{i}"),
@@ -112,6 +116,7 @@ impl Aarch64Inst for Aarch64Instruction {
             Self::Bl(i) => i.encode_word(),
             Self::LdrPost(i) => i.encode_word(),
             Self::LdrUoff(i) => i.encode_word(),
+            Self::Movk(i) => i.encode_word(),
             Self::Movz(i) => i.encode_word(),
             Self::OrrReg(i) => i.encode_word(),
             Self::Ret(i) => i.encode_word(),
@@ -139,7 +144,7 @@ macro_rules! impl_from_inst {
 
 impl_from_inst! {
     AddImm(AddImm), AddReg(AddReg), BCond(BCond), Bl(Bl),
-    LdrPost(LdrPost), LdrUoff(LdrUoff), Movz(Movz), OrrReg(OrrReg),
+    LdrPost(LdrPost), LdrUoff(LdrUoff), Movk(Movk), Movz(Movz), OrrReg(OrrReg),
     Ret(Ret), StrPre(StrPre), StrUoff(StrUoff), SubImm(SubImm),
     SubReg(SubReg), SubsImm(SubsImm), SubsReg(SubsReg),
 }
