@@ -313,9 +313,7 @@ impl<'a> LowerCtx<'a> {
         match inst {
             IrInst::Alu { op, dst, lhs, rhs } => self.lower_alu(*op, *dst, *lhs, *rhs, func),
             IrInst::BrIf {
-                cond: _,
-                block_if: _,
-                block_else,
+                block_else, ..
             } => self.lower_br_if(*block_else),
             IrInst::Branch { target } if Some(*target) == next_block => Ok(()),
             IrInst::Branch { target } => self.lower_branch(*target),
@@ -349,7 +347,9 @@ impl<'a> LowerCtx<'a> {
                 let def = &self.vreg_defs[vreg.0 as usize];
                 self.lower_stack_push(def, func)
             }
-            IrInst::Return { values, flush } => self.lower_return(values, *flush, func),
+            IrInst::Return => self.lower_return(&[], false, func),
+            IrInst::Move { .. } => todo!("Move not implemented in old backend"),
+            IrInst::Skipped(_) => Ok(()),
         }
     }
 

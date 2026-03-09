@@ -6,7 +6,8 @@
 
 extern crate alloc;
 
-use alloc::{format, string::String, vec::Vec};
+use alloc::boxed::Box;
+use alloc::vec::Vec;
 use core::fmt;
 
 use autosynth_isa::{PReg, Width};
@@ -61,18 +62,18 @@ pub enum Operand {
     VReg(VReg, Width),
     /// A physical register — already assigned (fuel, frame pointer, etc.).
     PReg(PReg, Width),
-    /// An inline 32-bit constant.
-    Imm32(i32),
-    /// An inline 64-bit constant.
-    Imm64(i64),
+    /// A constant 32-bit integer.
+    ConstI32(i32),
+    /// A constant 64-bit integer.
+    ConstI64(i64),
 }
 
 impl Operand {
     pub fn width(&self) -> Width {
         match self {
             Operand::VReg(_, w) | Operand::PReg(_, w) => *w,
-            Operand::Imm32(_) => Width::W32,
-            Operand::Imm64(_) => Width::W64,
+            Operand::ConstI32(_) => Width::W32,
+            Operand::ConstI64(_) => Width::W64,
         }
     }
 }
@@ -82,8 +83,8 @@ impl fmt::Display for Operand {
         match self {
             Operand::VReg(v, _) => write!(f, "{v}"),
             Operand::PReg(p, _) => write!(f, "p{}", p.0),
-            Operand::Imm32(n) => write!(f, "#{n}"),
-            Operand::Imm64(n) => write!(f, "#{n}"),
+            Operand::ConstI32(n) => write!(f, "#{n}"),
+            Operand::ConstI64(n) => write!(f, "#{n}"),
         }
     }
 }
@@ -119,10 +120,72 @@ impl fmt::Display for BlockId {
 }
 
 /// Index identifying a function in the compilation unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FunctionIdx {
     /// A user-defined function, indexed by its position in the module.
     User(u32),
+}
+
+/// WASM value type for the IR layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum IrType {
+    I32,
+    I64,
+}
+
+impl IrType {
+    /// The register width for this type.
+    pub fn width(self) -> Width {
+        match self {
+            IrType::I32 => Width::W32,
+            IrType::I64 => Width::W64,
+        }
+    }
+}
+
+impl fmt::Display for IrType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            IrType::I32 => write!(f, "i32"),
+            IrType::I64 => write!(f, "i64"),
+        }
+    }
+}
+
+/// Calling convention for a function.
+///
+/// Every function parameter has a canonical slot on the wasm stack.
+/// The Abi determines whether params and results are *also* passed
+/// in registers as an optimization, or exclusively through the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Abi {
+    /// Params and results are passed in scratch registers, indexed
+    /// by position. Param 0 and result 0 share the same register.
+    /// Used for direct JIT-to-JIT calls on the hot path.
+    ///
+    /// All available scratch registers are consumed for params and
+    /// results. Any overflow beyond the physical register pool is
+    /// flushed to the corresponding canonical stack slot.
+    NativeWasm,
+    /// No registers — params and results are read from and written
+    /// to their canonical wasm stack slots directly. Used for entry
+    /// trampolines and resume points where the stack is the source
+    /// of truth.
+    StackWasm,
+}
+
+/// Describes a function's parameter and return types.
+///
+/// Param and result indices are zero-based. Under [`Abi::NativeWasm`],
+/// index 0 maps to the first calling-convention register (e.g. x9),
+/// index 1 to the next, and so on. Params and results share the same
+/// register slots — a call pops params and pushes results into the
+/// same positions.
+#[derive(Debug, Clone)]
+pub struct FunctionSignature {
+    pub abi: Abi,
+    pub params: Vec<IrType>,
+    pub results: Vec<IrType>,
 }
 
 impl fmt::Display for FunctionIdx {
@@ -232,7 +295,11 @@ pub enum IrInst {
         rhs: Operand,
     },
 
-    /// Conditional branch — if cond is truthy, goto block_if, else block_else.
+    /// Conditional branch — branch based on a preceding comparison.
+    ///
+    /// The condition comes from a prior `Alu(Comp)` that sets flags.
+    /// The backend consumes the pending flags and emits the appropriate
+    /// conditional branch instruction.
     BrIf {
         cond: VReg,
         block_if: BlockId,
@@ -243,15 +310,7 @@ pub enum IrInst {
     Branch { target: BlockId },
 
     /// Function call (branch-and-link to another function).
-    Call {
-        func_idx: FunctionIdx,
-        /// VRegs holding call arguments (mapped to x9, x10, ...).
-        args: Vec<VReg>,
-        /// VRegs to receive return values (mapped from x9, x10, ...).
-        results: Vec<VReg>,
-        /// Frame pointer advance (bytes) applied before bl and reversed after.
-        frame_advance: u32,
-    },
+    Call { func_idx: FunctionIdx },
 
     /// Load from memory: dst = [base + offset].
     Load {
@@ -267,11 +326,121 @@ pub enum IrInst {
         offset: u32,
     },
 
-    /// Return from function.
+    /// Return from function (machine-level `ret`).
     ///
-    /// When `flush` is true, the lowerer stores all dirty registers to
-    /// their canonical slots before the `ret`.
-    Return { values: Vec<VReg>, flush: bool },
+    /// The orchestrator handles moving results into return registers
+    /// and flushing dirty state before emitting this.
+    Return,
+
+    /// Register-to-register move: dst = src.
+    ///
+    /// Used by the orchestrator for calling convention setup (moving
+    /// values into/out of argument registers).
+    Move { dst: Register, src: Register },
+
+    /// An instruction that was eliminated during optimization (e.g.
+    /// fallthrough branch elimination). Kept in the instruction list
+    /// so that IR instruction indices stay aligned with debugger groups.
+    Skipped(Box<IrInst>),
+}
+
+/// Index into the function builder's vstack table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VStackId(pub u32);
+
+
+/// Canonical memory location for a VReg — where it lives on the stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CanonSlot {
+    /// Which virtual stack this slot belongs to.
+    pub vstack: VStackId,
+    /// Slot index within that vstack.
+    pub index: u32,
+    /// Byte offset from the vstack's base (base_reg + base_offset + slot_offset).
+    pub byte_offset: u32,
+    /// Size in bytes (4 for i32/f32, 8 for i64/f64, 16 for v128).
+    pub size: u8,
+}
+
+/// Metadata for a virtual register definition.
+///
+/// Each VReg has a unique id, a width that determines register size and
+/// memory layout, an optional canonical stack slot, and an optional
+/// initial operand describing how it gets its value.
+///
+/// When `slot` is `None`, the VReg is a **temp** — it has no canonical
+/// memory location and cannot be spilled. Temps must be either consumed
+/// immediately (e.g. a comparison result feeding the next `BrIf`) or
+/// rematerializable from their `initial` value (e.g. a constant).
+#[derive(Debug, Clone, Copy)]
+pub struct VRegDef {
+    /// The unique virtual register identifier.
+    pub id: VReg,
+    /// Register width (W32 or W64) — determines instruction width and slot size.
+    pub width: Width,
+    /// Canonical memory location on a virtual stack, or `None` for temps.
+    pub slot: Option<CanonSlot>,
+    /// Initial value of this VReg, or `None` if written by an instruction
+    /// (ALU result, call return, etc.).
+    pub initial: Option<Operand>,
+    /// Register placement constraint for the allocator.
+    /// - `Some(PReg(..))`: must be in this physical register (CC constraints).
+    /// - `Some(VReg(..))`: coalesce — try to share the same physical register.
+    /// - `None`: allocator chooses freely.
+    pub target: Option<Register>,
+}
+
+/// Immutable configuration of a virtual stack — anchored to a register + offset.
+///
+/// This is the part of a vstack that never changes: which register it's
+/// relative to and where it starts. The mutable state (depth, slot
+/// assignments) lives on the block builder.
+#[derive(Debug, Clone)]
+pub struct VStackConfig {
+    pub id: VStackId,
+    /// Display label for this stack (e.g. "locals", "operands").
+    pub label: &'static str,
+    /// The register this stack is relative to (always Phys in practice).
+    pub base: Register,
+    /// Byte offset from the base register to the start of this stack.
+    pub base_offset: u32,
+}
+
+/// A complete IR function — the finalized output of FunctionBuilder.
+///
+/// This is a read-only type. All mutation happens during building.
+/// Blocks have their params, results, and successors computed.
+#[derive(Debug)]
+pub struct IRFunction {
+    /// Virtual stack configurations (base register + offset per vstack).
+    pub vstacks: Vec<VStackConfig>,
+    /// All VReg definitions, indexed by VReg id.
+    pub vreg_defs: Vec<VRegDef>,
+    /// All blocks with analyzed control flow.
+    pub blocks: Vec<IrBlock>,
+}
+
+/// A basic block in the IR.
+///
+/// Blocks have typed params (live-in values from predecessors) and
+/// results (live-out values passed to successors). At a branch to
+/// block B, the brancher provides B's params. At B's terminator,
+/// B provides its results to the target block's params.
+///
+/// This threading makes liveness explicit at every block boundary —
+/// the regcache only needs to preserve what's in params/results.
+#[derive(Debug)]
+pub struct IrBlock {
+    /// This block's identifier.
+    pub id: BlockId,
+    /// Values flowing into this block from predecessors (live-in VRegs).
+    pub params: Vec<VReg>,
+    /// Values flowing out of this block to successors (live-out VRegs).
+    pub results: Vec<VReg>,
+    /// Successor block IDs, extracted from the terminator instruction.
+    pub successors: Vec<BlockId>,
+    /// The instruction stream for this block.
+    pub instructions: Vec<IrInst>,
 }
 
 impl fmt::Display for IrInst {
@@ -290,20 +459,8 @@ impl fmt::Display for IrInst {
             IrInst::Branch { target } => {
                 write!(f, "br {target}")
             }
-            IrInst::Call {
-                func_idx,
-                args,
-                results,
-                frame_advance,
-            } => {
-                let args_s: Vec<String> = args.iter().map(|a| format!("{a}")).collect();
-                let res_s: Vec<String> = results.iter().map(|r| format!("{r}")).collect();
-                write!(
-                    f,
-                    "call {func_idx}({}) → ({}) fp+{frame_advance}",
-                    args_s.join(", "),
-                    res_s.join(", ")
-                )
+            IrInst::Call { func_idx } => {
+                write!(f, "call {func_idx}")
             }
             IrInst::Load { dst, base, offset } => {
                 write!(f, "{dst} = load [p{}, #{offset}]", base.0)
@@ -311,14 +468,9 @@ impl fmt::Display for IrInst {
             IrInst::Store { src, base, offset } => {
                 write!(f, "store [p{}, #{offset}], {src}", base.0)
             }
-            IrInst::Return { values, flush } => {
-                let vals: Vec<String> = values.iter().map(|v| format!("{v}")).collect();
-                if *flush {
-                    write!(f, "ret {} flush", vals.join(", "))
-                } else {
-                    write!(f, "ret {}", vals.join(", "))
-                }
-            }
+            IrInst::Return => write!(f, "ret"),
+            IrInst::Move { dst, src } => write!(f, "{dst} = mov {src}"),
+            IrInst::Skipped(inner) => write!(f, "~{inner}"),
         }
     }
 }

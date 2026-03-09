@@ -12,7 +12,9 @@
 //!   RW/RX lifecycle for writing and executing JIT code.
 
 mod code_buffer;
+mod conversion;
 mod jit_module;
+mod trampoline;
 
 pub use code_buffer::CodeBuffer;
 pub use jit_module::JitModule;

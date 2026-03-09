@@ -61,6 +61,20 @@ impl RegCache {
         panic!("register exhaustion: no free registers and eviction not yet implemented");
     }
 
+    /// Define a vreg into a specific physical register. Marks dirty.
+    ///
+    /// If the target PReg is occupied by another vreg, that binding is
+    /// evicted. Returns `Some((vreg, dirty))` if something was displaced.
+    pub fn define_at(&mut self, vreg: VReg, target: PReg) -> Option<(VReg, bool)> {
+        let slot = self.slots.iter_mut().find(|s| s.reg == target)
+            .unwrap_or_else(|| panic!("define_at: {target:?} not in pool"));
+        let evicted = slot.binding
+            .filter(|b| b.vreg != vreg)
+            .map(|b| (b.vreg, b.dirty));
+        slot.binding = Some(Binding { vreg, dirty: true });
+        evicted
+    }
+
     /// Ensure a vreg is in a register. Returns (preg, needs_load).
     pub fn ensure(&mut self, vreg: VReg) -> (PReg, bool) {
         // Already cached.
@@ -95,6 +109,48 @@ impl RegCache {
         for slot in &mut self.slots {
             slot.binding = None;
         }
+    }
+
+    /// Bind a vreg to a specific physical register (clean).
+    ///
+    /// Used when a value arrives in a known register (e.g. function
+    /// parameters in calling convention registers, or reserved registers
+    /// like LR being pushed onto the fibre stack).
+    ///
+    /// If the register is not already tracked (e.g. a reserved register),
+    /// a new slot is added dynamically.
+    pub fn bind(&mut self, vreg: VReg, phys: PReg) {
+        let slot = match self.slots.iter_mut().find(|s| s.reg == phys) {
+            Some(slot) => slot,
+            None => {
+                self.slots.push(RegSlot {
+                    reg: phys,
+                    binding: None,
+                });
+                self.slots.last_mut().unwrap()
+            }
+        };
+        // Dirty: the value is in the register but hasn't been stored
+        // to the canonical stack slot yet (e.g. params passed in regs).
+        slot.binding = Some(Binding {
+            vreg,
+            dirty: true,
+        });
+    }
+
+    /// Alias a new vreg to the same register as an existing vreg.
+    ///
+    /// The new vreg shares the physical register — no move needed.
+    /// Marked dirty since it has a different canonical slot.
+    pub fn alias(&mut self, dst: VReg, src: VReg) {
+        let reg = self
+            .lookup(src)
+            .unwrap_or_else(|| panic!("alias: source {src} not in cache"));
+        let slot = self.slots.iter_mut().find(|s| s.reg == reg).unwrap();
+        slot.binding = Some(Binding {
+            vreg: dst,
+            dirty: true,
+        });
     }
 
     /// Release a vreg from the cache, freeing the register.

@@ -20,6 +20,41 @@ use crate::disasm::boxes::{BlockBox, FunctionBox};
 use crate::disasm::table::{Align, Column, Row, Table};
 use crate::ir::block::BlockId;
 
+/// Install a [`Debugger`] as the thread-local debug sink.
+///
+/// Any subsequent calls to [`autosynth_lower::dbg`] will forward to it.
+pub fn install(debugger: Debugger) {
+    autosynth_lower::install_dbg(Box::new(debugger));
+}
+
+/// Remove the thread-local debug sink and downcast it back to a [`Debugger`].
+///
+/// Returns `None` if no debugger was installed.
+pub fn take() -> Option<Debugger> {
+    let boxed = autosynth_lower::take_dbg()?;
+    Some(
+        *boxed
+            .as_any()
+            .downcast::<Debugger>()
+            .expect("installed sink was not a Debugger"),
+    )
+}
+
+/// Run a closure with the thread-local debugger, if one is installed.
+///
+/// This is a convenience wrapper that downcasts to [`Debugger`] for
+/// source-level operations (add_source_column, set_pending, etc.).
+/// For machine-level operations, use [`autosynth_lower::dbg`] directly.
+pub fn dbg(f: impl FnOnce(&mut Debugger)) {
+    autosynth_lower::dbg(|sink| {
+        // SAFETY: if a Debugger was installed via install(), this downcast succeeds.
+        let dbg = (sink as &mut dyn core::any::Any).downcast_mut::<Debugger>();
+        if let Some(dbg) = dbg {
+            f(dbg);
+        }
+    });
+}
+
 /// A single machine instruction within an [`OpGroup`].
 struct MachineInst {
     /// Per-column values (one per machine column).
@@ -199,6 +234,7 @@ impl Debugger {
         );
 
         let idx = self.groups.len();
+
         self.groups.push(OpGroup {
             source_values,
             machine_insts: Vec::new(),
@@ -337,6 +373,32 @@ impl Debugger {
         let mut cols = self.source_columns.clone();
         cols.extend(self.machine_columns.iter().cloned());
         cols
+    }
+}
+
+impl autosynth_lower::DbgSink for Debugger {
+    fn begin_ir_inst(&mut self, ir_index: usize) {
+        self.begin_ir_inst(ir_index);
+    }
+
+    fn emit_machine_inst(&mut self) {
+        self.emit_machine_inst();
+    }
+
+    fn set_machine(&mut self, col: &str, value: &str) {
+        self.set_machine(col, value);
+    }
+
+    fn current_group(&self) -> usize {
+        self.current_group.unwrap_or(0)
+    }
+
+    fn set_current_group(&mut self, group: usize) {
+        self.current_group = Some(group);
+    }
+
+    fn as_any(self: Box<Self>) -> Box<dyn std::any::Any> {
+        self
     }
 }
 

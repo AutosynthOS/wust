@@ -4,7 +4,4 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autosynth-ir = { path = "../autosynth-ir" }
-autosynth-isa = { path = "../autosynth-isa" }
 autosynth-lower = { path = "../autosynth-lower" }
-smallvec = "1.10.0"

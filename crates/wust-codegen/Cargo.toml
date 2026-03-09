@@ -12,6 +12,11 @@ disarm64 = { version = "0.1", optional = true }
 libc = "0.2"
 wust-core = { path = "../wust-core" }
 autosynth-codegen = { path = "../autosynth-codegen" }
+autosynth-backend = { path = "../autosynth-backend" }
+autosynth-orchestrator = { path = "../autosynth-orchestrator" }
+autosynth-backend-aarch64 = { path = "../autosynth-backend-aarch64" }
+autosynth-ir = { path = "../autosynth-ir" }
+autosynth-isa = { path = "../autosynth-isa" }
 
 [dev-dependencies]
 wat = "1.245.1"

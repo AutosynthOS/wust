@@ -53,6 +53,25 @@ impl core::fmt::Display for Width {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PReg(pub u8);
 
+/// Architecture-abstract register role, resolved to a physical register
+/// by the backend's [`MachineConfig`](super::MachineConfig).
+///
+/// Lets the frontend declare named registers (frame pointer, fuel counter,
+/// etc.) without knowing the target platform's register numbering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsaReg {
+    /// The platform's frame pointer register (e.g. x29 on aarch64).
+    FramePointer,
+    /// The platform's stack pointer register (e.g. x28 as software SP on aarch64).
+    StackPointer,
+    /// The platform's return address / link register (e.g. x30 on aarch64).
+    ReturnAddress,
+    /// A general-purpose 64-bit register, auto-allocated from the remaining pool.
+    /// Positive indexes allocate from the start (0, 1, 2...),
+    /// negative indexes allocate from the end (-1, -2, -3...).
+    Alloc64(i8),
+}
+
 /// Result of trying to fold an operand as an immediate.
 ///
 /// The backend pattern-matches on this to select between immediate

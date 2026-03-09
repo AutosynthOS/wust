@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 autosynth-ir = { path = "../autosynth-ir" }
 autosynth-isa = { path = "../autosynth-isa" }
+autosynth-lower = { path = "../autosynth-lower" }
 autosynth-isa-aarch64 = { path = "../autosynth-isa-aarch64" }
 autosynth-isa-riscv64 = { path = "../autosynth-isa-riscv64" }
 autosynth-isa-x86_64 = { path = "../autosynth-isa-x86_64" }

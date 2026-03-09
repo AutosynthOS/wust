@@ -101,31 +101,40 @@ impl InlineOp {
 
 impl InlineOp {
     /// Human-readable label for disassembly output.
+    ///
+    /// Uses `OpCode::wasm_name()` for the base name and appends
+    /// decoded immediates via the appropriate accessor methods.
     pub fn display_label(self) -> String {
-        let imm = self.immediate_u32();
         let op = self.opcode();
         match op {
             OpCode::DataStream | OpCode::Nop => String::new(),
-            OpCode::I32Const => {
-                let val = (imm as i32) << 8 >> 8;
-                format!("i32.const {val}")
+            OpCode::I32Const => format!("{} {}", op.wasm_name(), self.immediate_i32()),
+            OpCode::I64Const => format!("{} {}", op.wasm_name(), self.immediate_i32()),
+            OpCode::LocalGetI32
+            | OpCode::LocalGetI64
+            | OpCode::LocalSetI32
+            | OpCode::LocalSetI64
+            | OpCode::LocalTeeI32
+            | OpCode::LocalTeeI64 => {
+                format!("{} {}", op.wasm_name(), self.local_index())
             }
-            OpCode::I64Const => {
-                let val = (imm as i32) << 8 >> 8;
-                format!("i64.const {val}")
+            OpCode::GlobalGet | OpCode::GlobalSet => {
+                format!("{} {}", op.wasm_name(), self.immediate_u32())
             }
-            OpCode::LocalGetI32 | OpCode::LocalGetI64 => format!("{} @{imm}", op.wasm_name()),
-            OpCode::LocalSetI32 | OpCode::LocalSetI64 => format!("{} @{imm}", op.wasm_name()),
-            OpCode::LocalTeeI32 | OpCode::LocalTeeI64 => format!("{} @{imm}", op.wasm_name()),
-            OpCode::GlobalGet => format!("global.get {imm}"),
-            OpCode::GlobalSet => format!("global.set {imm}"),
-            OpCode::Call => format!("call {imm}"),
+            OpCode::Call => format!("{} {}", op.wasm_name(), self.immediate_u32()),
+            OpCode::Br | OpCode::BrIf => {
+                format!("{} {}", op.wasm_name(), self.immediate_u32())
+            }
             OpCode::Block | OpCode::Loop | OpCode::Else | OpCode::End => String::new(),
-            OpCode::If => "if".into(),
-            OpCode::Br => format!("br {imm}"),
-            OpCode::BrIf => format!("br_if {imm}"),
+            OpCode::If => op.wasm_name().into(),
             _ => op.wasm_name().into(),
         }
+    }
+}
+
+impl std::fmt::Display for InlineOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.display_label())
     }
 }
 
@@ -160,11 +169,7 @@ pub fn pack_imm_u(opcode: OpCode, imm: u32) -> InlineOp {
 
 /// Pack a typed local access: byte_offset in bits[8..40], local_index in bits[40..56].
 pub fn pack_local(opcode: OpCode, byte_offset: u32, local_index: u16) -> InlineOp {
-    InlineOp(
-        (opcode as u64)
-            | ((byte_offset as u64) << 8)
-            | ((local_index as u64) << 40),
-    )
+    InlineOp((opcode as u64) | ((byte_offset as u64) << 8) | ((local_index as u64) << 40))
 }
 
 /// Pack opcode + u8 in bits[8..16] + i16 in bits[16..32].

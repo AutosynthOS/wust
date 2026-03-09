@@ -1,13 +1,14 @@
-use autosynth_ir::Operand;
+use autosynth_ir::{Abi, FunctionIdx, FunctionSignature, Operand};
 use autosynth_isa::{PReg, Width};
 
 use super::block_builder::BlockBuilder;
 use super::code_builder::CodeBuilder;
+use crate::debugger;
 use crate::disasm::table::Align;
 use crate::ir::block::{BlockId, IrBlock};
 use crate::ir::function::{IRFunction, VStackConfig};
 use crate::ir::instruction::IrInst;
-use crate::ir::{CanonSlot, Register, VReg, VRegDef, VStackId, VStackMut, Value};
+use crate::ir::{CanonSlot, Register, VReg, VRegDef, VStackId, VStackMut};
 
 /// Configuration for creating a virtual stack.
 ///
@@ -31,8 +32,11 @@ pub struct VStack {
 /// current block's vstack state onto target blocks, and `start_block`
 /// activates a block whose state was set by a prior branch.
 pub struct FunctionBuilder<'a> {
-    /// The code builder that collects finalized functions and holds the debugger.
+    /// The code builder that collects finalized functions.
     cb: &'a mut CodeBuilder,
+
+    /// The function's type signature and calling convention.
+    signature: FunctionSignature,
 
     /// VReg definitions, indexed by VReg id.
     vreg_defs: Vec<VRegDef>,
@@ -50,17 +54,19 @@ pub struct FunctionBuilder<'a> {
 }
 
 impl<'a> FunctionBuilder<'a> {
-    /// Create an empty function builder linked to a [`CodeBuilder`].
+    /// Create an empty function builder.
     ///
-    /// Automatically registers the standard source columns (pc, label).
-    pub fn new(cb: &'a mut CodeBuilder) -> Self {
-        cb.dbg(|dbg| {
+    /// Registers standard source columns (pc, label) on the thread-local
+    /// debugger if one is installed.
+    pub fn new(cb: &'a mut CodeBuilder, signature: FunctionSignature) -> Self {
+        debugger::dbg(|dbg| {
             dbg.add_source_column("pc", Align::Right);
             dbg.add_source_column("label", Align::Left);
         });
 
         Self {
             cb,
+            signature,
             vreg_defs: Vec::new(),
             next_vreg: 0,
             vstack_configs: Vec::new(),
@@ -79,8 +85,7 @@ impl<'a> FunctionBuilder<'a> {
     /// Panics if no block is active (call `entry_block` first).
     pub fn define_vstack(&mut self, vstack: VStack) -> VStackId {
         let id = VStackId(self.vstack_configs.len() as u32);
-        self.cb
-            .dbg(|dbg| dbg.add_source_column(vstack.label, Align::Left));
+        debugger::dbg(|dbg| dbg.add_source_column(vstack.label, Align::Left));
         self.vstack_configs.push(VStackConfig {
             id,
             label: vstack.label,
@@ -97,7 +102,10 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     /// Pre-define a slot in a vstack at a specific index.
-    pub fn define_slot(&mut self, vstack: VStackId, index: usize, width: Width, value: Value) {
+    ///
+    /// `initial` is the initial value of the slot, or `None` if it will
+    /// be written by an instruction (ALU result, call return, etc.).
+    pub fn define_slot(&mut self, vstack: VStackId, index: usize, width: Width, initial: Option<Operand>) {
         let size = width.bytes() as u8;
         let base_offset = self.vstack_configs[vstack.0 as usize].base_offset;
 
@@ -115,11 +123,11 @@ impl<'a> FunctionBuilder<'a> {
             size,
         };
 
-        if let Value::VReg(src) = value {
+        if let Some(Operand::VReg(src, _)) = initial {
             self.record_use(src);
         }
 
-        let vreg = self.alloc_vreg(width, slot, value);
+        let vreg = self.alloc_vreg(width, slot, initial);
         self.record_def(vreg);
 
         // Emit a Store when inside an active block (local.set).
@@ -132,7 +140,7 @@ impl<'a> FunctionBuilder<'a> {
                 offset: slot.byte_offset,
             });
             let op = format!("{label}[{index}] ← {vreg}");
-            self.cb.dbg(|dbg| dbg.set_source("operation", &op));
+            debugger::dbg(|dbg| dbg.set_source("operation", &op));
         }
 
         self.vstack_mut(vstack).slots[index] = Some(vreg);
@@ -143,14 +151,17 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
-    /// Push a typed value onto a vstack, returning the VReg allocated for it.
-    pub fn push(&mut self, vstack: VStackId, width: Width, value: Value) -> VReg {
-        self.push_typed(vstack, width, value)
+    /// Push a value onto a vstack, returning the VReg allocated for it.
+    ///
+    /// `initial` is the initial value, or `None` if it will be written
+    /// by an instruction (ALU result, call return, etc.).
+    pub fn push(&mut self, vstack: VStackId, width: Width, initial: Option<Operand>) -> VReg {
+        self.push_typed(vstack, width, initial)
     }
 
     /// Allocate a destination VReg on the vstack for an instruction result.
     pub fn push_dst(&mut self, vstack: VStackId, width: Width) -> VReg {
-        self.push_typed(vstack, width, Value::Destination)
+        self.push_typed(vstack, width, None)
     }
 
     /// Read a slot from a vstack by index (non-consuming, e.g. local.get).
@@ -179,7 +190,7 @@ impl<'a> FunctionBuilder<'a> {
     pub fn entry_block(&mut self, block: BlockId) {
         let idx = self.ensure_block(block);
         self.current_block = Some(idx);
-        self.cb.dbg(|dbg| dbg.mark_block_start(block));
+        debugger::dbg(|dbg| dbg.mark_block_start(block));
     }
 
     /// Finish vstack definitions and register the "operation" column.
@@ -187,8 +198,7 @@ impl<'a> FunctionBuilder<'a> {
     /// Call this after all `define_vstack` calls and before emitting
     /// instructions, so the operation column appears rightmost.
     pub fn finish_entry(&mut self) {
-        self.cb
-            .dbg(|dbg| dbg.add_source_column("operation", Align::Left));
+        debugger::dbg(|dbg| dbg.add_source_column("operation", Align::Left));
     }
 
     /// Start writing a block whose vstack state was set by a prior branch.
@@ -203,7 +213,7 @@ impl<'a> FunctionBuilder<'a> {
             "start_block({block}): no vstack state — was this block targeted by a branch?"
         );
         self.current_block = Some(idx);
-        self.cb.dbg(|dbg| dbg.mark_block_start(block));
+        debugger::dbg(|dbg| dbg.mark_block_start(block));
     }
 
     /// Unconditional branch — finalizes the current block.
@@ -221,28 +231,113 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Conditional branch — finalizes the current block.
     ///
-    /// Clones the current block's vstack state onto both target blocks.
+    /// Emits a `BrIf` that consumes flags from a preceding `Alu(Comp)`.
+    /// Clones the current block's vstack state onto both targets.
     pub fn br_if(&mut self, cond: VReg, block_if: BlockId, block_else: BlockId) {
-        self.emit(IrInst::BrIf {
-            cond,
-            block_if,
-            block_else,
+        let idx = self.current_block.expect("br_if: no active block");
+
+        let inst = IrInst::BrIf { cond, block_if, block_else };
+        debugger::dbg(|dbg| {
+            dbg.record_ir_emit();
+            dbg.set_source("operation", &format!("{inst}"));
         });
+        self.blocks[idx].push(inst);
+
         self.snapshot_vstack_onto(block_if);
         self.snapshot_vstack_onto(block_else);
-        let idx = self.current_block.expect("br_if: no active block");
         self.blocks[idx].successors.push(block_if);
         self.blocks[idx].successors.push(block_else);
         self.blocks[idx].finalized = true;
         self.current_block = None;
     }
 
-    /// Return — finalizes the current block (no successors).
-    pub fn ret(&mut self, values: Vec<VReg>, flush: bool) {
-        self.emit(IrInst::Return { values, flush });
+    /// Raw return — finalizes the current block (no successors).
+    ///
+    /// Does NOT pop results into calling convention registers.
+    /// Prefer [`emit_return`](Self::emit_return) which handles
+    /// the ABI automatically.
+    pub fn ret(&mut self) {
+        self.emit(IrInst::Return);
         let idx = self.current_block.expect("ret: no active block");
         self.blocks[idx].finalized = true;
         self.current_block = None;
+    }
+
+    /// Pop results, move into calling convention registers, and emit a return.
+    ///
+    /// Under [`Abi::NativeWasm`], results are popped from the operand
+    /// vstack and moved into CC registers (PReg(0), PReg(1), ...) in
+    /// reverse order (top of stack = last result).
+    ///
+    /// Under [`Abi::StackWasm`], results are already on the canonical
+    /// stack — no register moves needed.
+    pub fn emit_return(&mut self, operands: VStackId) {
+        match self.signature.abi {
+            Abi::NativeWasm => {
+                let n = self.signature.results.len();
+                for (i, ty) in self.signature.results.clone().iter().enumerate() {
+                    let vreg = self.peek(operands, n - 1 - i);
+                    assert_eq!(
+                        self.vreg_defs[vreg.0 as usize].width,
+                        ty.width(),
+                        "emit_return: result {i} width mismatch"
+                    );
+                    self.set_target(vreg, Register::PReg(PReg(i as u8), ty.width()));
+                }
+                self.drop_n(operands, n);
+            }
+            Abi::StackWasm => {}
+        }
+        self.ret();
+    }
+
+    /// Pop args, emit a call, and push results per the callee's ABI.
+    ///
+    /// Under [`Abi::NativeWasm`], arguments are popped from the operand
+    /// vstack and moved into CC registers (PReg(0), PReg(1), ...) in
+    /// reverse order, the call is emitted, and results are pushed back
+    /// from the same CC registers.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no signature is registered for `func_idx`.
+    pub fn emit_call(&mut self, operands: VStackId, func_idx: FunctionIdx) {
+        let callee_sig = self
+            .cb
+            .signature(&func_idx)
+            .unwrap_or_else(|| panic!("emit_call: no signature for {func_idx}"))
+            .clone();
+
+        match callee_sig.abi {
+            Abi::NativeWasm => {
+                // Set target CC registers on the arg VRegs already on the stack.
+                let n = callee_sig.params.len();
+                for (i, ty) in callee_sig.params.iter().enumerate() {
+                    let vreg = self.peek(operands, n - 1 - i);
+                    assert_eq!(
+                        self.vreg_defs[vreg.0 as usize].width,
+                        ty.width(),
+                        "emit_call: arg {i} width mismatch"
+                    );
+                    self.set_target(vreg, Register::PReg(PReg(i as u8), ty.width()));
+                }
+                // Soft-drop args — consumed by the call, no IR emitted.
+                self.drop_n(operands, n);
+            }
+            Abi::StackWasm => {}
+        }
+
+        self.emit(IrInst::Call { func_idx });
+
+        match callee_sig.abi {
+            Abi::NativeWasm => {
+                // Push fresh VRegs for results — same PRegs, new identities.
+                for (i, ty) in callee_sig.results.iter().enumerate() {
+                    self.push(operands, ty.width(), Some(Operand::PReg(PReg(i as u8), ty.width())));
+                }
+            }
+            Abi::StackWasm => {}
+        }
     }
 
     /// Whether the current block has been finalized by a br/br_if/ret.
@@ -278,7 +373,7 @@ impl<'a> FunctionBuilder<'a> {
     /// Panics if no block is active or if the block is finalized.
     pub fn emit(&mut self, inst: IrInst) {
         let idx = self.current_block.expect("emit: no active block");
-        self.cb.dbg(|dbg| {
+        debugger::dbg(|dbg| {
             dbg.record_ir_emit();
             dbg.set_source("operation", &format!("{inst}"));
         });
@@ -288,6 +383,17 @@ impl<'a> FunctionBuilder<'a> {
     /// Get the VRegDef for a given VReg.
     pub fn vreg_def(&self, vreg: VReg) -> VRegDef {
         self.vreg_defs[vreg.0 as usize]
+    }
+
+    /// Set a register placement constraint on a VReg.
+    ///
+    /// - `Register::PReg(..)`: the allocator must place this VReg in
+    ///   the given physical register, evicting the current occupant if
+    ///   necessary. Used for calling convention constraints.
+    /// - `Register::VReg(..)`: coalesce — the allocator should try to
+    ///   place this VReg in the same physical register as the target VReg.
+    pub fn set_target(&mut self, vreg: VReg, target: Register) {
+        self.vreg_defs[vreg.0 as usize].target = Some(target);
     }
 
     // --- Debug helpers ---
@@ -306,7 +412,7 @@ impl<'a> FunctionBuilder<'a> {
                 (cfg.label, format_vstack_snapshot(state))
             })
             .collect();
-        self.cb.dbg(|dbg| {
+        debugger::dbg(|dbg| {
             dbg.set_pending("pc", pc);
             dbg.set_pending("label", label);
             for (label, snapshot) in &snapshots {
@@ -316,16 +422,16 @@ impl<'a> FunctionBuilder<'a> {
     }
 
     /// Allocate a temp VReg with no canonical stack slot.
-    pub fn alloc_temp(&mut self, width: Width, value: Value) -> VReg {
+    pub fn alloc_temp(&mut self, width: Width, initial: Option<Operand>) -> VReg {
         let id = VReg(self.next_vreg);
         self.next_vreg += 1;
-        let remat = matches!(value, Value::ConstI32(_) | Value::ConstI64(_));
+
         self.vreg_defs.push(VRegDef {
             id,
             width,
             slot: None,
-            value,
-            remat,
+            initial,
+            target: None,
         });
         self.record_def(id);
         id
@@ -387,14 +493,6 @@ impl<'a> FunctionBuilder<'a> {
                     }
                 }
 
-                if let Some(IrInst::Return { values, .. }) = instructions.last() {
-                    for &v in values {
-                        if !results.contains(&v) {
-                            results.push(v);
-                        }
-                    }
-                }
-
                 IrBlock {
                     id,
                     params,
@@ -403,13 +501,48 @@ impl<'a> FunctionBuilder<'a> {
                     instructions,
                 }
             })
-            .collect();
+            .collect::<Vec<_>>();
+
+        // Fallthrough elimination: wrap trailing Branch instructions
+        // whose target is the immediately following block in Skipped.
+        // We keep the instruction in the list so ir_index stays aligned
+        // with debugger groups.
+        let mut blocks = blocks;
+        for i in 0..blocks.len() {
+            let next_id = blocks.get(i + 1).map(|b| b.id);
+            if let Some(IrInst::Branch { target }) = blocks[i].instructions.last() {
+                if Some(*target) == next_id {
+                    let inst = blocks[i].instructions.pop().unwrap();
+                    blocks[i].instructions.push(IrInst::Skipped(Box::new(inst)));
+                }
+            }
+        }
 
         let func = IRFunction {
             vstacks: self.vstack_configs,
             vreg_defs: self.vreg_defs,
             blocks,
         };
+
+        for block in &func.blocks {
+            let params: Vec<String> = block
+                .params
+                .iter()
+                .map(|vreg| {
+                    let def = &func.vreg_defs[vreg.0 as usize];
+                    format!("{}<{}>", vreg, def.width)
+                })
+                .collect();
+            let results: Vec<String> = block
+                .results
+                .iter()
+                .map(|vreg| {
+                    let def = &func.vreg_defs[vreg.0 as usize];
+                    format!("{}<{}>", vreg, def.width)
+                })
+                .collect();
+            debugger::dbg(|dbg| dbg.set_block_meta(block.id, params, results));
+        }
 
         self.cb.push_function(func);
     }
@@ -453,19 +586,15 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
-    fn alloc_vreg(&mut self, width: Width, slot: CanonSlot, value: Value) -> VReg {
+    fn alloc_vreg(&mut self, width: Width, slot: CanonSlot, initial: Option<Operand>) -> VReg {
         let id = VReg(self.next_vreg);
         self.next_vreg += 1;
-        // VStack-allocated VRegs are NOT rematerializable — their register
-        // contents may be overwritten by ALU results or call returns, making
-        // the VRegDef's `value` field stale. Only temps (alloc_temp) can be
-        // safely rematerialized.
         self.vreg_defs.push(VRegDef {
             id,
             width,
             slot: Some(slot),
-            value,
-            remat: false,
+            initial,
+            target: None,
         });
         id
     }
@@ -479,7 +608,7 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
-    fn push_typed(&mut self, vstack: VStackId, width: Width, value: Value) -> VReg {
+    fn push_typed(&mut self, vstack: VStackId, width: Width, initial: Option<Operand>) -> VReg {
         let cfg = &self.vstack_configs[vstack.0 as usize];
         let label = cfg.label;
         let base_offset = cfg.base_offset;
@@ -496,11 +625,11 @@ impl<'a> FunctionBuilder<'a> {
             size,
         };
 
-        if let Value::VReg(src) = value {
+        if let Some(Operand::VReg(src, _)) = initial {
             self.record_use(src);
         }
 
-        let vreg = self.alloc_vreg(width, slot, value);
+        let vreg = self.alloc_vreg(width, slot, initial);
         self.record_def(vreg);
 
         let base = base_preg(self.vstack_configs[slot.vstack.0 as usize].base);
@@ -509,8 +638,12 @@ impl<'a> FunctionBuilder<'a> {
             base,
             offset: slot.byte_offset,
         });
-        let op = format!("{label}.push {vreg} = {value}");
-        self.cb.dbg(|dbg| dbg.set_source("operation", &op));
+        let init_str = match initial {
+            Some(op) => format!("{op}"),
+            None => "dst".into(),
+        };
+        let op = format!("{label}.push {vreg} = {init_str}");
+        debugger::dbg(|dbg| dbg.set_source("operation", &op));
 
         let vs = self.vstack_mut(vstack);
         let idx = index as usize;
@@ -522,6 +655,37 @@ impl<'a> FunctionBuilder<'a> {
         vs.depth += 1;
 
         vreg
+    }
+
+    /// Peek at a vstack slot by offset from the top (0 = top, 1 = second from top).
+    ///
+    /// Returns the VReg without modifying the vstack. Used by `emit_call`
+    /// and `emit_return` to inspect operands before soft-dropping them.
+    pub fn peek(&self, vstack: VStackId, offset_from_top: usize) -> VReg {
+        let label = self.vstack_configs[vstack.0 as usize].label;
+        let vs = self.vstack_ref(vstack);
+        let depth = vs.depth as usize;
+        assert!(
+            offset_from_top < depth,
+            "peek: offset {offset_from_top} out of bounds (depth={depth}) on vstack '{label}'"
+        );
+        vs.slots[depth - 1 - offset_from_top].expect("peek: slot not defined")
+    }
+
+    /// Drop the top N values from a vstack without emitting any IR.
+    ///
+    /// Used after `peek` + `set_target` to consume args that are handed
+    /// off to a call — the values are "consumed" at the IR level but no
+    /// load/store instructions are needed.
+    pub fn drop_n(&mut self, vstack: VStackId, n: usize) {
+        let label = self.vstack_configs[vstack.0 as usize].label;
+        let vs = self.vstack_mut(vstack);
+        assert!(
+            n <= vs.depth as usize,
+            "drop_n: dropping {n} but vstack '{label}' depth is {}",
+            vs.depth
+        );
+        vs.depth -= n as u32;
     }
 
     /// Pop the top value from a vstack, asserting it matches the expected width.
@@ -546,8 +710,36 @@ impl<'a> FunctionBuilder<'a> {
             offset: slot.byte_offset,
         });
         let op = format!("{label}.pop {vreg}");
-        self.cb.dbg(|dbg| dbg.set_source("operation", &op));
+        debugger::dbg(|dbg| dbg.set_source("operation", &op));
         vreg
+    }
+
+    /// Pop the top value from a vstack into a specific register.
+    ///
+    /// Unlike [`pop`](Self::pop), this emits a `Load` with the given
+    /// register as the destination — bypassing vreg allocation. Used
+    /// for fixed-register values like LR (x30).
+    pub fn pop_into(&mut self, vstack: VStackId, width: Width, dst: Register) {
+        let label = self.vstack_configs[vstack.0 as usize].label;
+        let vs = self.vstack_mut(vstack);
+        assert!(vs.depth > 0, "pop_into: vstack '{label}' is empty");
+        vs.depth -= 1;
+        let vreg = vs.slots[vs.depth as usize].expect("pop_into: slot not defined");
+        let actual_width = self.vreg_defs[vreg.0 as usize].width;
+        assert_eq!(
+            actual_width, width,
+            "pop_into: vstack '{label}' expected {width:?} but top is {actual_width:?}"
+        );
+        let def = &self.vreg_defs[vreg.0 as usize];
+        let slot = def.slot.expect("pop_into on temp vreg (no slot)");
+        let base = base_preg(self.vstack_configs[slot.vstack.0 as usize].base);
+        self.emit(IrInst::Load {
+            dst,
+            base,
+            offset: slot.byte_offset,
+        });
+        let op = format!("{label}.pop_into {dst}");
+        debugger::dbg(|dbg| dbg.set_source("operation", &op));
     }
 }
 

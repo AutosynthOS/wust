@@ -121,10 +121,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 name = "autosynth-backend"
 version = "0.1.0"
 dependencies = [
- "autosynth-ir",
- "autosynth-isa",
  "autosynth-lower",
- "smallvec",
 ]
 
 [[package]]
@@ -148,6 +145,7 @@ dependencies = [
  "autosynth-isa-aarch64",
  "autosynth-isa-riscv64",
  "autosynth-isa-x86_64",
+ "autosynth-lower",
 ]
 
 [[package]]
@@ -3018,7 +3016,12 @@ name = "wust-codegen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autosynth-backend",
+ "autosynth-backend-aarch64",
  "autosynth-codegen",
+ "autosynth-ir",
+ "autosynth-isa",
+ "autosynth-orchestrator",
  "disarm64",
  "libc",
  "wat",

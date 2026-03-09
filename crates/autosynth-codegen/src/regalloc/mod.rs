@@ -1,4 +1,5 @@
 use crate::CodegenError;
+use autosynth_ir::Operand;
 use autosynth_isa::PReg;
 use crate::ir::{VReg, VRegDef};
 
@@ -243,11 +244,12 @@ impl RegCache {
     fn evict_slot(&mut self, idx: usize, vreg_defs: &[VRegDef]) -> Evicted {
         let slot = &mut self.slots[idx];
         let binding = slot.binding.take().expect("evict_slot: slot is empty");
-        let remat = vreg_defs[binding.vreg.0 as usize].remat;
+        let def = &vreg_defs[binding.vreg.0 as usize];
+        let is_const = matches!(def.initial, Some(Operand::ConstI32(_) | Operand::ConstI64(_)));
         Evicted {
             reg: slot.reg,
             vreg: binding.vreg,
-            needs_store: binding.dirty && !remat,
+            needs_store: binding.dirty && !is_const,
         }
     }
 }
@@ -256,7 +258,7 @@ impl RegCache {
 mod tests {
     use super::*;
     use autosynth_isa::Width;
-    use crate::ir::Value;
+    use autosynth_ir::Operand;
 
     fn pool() -> Vec<PReg> {
         vec![PReg(0), PReg(1), PReg(2)]
@@ -268,8 +270,8 @@ mod tests {
                 id: VReg(i as u32),
                 width: Width::W32,
                 slot: None,
-                value: Value::ConstI64(0),
-                remat: false,
+                initial: None,
+                target: None,
             })
             .collect()
     }
@@ -280,8 +282,8 @@ mod tests {
                 id: VReg(i as u32),
                 width: Width::W32,
                 slot: None,
-                value: Value::ConstI32(i as i32),
-                remat: true,
+                initial: Some(Operand::ConstI32(i as i32)),
+                target: None,
             })
             .collect()
     }

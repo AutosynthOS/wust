@@ -1,3 +1,9 @@
+use autosynth_backend_aarch64::Aarch64Backend;
+use autosynth_codegen::Debugger;
+use autosynth_codegen::debugger;
+use autosynth_codegen::disasm::table::Align;
+use wust_codegen::JitModule;
+
 const WAT: &str = r#"
 (module
   (func $fib (export "fib") (param $n i32) (result i32)
@@ -64,37 +70,57 @@ const WAT: &str = r#"
 
 #[test]
 fn fib_lower() -> anyhow::Result<()> {
-    use autosynth_codegen::CodeBuilder;
-    use autosynth_codegen::Debugger;
-    use autosynth_codegen::backend::aarch64::Aarch64Backend;
-
     let bytes = wat::parse_str(WAT)?;
     let module = wust_core::ParsedModule::new(&bytes)?;
-    let mut debugger = Debugger::new();
-    debugger.signature = "fib<0>(i32) -> (i32)".into();
-    debugger.globals = vec![
-        ("g.lb".into(), "x29".into()),
-        ("g.lr".into(), "x30".into()),
-        ("g.fuel".into(), "x0".into()),
-        ("g.ctx".into(), "x1".into()),
-        ("g.sp".into(), "x28".into()),
-    ];
 
-    let mut cb = CodeBuilder::new();
-    cb.attach_debugger(debugger);
+    let mut dbg = Debugger::new();
+    dbg.add_machine_column("addr", Align::Right);
+    dbg.add_machine_column("asm", Align::Left);
+    debugger::install(dbg);
 
-    let mut backend = Aarch64Backend::new();
-    wust_codegen::JitModule::compile_func(&mut cb, &mut backend, 0, &module.funcs)?;
+    type Jit = JitModule<Aarch64Backend>;
+    let _jit = Jit::new(module)?;
 
-    let mut debugger = cb.take_debugger();
-    let ir_func = &cb.functions()[0];
-    let (code, _) = backend.lower_with_disasm(ir_func, debugger.as_mut())?;
-
-    eprintln!("\n{}", debugger.unwrap().render());
-
-    assert!(!code.is_empty(), "lowerer produced no code");
+    let dbg = debugger::take().unwrap();
+    eprintln!("\n{}", dbg.render());
     Ok(())
 }
+
+// Simple test: (i32.add (local.get $x) (i32.const 42))
+// Tests parameter binding, constant folding, ALU, return sequence.
+// #[test]
+// fn add42_orchestrator() -> anyhow::Result<()> {
+//     let wat = r#"
+//     (module
+//       (func $add42 (export "add42") (param $x i32) (result i32)
+//         (i32.add (local.get $x) (i32.const 42))
+//       )
+//     )
+//     "#;
+
+//     let bytes = wat::parse_str(wat)?;
+//     let module = wust_core::ParsedModule::new(&bytes)?;
+
+//     let mut config = autosynth_backend_aarch64::Aarch64Backend::machine_config();
+//     let mut cb = CodeBuilder::new();
+
+//     let mut dbg = Debugger::new();
+//     dbg.signature = "add42<0>(w9<i32>) -> w9<i32>".into();
+//     dbg.add_machine_column("addr", Align::Right);
+//     dbg.add_machine_column("asm", Align::Left);
+//     debugger::install(dbg);
+
+//     let mut orch = wust_codegen::JitModule::new(module);
+
+//     let code = orch.compile(ir_func).map_err(|e| anyhow::anyhow!(e))?;
+
+//     if let Some(dbg) = debugger::take() {
+//         eprintln!("\n{}", dbg.render());
+//     }
+
+//     assert!(!code.is_empty(), "orchestrator produced no code");
+//     Ok(())
+// }
 
 #[test]
 fn fib_jit_base_case() -> anyhow::Result<()> {
@@ -104,7 +130,8 @@ fn fib_jit_base_case() -> anyhow::Result<()> {
     let module = wust_core::ParsedModule::new(&bytes)?;
     let instance = wust_core::Instance::new(&module);
 
-    let jit = wust_codegen::JitModule::new(module.clone())?;
+    type Jit = JitModule<Aarch64Backend>;
+    let jit = Jit::new(module.clone())?;
 
     // fib(1) = 1, base case (no recursion)
     let mut task = wust_core::Task::setup(&instance, "fib", &[wust_core::Val::I32(1)])?;
@@ -133,7 +160,8 @@ fn fib_jit() -> anyhow::Result<()> {
     let module = wust_core::ParsedModule::new(&bytes)?;
     let instance = wust_core::Instance::new(&module);
 
-    let jit = wust_codegen::JitModule::new(module.clone())?;
+    type Jit = JitModule<Aarch64Backend>;
+    let jit = Jit::new(module.clone())?;
     let mut task = wust_core::Task::setup(&instance, "fib", &[wust_core::Val::I32(10)])?;
     task.context.fuel = i64::MAX;
 

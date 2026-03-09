@@ -1,212 +1,352 @@
 //! Orchestrator — drives the backend emitter with register cache decisions.
 //!
 //! The orchestrator walks IR blocks, manages the register cache, and
-//! calls the backend for instruction selection. It owns the code buffer,
-//! patch points, and all mutable compilation state.
+//! calls the backend for instruction selection. It owns the code buffer
+//! and all mutable compilation state.
 //!
-//! The backend never sees calls, branches, or returns — the orchestrator
-//! handles those entirely. The backend only does instruction selection
-//! for ALU, Load, and Store via the [`BackendEmitter`] trait.
+//! The orchestrator's job is simple: walk IR instructions, handle register
+//! cache bookkeeping for stores/loads, and pass everything else to the backend.
 
 mod regcache;
 
 use std::collections::HashMap;
-use std::marker::PhantomData;
 
-use autosynth_backend::BackendEmitter;
-use autosynth_ir::{AluOp, BlockId, FunctionIdx, IrInst, Operand, Register, VReg};
+use autosynth_backend::{BackendEmitter, MachineConfig};
+use autosynth_ir::{
+    BlockId, CanonSlot, FunctionIdx, IRFunction, IrBlock, IrInst, Operand, Register, VReg, VRegDef,
+    VStackConfig,
+};
 use autosynth_isa::{PReg, Width};
 use autosynth_lower::LowerCtx;
 
 use regcache::RegCache;
 
-/// Canonical memory location for a virtual register.
-///
-/// This is where the vreg lives on the stack — the regcache treats
-/// registers as a write-back cache over these locations.
-#[derive(Debug, Clone, Copy)]
-pub struct SpillSlot {
-    /// Base register (e.g. x29 for frame pointer).
-    pub base: PReg,
-    /// Byte offset from the base register.
-    pub offset: u32,
-}
-
-/// Metadata about a virtual register known to the orchestrator.
-pub struct VRegInfo {
-    /// Register width — determines ldr/str size (w-reg vs x-reg).
-    pub width: Width,
-    /// Where this vreg lives in memory. `None` for temps that can't be spilled
-    /// (must be consumed immediately or be rematerializable).
-    pub slot: Option<SpillSlot>,
-    /// Known constant value, if any. Enables immediate folding and
-    /// rematerialization (movz instead of ldr from memory).
-    pub const_value: Option<i64>,
-}
-
-/// A patch point — a location in the code buffer that needs a target address.
-#[derive(Debug)]
-pub enum PatchPoint {
-    /// Conditional or unconditional branch to a block.
-    Branch {
-        /// Offset (in words) into the code buffer.
-        code_offset: usize,
-        target: BlockId,
-    },
-    /// Function call (bl instruction).
-    Call {
-        /// Offset (in words) into the code buffer.
-        code_offset: usize,
-        func_idx: u32,
-    },
-}
-
-/// The orchestrator. Generic over the backend emitter.
+/// The orchestrator — implements [`LowerCtx`] for the backend.
 ///
 /// Walks IR, manages the register cache, emits machine code. The backend
-/// is stateless — the orchestrator calls `B::emit()` for instruction
-/// selection, passing itself as the [`LowerCtx`].
-pub struct Orchestrator<B: BackendEmitter> {
+/// is passed into [`compile`](Self::compile) as a separate `&mut` so
+/// there's no borrow conflict when calling `backend.lower(self, inst)`.
+pub struct Orchestrator {
+    /// Machine configuration — owned, immutable after construction.
+    config: MachineConfig,
     /// Encoded instruction words.
-    code: Vec<u32>,
+    code: Vec<u8>,
     /// Register cache — tracks which vregs are in which physical registers.
     cache: RegCache,
-    /// Per-vreg metadata (width, known constant value).
-    vreg_info: Vec<VRegInfo>,
+    /// Per-vreg metadata, borrowed from the IRFunction.
+    vreg_defs: Vec<VRegDef>,
+    /// Virtual stack configs — needed to resolve canonical slot addresses for spills.
+    vstacks: Vec<VStackConfig>,
     /// Block label → code offset (in words).
     labels: HashMap<BlockId, usize>,
-    /// Locations that need target addresses patched in.
-    patches: Vec<PatchPoint>,
-    _backend: PhantomData<B>,
 }
 
-impl<B: BackendEmitter> Orchestrator<B> {
-    /// Create a new orchestrator with the backend's register pool.
-    pub fn new(vreg_info: Vec<VRegInfo>) -> Self {
-        let config = B::machine_config();
+impl Orchestrator {
+    /// Create a new orchestrator from a pre-configured `MachineConfig`.
+    ///
+    /// The caller reserves registers via `config.reserve()` before
+    /// passing it in. The remaining scratch pool is used for allocation.
+    pub fn new(config: MachineConfig) -> Self {
+        let cache = RegCache::new(config.scratch_pool());
         Self {
+            config,
             code: Vec::with_capacity(64),
-            cache: RegCache::new(&config.pool),
-            vreg_info,
+            cache,
+            vreg_defs: Vec::new(),
+            vstacks: Vec::new(),
             labels: HashMap::new(),
-            patches: Vec::new(),
-            _backend: PhantomData,
         }
     }
 
-    /// Compile a sequence of IR blocks into machine code bytes.
-    pub fn compile(&mut self, blocks: &[(BlockId, Vec<IrInst>)]) -> Result<Vec<u8>, String> {
-        for (block_id, insts) in blocks {
-            self.labels.insert(*block_id, self.code.len());
+    /// The machine configuration (reserved registers, scratch pool).
+    pub fn config(&self) -> &MachineConfig {
+        &self.config
+    }
 
-            if *block_id != BlockId::Entry {
-                self.cache.invalidate_all();
+    /// Compile an IR function into machine code bytes.
+    ///
+    /// The backend is passed separately so there's no borrow conflict
+    /// when calling `backend.lower(self, inst)` — `self` is the LowerCtx
+    /// and `backend` is a disjoint mutable reference.
+    pub fn compile(
+        &mut self,
+        func: &IRFunction,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<Vec<u8>, String> {
+        self.vreg_defs = func.vreg_defs.clone();
+        self.vstacks = func.vstacks.clone();
+
+        let mut ir_index = 0;
+
+        for block in &func.blocks {
+            self.labels.insert(block.id, self.code.len());
+
+            for inst in &block.instructions {
+                autosynth_lower::dbg(|dbg| dbg.begin_ir_inst(ir_index));
+                self.lower_inst(inst, func, backend)?;
+                ir_index += 1;
             }
 
-            let next_block = blocks
-                .iter()
-                .position(|b| b.0 == *block_id)
-                .and_then(|i| blocks.get(i + 1))
-                .map(|b| b.0);
-
-            for inst in insts {
-                self.lower_inst(inst, next_block)?;
-            }
+            backend.flush(self).map_err(|e| format!("{e}"))?;
         }
 
-        self.resolve_patches()?;
+        backend.finalize(self).map_err(|e| format!("{e}"))?;
+
         Ok(self.to_bytes())
     }
 
     /// Dispatch a single IR instruction.
-    fn lower_inst(&mut self, inst: &IrInst, next_block: Option<BlockId>) -> Result<(), String> {
+    ///
+    /// The orchestrator only intercepts Store for register cache
+    /// bookkeeping (param binds, const/alias skips, physical reg stores).
+    /// Everything else passes straight through to the backend.
+    fn lower_inst(
+        &mut self,
+        inst: &IrInst,
+        func: &IRFunction,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<(), String> {
         match inst {
-            // Backend handles instruction selection for these.
-            IrInst::Alu { .. } | IrInst::Load { .. } | IrInst::Store { .. } => {
-                let bytes = B::emit(self, inst.clone())?;
-                self.push_bytes(&bytes);
+            // VReg-source stores need cache bookkeeping (param binds,
+            // const/alias skips). Everything else passes to the backend.
+            IrInst::Store { src: src @ Operand::VReg(..), .. } => {
+                self.lower_store(src, func, backend)
+            }
+
+            IrInst::Load {
+                dst: Register::VReg(vreg, _),
+                ..
+            } => {
+                // VReg loads are only real memory ops when the value isn't
+                // already in the cache. If it's cached, skip the load.
+                if self.cache.lookup(*vreg).is_some() {
+                    return Ok(());
+                }
+                let def = &self.vreg_defs[vreg.0 as usize];
+                if matches!(def.initial, Some(Operand::PReg(..))) {
+                    backend
+                        .lower(self, inst.clone())
+                        .map_err(|e| format!("{e}"))
+                } else {
+                    Ok(())
+                }
+            }
+
+            // After a call, all scratch registers are clobbered.
+            IrInst::Call { .. } => {
+                backend
+                    .lower(self, inst.clone())
+                    .map_err(|e| format!("{e}"))?;
+                self.cache.invalidate_all();
                 Ok(())
             }
 
-            // Orchestrator handles control flow and calls directly.
-            IrInst::Branch { target } => {
-                if Some(*target) == next_block {
-                    return Ok(()); // fallthrough, no code needed
-                }
-                self.emit_branch(*target)
-            }
-            IrInst::BrIf {
-                cond: _,
-                block_if: _,
-                block_else,
-            } => self.emit_br_if(*block_else),
-            IrInst::Call {
-                func_idx,
-                args,
-                results,
-                frame_advance,
-            } => self.emit_call(func_idx, args, results, *frame_advance),
-            IrInst::Return { values, flush } => self.emit_return(values, *flush),
+            IrInst::Skipped(_) => Ok(()),
+
+            _ => backend
+                .lower(self, inst.clone())
+                .map_err(|e| format!("{e}")),
         }
     }
 
-    fn emit_branch(&mut self, target: BlockId) -> Result<(), String> {
-        todo!("emit_branch({target})")
-    }
-
-    fn emit_br_if(&mut self, block_else: BlockId) -> Result<(), String> {
-        todo!("emit_br_if(else={block_else})")
-    }
-
-    fn emit_call(
+    /// Handle a Store instruction (stack push) semantically.
+    ///
+    /// The meaning depends on the VRegDef's initial value:
+    /// - PReg: bind the vreg to that physical register (params, LR stores)
+    /// - ConstI32/I64: record as rematerializable, don't emit anything
+    /// - VReg: alias — the new vreg shares the source's register
+    /// - None: no-op (result written by a subsequent ALU/Call)
+    fn lower_store(
         &mut self,
-        func_idx: &FunctionIdx,
-        args: &[VReg],
-        results: &[VReg],
-        frame_advance: u32,
+        src: &autosynth_ir::Operand,
+        func: &IRFunction,
+        backend: &mut impl BackendEmitter,
     ) -> Result<(), String> {
-        todo!("emit_call({func_idx}, {frame_advance})")
-    }
-
-    fn emit_return(&mut self, values: &[VReg], flush: bool) -> Result<(), String> {
-        todo!("emit_return(flush={flush})")
-    }
-
-    /// Push raw bytes into the code buffer (must be 4-byte aligned).
-    fn push_bytes(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks_exact(4) {
-            let word = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            self.code.push(word);
+        let vreg = match src {
+            autosynth_ir::Operand::VReg(v, _) => *v,
+            _ => return Ok(()), // non-vreg stores handled elsewhere
+        };
+        let def = &self.vreg_defs[vreg.0 as usize];
+        match def.initial {
+            Some(Operand::PReg(preg, _)) => {
+                self.cache.bind(vreg, preg);
+            }
+            Some(Operand::ConstI32(_) | Operand::ConstI64(_)) => {
+                // Lazy: don't materialize yet. The regcache will handle it
+                // when someone actually needs this vreg in a register.
+            }
+            Some(Operand::VReg(src, _)) => {
+                // Transfer cache ownership: the destination vreg takes
+                // over the source's register. This ensures eviction
+                // spills to the destination's canonical slot (e.g. a
+                // local slot), not the source's (e.g. an operand slot).
+                if self.cache.lookup(src).is_some() {
+                    self.cache.alias(vreg, src);
+                    // Clear the VReg chain so that after cache
+                    // invalidation, resolve_vreg loads from this vreg's
+                    // own canonical slot instead of chaining to the
+                    // source (whose slot may be on a different vstack).
+                    self.vreg_defs[vreg.0 as usize].initial = None;
+                }
+            }
+            None => {} // destination — written by subsequent instruction
         }
+        Ok(())
     }
 
-    fn resolve_patches(&mut self) -> Result<(), String> {
-        todo!("resolve_patches")
+    /// Resolve a canonical slot to (base PReg, byte offset from base).
+    fn slot_address(&self, slot: &CanonSlot) -> (PReg, u32) {
+        let vstack = &self.vstacks[slot.vstack.0 as usize];
+        let base_preg = match vstack.base {
+            Register::PReg(preg, _) => preg,
+            Register::VReg(_, _) => panic!("vstack base must be a physical register"),
+        };
+        (base_preg, slot.byte_offset)
+    }
+
+    /// Emit a spill store for an evicted dirty vreg via the backend.
+    fn emit_eviction_store(
+        &mut self,
+        evicted_vreg: VReg,
+        from_preg: PReg,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<(), String> {
+        let def = &self.vreg_defs[evicted_vreg.0 as usize];
+
+        // Constants are rematerializable — no store needed.
+        if matches!(
+            def.initial,
+            Some(Operand::ConstI32(_) | Operand::ConstI64(_))
+        ) {
+            return Ok(());
+        }
+
+        let slot = def.slot.as_ref().unwrap_or_else(|| {
+            panic!("eviction of {evicted_vreg}: no canonical slot and not rematerializable")
+        });
+        let (base, offset) = self.slot_address(slot);
+        backend
+            .lower(
+                self,
+                IrInst::Store {
+                    src: Operand::PReg(from_preg, def.width),
+                    base,
+                    offset,
+                },
+            )
+            .map_err(|e| format!("{e}"))?;
+        // Flush immediately — the store must land before the instruction
+        // that overwrites the register (e.g. the sub that triggered eviction).
+        backend.flush(self).map_err(|e| format!("{e}"))
     }
 
     fn to_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.code.len() * 4);
-        for &word in &self.code {
-            out.extend_from_slice(&word.to_le_bytes());
-        }
-        out
+        self.code.clone()
     }
 }
 
-impl<B: BackendEmitter> LowerCtx for Orchestrator<B> {
+impl LowerCtx for Orchestrator {
     fn const_value(&self, vreg: VReg) -> Option<i64> {
-        self.vreg_info.get(vreg.0 as usize)?.const_value
+        let def = self.vreg_defs.get(vreg.0 as usize)?;
+        match def.initial {
+            Some(Operand::ConstI32(n)) => Some(n as i64),
+            Some(Operand::ConstI64(n)) => Some(n),
+            Some(Operand::VReg(src, _)) => self.const_value(src),
+            _ => None,
+        }
     }
 
-    fn materialize_const(&mut self, val: i64, width: Width) -> (PReg, Width) {
-        todo!("materialize_const({val}, {width})")
+    fn materialize_const(&mut self, _val: i64, width: Width) -> (PReg, Width) {
+        todo!("materialize_const({_val}, {width})")
     }
 
-    fn resolve_vreg(&mut self, vreg: VReg) -> (PReg, Width) {
-        todo!("resolve_vreg({vreg})")
+    fn resolve_vreg(&mut self, vreg: VReg, backend: &mut impl BackendEmitter) -> (PReg, Width) {
+        let def = self.vreg_defs[vreg.0 as usize];
+        // If this vreg is already cached (e.g. via alias transfer), use it
+        // directly — don't chain through to the source vreg.
+        if let Some(preg) = self.cache.lookup(vreg) {
+            return (preg, def.width);
+        }
+        // Follow VReg chain — aliases that weren't transferred (source
+        // wasn't cached at store time) resolve through the chain.
+        if let Some(Operand::VReg(src, _)) = def.initial {
+            return self.resolve_vreg(src, backend);
+        }
+        let (preg, needs_load) = self.cache.ensure(vreg);
+        if needs_load {
+            let slot = def.slot.unwrap_or_else(|| {
+                panic!("resolve_vreg: {vreg} needs load but has no canonical slot")
+            });
+            let (base, offset) = (
+                match self.vstacks[slot.vstack.0 as usize].base {
+                    Register::PReg(p, _) => p,
+                    _ => panic!("vstack base must be a physical register"),
+                },
+                slot.byte_offset,
+            );
+            backend
+                .lower(
+                    self,
+                    IrInst::Load {
+                        dst: Register::PReg(preg, def.width),
+                        base,
+                        offset,
+                    },
+                )
+                .expect("reload failed");
+            backend.flush(self).expect("reload flush failed");
+        }
+        (preg, def.width)
     }
 
-    fn define_vreg(&mut self, vreg: VReg) -> (PReg, Width) {
-        todo!("define_vreg({vreg})")
+    fn define_vreg(&mut self, vreg: VReg, backend: &mut impl BackendEmitter) -> (PReg, Width) {
+        let def = self.vreg_defs[vreg.0 as usize];
+        let width = def.width;
+        let preg = match def.target {
+            Some(Register::PReg(target, _)) => {
+                if let Some((evicted_vreg, dirty)) = self.cache.define_at(vreg, target) {
+                    if dirty {
+                        self.emit_eviction_store(evicted_vreg, target, backend)
+                            .expect("eviction store failed");
+                    }
+                }
+                target
+            }
+            Some(Register::VReg(src, _)) => {
+                let src_preg = self
+                    .cache
+                    .lookup(src)
+                    .unwrap_or_else(|| panic!("define_vreg: coalesce target {src} not in cache"));
+                if let Some((evicted_vreg, dirty)) = self.cache.define_at(vreg, src_preg) {
+                    if dirty {
+                        self.emit_eviction_store(evicted_vreg, src_preg, backend)
+                            .expect("eviction store failed");
+                    }
+                }
+                src_preg
+            }
+            None => self.cache.define(vreg),
+        };
+        (preg, width)
+    }
+
+    fn emit_code(&mut self, bytes: &[u8]) -> usize {
+        let offset = self.code.len();
+        autosynth_lower::dbg(|dbg| dbg.set_machine("addr", &format!("{offset:04x}")));
+        self.code.extend_from_slice(bytes);
+        offset
+    }
+
+    fn patch_code(&mut self, offset: usize, bytes: &[u8]) {
+        self.code[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn resolve_block(&self, block: BlockId) -> Option<usize> {
+        self.labels.get(&block).copied()
+    }
+
+    fn resolve_func(&self, _func_idx: FunctionIdx) -> Option<usize> {
+        // For now, all calls are self-recursive — function body starts at 0.
+        Some(0)
     }
 }

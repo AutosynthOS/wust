@@ -27,10 +27,10 @@ mod regalloc;
 pub use builder::{CodeBuilder, FunctionBuilder, VStack};
 pub use debugger::Debugger;
 pub use ir::block::BlockId;
-pub use ir::function::{FunctionIdx, IsaReg};
+pub use ir::function::FunctionIdx;
 pub use ir::instruction::{AluOp, CompOp, IrInst, Operand};
 pub use autosynth_isa::Width;
-pub use ir::{Register, VReg, VStackId, Value};
+pub use ir::{Register, VReg, VStackId};
 
 /// Errors that can occur during code generation.
 #[derive(Debug)]
