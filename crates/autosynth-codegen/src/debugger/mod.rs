@@ -16,9 +16,11 @@
 
 use std::collections::HashMap;
 
-use crate::disasm::boxes::{BlockBox, FunctionBox};
-use crate::disasm::table::{Align, Column, Row, Table};
-use crate::ir::block::BlockId;
+mod disasm;
+
+use autosynth_ir::BlockId;
+use disasm::boxes::{BlockBox, FunctionBox};
+pub use disasm::table::{Align, Column, Row, Table};
 
 /// Install a [`Debugger`] as the thread-local debug sink.
 ///

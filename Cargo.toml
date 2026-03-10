@@ -11,9 +11,7 @@ members = [
     "crates/autosynth-codegen",
     "crates/autosynth-ir",
     "crates/autosynth-lower",
-    "crates/autosynth-backend",
     "crates/autosynth-backend-aarch64",
-    "crates/autosynth-orchestrator",
     "crates/plasma",
     "crates/plasma_hello",
 ]

@@ -9,4 +9,4 @@ pub(crate) mod code_builder;
 mod function_builder;
 
 pub use code_builder::CodeBuilder;
-pub use function_builder::{FunctionBuilder, VStack};
+pub use function_builder::FunctionBuilder;

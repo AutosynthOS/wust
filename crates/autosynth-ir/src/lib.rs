@@ -25,79 +25,6 @@ impl fmt::Display for VReg {
     }
 }
 
-/// A register — either virtual (pre-allocation) or physical (post-allocation).
-///
-/// Carries a [`Width`] so the backend knows whether to use 32-bit or
-/// 64-bit instruction forms without querying external metadata.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Register {
-    VReg(VReg, Width),
-    PReg(PReg, Width),
-}
-
-impl Register {
-    pub fn width(&self) -> Width {
-        match self {
-            Register::VReg(_, w) | Register::PReg(_, w) => *w,
-        }
-    }
-}
-
-impl fmt::Display for Register {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Register::VReg(v, _) => write!(f, "{v}"),
-            Register::PReg(p, _) => write!(f, "p{}", p.0),
-        }
-    }
-}
-
-/// An instruction operand — a register or a compile-time constant.
-///
-/// Resolution methods (`try_imm_or_preg`, `into_preg`) are provided
-/// by `autosynth-lower` since they require a [`LowerCtx`].
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Operand {
-    /// A virtual register — has a canonical stack slot, goes through the cache.
-    VReg(VReg, Width),
-    /// A physical register — already assigned (fuel, frame pointer, etc.).
-    PReg(PReg, Width),
-    /// A constant 32-bit integer.
-    ConstI32(i32),
-    /// A constant 64-bit integer.
-    ConstI64(i64),
-}
-
-impl Operand {
-    pub fn width(&self) -> Width {
-        match self {
-            Operand::VReg(_, w) | Operand::PReg(_, w) => *w,
-            Operand::ConstI32(_) => Width::W32,
-            Operand::ConstI64(_) => Width::W64,
-        }
-    }
-}
-
-impl fmt::Display for Operand {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Operand::VReg(v, _) => write!(f, "{v}"),
-            Operand::PReg(p, _) => write!(f, "p{}", p.0),
-            Operand::ConstI32(n) => write!(f, "#{n}"),
-            Operand::ConstI64(n) => write!(f, "#{n}"),
-        }
-    }
-}
-
-impl From<Register> for Operand {
-    fn from(r: Register) -> Self {
-        match r {
-            Register::PReg(p, w) => Operand::PReg(p, w),
-            Register::VReg(v, w) => Operand::VReg(v, w),
-        }
-    }
-}
-
 /// Identifies a basic block within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BlockId {
@@ -278,21 +205,25 @@ impl fmt::Display for AluOp {
 
 /// An IR instruction in the function's instruction stream.
 ///
-/// Instructions operate on [`Operand`]s — virtual registers, physical
-/// registers, or inline immediates. The backend lowerer resolves virtual
-/// registers through the register cache and emits immediates directly.
+/// Instructions operate on [`VReg`]s. The backend lowerer resolves virtual
+/// registers through the register cache to get physical registers or
+/// constants, selecting immediate vs register forms accordingly.
 #[derive(Debug, Clone)]
 pub enum IrInst {
     /// Arithmetic, logic, or comparison: dst = lhs op rhs.
     ///
+    /// All operands are VRegs. The backend resolves them through the
+    /// register cache — constants fold as immediates when possible,
+    /// physical register bindings resolve directly.
+    ///
     /// For comparison ops (Eq, Ne, LtS, etc.), the result lives in CPU
-    /// flags — `dst` is typically the zero register (PReg). The subsequent
-    /// [`BrIf`](IrInst::BrIf) consumes the flags via a condition code.
+    /// flags — `dst` is typically a VReg bound to the zero register.
+    /// The subsequent [`BrIf`](IrInst::BrIf) consumes the flags.
     Alu {
         op: AluOp,
-        dst: Register,
-        lhs: Operand,
-        rhs: Operand,
+        dst: VReg,
+        lhs: VReg,
+        rhs: VReg,
     },
 
     /// Conditional branch — branch based on a preceding comparison.
@@ -310,18 +241,22 @@ pub enum IrInst {
     Branch { target: BlockId },
 
     /// Function call (branch-and-link to another function).
-    Call { func_idx: FunctionIdx },
+    Call {
+        func_idx: FunctionIdx,
+    },
 
     /// Load from memory: dst = [base + offset].
     Load {
-        dst: Register,
+        dst: PReg,
+        width: Width,
         base: PReg,
         offset: u32,
     },
 
     /// Store to memory: [base + offset] = src.
     Store {
-        src: Operand,
+        src: PReg,
+        width: Width,
         base: PReg,
         offset: u32,
     },
@@ -332,11 +267,16 @@ pub enum IrInst {
     /// and flushing dirty state before emitting this.
     Return,
 
-    /// Register-to-register move: dst = src.
+    /// Physical register-to-register move: dst = src.
     ///
     /// Used by the orchestrator for calling convention setup (moving
     /// values into/out of argument registers).
-    Move { dst: Register, src: Register },
+    Move {
+        dst: PReg,
+        dst_width: Width,
+        src: PReg,
+        src_width: Width,
+    },
 
     /// An instruction that was eliminated during optimization (e.g.
     /// fallthrough branch elimination). Kept in the instruction list
@@ -344,29 +284,41 @@ pub enum IrInst {
     Skipped(Box<IrInst>),
 }
 
-/// Index into the function builder's vstack table.
+/// Index into the virtual region table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VStackId(pub u32);
+pub struct VRegionId(pub u32);
 
-
-/// Canonical memory location for a VReg — where it lives on the stack.
+/// Canonical memory location for a VReg — where it lives in a virtual region.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CanonSlot {
-    /// Which virtual stack this slot belongs to.
-    pub vstack: VStackId,
-    /// Slot index within that vstack.
+    /// Which virtual region this slot belongs to.
+    pub region: VRegionId,
+    /// Slot index within that region.
     pub index: u32,
-    /// Byte offset from the vstack's base (base_reg + base_offset + slot_offset).
+    /// Byte offset from the region's base (base_reg + base_offset + byte_offset).
     pub byte_offset: u32,
     /// Size in bytes (4 for i32/f32, 8 for i64/f64, 16 for v128).
     pub size: u8,
+}
+
+/// How a VReg gets its initial value.
+///
+/// Width is always derived from the VRegDef — never stored here.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum VInit {
+    /// A compile-time constant (sign-extended to 64 bits).
+    Const(i64),
+    /// Arrives in a physical register (function params, call results).
+    PReg(PReg),
+    /// Copies value from another VReg (local assignments, operand forwarding).
+    CopyOf(VReg),
 }
 
 /// Metadata for a virtual register definition.
 ///
 /// Each VReg has a unique id, a width that determines register size and
 /// memory layout, an optional canonical stack slot, and an optional
-/// initial operand describing how it gets its value.
+/// initial value describing how it gets its value.
 ///
 /// When `slot` is `None`, the VReg is a **temp** — it has no canonical
 /// memory location and cannot be spilled. Temps must be either consumed
@@ -380,29 +332,27 @@ pub struct VRegDef {
     pub width: Width,
     /// Canonical memory location on a virtual stack, or `None` for temps.
     pub slot: Option<CanonSlot>,
-    /// Initial value of this VReg, or `None` if written by an instruction
+    /// How this VReg gets its value, or `None` if written by an instruction
     /// (ALU result, call return, etc.).
-    pub initial: Option<Operand>,
-    /// Register placement constraint for the allocator.
-    /// - `Some(PReg(..))`: must be in this physical register (CC constraints).
-    /// - `Some(VReg(..))`: coalesce — try to share the same physical register.
+    pub initial: Option<VInit>,
+    /// Physical register constraint for the allocator.
+    /// - `Some(preg)`: must be placed in this physical register (CC constraints).
     /// - `None`: allocator chooses freely.
-    pub target: Option<Register>,
+    pub target: Option<PReg>,
 }
 
-/// Immutable configuration of a virtual stack — anchored to a register + offset.
+/// A named region of memory anchored to a register + offset.
 ///
-/// This is the part of a vstack that never changes: which register it's
-/// relative to and where it starts. The mutable state (depth, slot
-/// assignments) lives on the block builder.
+/// Used for both stack-like regions (push/pop) and struct-like regions
+/// (indexed field access). The access pattern is determined by which
+/// builder methods the caller uses, not by this config.
 #[derive(Debug, Clone)]
-pub struct VStackConfig {
-    pub id: VStackId,
-    /// Display label for this stack (e.g. "locals", "operands").
+pub struct VRegion {
+    /// Display label (e.g. "locals", "operands").
     pub label: &'static str,
-    /// The register this stack is relative to (always Phys in practice).
-    pub base: Register,
-    /// Byte offset from the base register to the start of this stack.
+    /// The physical register this region is relative to.
+    pub base: PReg,
+    /// Byte offset from the base register to the start of this region.
     pub base_offset: u32,
 }
 
@@ -412,8 +362,8 @@ pub struct VStackConfig {
 /// Blocks have their params, results, and successors computed.
 #[derive(Debug)]
 pub struct IRFunction {
-    /// Virtual stack configurations (base register + offset per vstack).
-    pub vstacks: Vec<VStackConfig>,
+    /// Virtual region configurations, indexed by VRegionId.
+    pub regions: Vec<VRegion>,
     /// All VReg definitions, indexed by VReg id.
     pub vreg_defs: Vec<VRegDef>,
     /// All blocks with analyzed control flow.
@@ -462,14 +412,14 @@ impl fmt::Display for IrInst {
             IrInst::Call { func_idx } => {
                 write!(f, "call {func_idx}")
             }
-            IrInst::Load { dst, base, offset } => {
-                write!(f, "{dst} = load [p{}, #{offset}]", base.0)
+            IrInst::Load { dst, base, offset, .. } => {
+                write!(f, "p{} = load [p{}, #{offset}]", dst.0, base.0)
             }
-            IrInst::Store { src, base, offset } => {
-                write!(f, "store [p{}, #{offset}], {src}", base.0)
+            IrInst::Store { src, base, offset, .. } => {
+                write!(f, "store [p{}, #{offset}], p{}", base.0, src.0)
             }
             IrInst::Return => write!(f, "ret"),
-            IrInst::Move { dst, src } => write!(f, "{dst} = mov {src}"),
+            IrInst::Move { dst, src, .. } => write!(f, "p{} = mov p{}", dst.0, src.0),
             IrInst::Skipped(inner) => write!(f, "~{inner}"),
         }
     }

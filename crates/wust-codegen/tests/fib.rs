@@ -1,7 +1,8 @@
 use autosynth_backend_aarch64::Aarch64Backend;
-use autosynth_codegen::Debugger;
-use autosynth_codegen::debugger;
-use autosynth_codegen::disasm::table::Align;
+use autosynth_codegen::{
+    Align,
+    debugger::{self, Debugger},
+};
 use wust_codegen::JitModule;
 
 const WAT: &str = r#"

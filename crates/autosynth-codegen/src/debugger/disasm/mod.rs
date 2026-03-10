@@ -20,7 +20,7 @@ mod render;
 /// Column-aligned table renderer with sparse cells.
 pub mod table;
 
-use crate::ir::block::BlockId;
+use autosynth_ir::BlockId;
 
 /// Metadata collected during lowering for disassembly rendering.
 ///

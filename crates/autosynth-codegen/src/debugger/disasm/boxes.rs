@@ -6,7 +6,7 @@
 //! they just draw boxes, tables, and text.
 
 use super::table::Table;
-use crate::ir::block::BlockId;
+use autosynth_ir::BlockId;
 
 /// A block visualization with single-line border (`┌──┐`).
 ///

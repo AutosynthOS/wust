@@ -1,7 +1,14 @@
-use crate::ir::VReg;
-use crate::ir::VStackMut;
-use crate::ir::block::BlockId;
-use crate::ir::instruction::IrInst;
+use autosynth_ir::{BlockId, IrInst, VReg};
+
+/// Mutable vstack state — depth and slot assignments.
+///
+/// This is the per-block part of a vstack. It gets cloned at block
+/// boundaries (branches snapshot it onto target blocks).
+#[derive(Debug, Clone)]
+pub struct VStackMut {
+    /// Slot assignments (index → VReg). Length is the depth.
+    pub slots: Vec<VReg>,
+}
 
 /// Builder for a single basic block.
 ///

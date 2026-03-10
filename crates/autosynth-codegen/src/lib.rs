@@ -5,66 +5,18 @@
 //! trait for lowering to native machine code. It knows nothing about any
 //! specific language or runtime — the caller decides call conventions, frame
 //! layouts, and register roles.
-//!
-//! # Crate structure
-//!
-//! - [`ir`] — intermediate representation types (functions, blocks, instructions, registers).
-//! - [`backend`] — the [`BackendEmitter`](backend::BackendEmitter) trait and arch-specific implementations.
-//! - [`FunctionBuilder`] — incremental construction of [`ir::function::IRFunction`] via virtual stacks.
-//! - [`CodeBuilder`] — collects finalized functions from one or more builders.
 
-/// Backend trait and architecture-specific lowerers.
-pub mod backend;
 mod builder;
 /// Debug trace collector for the codegen pipeline.
 pub mod debugger;
-/// Disassembly metadata, register renames, and tree-style rendering.
-pub mod disasm;
-/// Intermediate representation types: registers, instructions, blocks, and functions.
-pub mod ir;
-mod regalloc;
+/// Orchestrator — drives the backend with register cache decisions.
+mod orchestrator;
+/// Register cache — write-back cache over canonical wasm stack slots.
+pub mod regcache;
 
-pub use builder::{CodeBuilder, FunctionBuilder, VStack};
-pub use debugger::Debugger;
-pub use ir::block::BlockId;
-pub use ir::function::FunctionIdx;
-pub use ir::instruction::{AluOp, CompOp, IrInst, Operand};
+pub use autosynth_ir::{AluOp, BlockId, CompOp, FunctionIdx, IrInst, VInit, VReg, VRegion, VRegionId};
 pub use autosynth_isa::Width;
-pub use ir::{Register, VReg, VStackId};
-
-/// Errors that can occur during code generation.
-#[derive(Debug)]
-pub enum CodegenError {
-    /// All physical registers are in use and eviction is not yet implemented.
-    RegisterExhaustion,
-    /// A branch target label was never defined.
-    UnresolvedLabel(BlockId),
-    /// An immediate offset exceeds the instruction encoding range.
-    OffsetOutOfRange { offset: u32, max: u32 },
-    /// A virtual register appeared where only physical registers are valid.
-    InvalidRegister(String),
-}
-
-impl std::fmt::Display for CodegenError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            CodegenError::RegisterExhaustion => {
-                write!(
-                    f,
-                    "register exhaustion: no free registers (eviction not yet implemented)"
-                )
-            }
-            CodegenError::UnresolvedLabel(id) => {
-                write!(f, "unresolved label: {id:?}")
-            }
-            CodegenError::OffsetOutOfRange { offset, max } => {
-                write!(f, "offset {offset} out of range (max {max})")
-            }
-            CodegenError::InvalidRegister(msg) => {
-                write!(f, "invalid register: {msg}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CodegenError {}
+pub use builder::{CodeBuilder, FunctionBuilder};
+pub use debugger::{Align, Debugger};
+pub use orchestrator::Orchestrator;
+pub use regcache::{PendingStore, RegCache, ResolveResult};

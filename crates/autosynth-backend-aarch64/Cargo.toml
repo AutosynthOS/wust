@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-autosynth-backend = { path = "../autosynth-backend" }
 autosynth-ir = { path = "../autosynth-ir" }
 autosynth-isa = { path = "../autosynth-isa" }
 autosynth-isa-aarch64 = { path = "../autosynth-isa-aarch64" }

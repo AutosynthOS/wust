@@ -62,14 +62,17 @@ pub struct PReg(pub u8);
 pub enum IsaReg {
     /// The platform's frame pointer register (e.g. x29 on aarch64).
     FramePointer,
-    /// The platform's stack pointer register (e.g. x28 as software SP on aarch64).
+    /// The platform's stack pointer register (e.g. sp (x31) on aarch64).
     StackPointer,
     /// The platform's return address / link register (e.g. x30 on aarch64).
     ReturnAddress,
-    /// A general-purpose 64-bit register, auto-allocated from the remaining pool.
-    /// Positive indexes allocate from the start (0, 1, 2...),
-    /// negative indexes allocate from the end (-1, -2, -3...).
-    Alloc64(i8),
+    /// A platform-reserved register that must never be used by generated code
+    /// (e.g. x18 on aarch64, reserved by macOS for thread-local state).
+    PlatformReserved,
+    /// Allocate from the front of the remaining pool.
+    FromStart,
+    /// Allocate from the end of the remaining pool.
+    FromEnd,
 }
 
 /// Result of trying to fold an operand as an immediate.
@@ -95,5 +98,5 @@ pub enum PRegOr<T> {
     /// The operand was folded into an immediate value.
     Imm(T),
     /// The operand is in a physical register.
-    PReg(PReg),
+    PReg(PReg, Width),
 }

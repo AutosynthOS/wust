@@ -12,7 +12,7 @@ use wust_core::{FRAME_HEADER_SIZE, FuncMeta, Outcome, slot_size};
 /// The trampoline bridges the inline-asm calling convention to the
 /// JIT function body:
 ///
-/// 1. Save lr on fibre stack (x28)
+/// 1. Save lr on fibre stack (sp)
 /// 2. Convert x29 from wasm_fp.ptr to locals base (g.lb)
 /// 3. Load parameters from local slots into x9+
 /// 4. bl to function body
@@ -24,8 +24,8 @@ pub fn emit_entry_trampoline(func: &FuncMeta) -> Vec<u8> {
     let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
     let mut words: Vec<u32> = Vec::with_capacity(16);
 
-    // str x30, [x28, #-16]!   — save lr on fibre stack (16-byte aligned)
-    words.push(encode_str_pre(30, 28, -16));
+    // str x30, [sp, #-16]!   — save lr on fibre stack (16-byte aligned)
+    words.push(encode_str_pre(30, 31, -16));
 
     // sub x29, x29, #locals_header_size  — convert to locals base
     words.push(encode_sub_imm_x(29, 29, locals_header_size));
@@ -59,8 +59,8 @@ pub fn emit_entry_trampoline(func: &FuncMeta) -> Vec<u8> {
         result_offset += slot_size(*ty) as u32 * 4;
     }
 
-    // ldr x30, [x28], #16  — restore lr from fibre stack
-    words.push(encode_ldr_post(30, 28, 16));
+    // ldr x30, [sp], #16  — restore lr from fibre stack
+    words.push(encode_ldr_post(30, 31, 16));
 
     // ret x30
     words.push(encode_ret(30));
@@ -82,9 +82,9 @@ pub fn emit_entry_trampoline(func: &FuncMeta) -> Vec<u8> {
 /// Call the JIT entry trampoline with the appropriate register setup.
 ///
 /// Register convention on entry to trampoline:
-/// - x0  = fuel counter (g.fuel)
+/// - x27 = fuel counter (g.fuel)
 /// - x29 = wasm_fp.ptr (operand base, past header)
-/// - x28 = fibre stack pointer
+/// - sp  = fibre stack pointer
 ///
 /// The trampoline converts x29 to locals base, loads params,
 /// calls the function body, stores results, and returns.
@@ -97,7 +97,7 @@ pub fn call_trampoline(trampoline_ptr: *const u8, ctx: &mut wust_core::Context) 
 
     unsafe {
         std::arch::asm!(
-            // Save host callee-saved registers.
+            // Save host callee-saved registers on host stack.
             "stp x29, x30, [sp, #-16]!",
             "stp x28, x27, [sp, #-16]!",
             "stp x26, x25, [sp, #-16]!",
@@ -105,24 +105,35 @@ pub fn call_trampoline(trampoline_ptr: *const u8, ctx: &mut wust_core::Context) 
             "stp x22, x21, [sp, #-16]!",
             "stp x20, x19, [sp, #-16]!",
 
-            // Save ctx pointer on native stack so it survives across the JIT
-            // call (any register may be clobbered by the JIT).
+            // Save ctx pointer on host stack.
             "str {ctx}, [sp, #-16]!",
 
             // Load JIT state from context.
-            "ldr x27, [{ctx}, #{fuel}]",
+            // fuel=x28, ctx=x27, fp=x29 (matches JIT register assignments).
+            "ldr x28, [{ctx}, #{fuel}]",
             "ldr x29, [{ctx}, #{fp}]",
-            "ldr x28, [{ctx}, #{fibre_sp}]",
 
-            // Call the entry trampoline.
+            // Switch to fibre stack: save host SP on fibre stack, then swap.
+            // Use x1 as temp for both host sp and fibre sp.
+            "mov x1, sp",                           // x1 = host sp
+            "ldr x2, [{ctx}, #{fibre_sp}]",         // x2 = fibre sp
+            "str x1, [x2, #-16]!",                 // push host sp onto fibre stack
+            "mov sp, x2",                           // switch to fibre stack
+
+            // Call the entry trampoline (sp = fibre stack).
             "blr {code}",
 
-            // After JIT returns: x27 = fuel, x29 = wasm_fp, x28 = fibre_sp.
-            // Reload ctx pointer from stack, then store JIT state back.
-            "ldr x1, [sp], #16",
-            "str x27, [x1, #{fuel}]",
-            "str x29, [x1, #{fp}]",
-            "str x28, [x1, #{fibre_sp}]",
+            // After JIT returns: sp = fibre stack (trampoline popped its LR).
+            // Pop host sp from fibre stack.
+            "ldr x1, [sp], #16",                    // x1 = host sp
+            "mov x2, sp",                           // x2 = current fibre sp
+            "mov sp, x1",                           // restore host sp
+
+            // Reload ctx from host stack, store JIT state back.
+            "ldr x3, [sp], #16",
+            "str x28, [x3, #{fuel}]",
+            "str x29, [x3, #{fp}]",
+            "str x2, [x3, #{fibre_sp}]",
 
             // Restore host callee-saved registers.
             "ldp x20, x19, [sp], #16",
@@ -138,8 +149,8 @@ pub fn call_trampoline(trampoline_ptr: *const u8, ctx: &mut wust_core::Context) 
             fp = const WASM_FP,
             fibre_sp = const FIBRE_SP,
             // Clobbers: all caller-saved registers the JIT might use.
-            out("x0") _, out("x1") _, out("x2") _,
-            out("x3") _, out("x4") _, out("x5") _,
+            out("x0") _, out("x1") _, out("x2") _, out("x3") _,
+            out("x4") _, out("x5") _,
             out("x6") _, out("x7") _, out("x8") _,
             out("x9") _, out("x10") _, out("x11") _,
             out("x12") _, out("x13") _, out("x14") _,

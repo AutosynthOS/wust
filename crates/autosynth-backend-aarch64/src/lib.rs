@@ -4,12 +4,14 @@
 //! It does NOT manage register allocation, spilling, or materialization.
 //! All operand resolution goes through [`autosynth_lower::LowerCtx`].
 
-use autosynth_backend::{BackendEmitter, LowerError, MachineConfig};
-use autosynth_ir::{AluOp, CompOp, FunctionIdx, IrInst, Operand, Register};
+use std::collections::HashMap;
+
+use autosynth_lower::{BackendEmitter, LowerError, MachineConfig};
+use autosynth_ir::{AluOp, BlockId, CompOp, FunctionIdx, IrInst, VReg};
 use autosynth_isa::{IsaReg, PReg, PRegOr, UImm12, Width};
 use autosynth_isa_aarch64::{
-    Aarch64Inst, AddImm, AddReg, BCond, Bl, Cond, LdrUoff, StrUoff, SubImm, SubReg, SubsImm,
-    SubsReg,
+    Aarch64Inst, AddImm, AddReg, BCond, Bl, Cond, LdrUoff, Movk, Movz, StrUoff, SubImm, SubReg,
+    SubsImm, SubsReg, UImm16,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
 use autosynth_lower::{self, LowerCtx, LowerCtxExt};
@@ -31,6 +33,13 @@ struct Patch {
 /// `Alu(Comp)` arrives, the condition code is stored. A subsequent
 /// `BrIf` consumes it and emits `b.cond` with the inverted condition.
 pub struct Aarch64Backend {
+    /// Code buffer for the backend.
+    code: Vec<u8>,
+
+    /// Map of block labels to their byte offsets.
+    labels: HashMap<BlockId, usize>,
+
+    /// Pending operations that need to be emitted.
     pending: Option<Operation>,
     /// Branch/call instructions that need offset patching after layout.
     patches: Vec<Patch>,
@@ -53,17 +62,21 @@ enum CompoundOperation {
 fn fixed_aarch64(role: IsaReg) -> Option<PReg> {
     match role {
         IsaReg::FramePointer => Some(PReg(29)),
-        IsaReg::StackPointer => Some(PReg(28)),
+        IsaReg::StackPointer => Some(PReg(31)),
         IsaReg::ReturnAddress => Some(PReg(30)),
-        IsaReg::Alloc64(_) => None,
+        IsaReg::PlatformReserved => Some(PReg(18)),
+        IsaReg::FromStart | IsaReg::FromEnd => None,
     }
 }
 
 impl BackendEmitter for Aarch64Backend {
     fn new() -> (Self, MachineConfig) {
-        let pool = (0u8..=30).filter(|&r| r != 18).map(PReg).collect();
-        let config = MachineConfig::new(pool, fixed_aarch64);
+        let pool = (0u8..=30).map(PReg).collect();
+        let mut config = MachineConfig::new(pool, fixed_aarch64);
+        config.reserve("x18", IsaReg::PlatformReserved);
         let backend = Self {
+            code: Vec::new(),
+            labels: HashMap::new(),
             pending: None,
             patches: Vec::new(),
         };
@@ -93,34 +106,55 @@ impl BackendEmitter for Aarch64Backend {
         }
     }
 
-    fn finalize(&mut self, ctx: &mut impl LowerCtx) -> Result<(), LowerError> {
-        for patch in self.patches.drain(..) {
-            let word = match &patch.inst {
-                IrInst::BrIf { block_else, .. } => {
-                    let target = ctx.resolve_block(*block_else)
-                        .expect("finalize: unresolved block");
-                    let disp = (target as i32 - patch.offset as i32) / 4;
-                    BCond {
-                        cond: patch.cond.unwrap(),
-                        offset: disp,
-                    }
-                    .encode_word()
-                }
-                IrInst::Call { func_idx } => {
-                    let target = ctx.resolve_func(*func_idx)
-                        .expect("finalize: unresolved function");
-                    let disp = (target as i32 - patch.offset as i32) / 4;
-                    Bl { offset: disp }.encode_word()
-                }
-                _ => unreachable!("unexpected patch instruction: {}", patch.inst),
-            };
-            ctx.patch_code(patch.offset, &word.to_le_bytes());
+    fn finalize(&mut self, _ctx: &mut impl LowerCtx) -> Result<(), LowerError> {
+        // TODO: real branch/call patching once backend owns labels
+        self.patches.clear();
+        Ok(())
+    }
+
+    fn materialize_const(&mut self, preg: PReg, val: i64, width: Width) -> Result<(), LowerError> {
+        let rd = to_gpr_or_zr(preg, width);
+        let uval = val as u64;
+        let max_hw: u8 = match width {
+            Width::W32 => 1,
+            Width::W64 => 3,
+        };
+        let chunk = |hw: u8| ((uval >> (hw as u32 * 16)) & 0xFFFF) as u16;
+
+        // MOVZ: load lowest 16 bits, zero the rest.
+        emit_inst(self, Movz { rd, imm: UImm16::from(chunk(0)), hw: 0 })?;
+
+        // MOVK: patch in each non-zero 16-bit chunk above.
+        for hw in 1..=max_hw {
+            let bits = chunk(hw);
+            if bits != 0 {
+                emit_inst(self, Movk { rd, imm: UImm16::from(bits), hw })?;
+            }
         }
         Ok(())
     }
 }
 
 impl Aarch64Backend {
+    fn emit_code(&mut self, bytes: &[u8]) -> usize {
+        let offset = self.code.len();
+        autosynth_lower::dbg(|dbg| dbg.set_machine("addr", &format!("{offset:04x}")));
+        self.code.extend_from_slice(bytes);
+        offset
+    }
+
+    fn patch_code(&mut self, offset: usize, bytes: &[u8]) {
+        self.code[offset..offset + bytes.len()].copy_from_slice(bytes);
+    }
+
+    fn resolve_block(&self, block: BlockId) -> Option<usize> {
+        self.labels.get(&block).copied()
+    }
+
+    fn resolve_func(&self, _func_idx: FunctionIdx) -> Option<usize> {
+        Some(0)
+    }
+
     fn fuse(
         &mut self,
         ctx: &mut impl LowerCtx,
@@ -141,13 +175,13 @@ impl Aarch64Backend {
             ) => {
                 // subs goes under the Comp's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(pending.dbg_group_idx));
-                let (lhs_preg, _) = ctx.into_preg(&lhs, self);
-                let (dst_preg, w) = ctx.define_register(&dst, self);
-                lower_cmp(ctx, *c, dst_preg, lhs_preg, w, rhs, self)?;
+                let (lhs_preg, lhs_width) = ctx.into_preg(*lhs, self)?;
+                let (dst_preg, dst_width) = ctx.define_vreg(*dst, self);
+                lower_cmp(ctx, *c, dst_preg, dst_width, lhs_preg, lhs_width, *rhs, self)?;
                 // b.cond goes under the BrIf's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(dbg_group_idx));
                 let cond = comp_op_to_cond(*c).invert();
-                let offset = emit_inst_at(ctx, BCond { cond, offset: 0 })?;
+                let offset = emit_inst_at(self, BCond { cond, offset: 0 })?;
                 self.patches.push(Patch {
                     offset,
                     inst: inst.clone(),
@@ -171,19 +205,20 @@ impl Aarch64Backend {
     fn emit_base(&mut self, ctx: &mut impl LowerCtx, inst: IrInst) -> Result<(), LowerError> {
         match inst {
             IrInst::Alu { op, dst, lhs, rhs } => lower_alu(self, ctx, op, dst, lhs, rhs),
-            IrInst::Load { dst, base, offset } => lower_load(self, ctx, dst, base, offset),
-            IrInst::Store { src, base, offset } => lower_store(self, ctx, src, base, offset),
-            IrInst::Move { dst, src } => lower_move(self, ctx, dst, src),
+            IrInst::Load { dst, width, base, offset } => lower_load(self, dst, width, base, offset),
+            IrInst::Store { src, width, base, offset } => lower_store(self, src, width, base, offset),
+            IrInst::Move { dst, dst_width, src, src_width } => lower_move(self, dst, dst_width, src, src_width),
             IrInst::Return => {
                 use autosynth_isa_aarch64::Ret;
                 emit_inst(
-                    ctx,
+                    self,
                     Ret {
-                        rn: XGpr(GprId::from_index(30)),
+                        rn: XGpr(GprId::LINK_REGISTER),
                     },
                 )
             }
-            IrInst::Call { func_idx } => lower_call(self, ctx, func_idx),
+            IrInst::Call { func_idx } => lower_call(self, func_idx),
+            IrInst::Skipped { .. } => Ok(()),
             other => {
                 unreachable!("backend received unexpected instruction: {other}")
             }
@@ -229,16 +264,16 @@ pub fn comp_op_to_cond(op: CompOp) -> Cond {
 #[inline]
 /// Encode and emit a single machine instruction.
 fn emit_inst(
-    ctx: &mut impl LowerCtx,
+    backend: &mut Aarch64Backend,
     inst: impl Aarch64Inst + core::fmt::Display,
 ) -> Result<(), LowerError> {
-    emit_inst_at(ctx, inst).map(|_| ())
+    emit_inst_at(backend, inst).map(|_| ())
 }
 
 /// Encode and emit a single machine instruction, returning the byte
 /// offset where it was placed. Used for instructions that need patching.
 fn emit_inst_at(
-    ctx: &mut impl LowerCtx,
+    backend: &mut Aarch64Backend,
     inst: impl Aarch64Inst + core::fmt::Display,
 ) -> Result<usize, LowerError> {
     autosynth_lower::dbg(|dbg| {
@@ -246,7 +281,7 @@ fn emit_inst_at(
         dbg.set_machine("asm", &format!("{inst}"));
     });
     let word = inst.encode_word();
-    Ok(ctx.emit_code(&word.to_le_bytes()))
+    Ok(backend.emit_code(&word.to_le_bytes()))
 }
 
 fn to_wgpr(p: PReg) -> WGpr {
@@ -269,6 +304,9 @@ fn to_gpr_or_zr(p: PReg, w: Width) -> GprOrZr {
 /// Convert a physical register + width to a `GprOrSp` with the correct
 /// w-reg (32-bit) or x-reg (64-bit) form.
 fn to_gpr_or_sp(p: PReg, w: Width) -> GprOrSp {
+    if p.0 == GprOrSp::STACK_POINTER_IDX {
+        return GprOrSp::Sp;
+    }
     match w {
         Width::W32 => GprOrSp::from(to_wgpr(p)),
         Width::W64 => GprOrSp::from(Gpr::X(to_xgpr(p))),
@@ -291,35 +329,33 @@ fn scale_offset(offset: u32, w: Width) -> Result<UImm12, LowerError> {
 
 fn lower_move(
     backend: &mut Aarch64Backend,
-    ctx: &mut impl LowerCtx,
-    dst: Register,
-    src: Register,
+    dst: PReg,
+    dst_width: Width,
+    src: PReg,
+    src_width: Width,
 ) -> Result<(), LowerError> {
-    let (dst_preg, w) = ctx.define_register(&dst, backend);
-    let (src_preg, _) = ctx.resolve_register(&src, backend);
-    let rd = to_gpr_or_zr(dst_preg, w);
-    let rn = to_gpr_or_zr(src_preg, w);
-    let zr = match w {
+    let rd = to_gpr_or_zr(dst, dst_width);
+    let rn = to_gpr_or_zr(src, src_width);
+    let zr = match dst_width {
         Width::W32 => GprOrZr::Wzr,
         Width::W64 => GprOrZr::Xzr,
     };
     use autosynth_isa_aarch64::OrrReg;
-    emit_inst(ctx, OrrReg { rd, rn: zr, rm: rn })
+    emit_inst(backend, OrrReg { rd, rn: zr, rm: rn })
 }
 
 fn lower_load(
     backend: &mut Aarch64Backend,
-    ctx: &mut impl LowerCtx,
-    dst: Register,
+    dst: PReg,
+    width: Width,
     base: PReg,
     offset: u32,
 ) -> Result<(), LowerError> {
-    let (dst_preg, w) = ctx.define_register(&dst, backend);
-    let imm = scale_offset(offset, w)?;
-    let rt = to_gpr_or_zr(dst_preg, w);
-    let rn = GprOrSp::from(Gpr::X(to_xgpr(base)));
+    let imm = scale_offset(offset, width)?;
+    let rt = to_gpr_or_zr(dst, width);
+    let rn = to_gpr_or_sp(base, Width::W64);
     emit_inst(
-        ctx,
+        backend,
         LdrUoff {
             rt,
             rn,
@@ -330,17 +366,16 @@ fn lower_load(
 
 fn lower_store(
     backend: &mut Aarch64Backend,
-    ctx: &mut impl LowerCtx,
-    src: Operand,
+    src: PReg,
+    src_width: Width,
     base: PReg,
     offset: u32,
 ) -> Result<(), LowerError> {
-    let (src_preg, w) = ctx.into_preg(&src, backend);
-    let imm = scale_offset(offset, w)?;
-    let rt = to_gpr_or_zr(src_preg, w);
-    let rn = GprOrSp::from(Gpr::X(to_xgpr(base)));
+    let imm = scale_offset(offset, src_width)?;
+    let rt = to_gpr_or_zr(src, src_width);
+    let rn = to_gpr_or_sp(base, Width::W64);
     emit_inst(
-        ctx,
+        backend,
         StrUoff {
             rt,
             rn,
@@ -353,17 +388,17 @@ fn lower_alu(
     backend: &mut Aarch64Backend,
     ctx: &mut impl LowerCtx,
     op: AluOp,
-    dst: Register,
-    lhs: Operand,
-    rhs: Operand,
+    dst: VReg,
+    lhs: VReg,
+    rhs: VReg,
 ) -> Result<(), LowerError> {
-    let (lhs_preg, _) = ctx.into_preg(&lhs, backend);
-    let (dst_preg, w) = ctx.define_register(&dst, backend);
+    let (lhs_preg, lhs_width) = ctx.into_preg(lhs, backend)?;
+    let (dst_preg, dst_width) = ctx.define_vreg(dst, backend);
 
     match op {
-        AluOp::Comp(c) => lower_cmp(ctx, c, dst_preg, lhs_preg, w, &rhs, backend),
-        AluOp::Add => lower_add(ctx, dst_preg, lhs_preg, w, &rhs, backend),
-        AluOp::Sub => lower_sub(ctx, dst_preg, lhs_preg, w, &rhs, backend),
+        AluOp::Comp(c) => lower_cmp(ctx, c, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend),
+        AluOp::Add => lower_add(ctx, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend),
+        AluOp::Sub => lower_sub(ctx, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend),
         AluOp::Mul => todo!("mul not yet in ISA crate"),
         AluOp::And => todo!("and not yet in ISA crate"),
         AluOp::Or => todo!("or not yet in ISA crate"),
@@ -374,12 +409,8 @@ fn lower_alu(
     }
 }
 
-fn lower_call(
-    backend: &mut Aarch64Backend,
-    ctx: &mut impl LowerCtx,
-    func_idx: FunctionIdx,
-) -> Result<(), LowerError> {
-    let offset = emit_inst_at(ctx, Bl { offset: 0 })?;
+fn lower_call(backend: &mut Aarch64Backend, func_idx: FunctionIdx) -> Result<(), LowerError> {
+    let offset = emit_inst_at(backend, Bl { offset: 0 })?;
     backend.patches.push(Patch {
         offset,
         inst: IrInst::Call { func_idx },
@@ -392,21 +423,22 @@ fn lower_cmp(
     ctx: &mut impl LowerCtx,
     _op: CompOp,
     dst: PReg,
+    dst_width: Width,
     lhs: PReg,
-    w: Width,
-    rhs: &Operand,
+    lhs_width: Width,
+    rhs: VReg,
     backend: &mut Aarch64Backend,
 ) -> Result<(), LowerError> {
-    let rd = to_gpr_or_zr(dst, w);
-    match ctx.try_imm_or_preg::<UImm12>(rhs, backend) {
+    let rd = to_gpr_or_zr(dst, dst_width);
+    match ctx.try_imm_or_preg::<UImm12>(rhs, backend)? {
         PRegOr::Imm(imm) => {
-            let rn = to_gpr_or_sp(lhs, w);
-            emit_inst(ctx, SubsImm { rd, rn, imm })
+            let rn = to_gpr_or_sp(lhs, lhs_width);
+            emit_inst(backend, SubsImm { rd, rn, imm })
         }
-        PRegOr::PReg(rhs_preg) => {
-            let rn = to_gpr_or_zr(lhs, w);
-            let rm = to_gpr_or_zr(rhs_preg, w);
-            emit_inst(ctx, SubsReg { rd, rn, rm })
+        PRegOr::PReg(rhs_preg, rhs_width) => {
+            let rn = to_gpr_or_zr(lhs, lhs_width);
+            let rm = to_gpr_or_zr(rhs_preg, rhs_width);
+            emit_inst(backend, SubsReg { rd, rn, rm })
         }
     }
 }
@@ -414,22 +446,23 @@ fn lower_cmp(
 fn lower_add(
     ctx: &mut impl LowerCtx,
     dst: PReg,
+    dst_width: Width,
     lhs: PReg,
-    w: Width,
-    rhs: &Operand,
+    lhs_width: Width,
+    rhs: VReg,
     backend: &mut Aarch64Backend,
 ) -> Result<(), LowerError> {
-    match ctx.try_imm_or_preg::<UImm12>(rhs, backend) {
+    match ctx.try_imm_or_preg::<UImm12>(rhs, backend)? {
         PRegOr::Imm(imm) => {
-            let rd = to_gpr_or_sp(dst, w);
-            let rn = to_gpr_or_sp(lhs, w);
-            emit_inst(ctx, AddImm { rd, rn, imm })
+            let rd = to_gpr_or_sp(dst, dst_width);
+            let rn = to_gpr_or_sp(lhs, lhs_width);
+            emit_inst(backend, AddImm { rd, rn, imm })
         }
-        PRegOr::PReg(rhs_preg) => {
-            let rd = to_gpr_or_zr(dst, w);
-            let rn = to_gpr_or_zr(lhs, w);
-            let rm = to_gpr_or_zr(rhs_preg, w);
-            emit_inst(ctx, AddReg { rd, rn, rm })
+        PRegOr::PReg(rhs_preg, width) => {
+            let rd = to_gpr_or_zr(dst, dst_width);
+            let rn = to_gpr_or_zr(lhs, lhs_width);
+            let rm = to_gpr_or_zr(rhs_preg, width);
+            emit_inst(backend, AddReg { rd, rn, rm })
         }
     }
 }
@@ -437,22 +470,23 @@ fn lower_add(
 fn lower_sub(
     ctx: &mut impl LowerCtx,
     dst: PReg,
+    dst_width: Width,
     lhs: PReg,
-    w: Width,
-    rhs: &Operand,
+    lhs_width: Width,
+    rhs: VReg,
     backend: &mut Aarch64Backend,
 ) -> Result<(), LowerError> {
-    match ctx.try_imm_or_preg::<UImm12>(rhs, backend) {
+    match ctx.try_imm_or_preg::<UImm12>(rhs, backend)? {
         PRegOr::Imm(imm) => {
-            let rd = to_gpr_or_sp(dst, w);
-            let rn = to_gpr_or_sp(lhs, w);
-            emit_inst(ctx, SubImm { rd, rn, imm })
+            let rd = to_gpr_or_sp(dst, dst_width);
+            let rn = to_gpr_or_sp(lhs, lhs_width);
+            emit_inst(backend, SubImm { rd, rn, imm })
         }
-        PRegOr::PReg(rhs_preg) => {
-            let rd = to_gpr_or_zr(dst, w);
-            let rn = to_gpr_or_zr(lhs, w);
-            let rm = to_gpr_or_zr(rhs_preg, w);
-            emit_inst(ctx, SubReg { rd, rn, rm })
+        PRegOr::PReg(rhs_preg, width) => {
+            let rd = to_gpr_or_zr(dst, dst_width);
+            let rn = to_gpr_or_zr(lhs, lhs_width);
+            let rm = to_gpr_or_zr(rhs_preg, width);
+            emit_inst(backend, SubReg { rd, rn, rm })
         }
     }
 }

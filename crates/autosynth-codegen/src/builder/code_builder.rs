@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use autosynth_ir::{FunctionIdx, FunctionSignature};
 
-use crate::ir::function::IRFunction;
+use autosynth_ir::IRFunction;
 
 /// Collects finalized [`IRFunction`]s from one or more [`FunctionBuilder`](super::FunctionBuilder)s.
 ///

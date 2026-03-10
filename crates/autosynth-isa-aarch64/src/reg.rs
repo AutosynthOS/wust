@@ -5,13 +5,42 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum GprId {
-    R0 = 0, R1, R2, R3, R4, R5, R6, R7,
-    R8, R9, R10, R11, R12, R13, R14, R15,
-    R16, R17, R18, R19, R20, R21, R22, R23,
-    R24, R25, R26, R27, R28, R29, R30,
+    R0 = 0,
+    R1,
+    R2,
+    R3,
+    R4,
+    R5,
+    R6,
+    R7,
+    R8,
+    R9,
+    R10,
+    R11,
+    R12,
+    R13,
+    R14,
+    R15,
+    R16,
+    R17,
+    R18,
+    R19,
+    R20,
+    R21,
+    R22,
+    R23,
+    R24,
+    R25,
+    R26,
+    R27,
+    R28,
+    R29,
+    R30,
 }
 
 impl GprId {
+    pub const LINK_REGISTER: GprId = GprId::R30;
+
     /// 5-bit encoding index (0–30).
     pub const fn index(self) -> u8 {
         self as u8
@@ -131,11 +160,15 @@ impl Gpr {
 }
 
 impl From<WGpr> for Gpr {
-    fn from(w: WGpr) -> Self { Gpr::W(w) }
+    fn from(w: WGpr) -> Self {
+        Gpr::W(w)
+    }
 }
 
 impl From<XGpr> for Gpr {
-    fn from(x: XGpr) -> Self { Gpr::X(x) }
+    fn from(x: XGpr) -> Self {
+        Gpr::X(x)
+    }
 }
 
 /// GPR or zero register — used in most ALU and load/store data positions.
@@ -196,15 +229,21 @@ impl GprOrZr {
 }
 
 impl From<WGpr> for GprOrZr {
-    fn from(w: WGpr) -> Self { GprOrZr::Gpr(Gpr::W(w)) }
+    fn from(w: WGpr) -> Self {
+        GprOrZr::Gpr(Gpr::W(w))
+    }
 }
 
 impl From<XGpr> for GprOrZr {
-    fn from(x: XGpr) -> Self { GprOrZr::Gpr(Gpr::X(x)) }
+    fn from(x: XGpr) -> Self {
+        GprOrZr::Gpr(Gpr::X(x))
+    }
 }
 
 impl From<Gpr> for GprOrZr {
-    fn from(g: Gpr) -> Self { GprOrZr::Gpr(g) }
+    fn from(g: Gpr) -> Self {
+        GprOrZr::Gpr(g)
+    }
 }
 
 /// GPR or stack pointer — used in add/sub immediate Rd/Rn and
@@ -219,11 +258,13 @@ pub enum GprOrSp {
 }
 
 impl GprOrSp {
+    pub const STACK_POINTER_IDX: u8 = 31;
+
     /// 5-bit encoding index (0–30 for GPRs, 31 for SP).
     pub const fn index(self) -> u8 {
         match self {
             GprOrSp::Gpr(g) => g.index(),
-            GprOrSp::Sp => 31,
+            GprOrSp::Sp => GprOrSp::STACK_POINTER_IDX,
         }
     }
 
@@ -253,13 +294,19 @@ impl GprOrSp {
 }
 
 impl From<WGpr> for GprOrSp {
-    fn from(w: WGpr) -> Self { GprOrSp::Gpr(Gpr::W(w)) }
+    fn from(w: WGpr) -> Self {
+        GprOrSp::Gpr(Gpr::W(w))
+    }
 }
 
 impl From<XGpr> for GprOrSp {
-    fn from(x: XGpr) -> Self { GprOrSp::Gpr(Gpr::X(x)) }
+    fn from(x: XGpr) -> Self {
+        GprOrSp::Gpr(Gpr::X(x))
+    }
 }
 
 impl From<Gpr> for GprOrSp {
-    fn from(g: Gpr) -> Self { GprOrSp::Gpr(g) }
+    fn from(g: Gpr) -> Self {
+        GprOrSp::Gpr(g)
+    }
 }

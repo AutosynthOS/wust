@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
 
-use autosynth_ir::{BlockId, FunctionIdx, Operand, Register, VReg};
+use autosynth_ir::VReg;
 use autosynth_isa::{IsaReg, PReg, PRegOr, Width};
 
 /// Minimal debug sink for machine instruction annotation.
@@ -77,22 +77,28 @@ pub fn dbg(f: impl FnOnce(&mut dyn DbgSink)) {
 ///
 /// The backend never touches virtual registers, the register cache,
 /// or spill logic directly — everything goes through this trait.
+/// Result of resolving a virtual register — either already in a
+/// physical register, or a known constant whose materialization
+/// can be deferred.
+pub enum ResolvedVReg {
+    /// Value is in a physical register, ready to use.
+    PReg(PReg, Width),
+    /// Value is a known constant — the caller decides whether to
+    /// fold it as an immediate or materialize into a register.
+    Const(i64, Width),
+}
+
 pub trait LowerCtx {
-    /// Get the constant value behind a virtual register, if known.
+    /// Resolve a virtual register to a physical register or constant.
     ///
-    /// Returns `None` if the vreg is not a compile-time constant.
-    fn const_value(&self, vreg: VReg) -> Option<i64>;
-
-    /// Force a constant into a physical register via materialization
-    /// (e.g. `movz`/`movk`). Returns the register and its width.
-    fn materialize_const(&mut self, val: i64, width: Width) -> (PReg, Width);
-
-    /// Resolve a virtual register to a physical register.
-    /// Returns the register and its width (from the vreg definition).
-    ///
-    /// If the vreg is not in the cache, the implementation emits a
-    /// load from its canonical slot via the backend.
-    fn resolve_vreg(&mut self, vreg: VReg, backend: &mut impl BackendEmitter) -> (PReg, Width);
+    /// If the vreg is cached or needs a load, returns `PReg`.
+    /// If the vreg is a known constant, returns `Const` so the
+    /// caller can attempt immediate folding before materializing.
+    fn resolve_vreg(
+        &mut self,
+        vreg: VReg,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<ResolvedVReg, LowerError>;
 
     /// Allocate a physical register for a definition (output).
     /// Returns the register and its width (from the vreg definition).
@@ -101,29 +107,9 @@ pub trait LowerCtx {
     /// implementation uses the backend to emit the spill store.
     fn define_vreg(&mut self, vreg: VReg, backend: &mut impl BackendEmitter) -> (PReg, Width);
 
-    /// Push encoded machine code into the code buffer.
-    ///
-    /// Returns the byte offset where the code was placed. The backend
-    /// can save this offset to patch the instruction later during
-    /// [`BackendEmitter::finalize`].
-    fn emit_code(&mut self, bytes: &[u8]) -> usize;
-
-    /// Overwrite bytes at a previously emitted offset.
-    ///
-    /// Used during finalization to patch branch/call offsets after
-    /// all blocks have been laid out and their addresses are known.
-    fn patch_code(&mut self, offset: usize, bytes: &[u8]);
-
-    /// Resolve a block label to its byte offset in the code buffer.
-    ///
-    /// Returns `None` if the block hasn't been emitted yet (should
-    /// only be called during finalization, after all blocks are laid out).
-    fn resolve_block(&self, block: BlockId) -> Option<usize>;
-
-    /// Resolve a function index to its byte offset in the code buffer.
-    ///
-    /// For self-recursive calls this is 0 (start of the function body).
-    fn resolve_func(&self, func_idx: FunctionIdx) -> Option<usize>;
+    /// Allocate a temporary scratch register for constant
+    /// materialization.
+    fn alloc_scratch(&mut self, width: Width) -> PReg;
 }
 
 /// Extension trait — convenience methods auto-implemented for all
@@ -132,82 +118,57 @@ pub trait LowerCtx {
 /// These compose the core `LowerCtx` methods to handle common operand
 /// resolution patterns (folding immediates, forcing into registers, etc.).
 pub trait LowerCtxExt: LowerCtx {
-    /// Try to fold an operand as an immediate of type `Imm`, falling back
-    /// to a physical register if the constant doesn't fit or the operand
+    /// Try to fold a VReg as an immediate of type `Imm`, falling back
+    /// to a physical register if the constant doesn't fit or the VReg
     /// isn't a constant.
     ///
     /// # Examples
     ///
     /// ```ignore
-    /// match ctx.try_imm_or_preg::<UImm12>(&operand) {
+    /// match ctx.try_imm_or_preg::<UImm12>(rhs_vreg) {
     ///     PRegOr::Imm(imm) => { /* emit immediate form */ }
     ///     PRegOr::PReg(reg) => { /* emit register form */ }
     /// }
     /// ```
-    fn try_imm_or_preg<Imm>(&mut self, operand: &Operand, backend: &mut impl BackendEmitter) -> PRegOr<Imm>
+    fn try_imm_or_preg<Imm>(
+        &mut self,
+        vreg: VReg,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<PRegOr<Imm>, LowerError>
     where
         Imm: TryFrom<i64>,
     {
-        match *operand {
-            Operand::ConstI32(val) => match Imm::try_from(val as i64) {
-                Ok(imm) => PRegOr::Imm(imm),
+        match self.resolve_vreg(vreg, backend)? {
+            ResolvedVReg::PReg(preg, w) => Ok(PRegOr::PReg(preg, w)),
+            ResolvedVReg::Const(val, w) => match Imm::try_from(val) {
+                Ok(imm) => Ok(PRegOr::Imm(imm)),
                 Err(_) => {
-                    let (preg, _) = self.materialize_const(val as i64, Width::W32);
-                    PRegOr::PReg(preg)
+                    let preg = self.alloc_scratch(w);
+                    backend.materialize_const(preg, val, w)?;
+                    Ok(PRegOr::PReg(preg, w))
                 }
             },
-            Operand::ConstI64(val) => match Imm::try_from(val) {
-                Ok(imm) => PRegOr::Imm(imm),
-                Err(_) => {
-                    let (preg, _) = self.materialize_const(val, Width::W64);
-                    PRegOr::PReg(preg)
-                }
-            },
-            Operand::VReg(vreg, _) => {
-                // Check if the vreg is a known constant that fits.
-                if let Some(val) = self.const_value(vreg) {
-                    if let Ok(imm) = Imm::try_from(val) {
-                        return PRegOr::Imm(imm);
-                    }
-                }
-                let (preg, _) = self.resolve_vreg(vreg, backend);
-                PRegOr::PReg(preg)
-            }
-            Operand::PReg(preg, _) => PRegOr::PReg(preg),
         }
     }
 
-    /// Force an operand into a physical register, returning its width.
-    fn into_preg(&mut self, operand: &Operand, backend: &mut impl BackendEmitter) -> (PReg, Width) {
-        match *operand {
-            Operand::ConstI32(val) => self.materialize_const(val as i64, Width::W32),
-            Operand::ConstI64(val) => self.materialize_const(val, Width::W64),
-            Operand::VReg(vreg, _) => self.resolve_vreg(vreg, backend),
-            Operand::PReg(preg, w) => (preg, w),
-        }
-    }
-
-    /// Resolve a register (virtual or physical) to a physical register,
-    /// returning its width.
-    fn resolve_register(&mut self, reg: &Register, backend: &mut impl BackendEmitter) -> (PReg, Width) {
-        match *reg {
-            Register::VReg(vreg, _) => self.resolve_vreg(vreg, backend),
-            Register::PReg(preg, w) => (preg, w),
-        }
-    }
-
-    /// Allocate a physical register for a register definition, returning
-    /// its width.
-    fn define_register(
+    /// Force a VReg into a physical register, returning its width.
+    ///
+    /// Constants are materialized into a scratch register.
+    fn into_preg(
         &mut self,
-        reg: &Register,
+        vreg: VReg,
         backend: &mut impl BackendEmitter,
-    ) -> (PReg, Width) {
-        match *reg {
-            Register::VReg(vreg, _) => self.define_vreg(vreg, backend),
-            Register::PReg(preg, w) => (preg, w),
+    ) -> Result<(PReg, Width), LowerError> {
+        match self.resolve_vreg(vreg, backend)? {
+            ResolvedVReg::PReg(preg, w) => Ok((preg, w)),
+            ResolvedVReg::Const(val, w) => {
+                let preg = self.alloc_scratch(w);
+                backend.materialize_const(preg, val, w)?;
+                Ok((preg, w))
+            }
         }
     }
+
 }
 
 impl<T: LowerCtx> LowerCtxExt for T {}
@@ -226,7 +187,7 @@ pub struct MachineConfig {
     /// Available (unreserved) registers.
     pool: Vec<PReg>,
     /// Named reserved registers.
-    reserved: HashMap<&'static str, Register>,
+    reserved: HashMap<&'static str, PReg>,
     /// Backend-provided mapping from fixed roles to physical registers.
     fixed: fn(IsaReg) -> Option<PReg>,
 }
@@ -243,42 +204,31 @@ impl MachineConfig {
     /// Reserve a register by name and architectural role.
     ///
     /// Fixed roles (FramePointer, ReturnAddress, StackPointer) map
-    /// to platform-specific registers. `Alloc64` allocates from the
-    /// remaining pool by index.
+    /// to platform-specific registers. `FromStart`/`FromEnd` allocate
+    /// from the remaining pool.
     ///
-    /// Returns a `Register::PReg` for use in IR instructions.
+    /// Returns the physical register assigned to this role.
     ///
     /// # Panics
     ///
     /// Panics if `name` is already reserved.
-    pub fn reserve(&mut self, name: &'static str, role: IsaReg) -> Register {
+    pub fn reserve(&mut self, name: &'static str, role: IsaReg) -> PReg {
         assert!(
             !self.reserved.contains_key(name),
             "register '{name}' already reserved"
         );
         let preg = if let Some(fixed) = (self.fixed)(role) {
-            let len_before = self.pool.len();
             self.pool.retain(|r| *r != fixed);
-            assert!(
-                self.pool.len() < len_before,
-                "register p{} (for '{name}') was already reserved",
-                fixed.0
-            );
             fixed
         } else {
-            let IsaReg::Alloc64(idx) = role else {
-                unreachable!()
-            };
-            if idx >= 0 {
-                self.pool.remove(idx as usize)
-            } else {
-                let pos = self.pool.len() - ((-idx) as usize);
-                self.pool.remove(pos)
+            match role {
+                IsaReg::FromStart => self.pool.remove(0),
+                IsaReg::FromEnd => self.pool.pop().expect("no registers left in pool"),
+                _ => unreachable!(),
             }
         };
-        let reg = Register::PReg(preg, Width::W64);
-        self.reserved.insert(name, reg);
-        reg
+        self.reserved.insert(name, preg);
+        preg
     }
 
     /// Look up a reserved register by name.
@@ -286,7 +236,7 @@ impl MachineConfig {
     /// # Panics
     ///
     /// Panics if `name` was never reserved.
-    pub fn use_reserved(&self, name: &str) -> Register {
+    pub fn use_reserved(&self, name: &str) -> PReg {
         *self
             .reserved
             .get(name)
@@ -351,4 +301,9 @@ pub trait BackendEmitter: Sized {
     /// [`LowerCtx::resolve_func`] to compute displacements, then
     /// [`LowerCtx::patch_code`] to overwrite the placeholder offsets.
     fn finalize(&mut self, ctx: &mut impl LowerCtx) -> Result<(), LowerError>;
+
+    /// Materialize a constant into a physical register.
+    ///
+    /// Returns the register and its width.
+    fn materialize_const(&mut self, preg: PReg, val: i64, width: Width) -> Result<(), LowerError>;
 }

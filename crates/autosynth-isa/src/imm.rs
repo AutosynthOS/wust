@@ -79,7 +79,13 @@ impl UImm16 {
     }
 }
 
-impl_try_from!(UImm16, u16, 0, 65535, i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
+impl From<u16> for UImm16 {
+    fn from(val: u16) -> Self {
+        Self(val)
+    }
+}
+
+impl_try_from!(UImm16, u16, 0, 65535, i8, u8, i16, i32, u32, i64, u64, isize, usize);
 
 /// 9-bit signed immediate (−256 to +255).
 ///
