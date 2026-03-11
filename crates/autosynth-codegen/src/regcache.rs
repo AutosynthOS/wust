@@ -87,8 +87,12 @@ impl RegCache {
 
             // PReg — value arrived in a physical register (e.g. param).
             // Bind it in the cache (dirty — not yet stored to canonical slot).
+            // Consumed after first use: if the preg is later clobbered (call,
+            // eviction), the next resolve will see None and load from the
+            // canonical slot instead of trusting a stale preg.
             Some(VInit::PReg(preg)) => {
                 self.bind(vreg, preg);
+                self.vreg_defs[vreg.0 as usize].initial = None;
                 ResolveResult::Ready(preg, def.width)
             }
 

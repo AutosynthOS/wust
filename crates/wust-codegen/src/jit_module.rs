@@ -127,23 +127,20 @@ impl<B: BackendEmitter> JitModule<B> {
             base_offset: 0,
         });
 
-        // VRegs for reserved registers used in IR instructions.
-        let lbp = f.preg_vreg(lbp_preg, Width::W64);
-        let fuel = f.preg_vreg(fuel_preg, Width::W64);
-
         // "operation" column registered after all vstacks so it appears rightmost.
         f.finish_entry();
 
         // Declare parameters — each starts in its CC register (PReg(i)).
-        f.begin_op("--", "params_start");
         for (i, param) in func.params.iter().enumerate() {
+            f.begin_op(&format!("p{i}"), &format!("param {i} = {param}"));
             let v = f.preg_vreg(PReg(i as u8), valtype_to_width(param));
             f.define_field(locals, v);
         }
 
-        f.begin_op("--", "locals_start");
         // Declare zero-initialized locals
-        for (_i, local) in func.locals.iter().enumerate() {
+        for (i, local) in func.locals.iter().enumerate() {
+            let idx = i + func.params.len();
+            f.begin_op(&format!("l{idx}"), &format!("local {idx} = {local}"));
             let v = match valtype_to_width(&local) {
                 Width::W32 => f.const_i32(0),
                 Width::W64 => f.const_i64(0),
@@ -294,7 +291,9 @@ impl<B: BackendEmitter> JitModule<B> {
                     // }
 
                     let func_idx = FunctionIdx::User(callee_idx as u32);
+                    let lbp = f.preg_vreg(lbp_preg, Width::W64);
                     f.emit_call(operands, func_idx, locals_header_size, lbp);
+                    let fuel = f.preg_vreg(fuel_preg, Width::W64);
                     Self::emit_fuel_check(&mut f, fuel, &mut pending_fuel, pc);
                 }
 
@@ -308,12 +307,7 @@ impl<B: BackendEmitter> JitModule<B> {
         Ok(())
     }
 
-    fn emit_fuel_check(
-        f: &mut FunctionBuilder,
-        fuel: VReg,
-        pending_fuel: &mut u32,
-        pc: usize,
-    ) {
+    fn emit_fuel_check(f: &mut FunctionBuilder, fuel: VReg, pending_fuel: &mut u32, pc: usize) {
         // Fused subtract-and-compare: subs fuel, fuel, #N
         // LeS makes the backend emit `subs` (flag-setting subtract).
         // Using `fuel` (physical register) as dst writes the result

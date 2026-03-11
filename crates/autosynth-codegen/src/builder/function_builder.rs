@@ -80,11 +80,16 @@ impl<'a> FunctionBuilder<'a> {
         id
     }
 
-    /// Allocate a destination VReg on the vstack for an instruction result.
+    /// Allocate a destination VReg with a canonical slot but don't push it.
     ///
-    /// No initial value — the vreg will be written by an instruction (ALU, etc.).
-    pub fn push_dst(&mut self, vstack: VRegionId, width: Width) -> VReg {
-        self.push_alloc(vstack, width)
+    /// The caller is responsible for pushing via [`push_vreg`] after
+    /// the instruction that produces the value is emitted.
+    pub fn alloc_dst(&mut self, vstack: VRegionId, width: Width) -> VReg {
+        let index = self.vstack_ref(vstack).slots.len();
+        let slot = self.make_slot(vstack, index, width);
+        let vreg = self.alloc_vreg(width, slot, None);
+        self.record_def(vreg);
+        vreg
     }
 
     /// Append a new field to a region, initialized from a VReg.
@@ -102,7 +107,8 @@ impl<'a> FunctionBuilder<'a> {
         }
 
         let label = self.regions[region.0 as usize].label;
-        debugger::dbg(|dbg| dbg.set_source("operation", &format!("{label}[{index}] ← {vreg}")));
+        let desc = self.fmt_vreg(vreg);
+        debugger::dbg(|dbg| dbg.note(&format!("{label}[{index}] ← {desc}")));
 
         self.vstack_mut(region).slots.push(vreg);
     }
@@ -141,7 +147,8 @@ impl<'a> FunctionBuilder<'a> {
         self.vreg_defs[vreg.0 as usize].slot = Some(existing_slot);
 
         let label = self.regions[region.0 as usize].label;
-        debugger::dbg(|dbg| dbg.set_source("operation", &format!("{label}[{index}] ← {vreg}")));
+        let desc = self.fmt_vreg(vreg);
+        debugger::dbg(|dbg| dbg.note(&format!("{label}[{index}] ← {desc}")));
 
         self.vstack_mut(region).slots[index] = vreg;
     }
@@ -306,7 +313,6 @@ impl<'a> FunctionBuilder<'a> {
             }
             Abi::StackWasm => {}
         }
-        self.begin_op("--", "advance frame");
 
         // Frame advance: add lbp, lbp, #frame_advance
         if frame_advance > 0 {
@@ -391,6 +397,11 @@ impl<'a> FunctionBuilder<'a> {
         self.vreg_defs[vreg.0 as usize]
     }
 
+    /// Format a VReg with its type and initializer for debug display.
+    fn fmt_vreg(&self, vreg: VReg) -> String {
+        format_vreg(vreg, &self.vreg_defs)
+    }
+
     /// Set a register placement constraint on a VReg.
     ///
     /// Constrain a VReg to a specific physical register.
@@ -453,7 +464,8 @@ impl<'a> FunctionBuilder<'a> {
     /// Push an existing VReg onto a region's stack. No new vreg allocated.
     pub fn push_vreg(&mut self, region: VRegionId, vreg: VReg) {
         let label = self.regions[region.0 as usize].label;
-        debugger::dbg(|dbg| dbg.set_source("operation", &format!("{label}.push {vreg}")));
+        let desc = self.fmt_vreg(vreg);
+        debugger::dbg(|dbg| dbg.note(&format!("{label} ← {desc}")));
         self.vstack_mut(region).slots.push(vreg);
     }
 
@@ -466,7 +478,8 @@ impl<'a> FunctionBuilder<'a> {
             .pop()
             .unwrap_or_else(|| panic!("pop_any: vstack '{label}' is empty"));
         self.record_use(vreg);
-        debugger::dbg(|dbg| dbg.set_source("operation", &format!("{label}.pop {vreg}")));
+        let desc = self.fmt_vreg(vreg);
+        debugger::dbg(|dbg| dbg.note(&format!("{label} → {desc}")));
         vreg
     }
 
@@ -477,8 +490,9 @@ impl<'a> FunctionBuilder<'a> {
         let rhs = self.pop_any(region);
         let lhs = self.pop_any(region);
         let w = self.vreg_defs[lhs.0 as usize].width;
-        let dst = self.push_dst(region, w);
+        let dst = self.alloc_dst(region, w);
         self.emit(IrInst::Alu { op, dst, lhs, rhs });
+        self.push_vreg(region, dst);
         dst
     }
 
@@ -693,24 +707,6 @@ impl<'a> FunctionBuilder<'a> {
         }
     }
 
-    /// Allocate a fresh VReg with an operand canonical slot and push it.
-    ///
-    /// Used for instruction destinations (ALU results, etc.) that need
-    /// a new vreg identity at a specific operand stack position.
-    fn push_alloc(&mut self, vstack: VRegionId, width: Width) -> VReg {
-        let label = self.regions[vstack.0 as usize].label;
-        let index = self.vstack_ref(vstack).slots.len();
-        let slot = self.make_slot(vstack, index, width);
-
-        let vreg = self.alloc_vreg(width, slot, None);
-        self.record_def(vreg);
-
-        debugger::dbg(|dbg| dbg.set_source("operation", &format!("{label}.push {vreg} = dst")));
-
-        self.vstack_mut(vstack).slots.push(vreg);
-
-        vreg
-    }
 
     /// Peek at a vstack slot by offset from the top (0 = top, 1 = second from top).
     ///
@@ -761,38 +757,36 @@ impl<'a> FunctionBuilder<'a> {
             "pop: vstack '{label}' expected {width:?} but top is {actual_width:?}"
         );
         self.record_use(vreg);
-        debugger::dbg(|dbg| dbg.set_source("operation", &format!("{label}.pop {vreg}")));
+        let desc = self.fmt_vreg(vreg);
+        debugger::dbg(|dbg| dbg.note(&format!("{label} → {desc}")));
         vreg
     }
+}
 
+/// Format a single VReg with its type and initializer info.
+///
+/// Examples: `v0=i32` (no known value), `v1=0:i32` (const 0),
+/// `v2=p0:i32` (from PReg 0), `v3=v1:i32` (copy of v1).
+fn format_vreg(vreg: VReg, defs: &[VRegDef]) -> String {
+    let def = &defs[vreg.0 as usize];
+    let ty = match def.width {
+        Width::W32 => "i32",
+        Width::W64 => "i64",
+    };
+    match def.initial {
+        Some(VInit::Const(n)) => format!("{vreg}={n}:{ty}"),
+        Some(VInit::PReg(p)) => format!("{vreg}=p{}:{ty}", p.0),
+        Some(VInit::CopyOf(src)) => format!("{vreg}={src}:{ty}"),
+        None => format!("{vreg}={ty}"),
+    }
 }
 
 /// Format a vstack's current slots with type and value info.
-///
-/// Examples: `v0<i32>` (no known value), `v1<0i32>` (const 0),
-/// `v2<p0:i32>` (from PReg 0), `v3<v1:i32>` (copy of v1).
 fn format_vstack_snapshot(vs: Option<&VStackMut>, defs: &[VRegDef]) -> String {
     let Some(vs) = vs else { return String::new() };
     vs.slots
         .iter()
-        .map(|vreg| {
-            let def = &defs[vreg.0 as usize];
-            let ty = match def.width {
-                Width::W32 => "i32",
-                Width::W64 => "i64",
-            };
-            let val = match def.initial {
-                Some(VInit::Const(n)) => format!("{n}"),
-                Some(VInit::PReg(p)) => format!("p{}", p.0),
-                Some(VInit::CopyOf(src)) => format!("{src}"),
-                None => String::new(),
-            };
-            if val.is_empty() {
-                format!("{vreg}{ty}")
-            } else {
-                format!("{vreg}={val}:{ty}")
-            }
-        })
+        .map(|vreg| format_vreg(*vreg, defs))
         .collect::<Vec<_>>()
         .join(" ")
 }

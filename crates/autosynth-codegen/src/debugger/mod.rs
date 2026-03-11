@@ -226,6 +226,28 @@ impl Debugger {
         });
     }
 
+    /// Create a standalone annotation group with just an operation label.
+    ///
+    /// Unlike [`record_ir_emit`](Self::record_ir_emit), this does NOT
+    /// map to an IR index. Consumes pending source values so pc/label
+    /// appear once. Use for bookkeeping annotations (push, pop, field
+    /// access) that should appear as their own rows.
+    pub fn note(&mut self, text: &str) {
+        let mut source_values = std::mem::replace(
+            &mut self.pending_source,
+            vec![None; self.source_columns.len()],
+        );
+        if let Some(&idx) = self.source_index.get("operation") {
+            source_values[idx] = Some(text.to_string());
+        }
+        let group_idx = self.groups.len();
+        self.groups.push(OpGroup {
+            source_values,
+            machine_insts: Vec::new(),
+        });
+        self.current_group = Some(group_idx);
+    }
+
     /// Map the next IR instruction index to a new group.
     ///
     /// Always creates a new group, consuming any pending source values.
