@@ -9,14 +9,15 @@
 mod builder;
 /// Debug trace collector for the codegen pipeline.
 pub mod debugger;
-/// Orchestrator — drives the backend with register cache decisions.
-mod orchestrator;
-/// Register cache — write-back cache over canonical wasm stack slots.
-pub mod regcache;
-
-pub use autosynth_ir::{AluOp, BlockId, CompOp, FunctionIdx, IrInst, VInit, VReg, VRegion, VRegionId};
+/// IR function and block types.
+mod ir_function;
+/// Lowerer — drives the backend with register cache decisions.
+mod lowerer;
+pub use autosynth_ir::{
+    AluOp, BlockId, CompOp, FunctionIdx, IrInst, LowerInst, RegInst, SlotRef, VReg, VInit,
+    VRegion, VRegionId,
+};
 pub use autosynth_isa::Width;
 pub use builder::{CodeBuilder, FunctionBuilder};
 pub use debugger::{Align, Debugger};
-pub use orchestrator::Orchestrator;
-pub use regcache::{PendingStore, RegCache, ResolveResult};
+pub use lowerer::Lowerer;

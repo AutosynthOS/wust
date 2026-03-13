@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 
-use autosynth_lower::{BackendEmitter, LowerError, MachineConfig};
 use autosynth_ir::{AluOp, BlockId, CompOp, FunctionIdx, IrInst, VReg};
 use autosynth_isa::{IsaReg, PReg, PRegOr, UImm12, Width};
 use autosynth_isa_aarch64::{
@@ -15,6 +14,7 @@ use autosynth_isa_aarch64::{
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
 use autosynth_lower::{self, LowerCtx, LowerCtxExt};
+use autosynth_lower::{BackendEmitter, LowerError, MachineConfig};
 
 /// A saved patch point — the byte offset of an instruction that needs
 /// its offset field rewritten after all blocks are laid out.
@@ -59,21 +59,16 @@ enum CompoundOperation {
     Base(IrInst),
 }
 
-fn fixed_aarch64(role: IsaReg) -> Option<PReg> {
-    match role {
-        IsaReg::FramePointer => Some(PReg(29)),
-        IsaReg::StackPointer => Some(PReg(31)),
-        IsaReg::ReturnAddress => Some(PReg(30)),
-        IsaReg::PlatformReserved => Some(PReg(18)),
-        IsaReg::FromStart | IsaReg::FromEnd => None,
-    }
-}
-
 impl BackendEmitter for Aarch64Backend {
     fn new() -> (Self, MachineConfig) {
         let pool = (0u8..=30).map(PReg).collect();
-        let mut config = MachineConfig::new(pool, fixed_aarch64);
-        config.reserve("x18", IsaReg::PlatformReserved);
+        let isa_regs = HashMap::from([
+            (IsaReg::FramePointer, PReg(29)),
+            (IsaReg::StackPointer, PReg(31)),
+            (IsaReg::ReturnAddress, PReg(30)),
+            (IsaReg::PlatformReserved, PReg(18)),
+        ]);
+        let config = MachineConfig::new(pool, isa_regs);
         let backend = Self {
             code: Vec::new(),
             labels: HashMap::new(),
@@ -122,13 +117,27 @@ impl BackendEmitter for Aarch64Backend {
         let chunk = |hw: u8| ((uval >> (hw as u32 * 16)) & 0xFFFF) as u16;
 
         // MOVZ: load lowest 16 bits, zero the rest.
-        emit_inst(self, Movz { rd, imm: UImm16::from(chunk(0)), hw: 0 })?;
+        emit_inst(
+            self,
+            Movz {
+                rd,
+                imm: UImm16::from(chunk(0)),
+                hw: 0,
+            },
+        )?;
 
         // MOVK: patch in each non-zero 16-bit chunk above.
         for hw in 1..=max_hw {
             let bits = chunk(hw);
             if bits != 0 {
-                emit_inst(self, Movk { rd, imm: UImm16::from(bits), hw })?;
+                emit_inst(
+                    self,
+                    Movk {
+                        rd,
+                        imm: UImm16::from(bits),
+                        hw,
+                    },
+                )?;
             }
         }
         Ok(())
@@ -177,7 +186,9 @@ impl Aarch64Backend {
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(pending.dbg_group_idx));
                 let (lhs_preg, lhs_width) = ctx.into_preg(*lhs, self)?;
                 let (dst_preg, dst_width) = ctx.define_vreg(*dst, self);
-                lower_cmp(ctx, *c, dst_preg, dst_width, lhs_preg, lhs_width, *rhs, self)?;
+                lower_cmp(
+                    ctx, *c, dst_preg, dst_width, lhs_preg, lhs_width, *rhs, self,
+                )?;
                 // b.cond goes under the BrIf's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(dbg_group_idx));
                 let cond = comp_op_to_cond(*c).invert();
@@ -205,9 +216,24 @@ impl Aarch64Backend {
     fn emit_base(&mut self, ctx: &mut impl LowerCtx, inst: IrInst) -> Result<(), LowerError> {
         match inst {
             IrInst::Alu { op, dst, lhs, rhs } => lower_alu(self, ctx, op, dst, lhs, rhs),
-            IrInst::Load { dst, width, base, offset } => lower_load(self, dst, width, base, offset),
-            IrInst::Store { src, width, base, offset } => lower_store(self, src, width, base, offset),
-            IrInst::Move { dst, dst_width, src, src_width } => lower_move(self, dst, dst_width, src, src_width),
+            IrInst::Load {
+                dst,
+                width,
+                base,
+                offset,
+            } => lower_load(self, dst, width, base, offset),
+            IrInst::Store {
+                src,
+                width,
+                base,
+                offset,
+            } => lower_store(self, src, width, base, offset),
+            IrInst::Move {
+                dst,
+                dst_width,
+                src,
+                src_width,
+            } => lower_move(self, dst, dst_width, src, src_width),
             IrInst::Return => {
                 use autosynth_isa_aarch64::Ret;
                 emit_inst(
@@ -396,7 +422,9 @@ fn lower_alu(
     let (dst_preg, dst_width) = ctx.define_vreg(dst, backend);
 
     match op {
-        AluOp::Comp(c) => lower_cmp(ctx, c, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend),
+        AluOp::Comp(c) => lower_cmp(
+            ctx, c, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend,
+        ),
         AluOp::Add => lower_add(ctx, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend),
         AluOp::Sub => lower_sub(ctx, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend),
         AluOp::Mul => todo!("mul not yet in ISA crate"),

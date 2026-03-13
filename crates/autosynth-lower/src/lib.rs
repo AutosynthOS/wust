@@ -175,72 +175,65 @@ impl<T: LowerCtx> LowerCtxExt for T {}
 
 // --- Machine configuration and backend trait ---
 
-/// Machine configuration — register pool and named reservations.
+/// Machine configuration — register pool and architectural register mapping.
 ///
 /// Created by the backend with the full register pool and
-/// arch-specific fixed mappings. The frontend reserves registers
-/// by name via [`reserve`](Self::reserve), and the remaining pool
-/// is used for scratch allocation. Reserved registers are looked up
-/// by name via [`use_reserved`](Self::use_reserved).
-#[derive(Clone)]
+/// arch-specific register roles. The frontend reserves registers
+/// via [`reserve`](Self::reserve), which removes them from the
+/// available pool and returns the physical register.
+#[derive(Debug, Clone)]
 pub struct MachineConfig {
     /// Available (unreserved) registers.
     pool: Vec<PReg>,
-    /// Named reserved registers.
-    reserved: HashMap<&'static str, PReg>,
-    /// Backend-provided mapping from fixed roles to physical registers.
-    fixed: fn(IsaReg) -> Option<PReg>,
+    /// Architectural register mapping — arch-agnostic roles to physical registers.
+    isa_regs: HashMap<IsaReg, PReg>,
 }
 
 impl MachineConfig {
-    pub fn new(pool: Vec<PReg>, fixed: fn(IsaReg) -> Option<PReg>) -> Self {
-        Self {
-            pool,
-            reserved: HashMap::new(),
-            fixed,
+    pub fn new(pool: Vec<PReg>, isa_regs: HashMap<IsaReg, PReg>) -> Self {
+        // Remove ISA-mapped registers from the pool up front.
+        let mut pool = pool;
+        for preg in isa_regs.values() {
+            pool.retain(|r| r != preg);
+        }
+        Self { pool, isa_regs }
+    }
+
+    /// Reserve a register by architectural role, removing it from the
+    /// available pool.
+    ///
+    /// For fixed roles (FramePointer, StackPointer, etc.), looks up the
+    /// arch-specific PReg from the isa_regs mapping. For `FromEnd`/`FromStart`,
+    /// allocates from the pool directly.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the role has no mapping or the pool is empty.
+    pub fn reserve(&mut self, role: IsaReg) -> PReg {
+        match role {
+            IsaReg::FromEnd => self.pool.pop().expect("no registers left in pool"),
+            IsaReg::FromStart => self.pool.remove(0),
+            role => {
+                let preg = *self
+                    .isa_regs
+                    .get(&role)
+                    .unwrap_or_else(|| panic!("no ISA register mapping for {role:?}"));
+                self.pool.retain(|r| *r != preg);
+                preg
+            }
         }
     }
 
-    /// Reserve a register by name and architectural role.
-    ///
-    /// Fixed roles (FramePointer, ReturnAddress, StackPointer) map
-    /// to platform-specific registers. `FromStart`/`FromEnd` allocate
-    /// from the remaining pool.
-    ///
-    /// Returns the physical register assigned to this role.
+    /// Look up an architectural register by role (read-only).
     ///
     /// # Panics
     ///
-    /// Panics if `name` is already reserved.
-    pub fn reserve(&mut self, name: &'static str, role: IsaReg) -> PReg {
-        assert!(
-            !self.reserved.contains_key(name),
-            "register '{name}' already reserved"
-        );
-        let preg = if let Some(fixed) = (self.fixed)(role) {
-            self.pool.retain(|r| *r != fixed);
-            fixed
-        } else {
-            match role {
-                IsaReg::FromStart => self.pool.remove(0),
-                IsaReg::FromEnd => self.pool.pop().expect("no registers left in pool"),
-                _ => unreachable!(),
-            }
-        };
-        self.reserved.insert(name, preg);
-        preg
-    }
-
-    /// Look up a reserved register by name.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `name` was never reserved.
-    pub fn use_reserved(&self, name: &str) -> PReg {
+    /// Panics if the role has no mapping for this architecture.
+    pub fn isa_reg(&self, role: IsaReg) -> PReg {
         *self
-            .reserved
-            .get(name)
-            .unwrap_or_else(|| panic!("register '{name}' was never reserved"))
+            .isa_regs
+            .get(&role)
+            .unwrap_or_else(|| panic!("no ISA register mapping for {role:?}"))
     }
 
     /// The remaining unreserved registers (scratch pool).

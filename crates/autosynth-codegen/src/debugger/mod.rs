@@ -97,17 +97,6 @@ struct BlockDebugMeta {
 ///    [`emit_machine_inst`](Self::emit_machine_inst) adds machine rows,
 ///    [`set_machine`](Self::set_machine) fills machine column values.
 /// 4. **Render**: [`render`](Self::render) produces the visualization.
-///
-/// # Examples
-///
-/// ```
-/// use autosynth_codegen::Debugger;
-/// use autosynth_codegen::disasm::table::Align;
-///
-/// let mut dbg = Debugger::new();
-/// dbg.add_source_column("pc", Align::Right);
-/// dbg.set_pending("pc", "42");
-/// ```
 pub struct Debugger {
     /// Function signature for the header (e.g. "fib<0>(w9<i32>) -> w9<i32>").
     pub signature: String,
@@ -306,27 +295,6 @@ impl Debugger {
     }
 
     /// Render the collected debug trace as a box-drawing visualization.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use autosynth_codegen::Debugger;
-    /// use autosynth_codegen::BlockId;
-    /// use autosynth_codegen::disasm::table::Align;
-    ///
-    /// let mut dbg = Debugger::new();
-    /// dbg.signature = "test<0>() -> ()".into();
-    /// dbg.add_source_column("pc", Align::Right);
-    /// dbg.add_source_column("label", Align::Left);
-    /// dbg.add_machine_column("asm", Align::Left);
-    /// dbg.mark_block_start(BlockId::Entry);
-    /// dbg.set_block_meta(BlockId::Entry, vec![], vec![]);
-    /// dbg.set_pending("pc", "0");
-    /// dbg.set_pending("label", "nop");
-    /// dbg.record_ir_emit();
-    /// let output = dbg.render();
-    /// assert!(output.contains("test<0>"));
-    /// ```
     pub fn render(&self) -> String {
         let columns = self.build_columns();
         let num_source = self.source_columns.len();

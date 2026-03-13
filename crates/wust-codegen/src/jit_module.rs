@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use autosynth_codegen::{
-    AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, Orchestrator, VReg,
-    VRegion, Width,
+    Align, AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, Lowerer,
+    RegInst, SlotRef, VInit, VReg, VRegion, VRegionId, Width, debugger,
 };
 use autosynth_isa::{IsaReg, PReg};
 use autosynth_lower::BackendEmitter;
@@ -31,14 +31,9 @@ pub struct JitModule<B: BackendEmitter> {
 impl<B: BackendEmitter> JitModule<B> {
     /// Compile all functions in the parsed WASM module to native code.
     pub fn new(module: ParsedModule) -> Result<Self, anyhow::Error> {
-        let (mut backend, mut config) = B::new();
-        config.reserve("fsp", IsaReg::StackPointer); // x31 (sp) stack pointer on aarch64
-        config.reserve("lr", IsaReg::ReturnAddress); // x30 link register on aarch64
-        config.reserve("lbp", IsaReg::FramePointer); // x29 frame pointer on aarch64
-        config.reserve("fuel", IsaReg::FromEnd); // x28 fuel counter on aarch64
-        config.reserve("ctx", IsaReg::FromEnd); // x27 context pointer on aarch64
+        let (mut backend, config) = B::new();
 
-        let mut orch = Orchestrator::new(config);
+        let mut orch = Lowerer::new(config.clone());
         let mut compiler = CodeBuilder::new();
 
         let signatures = build_signatures(&module);
@@ -51,7 +46,12 @@ impl<B: BackendEmitter> JitModule<B> {
         let mut trampoline_offsets: Vec<usize> = Vec::new();
 
         for (func_idx, func) in module.funcs.iter().enumerate() {
-            Self::compile_func(&mut compiler, orch.config(), func_idx as i32, &module.funcs)?;
+            Self::compile_func(
+                &mut compiler,
+                &mut config.clone(),
+                func_idx as i32,
+                &module.funcs,
+            )?;
 
             let ir_func = &compiler.functions()[compiler.functions().len() - 1];
             let body_bytes = orch
@@ -88,20 +88,20 @@ impl<B: BackendEmitter> JitModule<B> {
     /// source-level annotations are recorded automatically.
     pub fn compile_func(
         cb: &mut CodeBuilder,
-        config: &autosynth_lower::MachineConfig,
+        config: &mut autosynth_lower::MachineConfig,
         func_idx: i32,
         all_funcs: &[FuncMeta],
     ) -> anyhow::Result<()> {
         let func = &all_funcs[func_idx as usize];
         let sig = func_signature(func);
 
-        let mut f = FunctionBuilder::new(cb, sig);
+        let lbp_preg = config.reserve(IsaReg::FramePointer);
+        let lr_preg = config.reserve(IsaReg::ReturnAddress);
+        let fuel_preg = config.reserve(IsaReg::FromEnd);
+        let ctx_preg = config.reserve(IsaReg::FromEnd);
+        let fsp_preg = config.reserve(IsaReg::StackPointer);
 
-        let lbp_preg = config.use_reserved("lbp");
-        let _lr_preg = config.use_reserved("lr");
-        let fuel_preg = config.use_reserved("fuel");
-        let _ctx_preg = config.use_reserved("ctx");
-        let fsp_preg = config.use_reserved("fsp");
+        let mut f = FunctionBuilder::new(cb, sig);
 
         // Entry block must be active before defining vstacks,
         // since vstack state lives on the block.
@@ -111,41 +111,46 @@ impl<B: BackendEmitter> JitModule<B> {
         //
         // [param0, param1, local_2, ...][frame header][operands]
         // ^ lbp
+        let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
+
         let locals = f.define_region(VRegion {
             label: "local",
             base: lbp_preg,
             base_offset: 0,
+            slots: Vec::new(),
         });
         let operands = f.define_region(VRegion {
             label: "ops",
             base: lbp_preg,
-            base_offset: func.locals_size as u32 + FRAME_HEADER_SIZE as u32,
+            base_offset: locals_header_size,
+            slots: Vec::new(),
         });
         let _fibre = f.define_region(VRegion {
             label: "fibre",
             base: fsp_preg,
             base_offset: 0,
+            slots: Vec::new(),
         });
 
         // "operation" column registered after all vstacks so it appears rightmost.
-        f.finish_entry();
+        debugger::dbg(|dbg| dbg.add_source_column("operation", Align::Left));
 
         // Declare parameters — each starts in its CC register (PReg(i)).
         for (i, param) in func.params.iter().enumerate() {
             f.begin_op(&format!("p{i}"), &format!("param {i} = {param}"));
-            let v = f.preg_vreg(PReg(i as u8), valtype_to_width(param));
-            f.define_field(locals, v);
+            let w = valtype_to_width(param);
+            let preg = PReg(i as u8);
+            let v = f.alloc_vreg(w, VInit::PReg(preg));
+            f.push_vreg(locals, v);
         }
 
         // Declare zero-initialized locals
         for (i, local) in func.locals.iter().enumerate() {
             let idx = i + func.params.len();
             f.begin_op(&format!("l{idx}"), &format!("local {idx} = {local}"));
-            let v = match valtype_to_width(&local) {
-                Width::W32 => f.const_i32(0),
-                Width::W64 => f.const_i64(0),
-            };
-            f.define_field(locals, v);
+            let w = valtype_to_width(&local);
+            let v = f.alloc_vreg(w, VInit::Const(0));
+            f.push_vreg(locals, v);
         }
 
         f.begin_op("--", "prologue");
@@ -157,7 +162,6 @@ impl<B: BackendEmitter> JitModule<B> {
 
         // Fuel tracking: accumulate cost per opcode, flush before calls.
         let mut pending_fuel: u32 = 0;
-        let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
 
         // Main compilation loop
         let mut pc = 0;
@@ -177,18 +181,20 @@ impl<B: BackendEmitter> JitModule<B> {
 
             match op {
                 OpCode::I32Const => {
-                    f.push_const_i32(operands, inline_op.immediate_i32());
+                    let value = inline_op.immediate_i32() as i64;
+                    let v = f.alloc_vreg(Width::W32, VInit::Const(value));
+                    f.push_vreg(operands, v);
                 }
 
                 OpCode::LocalGetI32 => {
-                    let idx = inline_op.local_index();
-                    let src = f.get_field(locals, idx as usize);
+                    let idx = inline_op.local_index() as usize;
+                    let src = f.get_field(locals, idx);
                     f.push_vreg(operands, src);
                 }
                 OpCode::LocalSetI32 => {
-                    let idx = inline_op.local_index();
+                    let idx = inline_op.local_index() as usize;
                     let val = f.pop_any(operands);
-                    f.set_field(locals, idx as usize, val);
+                    f.set_field(locals, idx, val);
                 }
 
                 OpCode::I32Add => {
@@ -222,22 +228,7 @@ impl<B: BackendEmitter> JitModule<B> {
                 OpCode::End => {
                     let block_idx = inline_op.immediate_u32();
                     if block_idx == 0 {
-                        // if lr_saved {
-                        //     // ldr lr, [fsp, #0]
-                        //     f.emit(IrInst::Load {
-                        //         dst: lr,
-                        //         base: fsp_preg,
-                        //         offset: 0,
-                        //     });
-                        //     // add fsp, fsp, #16
-                        //     f.emit(IrInst::Alu {
-                        //         op: AluOp::Add,
-                        //         dst: fsp,
-                        //         lhs: Operand::from(fsp),
-                        //         rhs: Operand::ConstI32(16),
-                        //     });
-                        // }
-                        // f.emit_return(operands);
+                        Self::emit_return(&mut f, operands, func);
                         break;
                     }
                     // Wasm block end — finalize current block if not already done.
@@ -248,22 +239,7 @@ impl<B: BackendEmitter> JitModule<B> {
                 }
 
                 OpCode::Return => {
-                    // if lr_saved {
-                    //     // ldr lr, [fsp, #0]
-                    //     f.emit(IrInst::Load {
-                    //         dst: lr,
-                    //         base: fsp_preg,
-                    //         offset: 0,
-                    //     });
-                    //     // add fsp, fsp, #16
-                    //     f.emit(IrInst::Alu {
-                    //         op: AluOp::Add,
-                    //         dst: fsp,
-                    //         lhs: Operand::from(fsp),
-                    //         rhs: Operand::ConstI32(16),
-                    //     });
-                    // }
-                    f.emit_return(operands);
+                    Self::emit_return(&mut f, operands, func);
                 }
 
                 OpCode::Call => {
@@ -272,28 +248,28 @@ impl<B: BackendEmitter> JitModule<B> {
                         todo!("call to negative index function");
                     }
 
-                    // // Save LR to fibre stack (once, before first call).
-                    // if !lr_saved {
-                    //     lr_saved = true;
-                    //     // sub fsp, fsp, #16
-                    //     f.emit(IrInst::Alu {
-                    //         op: AluOp::Sub,
-                    //         dst: fsp,
-                    //         lhs: Operand::from(fsp),
-                    //         rhs: Operand::ConstI32(16),
-                    //     });
-                    //     // str lr, [fsp, #0]
-                    //     f.emit(IrInst::Store {
-                    //         src: Operand::from(lr),
-                    //         base: fsp_preg,
-                    //         offset: 0,
-                    //     });
-                    // }
-
                     let func_idx = FunctionIdx::User(callee_idx as u32);
-                    let lbp = f.preg_vreg(lbp_preg, Width::W64);
-                    f.emit_call(operands, func_idx, locals_header_size, lbp);
-                    let fuel = f.preg_vreg(fuel_preg, Width::W64);
+                    let callee = &all_funcs[callee_idx as usize];
+                    let callee_sig = func_signature(callee);
+
+                    // Pop args and constrain each to its CC register.
+                    let n = callee_sig.params.len();
+                    for i in (0..n).rev() {
+                        let vreg = f.pop_any(operands);
+                        f.set_target(vreg, PReg(i as u8));
+                    }
+
+                    f.emit(IrInst::Call { func_idx });
+
+                    f.begin_op("--", "restore frame");
+
+                    // Push result vregs — initialized from CC registers.
+                    for (i, ty) in callee_sig.results.iter().enumerate() {
+                        let v = f.alloc_vreg(ty.width(), VInit::PReg(PReg(i as u8)));
+                        f.push_vreg(operands, v);
+                    }
+
+                    let fuel = f.alloc_vreg(Width::W64, VInit::PReg(fuel_preg));
                     Self::emit_fuel_check(&mut f, fuel, &mut pending_fuel, pc);
                 }
 
@@ -307,13 +283,22 @@ impl<B: BackendEmitter> JitModule<B> {
         Ok(())
     }
 
+    /// Pop results into CC registers and emit ret.
+    fn emit_return(f: &mut FunctionBuilder, operands: VRegionId, func: &FuncMeta) {
+        for i in (0..func.results.len()).rev() {
+            let vreg = f.pop_any(operands);
+            f.set_target(vreg, PReg(i as u8));
+        }
+        f.ret();
+    }
+
     fn emit_fuel_check(f: &mut FunctionBuilder, fuel: VReg, pending_fuel: &mut u32, pc: usize) {
         // Fused subtract-and-compare: subs fuel, fuel, #N
         // LeS makes the backend emit `subs` (flag-setting subtract).
         // Using `fuel` (physical register) as dst writes the result
         // back to fuel while setting flags for the LE condition.
-        let fuel_cond = f.const_i64(0);
-        let cost = f.const_i32(*pending_fuel as i32);
+        let fuel_cond = f.alloc_vreg(Width::W64, VInit::Const(0));
+        let cost = f.alloc_vreg(Width::W32, VInit::Const(*pending_fuel as i64));
         f.emit(IrInst::Alu {
             op: AluOp::Comp(CompOp::LeS),
             dst: fuel,

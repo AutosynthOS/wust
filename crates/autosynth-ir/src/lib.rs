@@ -284,60 +284,84 @@ pub enum IrInst {
     Skipped(Box<IrInst>),
 }
 
+/// A register allocation instruction — commands to the register allocator.
+///
+/// These are interleaved with [`IrInst`]s in the [`LowerInst`] stream.
+/// The register allocator processes these to maintain its internal state
+/// (vreg definitions, slot assignments, liveness, dirtiness).
+#[derive(Debug, Clone)]
+pub enum RegInst {
+    /// Assign a canonical memory slot to a vreg (push, set_field).
+    /// The slot is always dirty — memory doesn't have the value yet.
+    SetSlot { vreg: VReg, slot: SlotRef },
+    /// Remove a vreg's canonical slot (pop — value becomes a temp).
+    ClearSlot { vreg: VReg, slot: SlotRef },
+    /// Origin binding — this vreg's value is currently in this preg.
+    Bind { vreg: VReg, preg: PReg },
+    /// Mark all scratch registers as clobbered (call boundary).
+    Clobber,
+    /// Record a use of a vreg (for liveness / LRU tracking).
+    Use { vreg: VReg },
+}
+
+/// A combined instruction for the lowering pipeline.
+///
+/// The register allocator processes this stream linearly. `Ir` instructions
+/// are forwarded to the backend after vreg resolution. `Reg` instructions
+/// update the allocator's internal state (no code emitted).
+#[derive(Debug, Clone)]
+pub enum LowerInst {
+    /// An IR instruction — the backend selects machine instructions for this.
+    Ir(IrInst),
+    /// A register allocation command — the allocator updates its state.
+    Reg(RegInst),
+}
+
 /// Index into the virtual region table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VRegionId(pub u32);
 
-/// Canonical memory location for a VReg — where it lives in a virtual region.
+/// Reference to a slot in a virtual region.
+///
+/// The byte offset is computed on-the-fly by the lowerer from the
+/// region's layout — no precomputed addresses stored here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CanonSlot {
+pub struct SlotRef {
     /// Which virtual region this slot belongs to.
     pub region: VRegionId,
     /// Slot index within that region.
     pub index: u32,
-    /// Byte offset from the region's base (base_reg + base_offset + byte_offset).
-    pub byte_offset: u32,
-    /// Size in bytes (4 for i32/f32, 8 for i64/f64, 16 for v128).
-    pub size: u8,
 }
 
-/// How a VReg gets its initial value.
+/// Immutable origin of a VReg's value — how it was created.
 ///
-/// Width is always derived from the VRegDef — never stored here.
+/// SSA: a VReg's value never changes after definition. The origin
+/// tells the lowerer how to obtain the value (rematerialize a const,
+/// look up a register binding, resolve via the register allocator).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum VInit {
-    /// A compile-time constant (sign-extended to 64 bits).
+    /// A compile-time constant (sign-extended to 64 bits). Rematerializable.
     Const(i64),
-    /// Arrives in a physical register (function params, call results).
+    /// Value arrived in a physical register (function params, call results).
     PReg(PReg),
-    /// Copies value from another VReg (local assignments, operand forwarding).
-    CopyOf(VReg),
+    /// Produced as the destination of an instruction (ALU, load, etc.).
+    InstDst,
 }
 
 /// Metadata for a virtual register definition.
 ///
-/// Each VReg has a unique id, a width that determines register size and
-/// memory layout, an optional canonical stack slot, and an optional
-/// initial value describing how it gets its value.
-///
-/// When `slot` is `None`, the VReg is a **temp** — it has no canonical
-/// memory location and cannot be spilled. Temps must be either consumed
-/// immediately (e.g. a comparison result feeding the next `BrIf`) or
-/// rematerializable from their `initial` value (e.g. a constant).
+/// Each VReg has a unique id, a width, and an immutable origin
+/// describing how its value was produced.
 #[derive(Debug, Clone, Copy)]
 pub struct VRegDef {
     /// The unique virtual register identifier.
     pub id: VReg,
     /// Register width (W32 or W64) — determines instruction width and slot size.
     pub width: Width,
-    /// Canonical memory location on a virtual stack, or `None` for temps.
-    pub slot: Option<CanonSlot>,
-    /// How this VReg gets its value, or `None` if written by an instruction
-    /// (ALU result, call return, etc.).
-    pub initial: Option<VInit>,
-    /// Physical register constraint for the allocator.
-    /// - `Some(preg)`: must be placed in this physical register (CC constraints).
-    /// - `None`: allocator chooses freely.
+    /// How this vreg's value was produced.
+    pub origin: VInit,
+    /// If set, the allocator should place this vreg in this preg.
+    /// Used for call args and return values.
     pub target: Option<PReg>,
 }
 
@@ -354,43 +378,8 @@ pub struct VRegion {
     pub base: PReg,
     /// Byte offset from the base register to the start of this region.
     pub base_offset: u32,
-}
-
-/// A complete IR function — the finalized output of FunctionBuilder.
-///
-/// This is a read-only type. All mutation happens during building.
-/// Blocks have their params, results, and successors computed.
-#[derive(Debug)]
-pub struct IRFunction {
-    /// Virtual region configurations, indexed by VRegionId.
-    pub regions: Vec<VRegion>,
-    /// All VReg definitions, indexed by VReg id.
-    pub vreg_defs: Vec<VRegDef>,
-    /// All blocks with analyzed control flow.
-    pub blocks: Vec<IrBlock>,
-}
-
-/// A basic block in the IR.
-///
-/// Blocks have typed params (live-in values from predecessors) and
-/// results (live-out values passed to successors). At a branch to
-/// block B, the brancher provides B's params. At B's terminator,
-/// B provides its results to the target block's params.
-///
-/// This threading makes liveness explicit at every block boundary —
-/// the regcache only needs to preserve what's in params/results.
-#[derive(Debug)]
-pub struct IrBlock {
-    /// This block's identifier.
-    pub id: BlockId,
-    /// Values flowing into this block from predecessors (live-in VRegs).
-    pub params: Vec<VReg>,
-    /// Values flowing out of this block to successors (live-out VRegs).
-    pub results: Vec<VReg>,
-    /// Successor block IDs, extracted from the terminator instruction.
-    pub successors: Vec<BlockId>,
-    /// The instruction stream for this block.
-    pub instructions: Vec<IrInst>,
+    /// Which VReg occupies each slot position in this region.
+    pub slots: Vec<VReg>,
 }
 
 impl fmt::Display for IrInst {

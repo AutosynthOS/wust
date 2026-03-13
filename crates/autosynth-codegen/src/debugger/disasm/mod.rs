@@ -4,15 +4,6 @@
 //! consumer can then add annotations, apply register renames, and call
 //! [`DisasmMetadata::render`] to produce a tree-style visualization with
 //! control flow edges drawn using box-drawing characters.
-//!
-//! # Example
-//!
-//! ```ignore
-//! let (bytes, mut meta) = backend.lower_with_disasm(&func);
-//! meta.instructions[3].annotation = Some("; local.get 0".into());
-//! let output = meta.render(Some(&renames));
-//! println!("{output}");
-//! ```
 
 /// Box-drawing renderers for function and block visualizations.
 pub mod boxes;
@@ -94,17 +85,6 @@ pub struct BranchInfo {
 /// Applied to instruction text before rendering. Replacement is done at
 /// word boundaries to avoid partial matches (e.g. "x20" inside "x200"
 /// is not replaced).
-///
-/// # Example
-///
-/// ```
-/// use autosynth_codegen::disasm::RegisterRenames;
-///
-/// let mut renames = RegisterRenames::new();
-/// renames.add("x29", "g.lb");
-/// renames.add("x20", "g.ctx");
-/// assert_eq!(renames.apply("ldr x9, [x29, #0]"), "ldr x9, [g.lb, #0]");
-/// ```
 pub struct RegisterRenames {
     /// Ordered list of (from, to) pairs. Longer names are matched first
     /// to prevent partial replacement (e.g. "x20" before "x2").

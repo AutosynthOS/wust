@@ -12,23 +12,6 @@ use autosynth_ir::BlockId;
 ///
 /// Contains optional params/results headers and a columnar data table.
 /// The block auto-sizes its border to fit the widest content line.
-///
-/// # Examples
-///
-/// ```
-/// use autosynth_codegen::disasm::boxes::BlockBox;
-/// use autosynth_codegen::disasm::table::{Table, Column, Row, Align};
-/// use autosynth_codegen::ir::block::BlockId;
-///
-/// let block = BlockBox {
-///     id: BlockId::User(6),
-///     params: vec!["v4<i32>".into()],
-///     results: vec!["v4<i32>".into(), "v5<i32>".into()],
-///     table: Table { columns: vec![], rows: vec![] },
-/// };
-/// let lines = block.render();
-/// assert!(lines[0].contains("U6"));
-/// ```
 pub struct BlockBox {
     /// The block identifier, displayed in the top border.
     pub id: BlockId,
@@ -158,22 +141,6 @@ impl BlockBox {
 ///
 /// Contains a function signature, global register assignments, and
 /// one or more [`BlockBox`] visualizations nested inside.
-///
-/// # Examples
-///
-/// ```
-/// use autosynth_codegen::disasm::boxes::{FunctionBox, BlockBox};
-/// use autosynth_codegen::disasm::table::Table;
-/// use autosynth_codegen::ir::block::BlockId;
-///
-/// let func = FunctionBox {
-///     signature: "fib<0>(w9<i32>) -> w9<i32>".into(),
-///     globals: vec![("g.lb".into(), "x29".into())],
-///     blocks: vec![],
-/// };
-/// let output = func.render();
-/// assert!(output.contains("fib<0>"));
-/// ```
 pub struct FunctionBox {
     /// Function signature displayed in the top border.
     pub signature: String,

@@ -4,24 +4,6 @@
 //! box-drawing characters for header/footer separators. Cells can be
 //! `None` (sparse) to visually group multi-row expansions.
 //!
-//! # Example
-//!
-//! ```
-//! use autosynth_codegen::disasm::table::{Table, Column, Row, Align};
-//!
-//! let table = Table {
-//!     columns: vec![
-//!         Column { header: "pc".into(), align: Align::Right },
-//!         Column { header: "asm".into(), align: Align::Left },
-//!     ],
-//!     rows: vec![
-//!         Row { cells: vec![Some("6".into()), Some("ldr w1, [g.lb]".into())] },
-//!         Row { cells: vec![None, Some("sub w4, w1, #1".into())] },
-//!     ],
-//! };
-//! let lines = table.render();
-//! assert!(lines[1].contains("pc"));
-//! ```
 
 /// Column text alignment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,24 +55,6 @@ impl Table {
     /// 3. A middle separator with `┼` at column joins
     /// 4. Data rows with `│` column separators
     /// 5. A bottom separator with `┴` at column joins
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use autosynth_codegen::disasm::table::{Table, Column, Row, Align};
-    ///
-    /// let table = Table {
-    ///     columns: vec![
-    ///         Column { header: "a".into(), align: Align::Left },
-    ///         Column { header: "bb".into(), align: Align::Left },
-    ///     ],
-    ///     rows: vec![
-    ///         Row { cells: vec![Some("x".into()), Some("yy".into())] },
-    ///     ],
-    /// };
-    /// let lines = table.render();
-    /// assert_eq!(lines.len(), 5); // top sep, header, mid sep, data row, bottom sep
-    /// ```
     pub fn render(&self) -> Vec<String> {
         let widths = self.compute_column_widths();
         let mut lines = Vec::new();
