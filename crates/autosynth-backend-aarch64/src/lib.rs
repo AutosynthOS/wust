@@ -120,10 +120,43 @@ impl BackendEmitter for Aarch64Backend {
         }
     }
 
+    fn bind_label(&mut self, block: BlockId) {
+        self.labels.insert(block, self.code.len());
+    }
+
     fn finalize(&mut self, _ctx: &mut impl LowerCtx) -> Result<(), LowerError> {
-        // TODO: real branch/call patching once backend owns labels
-        self.patches.clear();
+        for patch in std::mem::take(&mut self.patches) {
+            match (&patch.inst, patch.cond) {
+                (IrInst::BrIf { block_else, .. }, Some(cond)) => {
+                    let target = self.labels[block_else];
+                    let disp_bytes = target as i64 - patch.offset as i64;
+                    let word_offset = (disp_bytes / 4) as i32;
+                    if word_offset < -(1 << 18) || word_offset >= (1 << 18) {
+                        return Err(LowerError::ImmediateOutOfRange);
+                    }
+                    let word = BCond { cond, offset: word_offset }.encode_word();
+                    self.patch_code(patch.offset, &word.to_le_bytes());
+                }
+                (IrInst::Call { func_idx }, None) => {
+                    // TODO: cross-function call patching — for now,
+                    // resolve_func returns 0 (self-recursive only).
+                    let target = self.resolve_func(*func_idx).unwrap_or(0);
+                    let disp_bytes = target as i64 - patch.offset as i64;
+                    let word_offset = (disp_bytes / 4) as i32;
+                    if word_offset < -(1 << 25) || word_offset >= (1 << 25) {
+                        return Err(LowerError::ImmediateOutOfRange);
+                    }
+                    let word = Bl { offset: word_offset }.encode_word();
+                    self.patch_code(patch.offset, &word.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
         Ok(())
+    }
+
+    fn code(&self) -> &[u8] {
+        &self.code
     }
 
     fn materialize_const(&mut self, preg: PReg, val: i64, width: Width) -> Result<(), LowerError> {

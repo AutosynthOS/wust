@@ -25,6 +25,7 @@ pub fn compile(
         }
 
         regalloc.state.begin_block(&block.remaining_uses, &block.results);
+        backend.bind_label(block_id);
 
         for inst in &block.instructions {
             autosynth_lower::dbg(|dbg| dbg.begin_ir_inst(ir_index));
@@ -47,5 +48,5 @@ pub fn compile(
 
     backend.finalize(&mut regalloc)?;
 
-    Ok(vec![])
+    Ok(backend.code().to_vec())
 }

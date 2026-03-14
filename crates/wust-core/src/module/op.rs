@@ -430,12 +430,13 @@ impl OpCode {
             OpCode::Nop
             | OpCode::DataStream
             | OpCode::Block
-            | OpCode::Loop
             | OpCode::Else
             | OpCode::End
             | OpCode::I32Eqz
             | OpCode::I32LeS => 0,
             OpCode::If | OpCode::BrIf => 2,
+            OpCode::Call => 4,
+            OpCode::Loop => 1,
             _ => 1,
         }
     }

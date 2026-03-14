@@ -195,6 +195,74 @@ This decouples callee from caller completely:
 - On suspend/resume, the callee can be resumed in a different execution
   mode without any knowledge of the caller's state.
 
+### JIT locals-base register (g.lb)
+
+The interpreter uses `wasm_fp.ptr` (past the header) and accesses locals via
+**negative** byte offsets: `fp - (HEADER_SIZE + locals_size - byte_offset)`.
+
+The JIT uses a **locals-base** register (`g.lb`, ARM64 x29) that points to
+the start of the frame — before locals, before the header. All access uses
+**positive** unsigned offsets from `g.lb`:
+
+```text
+[params][locals][FrameHeader 12B][operands...]
+^g.lb           ^g.lb+locals_size ^g.lb+locals_header_size
+```
+
+**Why positive offsets?** ARM64's `ldr/str [Xn, #imm12]` with unsigned
+immediate gives 0–16,380 bytes (4,095 i32s) of range with zero-cost
+encoding. The negative-offset form (`ldur [Xn, #simm9]`) only covers
+±256 bytes (~64 i32s). Since locals, header, and operands all live at
+positive offsets from the frame start, `g.lb` gives the full range to
+all of them. In practice the limit is unreachable — a function would
+need thousands of locals plus deep operand stacks to exceed 16KB.
+
+The entry trampoline converts between the two representations:
+- **Entry:** `g.lb = wasm_fp.ptr - (locals_size + HEADER_SIZE)`
+- **Exit/suspend:** `wasm_fp.ptr = g.lb + locals_size + HEADER_SIZE`
+
+### Frame advance on calls
+
+The caller's top-of-stack operands become the callee's parameters.
+They occupy the same stack slots — the caller "pushes" args as
+operands, and the callee sees them as `locals[0], locals[1], ...`
+at the start of its frame:
+
+```text
+caller frame                                callee frame
+[params][locals][header][op0][op1][arg0][arg1][decl locals][header][ops...]
+^caller g.lb                     ^callee g.lb
+                                  args = callee's params
+```
+
+The advance skips the caller's frame up to (but not including) the
+args, because those args are now the callee's first locals:
+
+```
+advance = locals_header_size + (operand_depth[pc] - callee_param_slots) * 4
+```
+
+- `locals_header_size` — caller's `locals_size + HEADER_SIZE` (bytes)
+- `operand_depth[pc]` — caller's operand stack depth **before** the
+  call executes (in 4-byte slots, from the statically-known depth
+  table). This includes the args about to be consumed.
+- `callee_param_slots` — total slot count of the callee's parameters
+  (`sum of slot_size per param`). Subtracted because those slots
+  become part of the callee's frame, not the caller's.
+
+Before call: `add g.lb, g.lb, #advance`
+After return: `sub g.lb, g.lb, #advance`
+
+This is per-call-site (not per-function max) because the
+interpreter's `prev_fp_offset` is computed from the live `sp`, and
+suspend/resume interop requires both engines to agree on frame
+positions.
+
+**TODO:** When a callee has more parameters than available CC
+registers, overflow params will need to remain on the stack rather
+than being moved into registers. The current scheme assumes all
+params fit in registers.
+
 ### JIT hot path vs. host boundary
 
 - **JIT-to-JIT calls:** Can use registers (x9-x15 etc.) as an

@@ -337,6 +337,13 @@ pub trait BackendEmitter: Sized {
     /// Flush any pending instructions at block boundaries.
     fn flush(&mut self, ctx: &mut impl LowerCtx) -> Result<(), LowerError>;
 
+    /// Record that `block` starts at the current code offset.
+    ///
+    /// Called by the lowerer at the start of each block, after flushing
+    /// any pending instructions from the previous block. Used by
+    /// [`finalize`](Self::finalize) to resolve branch targets.
+    fn bind_label(&mut self, block: autosynth_ir::BlockId);
+
     /// Patch branch and call offsets after all blocks are laid out.
     ///
     /// Called once after all blocks have been emitted. The backend uses
@@ -349,4 +356,7 @@ pub trait BackendEmitter: Sized {
     ///
     /// Returns the register and its width.
     fn materialize_const(&mut self, preg: PReg, val: i64, width: Width) -> Result<(), LowerError>;
+
+    /// The emitted machine code buffer.
+    fn code(&self) -> &[u8];
 }

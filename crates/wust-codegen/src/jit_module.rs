@@ -1,14 +1,14 @@
 use std::marker::PhantomData;
 
 use autosynth_codegen::{
-    Align, AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst,
-    RegInst, VInit, VReg, VRegion, VRegionId, Width, debugger,
+    Align, AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, RegInst,
+    VInit, VReg, VRegion, VRegionId, Width, debugger,
 };
 use autosynth_isa::{IsaReg, PReg};
-use autosynth_lower::BackendEmitter;
+use autosynth_lower::{BackendEmitter, MachineConfig};
 
 use wust_core::exec::ModuleExecutor;
-use wust_core::{FRAME_HEADER_SIZE, FuncMeta, OpCode, Outcome, ParsedModule, Task};
+use wust_core::{FRAME_HEADER_SIZE, FuncMeta, OpCode, Outcome, ParsedModule, Task, slot_size};
 
 use crate::CodeBuffer;
 use crate::conversion::{build_signatures, func_signature, valtype_to_width};
@@ -32,7 +32,6 @@ impl<B: BackendEmitter> JitModule<B> {
     /// Compile all functions in the parsed WASM module to native code.
     pub fn new(module: ParsedModule) -> Result<Self, anyhow::Error> {
         let mut backend = B::new();
-        let config = B::machine_config();
         let mut compiler = CodeBuilder::new();
 
         let signatures = build_signatures(&module);
@@ -47,7 +46,7 @@ impl<B: BackendEmitter> JitModule<B> {
         for (func_idx, func) in module.funcs.iter().enumerate() {
             Self::compile_func(
                 &mut compiler,
-                config.clone(),
+                B::machine_config(),
                 func_idx as i32,
                 &module.funcs,
             )?;
@@ -86,7 +85,7 @@ impl<B: BackendEmitter> JitModule<B> {
     /// source-level annotations are recorded automatically.
     pub fn compile_func(
         cb: &mut CodeBuilder,
-        mut config: autosynth_lower::MachineConfig,
+        mut config: MachineConfig,
         func_idx: i32,
         all_funcs: &[FuncMeta],
     ) -> anyhow::Result<()> {
@@ -106,10 +105,13 @@ impl<B: BackendEmitter> JitModule<B> {
         // since vstack state lives on the block.
         f.entry_block(BlockId::Entry);
 
-        // Virtual stacks anchored to physical registers
+        // g.lb (locals-base) points to the start of the frame. All stack
+        // access uses positive unsigned offsets from g.lb, which gives
+        // 0–16KB range via ARM64's ldr/str [Xn, #imm12] encoding.
+        // See abi.md "JIT locals-base register" for the full rationale.
         //
-        // [param0, param1, local_2, ...][frame header][operands]
-        // ^ lbp
+        // [params][locals][FrameHeader 12B][operands...]
+        // ^g.lb           ^+locals_size    ^+locals_header_size
         let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
 
         let locals = f.define_region(VRegion {
@@ -198,7 +200,6 @@ impl<B: BackendEmitter> JitModule<B> {
                     let v = f.alloc_vreg(Width::W32, VInit::Const(value));
                     f.push_vreg(operands, v);
                 }
-
                 OpCode::LocalGetI32 => {
                     let idx = inline_op.local_index() as usize;
                     let src = f.get_field(locals, idx);
@@ -209,11 +210,9 @@ impl<B: BackendEmitter> JitModule<B> {
                     let val = f.pop(operands, Width::W32);
                     f.set_field(locals, idx, val);
                 }
-
                 OpCode::I32Add => f.binop(AluOp::Add, operands, Width::W32),
                 OpCode::I32Sub => f.binop(AluOp::Sub, operands, Width::W32),
                 OpCode::I32LeS => f.binop(AluOp::Comp(CompOp::LeS), operands, Width::W32),
-
                 OpCode::If => {
                     let block_idx = inline_op.immediate_u32();
                     let cond = f.pop(operands, Width::W32);
@@ -252,7 +251,6 @@ impl<B: BackendEmitter> JitModule<B> {
                     }
                     f.start_block(BlockId::User(pc as u32));
                 }
-
                 OpCode::Return => Self::emit_epilogue(
                     &mut f,
                     operands,
@@ -262,7 +260,6 @@ impl<B: BackendEmitter> JitModule<B> {
                     stack_alignment,
                     func,
                 ),
-
                 OpCode::Call => {
                     let callee_idx = inline_op.immediate_i32();
                     if callee_idx.is_negative() {
@@ -279,14 +276,55 @@ impl<B: BackendEmitter> JitModule<B> {
                         f.set_target(vreg, PReg(i as u8));
                     }
 
+                    f.begin_op("--", "clobber call");
+
                     // Clobber all live vregs — call will destroy registers.
                     f.clobber_region(locals);
                     f.clobber_region(operands);
                     f.clobber_region(fibre);
 
+                    // Frame advance: the caller's top-of-stack operands
+                    // become the callee's params (same stack slots). We
+                    // advance g.lb past the caller's frame up to (but not
+                    // including) those args, so the callee sees them as
+                    // locals[0..N]. See abi.md "Frame advance on calls".
+                    //
+                    // advance = locals_header_size
+                    //         + (operand_depth[pc] - callee_param_slots) * 4
+                    let callee_param_slots: u32 = callee.params.iter()
+                        .map(|t| slot_size(*t) as u32)
+                        .sum();
+                    let caller_operand_depth = func.body.operand_depth[pc] as u32;
+                    let advance = locals_header_size
+                        + (caller_operand_depth - callee_param_slots) * 4;
+
+                    f.begin_op("--", &format!("advance g.lb +{advance}"));
+
+                    // TODO: when callee has more params than CC registers,
+                    // overflow params stay on the stack instead of moving
+                    // to registers.
+                    let lb = f.alloc_vreg(Width::W64, VInit::PReg(lbp_preg));
+                    let advance_vreg = f.alloc_vreg(Width::W64, VInit::Const(advance as i64));
+                    f.emit(IrInst::Alu {
+                        op: AluOp::Add,
+                        dst: lb,
+                        lhs: lb,
+                        rhs: advance_vreg,
+                    });
+
                     f.emit(IrInst::Call { func_idx });
 
-                    f.begin_op("--", "restore frame");
+                    f.begin_op("--", &format!("restore g.lb -{advance}"));
+
+                    // Restore g.lb after call returns.
+                    let lb = f.alloc_vreg(Width::W64, VInit::PReg(lbp_preg));
+                    let advance_vreg = f.alloc_vreg(Width::W64, VInit::Const(advance as i64));
+                    f.emit(IrInst::Alu {
+                        op: AluOp::Sub,
+                        dst: lb,
+                        lhs: lb,
+                        rhs: advance_vreg,
+                    });
 
                     // Push result vregs — initialized from CC registers.
                     for (i, ty) in callee_sig.results.iter().enumerate() {
@@ -297,7 +335,6 @@ impl<B: BackendEmitter> JitModule<B> {
                     let fuel = f.alloc_vreg(Width::W64, VInit::PReg(fuel_preg));
                     Self::emit_fuel_check(&mut f, fuel, &mut pending_fuel, pc);
                 }
-
                 _ => todo!("unhandled opcode: {:?}", op),
             }
 
