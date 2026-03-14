@@ -18,6 +18,7 @@ use autosynth_lower::{BackendEmitter, LowerError, MachineConfig};
 
 /// A saved patch point — the byte offset of an instruction that needs
 /// its offset field rewritten after all blocks are laid out.
+#[allow(dead_code)]
 struct Patch {
     /// Byte offset of the instruction in the code buffer.
     offset: usize,
@@ -32,6 +33,7 @@ struct Patch {
 /// Uses `pending` to fuse compare+branch sequences: when an
 /// `Alu(Comp)` arrives, the condition code is stored. A subsequent
 /// `BrIf` consumes it and emits `b.cond` with the inverted condition.
+#[allow(dead_code)]
 pub struct Aarch64Backend {
     /// Code buffer for the backend.
     code: Vec<u8>,
@@ -144,6 +146,7 @@ impl BackendEmitter for Aarch64Backend {
     }
 }
 
+#[allow(dead_code)]
 impl Aarch64Backend {
     fn emit_code(&mut self, bytes: &[u8]) -> usize {
         let offset = self.code.len();

@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use autosynth_codegen::{
     Align, AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, Lowerer,
-    RegInst, SlotRef, VInit, VReg, VRegion, VRegionId, Width, debugger,
+    VInit, VReg, VRegion, VRegionId, Width, debugger,
 };
 use autosynth_isa::{IsaReg, PReg};
 use autosynth_lower::BackendEmitter;
@@ -96,9 +96,9 @@ impl<B: BackendEmitter> JitModule<B> {
         let sig = func_signature(func);
 
         let lbp_preg = config.reserve(IsaReg::FramePointer);
-        let lr_preg = config.reserve(IsaReg::ReturnAddress);
+        let _lr_preg = config.reserve(IsaReg::ReturnAddress);
         let fuel_preg = config.reserve(IsaReg::FromEnd);
-        let ctx_preg = config.reserve(IsaReg::FromEnd);
+        let _ctx_preg = config.reserve(IsaReg::FromEnd);
         let fsp_preg = config.reserve(IsaReg::StackPointer);
 
         let mut f = FunctionBuilder::new(cb, sig);
@@ -197,15 +197,9 @@ impl<B: BackendEmitter> JitModule<B> {
                     f.set_field(locals, idx, val);
                 }
 
-                OpCode::I32Add => {
-                    f.binop(AluOp::Add, operands);
-                }
-                OpCode::I32Sub => {
-                    f.binop(AluOp::Sub, operands);
-                }
-                OpCode::I32LeS => {
-                    f.binop(AluOp::Comp(CompOp::LeS), operands);
-                }
+                OpCode::I32Add => f.binop(AluOp::Add, operands),
+                OpCode::I32Sub => f.binop(AluOp::Sub, operands),
+                OpCode::I32LeS => f.binop(AluOp::Comp(CompOp::LeS), operands),
 
                 OpCode::If => {
                     let block_idx = inline_op.immediate_u32();
@@ -238,9 +232,7 @@ impl<B: BackendEmitter> JitModule<B> {
                     f.start_block(BlockId::User(pc as u32));
                 }
 
-                OpCode::Return => {
-                    Self::emit_return(&mut f, operands, func);
-                }
+                OpCode::Return => Self::emit_return(&mut f, operands, func),
 
                 OpCode::Call => {
                     let callee_idx = inline_op.immediate_i32();

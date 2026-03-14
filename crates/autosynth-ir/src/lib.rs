@@ -241,9 +241,7 @@ pub enum IrInst {
     Branch { target: BlockId },
 
     /// Function call (branch-and-link to another function).
-    Call {
-        func_idx: FunctionIdx,
-    },
+    Call { func_idx: FunctionIdx },
 
     /// Load from memory: dst = [base + offset].
     Load {
@@ -291,17 +289,14 @@ pub enum IrInst {
 /// (vreg definitions, slot assignments, liveness, dirtiness).
 #[derive(Debug, Clone)]
 pub enum RegInst {
+    /// Define a new vreg with its initial value origin.
+    /// Panics if the vreg has already been defined.
+    Define { vreg: VReg, value: VInit },
     /// Assign a canonical memory slot to a vreg (push, set_field).
     /// The slot is always dirty — memory doesn't have the value yet.
     SetSlot { vreg: VReg, slot: SlotRef },
     /// Remove a vreg's canonical slot (pop — value becomes a temp).
     ClearSlot { vreg: VReg, slot: SlotRef },
-    /// Origin binding — this vreg's value is currently in this preg.
-    Bind { vreg: VReg, preg: PReg },
-    /// Mark all scratch registers as clobbered (call boundary).
-    Clobber,
-    /// Record a use of a vreg (for liveness / LRU tracking).
-    Use { vreg: VReg },
 }
 
 /// A combined instruction for the lowering pipeline.
@@ -350,16 +345,15 @@ pub enum VInit {
 
 /// Metadata for a virtual register definition.
 ///
-/// Each VReg has a unique id, a width, and an immutable origin
-/// describing how its value was produced.
+/// Each VReg has a unique id and a width. The origin (how the value
+/// was produced) is communicated via `RegInst::Define` in the
+/// instruction stream.
 #[derive(Debug, Clone, Copy)]
 pub struct VRegDef {
     /// The unique virtual register identifier.
     pub id: VReg,
     /// Register width (W32 or W64) — determines instruction width and slot size.
     pub width: Width,
-    /// How this vreg's value was produced.
-    pub origin: VInit,
     /// If set, the allocator should place this vreg in this preg.
     /// Used for call args and return values.
     pub target: Option<PReg>,
@@ -401,10 +395,14 @@ impl fmt::Display for IrInst {
             IrInst::Call { func_idx } => {
                 write!(f, "call {func_idx}")
             }
-            IrInst::Load { dst, base, offset, .. } => {
+            IrInst::Load {
+                dst, base, offset, ..
+            } => {
                 write!(f, "p{} = load [p{}, #{offset}]", dst.0, base.0)
             }
-            IrInst::Store { src, base, offset, .. } => {
+            IrInst::Store {
+                src, base, offset, ..
+            } => {
                 write!(f, "store [p{}, #{offset}], p{}", base.0, src.0)
             }
             IrInst::Return => write!(f, "ret"),

@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 
+#[allow(dead_code)]
 mod disasm;
 
 use autosynth_ir::BlockId;

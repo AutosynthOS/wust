@@ -6,11 +6,22 @@
 
 use std::collections::HashMap;
 
-use autosynth_ir::{BlockId, IrInst, LowerInst, RegInst, VReg, VRegDef};
+use autosynth_ir::{BlockId, IrInst, LowerInst, RegInst, VInit, VReg, VRegDef};
 
 use crate::ir_function::IRFunction;
 use autosynth_isa::{PReg, Width};
 use autosynth_lower::{BackendEmitter, LowerCtx, LowerError, MachineConfig, ResolvedVReg};
+
+/// Where a vreg's value currently lives.
+#[derive(Debug, Clone)]
+enum VRegLoc {
+    /// Compile-time constant — rematerialize on demand.
+    Const(i64),
+    /// Destination of a future instruction — no physical location yet.
+    Pending,
+    /// In a physical register.
+    Reg(PReg),
+}
 
 /// The lowerer — implements [`LowerCtx`] for the backend.
 pub struct Lowerer {
@@ -18,6 +29,8 @@ pub struct Lowerer {
     code: Vec<u8>,
     /// Function-global vreg definitions, set at the start of compile().
     vreg_defs: Vec<VRegDef>,
+    /// Per-vreg location, indexed by VReg id.
+    vreg_locs: Vec<Option<VRegLoc>>,
     labels: HashMap<BlockId, usize>,
 }
 
@@ -27,6 +40,7 @@ impl Lowerer {
             config,
             code: Vec::with_capacity(64),
             vreg_defs: Vec::new(),
+            vreg_locs: Vec::new(),
             labels: HashMap::new(),
         }
     }
@@ -39,6 +53,18 @@ impl Lowerer {
         self.vreg_defs[vreg.0 as usize].width
     }
 
+    fn vreg_loc(&self, vreg: VReg) -> &VRegLoc {
+        self.vreg_locs[vreg.0 as usize]
+            .as_ref()
+            .unwrap_or_else(|| panic!("vreg {vreg} has not been defined"))
+    }
+
+    fn vreg_loc_mut(&mut self, vreg: VReg) -> &mut VRegLoc {
+        self.vreg_locs[vreg.0 as usize]
+            .as_mut()
+            .unwrap_or_else(|| panic!("vreg {vreg} has not been defined"))
+    }
+
     /// Compile an IR function into machine code bytes.
     pub fn compile(
         &mut self,
@@ -46,6 +72,7 @@ impl Lowerer {
         backend: &mut impl BackendEmitter,
     ) -> Result<Vec<u8>, LowerError> {
         self.vreg_defs = func.vreg_defs.clone();
+        self.vreg_locs = vec![None; func.vreg_defs.len()];
         let mut ir_index = 0;
 
         for &block_id in &func.block_order {
@@ -85,22 +112,27 @@ impl Lowerer {
         inst: &IrInst,
         backend: &mut impl BackendEmitter,
     ) -> Result<(), LowerError> {
-        // TODO: Call handling — process RegInst::Clobber + flush dirty
-        // vregs before the call, then process RegInst::Bind for results
-        // after. For now, just forward everything to the backend.
+        // TODO: Call handling — flush dirty vregs before the call.
         backend.lower(self, inst.clone())
     }
 
     fn lower_reg(&mut self, inst: &RegInst) {
-        // TODO: process RegInst to update per-vreg VRegState in the
-        // register allocator. This is the new state machine:
-        //   Define → creates vreg entry
-        //   Bind { vreg, preg } → binds vreg to physical register
-        //   SetSlot { vreg, slot } → assigns canonical slot
-        //   ClearSlot { vreg } → removes canonical slot (pop)
-        //   Clobber → marks all scratch registers as clobbered
-        //   Use { vreg } → records a use for LRU tracking
-        let _ = inst;
+        match inst {
+            RegInst::Define { vreg, value } => {
+                let idx = vreg.0 as usize;
+                assert!(
+                    self.vreg_locs[idx].is_none(),
+                    "vreg {vreg} already defined"
+                );
+                self.vreg_locs[idx] = Some(match value {
+                    VInit::Const(val) => VRegLoc::Const(*val),
+                    VInit::PReg(preg) => VRegLoc::Reg(*preg),
+                    VInit::InstDst => VRegLoc::Pending,
+                });
+            }
+            // Slot bookkeeping — will matter for flush/eviction later.
+            RegInst::SetSlot { .. } | RegInst::ClearSlot { .. } => {}
+        }
     }
 }
 
@@ -110,15 +142,31 @@ impl LowerCtx for Lowerer {
         vreg: VReg,
         _backend: &mut impl BackendEmitter,
     ) -> Result<ResolvedVReg, LowerError> {
-        // TODO: implement proper resolution from VRegState.
         let width = self.vreg_width(vreg);
-        Ok(ResolvedVReg::PReg(PReg(0), width))
+        match self.vreg_loc(vreg) {
+            VRegLoc::Const(val) => Ok(ResolvedVReg::Const(*val, width)),
+            VRegLoc::Reg(preg) => Ok(ResolvedVReg::PReg(*preg, width)),
+            VRegLoc::Pending => {
+                panic!("resolve_vreg({vreg}): vreg is Pending — instruction not yet lowered")
+            }
+        }
     }
 
     fn define_vreg(&mut self, vreg: VReg, _backend: &mut impl BackendEmitter) -> (PReg, Width) {
-        // TODO: implement proper allocation from VRegState.
         let width = self.vreg_width(vreg);
-        (PReg(0), width)
+        match self.vreg_loc(vreg) {
+            VRegLoc::Pending => {
+                // TODO: allocate a real register from the free pool.
+                let preg = PReg(0);
+                *self.vreg_loc_mut(vreg) = VRegLoc::Reg(preg);
+                (preg, width)
+            }
+            VRegLoc::Reg(preg) => {
+                // Already in a register (e.g. PReg-origin vreg reused as dst).
+                (*preg, width)
+            }
+            other => panic!("define_vreg({vreg}): unexpected state {other:?}"),
+        }
     }
 
     fn alloc_scratch(&mut self, _width: Width) -> PReg {

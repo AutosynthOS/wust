@@ -1,7 +1,9 @@
 //! IR function and block types — the output of the function builder,
 //! consumed by the lowerer.
 
-use autosynth_ir::{BlockId, LowerInst, VRegDef, VRegion};
+use std::collections::{HashMap, HashSet};
+
+use autosynth_ir::{BlockId, LowerInst, VReg, VRegDef, VRegion};
 
 /// A complete IR function — the finalized output of FunctionBuilder.
 #[derive(Debug)]
@@ -25,4 +27,16 @@ pub struct IrBlock {
     pub instructions: Vec<LowerInst>,
     /// Whether a terminator (br, br_if, ret) has been emitted.
     pub finalized: bool,
+    /// VRegs defined in this block (via alloc_vreg).
+    pub defs: HashSet<VReg>,
+    /// VRegs referenced in this block (via push, pop, get_field, set_field, set_target).
+    pub uses: HashSet<VReg>,
+    /// VRegs that are used but not defined in this block — must come from predecessors.
+    pub params: HashSet<VReg>,
+    /// VRegs from this block that are needed by successor blocks' params.
+    pub results: HashSet<VReg>,
+    /// Block-relative last use: vreg → instruction index of its final reference
+    /// within this block. VRegs in `results` are implicitly live at block exit
+    /// regardless of this value.
+    pub last_use: HashMap<VReg, usize>,
 }
