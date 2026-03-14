@@ -46,23 +46,15 @@ pub(crate) struct RegAlloc {
 }
 
 impl RegAlloc {
-    pub(crate) fn new(config: MachineConfig) -> Self {
-        let num_regs = config.num_regs();
+    pub(crate) fn new(config: &MachineConfig, vreg_defs: &[VRegDef]) -> Self {
         Self {
-            config,
-            vreg_defs: Vec::new(),
-            entries: Vec::new(),
-            bindings: vec![None; num_regs],
+            config: config.clone(),
+            vreg_defs: vreg_defs.to_vec(),
+            entries: vec![None; vreg_defs.len()],
+            bindings: vec![None; config.num_regs()],
             remaining: HashMap::new(),
             results: Vec::new(),
         }
-    }
-
-    pub(crate) fn reset(&mut self, vreg_defs: Vec<VRegDef>) {
-        let count = vreg_defs.len();
-        self.vreg_defs = vreg_defs;
-        self.entries.clear();
-        self.entries.resize(count, None);
     }
 
     pub(crate) fn snapshot(&self) -> RegAllocSnapshot {

@@ -1,7 +1,7 @@
 use std::marker::PhantomData;
 
 use autosynth_codegen::{
-    Align, AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, Lowerer,
+    Align, AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst,
     RegInst, VInit, VReg, VRegion, VRegionId, Width, debugger,
 };
 use autosynth_isa::{IsaReg, PReg};
@@ -32,8 +32,6 @@ impl<B: BackendEmitter> JitModule<B> {
     /// Compile all functions in the parsed WASM module to native code.
     pub fn new(module: ParsedModule) -> Result<Self, anyhow::Error> {
         let (mut backend, config) = B::new();
-
-        let mut orch = Lowerer::new(config.clone());
         let mut compiler = CodeBuilder::new();
 
         let signatures = build_signatures(&module);
@@ -54,8 +52,7 @@ impl<B: BackendEmitter> JitModule<B> {
             )?;
 
             let ir_func = &compiler.functions()[compiler.functions().len() - 1];
-            let body_bytes = orch
-                .compile(ir_func, &mut backend)
+            let body_bytes = autosynth_codegen::compile(&config, ir_func, &mut backend)
                 .map_err(|e| anyhow::anyhow!(e))?;
 
             let trampoline_bytes = emit_entry_trampoline(func);

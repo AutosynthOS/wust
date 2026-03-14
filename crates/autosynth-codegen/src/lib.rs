@@ -22,4 +22,4 @@ pub use autosynth_ir::{
 pub use autosynth_isa::Width;
 pub use builder::{CodeBuilder, FunctionBuilder};
 pub use debugger::{Align, Debugger};
-pub use lowerer::Lowerer;
+pub use lowerer::compile;
