@@ -316,16 +316,16 @@ pub enum LowerInst {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct VRegionId(pub u32);
 
-/// Reference to a slot in a virtual region.
+/// A resolved memory location for a vreg slot.
 ///
-/// The byte offset is computed on-the-fly by the lowerer from the
-/// region's layout — no precomputed addresses stored here.
+/// The builder computes the byte offset at emit time from the
+/// region's base register, base offset, and preceding slot widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotRef {
-    /// Which virtual region this slot belongs to.
-    pub region: VRegionId,
-    /// Slot index within that region.
-    pub index: u32,
+    /// Base physical register (e.g. frame pointer).
+    pub base: PReg,
+    /// Byte offset from the base register.
+    pub offset: u32,
 }
 
 /// Immutable origin of a VReg's value — how it was created.

@@ -193,17 +193,17 @@ impl<B: BackendEmitter> JitModule<B> {
                 }
                 OpCode::LocalSetI32 => {
                     let idx = inline_op.local_index() as usize;
-                    let val = f.pop_any(operands);
+                    let val = f.pop(operands, Width::W32);
                     f.set_field(locals, idx, val);
                 }
 
-                OpCode::I32Add => f.binop(AluOp::Add, operands),
-                OpCode::I32Sub => f.binop(AluOp::Sub, operands),
-                OpCode::I32LeS => f.binop(AluOp::Comp(CompOp::LeS), operands),
+                OpCode::I32Add => f.binop(AluOp::Add, operands, Width::W32),
+                OpCode::I32Sub => f.binop(AluOp::Sub, operands, Width::W32),
+                OpCode::I32LeS => f.binop(AluOp::Comp(CompOp::LeS), operands, Width::W32),
 
                 OpCode::If => {
                     let block_idx = inline_op.immediate_u32();
-                    let cond = f.pop_any(operands);
+                    let cond = f.pop(operands, Width::W32);
                     let then_block = BlockId::User(pc as u32 + 1);
                     let end_pc = func.body.blocks[block_idx as usize].end_pc;
                     let cont_block = BlockId::User(end_pc);
@@ -215,14 +215,14 @@ impl<B: BackendEmitter> JitModule<B> {
                     let target_block = &func.body.blocks[block_idx as usize];
                     let target = BlockId::User(target_block.end_pc);
                     let cont = BlockId::User(pc as u32 + 1);
-                    let cond = f.pop_any(operands);
+                    let cond = f.pop(operands, Width::W32);
                     f.br_if(cond, target, cont);
                     f.start_block(cont);
                 }
                 OpCode::End => {
                     let block_idx = inline_op.immediate_u32();
                     if block_idx == 0 {
-                        Self::emit_return(&mut f, operands, func);
+                        f.emit_return(operands);
                         break;
                     }
                     // Wasm block end — finalize current block if not already done.
@@ -232,7 +232,7 @@ impl<B: BackendEmitter> JitModule<B> {
                     f.start_block(BlockId::User(pc as u32));
                 }
 
-                OpCode::Return => Self::emit_return(&mut f, operands, func),
+                OpCode::Return => f.emit_return(operands),
 
                 OpCode::Call => {
                     let callee_idx = inline_op.immediate_i32();
@@ -245,9 +245,8 @@ impl<B: BackendEmitter> JitModule<B> {
                     let callee_sig = func_signature(callee);
 
                     // Pop args and constrain each to its CC register.
-                    let n = callee_sig.params.len();
-                    for i in (0..n).rev() {
-                        let vreg = f.pop_any(operands);
+                    for i in (0..callee_sig.params.len()).rev() {
+                        let vreg = f.pop(operands, callee_sig.params[i].width());
                         f.set_target(vreg, PReg(i as u8));
                     }
 
@@ -273,15 +272,6 @@ impl<B: BackendEmitter> JitModule<B> {
 
         f.build();
         Ok(())
-    }
-
-    /// Pop results into CC registers and emit ret.
-    fn emit_return(f: &mut FunctionBuilder, operands: VRegionId, func: &FuncMeta) {
-        for i in (0..func.results.len()).rev() {
-            let vreg = f.pop_any(operands);
-            f.set_target(vreg, PReg(i as u8));
-        }
-        f.ret();
     }
 
     fn emit_fuel_check(f: &mut FunctionBuilder, fuel: VReg, pending_fuel: &mut u32, pc: usize) {

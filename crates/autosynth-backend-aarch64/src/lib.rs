@@ -188,7 +188,7 @@ impl Aarch64Backend {
                 // subs goes under the Comp's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(pending.dbg_group_idx));
                 let (lhs_preg, lhs_width) = ctx.into_preg(*lhs, self)?;
-                let (dst_preg, dst_width) = ctx.define_vreg(*dst, self);
+                let (dst_preg, dst_width) = ctx.define_vreg(*dst, self)?;
                 lower_cmp(
                     ctx, *c, dst_preg, dst_width, lhs_preg, lhs_width, *rhs, self,
                 )?;
@@ -422,7 +422,7 @@ fn lower_alu(
     rhs: VReg,
 ) -> Result<(), LowerError> {
     let (lhs_preg, lhs_width) = ctx.into_preg(lhs, backend)?;
-    let (dst_preg, dst_width) = ctx.define_vreg(dst, backend);
+    let (dst_preg, dst_width) = ctx.define_vreg(dst, backend)?;
 
     match op {
         AluOp::Comp(c) => lower_cmp(

@@ -105,11 +105,14 @@ pub trait LowerCtx {
     ///
     /// If a target constraint requires evicting a dirty vreg, the
     /// implementation uses the backend to emit the spill store.
-    fn define_vreg(&mut self, vreg: VReg, backend: &mut impl BackendEmitter) -> (PReg, Width);
+    fn define_vreg(
+        &mut self,
+        vreg: VReg,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<(PReg, Width), LowerError>;
 
-    /// Allocate a temporary scratch register for constant
-    /// materialization.
-    fn alloc_scratch(&mut self, width: Width) -> PReg;
+    /// Allocate a free physical register.
+    fn alloc_reg(&mut self) -> Result<PReg, LowerError>;
 }
 
 /// Extension trait — convenience methods auto-implemented for all
@@ -143,7 +146,7 @@ pub trait LowerCtxExt: LowerCtx {
             ResolvedVReg::Const(val, w) => match Imm::try_from(val) {
                 Ok(imm) => Ok(PRegOr::Imm(imm)),
                 Err(_) => {
-                    let preg = self.alloc_scratch(w);
+                    let preg = self.alloc_reg()?;
                     backend.materialize_const(preg, val, w)?;
                     Ok(PRegOr::PReg(preg, w))
                 }
@@ -162,7 +165,7 @@ pub trait LowerCtxExt: LowerCtx {
         match self.resolve_vreg(vreg, backend)? {
             ResolvedVReg::PReg(preg, w) => Ok((preg, w)),
             ResolvedVReg::Const(val, w) => {
-                let preg = self.alloc_scratch(w);
+                let preg = self.alloc_reg()?;
                 backend.materialize_const(preg, val, w)?;
                 Ok((preg, w))
             }
@@ -249,6 +252,14 @@ pub enum LowerError {
     MisalignedOffset,
     /// An immediate value is out of the encodable range.
     ImmediateOutOfRange,
+    /// No physical registers available for allocation.
+    RegPoolExhausted,
+    /// A vreg was referenced before being defined.
+    UndefinedVReg(VReg),
+    /// A vreg was defined more than once.
+    DuplicateDefine(VReg),
+    /// define_vreg called on a vreg that isn't pending.
+    UnexpectedDefine(VReg),
 }
 
 impl fmt::Display for LowerError {
@@ -256,6 +267,10 @@ impl fmt::Display for LowerError {
         match self {
             LowerError::MisalignedOffset => write!(f, "misaligned offset"),
             LowerError::ImmediateOutOfRange => write!(f, "immediate out of range"),
+            LowerError::RegPoolExhausted => write!(f, "register pool exhausted"),
+            LowerError::UndefinedVReg(v) => write!(f, "vreg {v} used before definition"),
+            LowerError::DuplicateDefine(v) => write!(f, "vreg {v} defined more than once"),
+            LowerError::UnexpectedDefine(v) => write!(f, "define on vreg {v} that isn't pending"),
         }
     }
 }

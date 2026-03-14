@@ -11,8 +11,10 @@ mod builder;
 pub mod debugger;
 /// IR function and block types.
 mod ir_function;
-/// Lowerer — drives the backend with register cache decisions.
+/// Lowerer — drives the backend with register allocation decisions.
 mod lowerer;
+/// Register allocator — vreg location tracking and physical register pool.
+mod regalloc;
 pub use autosynth_ir::{
     AluOp, BlockId, CompOp, FunctionIdx, IrInst, LowerInst, RegInst, SlotRef, VReg, VInit,
     VRegion, VRegionId,

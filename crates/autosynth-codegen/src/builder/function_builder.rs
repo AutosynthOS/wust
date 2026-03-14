@@ -71,14 +71,28 @@ impl<'a> FunctionBuilder<'a> {
 
     fn record_use(&mut self, vreg: VReg) {
         if let Some(id) = self.current_block {
-            let block = self.blocks.get_mut(&id).unwrap();
-            block.uses.insert(vreg);
-            let inst_idx = block.instructions.len();
-            block.last_use.insert(vreg, inst_idx);
+            self.blocks.get_mut(&id).unwrap().uses.insert(vreg);
         }
     }
 
     // --- Region operations ---
+
+    /// Compute the byte offset of a slot within a region.
+    ///
+    /// Sums the widths (in bytes) of all slots preceding `index`,
+    /// then adds the region's base_offset.
+    fn slot_offset(&self, region: VRegionId, index: u32) -> SlotRef {
+        let r = &self.regions[region.0 as usize];
+        let mut offset = r.base_offset;
+        for i in 0..index as usize {
+            let vreg = r.slots[i];
+            offset += self.vreg_defs[vreg.0 as usize].width.bytes();
+        }
+        SlotRef {
+            base: r.base,
+            offset,
+        }
+    }
 
     /// Register a new virtual region.
     pub fn define_region(&mut self, region: VRegion) -> VRegionId {
@@ -88,29 +102,39 @@ impl<'a> FunctionBuilder<'a> {
         id
     }
 
+    /// Format a debug label for a region slot, e.g. "locals[0]".
+    fn slot_label(&self, region: VRegionId, index: u32) -> String {
+        let label = self.regions[region.0 as usize].label;
+        format!("{label}[{index}]")
+    }
+
     /// Push a vreg onto a region. Emits `RegInst::SetSlot`.
     pub fn push_vreg(&mut self, region: VRegionId, vreg: VReg) {
         self.record_use(vreg);
         let index = self.regions[region.0 as usize].slots.len() as u32;
+        let slot = self.slot_offset(region, index);
+        let desc = format!("{} <- {}", self.slot_label(region, index), self.fmt_vreg(vreg));
         self.regions[region.0 as usize].slots.push(vreg);
-        self.emit_reg(RegInst::SetSlot {
-            vreg,
-            slot: SlotRef { region, index },
-        });
+        self.emit_reg_with(RegInst::SetSlot { vreg, slot }, desc);
     }
 
-    /// Pop the top vreg from a region. Emits `RegInst::ClearSlot`.
-    pub fn pop_any(&mut self, region: VRegionId) -> VReg {
+    /// Pop the top vreg from a region. Asserts the vreg's width matches
+    /// `expected`. Emits `RegInst::ClearSlot`.
+    pub fn pop(&mut self, region: VRegionId, expected: Width) -> VReg {
         let index = self.regions[region.0 as usize].slots.len() as u32 - 1;
+        let slot = self.slot_offset(region, index);
         let vreg = self.regions[region.0 as usize]
             .slots
             .pop()
-            .expect("pop_any: region is empty");
+            .expect("pop: region is empty");
+        let actual = self.vreg_width(vreg);
+        assert_eq!(
+            actual, expected,
+            "pop: expected {expected} but vreg {vreg} is {actual}"
+        );
         self.record_use(vreg);
-        self.emit_reg(RegInst::ClearSlot {
-            vreg,
-            slot: SlotRef { region, index },
-        });
+        let desc = format!("{}:pop -> {}", self.slot_label(region, index), self.fmt_vreg(vreg));
+        self.emit_reg_with(RegInst::ClearSlot { vreg, slot }, desc);
         vreg
     }
 
@@ -124,14 +148,10 @@ impl<'a> FunctionBuilder<'a> {
     /// Write a vreg into an existing region slot. Emits `RegInst::SetSlot`.
     pub fn set_field(&mut self, region: VRegionId, index: usize, vreg: VReg) {
         self.record_use(vreg);
+        let slot = self.slot_offset(region, index as u32);
+        let desc = format!("{} <- {}", self.slot_label(region, index as u32), self.fmt_vreg(vreg));
         self.regions[region.0 as usize].slots[index] = vreg;
-        self.emit_reg(RegInst::SetSlot {
-            vreg,
-            slot: SlotRef {
-                region,
-                index: index as u32,
-            },
-        });
+        self.emit_reg_with(RegInst::SetSlot { vreg, slot }, desc);
     }
 
     // --- VReg allocation ---
@@ -266,9 +286,9 @@ impl<'a> FunctionBuilder<'a> {
     pub fn emit_return(&mut self, operands: VRegionId) {
         match self.signature.abi {
             Abi::NativeWasm => {
-                let n = self.signature.results.len();
-                for i in (0..n).rev() {
-                    let vreg = self.pop_any(operands);
+                let results = self.signature.results.clone();
+                for i in (0..results.len()).rev() {
+                    let vreg = self.pop(operands, results[i].width());
                     self.set_target(vreg, PReg(i as u8));
                 }
             }
@@ -291,6 +311,20 @@ impl<'a> FunctionBuilder<'a> {
     /// Emit an IR instruction into the currently active block.
     pub fn emit(&mut self, inst: IrInst) {
         let id = self.current_block.expect("emit: no active block");
+
+        // Count vreg operands for remaining_uses.
+        let block = self.blocks.get_mut(&id).unwrap();
+        match &inst {
+            IrInst::Alu { lhs, rhs, .. } => {
+                *block.remaining_uses.entry(*lhs).or_insert(0) += 1;
+                *block.remaining_uses.entry(*rhs).or_insert(0) += 1;
+            }
+            IrInst::BrIf { cond, .. } => {
+                *block.remaining_uses.entry(*cond).or_insert(0) += 1;
+            }
+            _ => {}
+        }
+
         self.snapshot_debug();
         debugger::dbg(|dbg| {
             dbg.record_ir_emit();
@@ -307,6 +341,18 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Emit a register allocation instruction into the currently active block.
     pub fn emit_reg(&mut self, inst: RegInst) {
+        let desc = match &inst {
+            RegInst::Define { vreg, value } => match value {
+                VInit::Const(val) => format!("{}=#{}", self.fmt_vreg(*vreg), val),
+                VInit::PReg(preg) => format!("{} = p{}", self.fmt_vreg(*vreg), preg.0),
+                VInit::InstDst => format!("{} = <pending>", self.fmt_vreg(*vreg)),
+            },
+            _ => String::new(),
+        };
+        self.emit_reg_with(inst, desc);
+    }
+
+    fn emit_reg_with(&mut self, inst: RegInst, desc: String) {
         let id = self.current_block.expect("emit_reg: no active block");
         let block = self.blocks.get(&id).unwrap();
         assert!(
@@ -315,7 +361,6 @@ impl<'a> FunctionBuilder<'a> {
             id
         );
         self.snapshot_debug();
-        let desc = self.fmt_reg_inst(&inst);
         debugger::dbg(|dbg| {
             dbg.record_ir_emit();
             dbg.set_source("operation", &desc);
@@ -324,28 +369,10 @@ impl<'a> FunctionBuilder<'a> {
         block.instructions.push(LowerInst::Reg(inst));
     }
 
-    fn fmt_reg_inst(&self, inst: &RegInst) -> String {
-        match inst {
-            RegInst::Define { vreg, value } => match value {
-                VInit::Const(val) => format!("{}=#{}", self.fmt_vreg(*vreg), val),
-                VInit::PReg(preg) => format!("{} = p{}", self.fmt_vreg(*vreg), preg.0),
-                VInit::InstDst => format!("{} = <pending>", self.fmt_vreg(*vreg)),
-            }
-            RegInst::SetSlot { vreg, slot } => {
-                let label = self.regions[slot.region.0 as usize].label;
-                format!("{}[{}] <- {}", label, slot.index, self.fmt_vreg(*vreg))
-            }
-            RegInst::ClearSlot { vreg, slot } => {
-                let label = self.regions[slot.region.0 as usize].label;
-                format!("{}[{}]:pop -> {}", label, slot.index, self.fmt_vreg(*vreg))
-            }
-        }
-    }
-
-    pub fn binop(&mut self, op: AluOp, region: VRegionId) {
-        let rhs = self.pop_any(region);
-        let lhs = self.pop_any(region);
-        let w = self.vreg_width(lhs);
+    pub fn binop(&mut self, op: AluOp, region: VRegionId, width: Width) {
+        let rhs = self.pop(region, width);
+        let lhs = self.pop(region, width);
+        let w = width;
         let dst = self.alloc_vreg(w, VInit::InstDst);
         self.emit(IrInst::Alu { op, dst, lhs, rhs });
         self.push_vreg(region, dst);
@@ -465,7 +492,7 @@ impl<'a> FunctionBuilder<'a> {
                     uses: HashSet::new(),
                     params: HashSet::new(),
                     results: HashSet::new(),
-                    last_use: HashMap::new(),
+                    remaining_uses: HashMap::new(),
                 },
             );
         }

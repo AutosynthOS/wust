@@ -35,8 +35,7 @@ pub struct IrBlock {
     pub params: HashSet<VReg>,
     /// VRegs from this block that are needed by successor blocks' params.
     pub results: HashSet<VReg>,
-    /// Block-relative last use: vreg → instruction index of its final reference
-    /// within this block. VRegs in `results` are implicitly live at block exit
-    /// regardless of this value.
-    pub last_use: HashMap<VReg, usize>,
+    /// How many times each vreg is read by IR instructions in this block.
+    /// Decremented during lowering; zero = dead, register can be freed.
+    pub remaining_uses: HashMap<VReg, usize>,
 }
