@@ -300,6 +300,10 @@ pub enum RegInst {
     /// Store to memory if dirty, then clear the register binding.
     /// Used before calls — the register is about to be destroyed.
     Clobber { vreg: VReg },
+    /// Force-resolve a vreg — ensure its value is in a register.
+    /// Emits load from memory if needed. Used with set_target to
+    /// ensure a vreg ends up in a specific physical register.
+    Resolve { vreg: VReg },
 }
 
 /// A combined instruction for the lowering pipeline.

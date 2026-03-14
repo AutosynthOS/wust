@@ -31,6 +31,13 @@ struct VRegEntry {
     slots: Vec<SlotState>,
 }
 
+/// Snapshot of allocator state at a block boundary.
+#[derive(Clone)]
+pub(crate) struct RegAllocSnapshot {
+    entries: Vec<Option<VRegEntry>>,
+    bindings: Vec<Option<VReg>>,
+}
+
 pub(crate) struct RegAlloc {
     config: MachineConfig,
     vreg_defs: Vec<VRegDef>,
@@ -58,6 +65,20 @@ impl RegAlloc {
         self.vreg_defs = vreg_defs;
         self.entries.clear();
         self.entries.resize(count, None);
+    }
+
+    /// Snapshot the current allocator state (entries + bindings).
+    pub(crate) fn snapshot(&self) -> RegAllocSnapshot {
+        RegAllocSnapshot {
+            entries: self.entries.clone(),
+            bindings: self.bindings.clone(),
+        }
+    }
+
+    /// Restore allocator state from a snapshot.
+    pub(crate) fn restore(&mut self, snapshot: &RegAllocSnapshot) {
+        self.entries = snapshot.entries.clone();
+        self.bindings = snapshot.bindings.clone();
     }
 
     pub(crate) fn begin_block(
@@ -136,6 +157,24 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::ClearSlot { vreg, slot } => {
+                // If the vreg is in Mem and this is a clean slot we could
+                // reload from, load it into a register before losing the slot.
+                let entry = self.entry(*vreg)?;
+                if matches!(entry.loc, VRegLoc::Mem) && entry.slots.iter().any(|s| s.slot == *slot && !s.dirty) {
+                    let width = self.vreg_width(*vreg);
+                    let target = self.vreg_defs[vreg.0 as usize].target;
+                    let preg = match target {
+                        Some(t) => { self.acquire(t, backend)?; t }
+                        None => self.alloc_reg()?,
+                    };
+                    backend.flush(self)?;
+                    backend.lower(self, IrInst::Load {
+                        dst: preg, width,
+                        base: slot.base, offset: slot.offset,
+                    }, Emit::Immediate)?;
+                    self.bindings[preg.0 as usize] = Some(*vreg);
+                    self.entry_mut(*vreg)?.loc = VRegLoc::Reg(preg);
+                }
                 self.entry_mut(*vreg)?.slots.retain(|s| s.slot != *slot);
                 Ok(())
             }
@@ -155,6 +194,10 @@ impl RegAlloc {
                         self.bindings[preg.0 as usize] = None;
                     }
                 }
+                Ok(())
+            }
+            RegInst::Resolve { vreg } => {
+                self.define_vreg(*vreg, backend)?;
                 Ok(())
             }
         }
@@ -255,7 +298,11 @@ impl LowerCtx for RegAlloc {
                     .find(|s| !s.dirty)
                     .map(|s| s.slot)
                     .ok_or(LowerError::UndefinedVReg(vreg))?;
-                let preg = self.alloc_reg()?;
+                let target = self.vreg_defs[vreg.0 as usize].target;
+                let preg = match target {
+                    Some(t) => { self.acquire(t, backend)?; t }
+                    None => self.alloc_reg()?,
+                };
                 backend.lower(
                     self,
                     IrInst::Load {
@@ -293,7 +340,24 @@ impl LowerCtx for RegAlloc {
                 self.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
                 Ok((preg, width))
             }
-            VRegLoc::Reg(preg) => Ok((*preg, width)),
+            VRegLoc::Reg(preg) => {
+                let preg = *preg;
+                if let Some(t) = target {
+                    if preg != t {
+                        self.acquire(t, backend)?;
+                        backend.flush(self)?;
+                        backend.lower(self, IrInst::Move {
+                            dst: t, dst_width: width,
+                            src: preg, src_width: width,
+                        }, Emit::Immediate)?;
+                        self.bindings[t.0 as usize] = Some(vreg);
+                        self.bindings[preg.0 as usize] = None;
+                        self.entry_mut(vreg)?.loc = VRegLoc::Reg(t);
+                        return Ok((t, width));
+                    }
+                }
+                Ok((preg, width))
+            }
             _ => Err(LowerError::UnexpectedDefine(vreg)),
         }
     }

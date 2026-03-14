@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use autosynth_codegen::{
     Align, AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, Lowerer,
-    VInit, VReg, VRegion, VRegionId, Width, debugger,
+    RegInst, VInit, VReg, VRegion, VRegionId, Width, debugger,
 };
 use autosynth_isa::{IsaReg, PReg};
 use autosynth_lower::BackendEmitter;
@@ -237,7 +237,15 @@ impl<B: BackendEmitter> JitModule<B> {
                 OpCode::End => {
                     let block_idx = inline_op.immediate_u32();
                     if block_idx == 0 {
-                        Self::emit_epilogue(&mut f, operands, fibre, lr_preg, fsp_preg, stack_alignment, func);
+                        Self::emit_epilogue(
+                            &mut f,
+                            operands,
+                            fibre,
+                            lr_preg,
+                            fsp_preg,
+                            stack_alignment,
+                            func,
+                        );
                         break;
                     }
                     // Wasm block end — finalize current block if not already done.
@@ -247,7 +255,15 @@ impl<B: BackendEmitter> JitModule<B> {
                     f.start_block(BlockId::User(pc as u32));
                 }
 
-                OpCode::Return => Self::emit_epilogue(&mut f, operands, fibre, lr_preg, fsp_preg, stack_alignment, func),
+                OpCode::Return => Self::emit_epilogue(
+                    &mut f,
+                    operands,
+                    fibre,
+                    lr_preg,
+                    fsp_preg,
+                    stack_alignment,
+                    func,
+                ),
 
                 OpCode::Call => {
                     let callee_idx = inline_op.immediate_i32();
@@ -309,9 +325,10 @@ impl<B: BackendEmitter> JitModule<B> {
             let vreg = f.pop(operands, width);
             f.set_target(vreg, PReg(i as u8));
         }
-        // Restore lr from fibre.
+        // Restore lr into x30.
         let lr = f.pop(fibre, Width::W64);
         f.set_target(lr, lr_preg);
+        f.emit_reg(RegInst::Resolve { vreg: lr });
         // Restore native stack pointer.
         let sp = f.alloc_vreg(Width::W64, VInit::PReg(fsp_preg));
         let frame_size = f.alloc_vreg(Width::W64, VInit::Const(stack_alignment as i64));
@@ -329,19 +346,19 @@ impl<B: BackendEmitter> JitModule<B> {
         // LeS makes the backend emit `subs` (flag-setting subtract).
         // Using `fuel` (physical register) as dst writes the result
         // back to fuel while setting flags for the LE condition.
-        let fuel_cond = f.alloc_vreg(Width::W64, VInit::Const(0));
-        let cost = f.alloc_vreg(Width::W32, VInit::Const(*pending_fuel as i64));
-        f.emit(IrInst::Alu {
+
+        let op = IrInst::Alu {
             op: AluOp::Comp(CompOp::LeS),
             dst: fuel,
             lhs: fuel,
-            rhs: cost,
-        });
+            rhs: f.alloc_vreg(Width::W32, VInit::Const(*pending_fuel as i64)),
+        };
+        f.emit(op);
         *pending_fuel = 0;
 
+        let fuel_cond = f.alloc_vreg(Width::W64, VInit::Const(0));
         let suspend_block = f.gen_block();
         let cont_block = BlockId::User(pc as u32);
-
         f.br_if(fuel_cond, suspend_block, cont_block);
 
         f.start_block(suspend_block);
