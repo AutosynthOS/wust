@@ -186,10 +186,9 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::ClearSlot { vreg, slot } => {
-                let entry = self.entry(*vreg)?;
-                if matches!(entry.loc, VRegLoc::Mem)
-                    && entry.slots.iter().any(|s| s.slot == *slot && !s.dirty)
-                {
+                let loc = self.entry(*vreg)?.loc;
+                let is_clean = self.entry(*vreg)?.slots.iter().any(|s| s.slot == *slot && !s.dirty);
+                if matches!(loc, VRegLoc::Mem) && is_clean {
                     self.reload(*vreg, backend)?;
                 }
                 self.entry_mut(*vreg)?.slots.retain(|s| s.slot != *slot);
@@ -197,9 +196,9 @@ impl RegAlloc {
             }
             RegInst::Clobber { vreg } => {
                 backend.flush(self)?;
-                let entry = self.entry(*vreg)?;
-                if let VRegLoc::Reg(preg) = entry.loc {
-                    let has_dirty = entry.slots.iter().any(|s| s.dirty);
+                let loc = self.entry(*vreg)?.loc;
+                if let VRegLoc::Reg(preg) = loc {
+                    let has_dirty = self.entry(*vreg)?.slots.iter().any(|s| s.dirty);
                     if has_dirty {
                         let width = self.vreg_width(*vreg);
                         self.flush_vreg(*vreg, preg, width, backend)?;
@@ -229,7 +228,8 @@ impl RegAlloc {
             None => return Ok(preg),
         };
 
-        if !self.is_live(victim) || matches!(self.entry(victim)?.loc, VRegLoc::Const(_)) {
+        let loc = self.entry(victim)?.loc;
+        if !self.is_live(victim) || matches!(loc, VRegLoc::Const(_)) {
             self.bindings[preg.0 as usize] = None;
             return Ok(preg);
         }
@@ -282,13 +282,11 @@ impl LowerCtx for RegAlloc {
         backend: &mut impl BackendEmitter,
     ) -> Result<ResolvedVReg, LowerError> {
         let width = self.vreg_width(vreg);
-        let result = match &self.entry(vreg)?.loc {
-            VRegLoc::Const(val) => ResolvedVReg::Const(*val, width),
-            VRegLoc::Reg(preg) => ResolvedVReg::PReg(*preg, width),
-            VRegLoc::Mem => {
-                let preg = self.reload(vreg, backend)?;
-                ResolvedVReg::PReg(preg, width)
-            }
+        let loc = self.entry(vreg)?.loc;
+        let result = match loc {
+            VRegLoc::Const(val) => ResolvedVReg::Const(val, width),
+            VRegLoc::Reg(preg) => ResolvedVReg::PReg(preg, width),
+            VRegLoc::Mem => ResolvedVReg::PReg(self.reload(vreg, backend)?, width),
             VRegLoc::Pending => return Err(LowerError::UndefinedVReg(vreg)),
         };
         self.consume(vreg);
@@ -301,14 +299,14 @@ impl LowerCtx for RegAlloc {
         backend: &mut impl BackendEmitter,
     ) -> Result<(PReg, Width), LowerError> {
         let width = self.vreg_width(vreg);
-        match &self.entry(vreg)?.loc {
+        let loc = self.entry(vreg)?.loc;
+        match loc {
             VRegLoc::Pending => {
                 let preg = self.alloc_for(vreg, backend)?;
                 self.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
                 Ok((preg, width))
             }
             VRegLoc::Reg(preg) => {
-                let preg = *preg;
                 if let Some(t) = self.vreg_defs[vreg.0 as usize].target {
                     if preg != t {
                         self.acquire(t, backend)?;
