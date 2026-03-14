@@ -277,6 +277,17 @@ impl fmt::Display for LowerError {
 
 impl std::error::Error for LowerError {}
 
+/// Controls whether the backend buffers an instruction for fusion
+/// or emits it immediately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Emit {
+    /// Try to fuse with the next instruction (default for IR stream).
+    Fuse,
+    /// Flush pending buffer first, then emit immediately.
+    /// Used by the register allocator for moves/stores/loads.
+    Immediate,
+}
+
 /// A backend that lowers IR instructions into machine code.
 ///
 /// The backend is responsible for **instruction selection** — it picks
@@ -293,10 +304,17 @@ pub trait BackendEmitter: Sized {
     fn new() -> (Self, MachineConfig);
 
     /// Lower a single IR instruction into machine code.
+    ///
+    /// If `emit` is [`Emit::Fuse`], the backend may buffer the
+    /// instruction for fusion with the next one.
+    /// If `emit` is [`Emit::Immediate`], the backend flushes any
+    /// pending buffer first, then emits this instruction immediately
+    /// (no buffering).
     fn lower(
         &mut self,
         ctx: &mut impl LowerCtx,
         inst: autosynth_ir::IrInst,
+        emit: Emit,
     ) -> Result<(), LowerError>;
 
     /// Flush any pending instructions at block boundaries.

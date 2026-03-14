@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use autosynth_ir::{IrInst, RegInst, SlotRef, VInit, VReg, VRegDef};
 use autosynth_isa::{PReg, Width};
-use autosynth_lower::{BackendEmitter, LowerCtx, LowerError, ResolvedVReg};
+use autosynth_lower::{BackendEmitter, Emit, LowerCtx, LowerError, ResolvedVReg};
 
 #[derive(Debug, Clone)]
 enum VRegLoc {
@@ -153,12 +153,31 @@ impl RegAlloc {
                 self.entry_mut(*vreg)?.slots.retain(|s| s.slot != *slot);
                 Ok(())
             }
+            RegInst::Clobber { vreg } => {
+                let entry = self.entry(*vreg)?;
+                if let VRegLoc::Reg(preg) = entry.loc {
+                    let has_dirty = entry.slots.iter().any(|s| s.dirty);
+                    if has_dirty {
+                        let width = self.vreg_width(*vreg);
+                        self.flush_vreg(*vreg, preg, width, backend)?;
+                    } else {
+                        // Already stored (or no slots) — just clear the binding.
+                        self.entry_mut(*vreg)?.loc = VRegLoc::Mem;
+                        self.bindings[preg.0 as usize] = None;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
     // --- Eviction ---
 
-    fn acquire(&mut self, preg: PReg, backend: &mut impl BackendEmitter) -> Result<PReg, LowerError> {
+    fn acquire(
+        &mut self,
+        preg: PReg,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<PReg, LowerError> {
         let victim = match self.bindings[preg.0 as usize] {
             Some(v) => v,
             None => return Ok(preg),
@@ -173,12 +192,16 @@ impl RegAlloc {
         let width = self.vreg_width(victim);
         match self.alloc_reg() {
             Ok(dest) => {
-                backend.lower(self, IrInst::Move {
-                    dst: dest,
-                    dst_width: width,
-                    src: preg,
-                    src_width: width,
-                })?;
+                backend.lower(
+                    self,
+                    IrInst::Move {
+                        dst: dest,
+                        dst_width: width,
+                        src: preg,
+                        src_width: width,
+                    },
+                    Emit::Immediate,
+                )?;
                 self.bindings[dest.0 as usize] = Some(victim);
                 self.bindings[preg.0 as usize] = None;
                 self.entry_mut(victim)?.loc = VRegLoc::Reg(dest);
@@ -197,18 +220,23 @@ impl RegAlloc {
         width: Width,
         backend: &mut impl BackendEmitter,
     ) -> Result<(), LowerError> {
-        let slot = self.entry(vreg)?
+        let slot = self
+            .entry(vreg)?
             .slots
             .iter()
             .find(|s| s.dirty)
             .map(|s| s.slot)
             .ok_or(LowerError::UndefinedVReg(vreg))?;
-        backend.lower(self, IrInst::Store {
-            src: preg,
-            width,
-            base: slot.base,
-            offset: slot.offset,
-        })?;
+        backend.lower(
+            self,
+            IrInst::Store {
+                src: preg,
+                width,
+                base: slot.base,
+                offset: slot.offset,
+            },
+            Emit::Immediate,
+        )?;
         let entry = self.entry_mut(vreg)?;
         for s in &mut entry.slots {
             s.dirty = false;
@@ -230,19 +258,24 @@ impl LowerCtx for RegAlloc {
             VRegLoc::Const(val) => ResolvedVReg::Const(*val, width),
             VRegLoc::Reg(preg) => ResolvedVReg::PReg(*preg, width),
             VRegLoc::Mem => {
-                let slot = self.entry(vreg)?
+                let slot = self
+                    .entry(vreg)?
                     .slots
                     .iter()
                     .find(|s| !s.dirty)
                     .map(|s| s.slot)
                     .ok_or(LowerError::UndefinedVReg(vreg))?;
                 let preg = self.alloc_reg()?;
-                backend.lower(self, IrInst::Load {
-                    dst: preg,
-                    width,
-                    base: slot.base,
-                    offset: slot.offset,
-                })?;
+                backend.lower(
+                    self,
+                    IrInst::Load {
+                        dst: preg,
+                        width,
+                        base: slot.base,
+                        offset: slot.offset,
+                    },
+                    Emit::Immediate,
+                )?;
                 self.bindings[preg.0 as usize] = Some(vreg);
                 self.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
                 ResolvedVReg::PReg(preg, width)

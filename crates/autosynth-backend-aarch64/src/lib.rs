@@ -80,9 +80,24 @@ impl BackendEmitter for Aarch64Backend {
         (backend, config)
     }
 
-    fn lower(&mut self, ctx: &mut impl LowerCtx, inst: IrInst) -> Result<(), LowerError> {
+    fn lower(
+        &mut self,
+        ctx: &mut impl LowerCtx,
+        inst: IrInst,
+        emit: autosynth_lower::Emit,
+    ) -> Result<(), LowerError> {
         let mut dbg_group_idx = 0;
         autosynth_lower::dbg(|dbg| dbg_group_idx = dbg.current_group());
+
+        if emit == autosynth_lower::Emit::Immediate {
+            // Flush pending first, then emit immediately (no buffering).
+            self.flush(ctx)?;
+            let op = Operation {
+                dbg_group_idx,
+                op: CompoundOperation::Base(inst),
+            };
+            return self.emit(ctx, op);
+        }
 
         match self.pending.take() {
             None => {

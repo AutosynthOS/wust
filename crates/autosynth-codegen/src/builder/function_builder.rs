@@ -138,6 +138,17 @@ impl<'a> FunctionBuilder<'a> {
         vreg
     }
 
+    /// Emit Clobber for every vreg in a region. Used before calls to
+    /// ensure all values are stored to memory.
+    pub fn clobber_region(&mut self, region: VRegionId) {
+        for vreg in self.regions[region.0 as usize].slots.clone() {
+            self.emit_reg_with(
+                RegInst::Clobber { vreg },
+                format!("clobber {}", self.fmt_vreg(vreg)),
+            );
+        }
+    }
+
     /// Read a field from a region by index.
     pub fn get_field(&mut self, region: VRegionId, index: usize) -> VReg {
         let vreg = self.regions[region.0 as usize].slots[index];

@@ -297,6 +297,9 @@ pub enum RegInst {
     SetSlot { vreg: VReg, slot: SlotRef },
     /// Remove a vreg's canonical slot (pop — value becomes a temp).
     ClearSlot { vreg: VReg, slot: SlotRef },
+    /// Store to memory if dirty, then clear the register binding.
+    /// Used before calls — the register is about to be destroyed.
+    Clobber { vreg: VReg },
 }
 
 /// A combined instruction for the lowering pipeline.

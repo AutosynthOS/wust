@@ -33,7 +33,7 @@ impl Lowerer {
                 autosynth_lower::dbg(|dbg| dbg.begin_ir_inst(ir_index));
                 match inst {
                     LowerInst::Ir(ir) => {
-                        backend.lower(&mut self.regalloc, ir.clone())?;
+                        backend.lower(&mut self.regalloc, ir.clone(), autosynth_lower::Emit::Fuse)?;
                     }
                     LowerInst::Reg(reg) => {
                         self.regalloc.process(reg, backend)?;

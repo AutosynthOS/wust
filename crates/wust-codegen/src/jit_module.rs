@@ -250,6 +250,10 @@ impl<B: BackendEmitter> JitModule<B> {
                         f.set_target(vreg, PReg(i as u8));
                     }
 
+                    // Clobber all live vregs — call will destroy registers.
+                    f.clobber_region(locals);
+                    f.clobber_region(operands);
+
                     f.emit(IrInst::Call { func_idx });
 
                     f.begin_op("--", "restore frame");
