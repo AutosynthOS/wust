@@ -1,3 +1,5 @@
+use autosynth_isa::SImm19;
+
 use crate::cond::Cond;
 
 use super::Aarch64Inst;
@@ -9,19 +11,17 @@ use super::Aarch64Inst;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BCond {
     pub cond: Cond,
-    /// Signed word offset from this instruction.
-    pub offset: i32,
+    pub offset: SImm19,
 }
 
 impl Aarch64Inst for BCond {
     fn encode_word(&self) -> u32 {
-        let imm19 = ((self.offset as u32) & 0x7FFFF) << 5;
-        0x54000000 | imm19 | self.cond as u32
+        0x54000000 | (self.offset.bits() << 5) | self.cond as u32
     }
 }
 
 impl core::fmt::Display for BCond {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "b.{} #{}", self.cond, self.offset * 4)
+        write!(f, "b.{} #{}", self.cond, self.offset.value() * 4)
     }
 }

@@ -34,6 +34,8 @@ pub enum BlockId {
     User(u32),
     /// Generated block (suspend stubs, cold paths, trampolines).
     Gen(u32),
+    /// Shared native epilogue — restores lr, sp, and returns.
+    Epilogue,
 }
 
 impl fmt::Display for BlockId {
@@ -42,6 +44,7 @@ impl fmt::Display for BlockId {
             BlockId::Entry => write!(f, "E0"),
             BlockId::User(n) => write!(f, "U{n}"),
             BlockId::Gen(n) => write!(f, "G{n}"),
+            BlockId::Epilogue => write!(f, "Ep"),
         }
     }
 }

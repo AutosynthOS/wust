@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use autosynth_ir::{BlockId, LowerInst};
+use autosynth_ir::{BlockId, IrInst, LowerInst};
 
 use crate::ir_function::IRFunction;
 use crate::regalloc::{MachineState, RegAlloc};
@@ -17,8 +17,9 @@ pub fn compile(
     let mut snapshots: HashMap<BlockId, MachineState> = HashMap::new();
     let mut ir_index = 0;
 
-    for &block_id in &func.block_order {
+    for (idx, &block_id) in func.block_order.iter().enumerate() {
         let block = &func.blocks[&block_id];
+        let next_block = func.block_order.get(idx + 1).copied();
 
         if let Some(snapshot) = snapshots.get(&block_id) {
             regalloc.state = snapshot.clone();
@@ -30,6 +31,10 @@ pub fn compile(
         for inst in &block.instructions {
             autosynth_lower::dbg(|dbg| dbg.begin_ir_inst(ir_index));
             match inst {
+                // Skip fall-through branches — the next block is already
+                // laid out immediately after, so no jump is needed.
+                LowerInst::Ir(IrInst::Branch { target })
+                    if Some(*target) == next_block => {}
                 LowerInst::Ir(ir) => {
                     backend.lower(&mut regalloc, ir.clone(), autosynth_lower::Emit::Fuse)?
                 }

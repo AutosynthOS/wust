@@ -2,7 +2,7 @@
 
 pub mod imm;
 
-pub use imm::{ImmOutOfRange, SImm9, UImm12, UImm16};
+pub use imm::{ImmOutOfRange, SImm19, SImm26, SImm9, UImm12, UImm16};
 
 /// Error returned when the encode buffer is too small.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

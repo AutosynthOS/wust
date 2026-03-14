@@ -7,10 +7,10 @@
 use std::collections::HashMap;
 
 use autosynth_ir::{AluOp, BlockId, CompOp, FunctionIdx, IrInst, VReg};
-use autosynth_isa::{IsaReg, PReg, PRegOr, UImm12, Width};
+use autosynth_isa::{IsaReg, PReg, PRegOr, SImm19, SImm26, UImm12, Width};
 use autosynth_isa_aarch64::{
-    Aarch64Inst, AddImm, AddReg, BCond, Bl, Cond, LdrUoff, Movk, Movz, StrUoff, SubImm, SubReg,
-    SubsImm, SubsReg, UImm16,
+    Aarch64Inst, AddImm, AddReg, B, BCond, Bl, Cond, LdrUoff, Movk, Movz, StrUoff, SubImm,
+    SubReg, SubsImm, SubsReg, UImm16,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
 use autosynth_lower::{self, LowerCtx, LowerCtxExt};
@@ -126,27 +126,28 @@ impl BackendEmitter for Aarch64Backend {
 
     fn finalize(&mut self, _ctx: &mut impl LowerCtx) -> Result<(), LowerError> {
         for patch in std::mem::take(&mut self.patches) {
+            let disp = |target: usize| (target as i64 - patch.offset as i64) / 4;
+
             match (&patch.inst, patch.cond) {
                 (IrInst::BrIf { block_else, .. }, Some(cond)) => {
-                    let target = self.labels[block_else];
-                    let disp_bytes = target as i64 - patch.offset as i64;
-                    let word_offset = (disp_bytes / 4) as i32;
-                    if word_offset < -(1 << 18) || word_offset >= (1 << 18) {
-                        return Err(LowerError::ImmediateOutOfRange);
-                    }
-                    let word = BCond { cond, offset: word_offset }.encode_word();
+                    let offset = SImm19::try_from(disp(self.labels[block_else]))
+                        .map_err(|_| LowerError::ImmediateOutOfRange)?;
+                    let word = BCond { cond, offset }.encode_word();
+                    self.patch_code(patch.offset, &word.to_le_bytes());
+                }
+                (IrInst::Branch { target }, None) => {
+                    let offset = SImm26::try_from(disp(self.labels[target]))
+                        .map_err(|_| LowerError::ImmediateOutOfRange)?;
+                    let word = B { offset }.encode_word();
                     self.patch_code(patch.offset, &word.to_le_bytes());
                 }
                 (IrInst::Call { func_idx }, None) => {
                     // TODO: cross-function call patching — for now,
                     // resolve_func returns 0 (self-recursive only).
                     let target = self.resolve_func(*func_idx).unwrap_or(0);
-                    let disp_bytes = target as i64 - patch.offset as i64;
-                    let word_offset = (disp_bytes / 4) as i32;
-                    if word_offset < -(1 << 25) || word_offset >= (1 << 25) {
-                        return Err(LowerError::ImmediateOutOfRange);
-                    }
-                    let word = Bl { offset: word_offset }.encode_word();
+                    let offset = SImm26::try_from(disp(target))
+                        .map_err(|_| LowerError::ImmediateOutOfRange)?;
+                    let word = Bl { offset }.encode_word();
                     self.patch_code(patch.offset, &word.to_le_bytes());
                 }
                 _ => {}
@@ -244,7 +245,7 @@ impl Aarch64Backend {
                 // b.cond goes under the BrIf's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(dbg_group_idx));
                 let cond = comp_op_to_cond(*c).invert();
-                let offset = emit_inst_at(self, BCond { cond, offset: 0 })?;
+                let offset = emit_inst_at(self, BCond { cond, offset: SImm19::try_from(0).unwrap() })?;
                 self.patches.push(Patch {
                     offset,
                     inst: inst.clone(),
@@ -296,6 +297,15 @@ impl Aarch64Backend {
                 )
             }
             IrInst::Call { func_idx } => lower_call(self, func_idx),
+            IrInst::Branch { target } => {
+                let offset = emit_inst_at(self, B { offset: SImm26::try_from(0).unwrap() })?;
+                self.patches.push(Patch {
+                    offset,
+                    inst: IrInst::Branch { target },
+                    cond: None,
+                });
+                Ok(())
+            }
             IrInst::Skipped { .. } => Ok(()),
             other => {
                 unreachable!("backend received unexpected instruction: {other}")
@@ -479,7 +489,7 @@ fn lower_alu(
 }
 
 fn lower_call(backend: &mut Aarch64Backend, func_idx: FunctionIdx) -> Result<(), LowerError> {
-    let offset = emit_inst_at(backend, Bl { offset: 0 })?;
+    let offset = emit_inst_at(backend, Bl { offset: SImm26::try_from(0).unwrap() })?;
     backend.patches.push(Patch {
         offset,
         inst: IrInst::Call { func_idx },

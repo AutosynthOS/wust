@@ -1,5 +1,6 @@
 mod add_imm;
 mod add_reg;
+mod b;
 mod b_cond;
 mod bl;
 mod ldr_post;
@@ -17,8 +18,10 @@ mod subs_reg;
 
 pub use add_imm::AddImm;
 pub use add_reg::AddReg;
+pub use b::B;
 pub use b_cond::BCond;
 pub use bl::Bl;
+
 pub use ldr_post::LdrPost;
 pub use ldr_uoff::LdrUoff;
 pub use movk::Movk;
@@ -68,6 +71,7 @@ impl<T: Aarch64Inst> From<T> for InstAdapter<T> {
 pub enum Aarch64Instruction {
     AddImm(AddImm),
     AddReg(AddReg),
+    B(B),
     BCond(BCond),
     Bl(Bl),
     LdrPost(LdrPost),
@@ -89,6 +93,7 @@ impl core::fmt::Display for Aarch64Instruction {
         match self {
             Self::AddImm(i) => write!(f, "{i}"),
             Self::AddReg(i) => write!(f, "{i}"),
+            Self::B(i) => write!(f, "{i}"),
             Self::BCond(i) => write!(f, "{i}"),
             Self::Bl(i) => write!(f, "{i}"),
             Self::LdrPost(i) => write!(f, "{i}"),
@@ -112,6 +117,7 @@ impl Aarch64Inst for Aarch64Instruction {
         match self {
             Self::AddImm(i) => i.encode_word(),
             Self::AddReg(i) => i.encode_word(),
+            Self::B(i) => i.encode_word(),
             Self::BCond(i) => i.encode_word(),
             Self::Bl(i) => i.encode_word(),
             Self::LdrPost(i) => i.encode_word(),
@@ -143,7 +149,7 @@ macro_rules! impl_from_inst {
 }
 
 impl_from_inst! {
-    AddImm(AddImm), AddReg(AddReg), BCond(BCond), Bl(Bl),
+    AddImm(AddImm), AddReg(AddReg), B(B), BCond(BCond), Bl(Bl),
     LdrPost(LdrPost), LdrUoff(LdrUoff), Movk(Movk), Movz(Movz), OrrReg(OrrReg),
     Ret(Ret), StrPre(StrPre), StrUoff(StrUoff), SubImm(SubImm),
     SubReg(SubReg), SubsImm(SubsImm), SubsReg(SubsReg),

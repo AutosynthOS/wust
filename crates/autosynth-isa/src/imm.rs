@@ -119,6 +119,44 @@ impl SImm9 {
 
 impl_try_from!(SImm9, i16, -256, 255, i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
 
+/// 19-bit signed word offset (−262144 to +262143).
+///
+/// Used by ARM64 `B.cond` instructions. The offset is in words (4 bytes),
+/// giving a ±1MB range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SImm19(i32);
+
+impl SImm19 {
+    pub const fn value(self) -> i32 {
+        self.0
+    }
+
+    pub const fn bits(self) -> u32 {
+        (self.0 as u32) & 0x7FFFF
+    }
+}
+
+impl_try_from!(SImm19, i32, -262144, 262143, i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
+
+/// 26-bit signed word offset (−33554432 to +33554431).
+///
+/// Used by ARM64 `B` and `BL` instructions. The offset is in words (4 bytes),
+/// giving a ±128MB range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SImm26(i32);
+
+impl SImm26 {
+    pub const fn value(self) -> i32 {
+        self.0
+    }
+
+    pub const fn bits(self) -> u32 {
+        (self.0 as u32) & 0x03FF_FFFF
+    }
+}
+
+impl_try_from!(SImm26, i32, -33554432, 33554431, i8, u8, i16, u16, i32, u32, i64, u64, isize, usize);
+
 #[cfg(test)]
 mod tests {
     use super::*;
