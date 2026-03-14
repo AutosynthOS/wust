@@ -233,11 +233,14 @@ impl Aarch64Backend {
                     lhs,
                     rhs,
                 }),
-                IrInst::BrIf { .. },
+                IrInst::BrIf { cond: cond_vreg, .. },
             ) => {
                 // subs goes under the Comp's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(pending.dbg_group_idx));
                 lower_cmp(ctx, *c, *dst, *lhs, *rhs, self)?;
+                // Consume the cond vreg's remaining use — only the flags
+                // matter, but the register needs to be freed.
+                let _ = ctx.resolve_vreg(*cond_vreg, self)?;
                 // b.cond goes under the BrIf's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(dbg_group_idx));
                 let cond = comp_op_to_cond(*c).invert();

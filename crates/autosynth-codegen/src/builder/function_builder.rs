@@ -168,6 +168,12 @@ impl<'a> FunctionBuilder<'a> {
     pub fn set_field(&mut self, region: VRegionId, index: usize, vreg: VReg) {
         self.record_use(vreg);
         let slot = self.slot_offset(region, index as u32);
+        // Clear the old occupant's slot association before overwriting.
+        let old = self.regions[region.0 as usize].slots[index];
+        if old != vreg {
+            let clear_desc = format!("{} clear {}", self.slot_label(region, index as u32), self.fmt_vreg(old));
+            self.emit_reg_with(RegInst::ClearSlot { vreg: old, slot }, clear_desc);
+        }
         let desc = format!("{} <- {}", self.slot_label(region, index as u32), self.fmt_vreg(vreg));
         self.regions[region.0 as usize].slots[index] = vreg;
         self.emit_reg_with(RegInst::SetSlot { vreg, slot }, desc);

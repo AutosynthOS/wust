@@ -360,6 +360,18 @@ impl<B: BackendEmitter> JitModule<B> {
             let vreg = f.pop(operands, width);
             f.set_target(vreg, PReg(i as u8));
         }
+        Self::emit_native_ret(f, fibre, lr_preg, fsp_preg, stack_alignment);
+    }
+
+    /// Restore lr, sp, and emit ret. Shared by normal return and
+    /// suspend paths — neither needs to handle wasm-level results.
+    fn emit_native_ret(
+        f: &mut FunctionBuilder,
+        fibre: VRegionId,
+        lr_preg: PReg,
+        fsp_preg: PReg,
+        stack_alignment: u32,
+    ) {
         // Restore lr into x30.
         let lr = f.pop(fibre, Width::W64);
         f.set_target(lr, lr_preg);
