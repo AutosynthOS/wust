@@ -198,27 +198,28 @@ impl RegAlloc {
             return Ok(preg);
         }
 
-        // Live vreg — try move, fall back to spill.
+        // Live vreg — if no more reads, store directly. Otherwise move.
         let width = self.vreg_width(victim);
-        match self.alloc_reg() {
-            Ok(dest) => {
-                backend.lower(
-                    self,
-                    IrInst::Move {
-                        dst: dest,
-                        dst_width: width,
-                        src: preg,
-                        src_width: width,
-                    },
-                    Emit::Immediate,
-                )?;
-                self.bindings[dest.0 as usize] = Some(victim);
-                self.bindings[preg.0 as usize] = None;
-                self.entry_mut(victim)?.loc = VRegLoc::Reg(dest);
-            }
-            Err(_) => {
-                self.flush_vreg(victim, preg, width, backend)?;
-            }
+        let has_remaining = self.remaining.get(&victim).map(|&n| n > 0).unwrap_or(false);
+        if !has_remaining {
+            // Only alive for results — store and transition to Mem.
+            self.flush_vreg(victim, preg, width, backend)?;
+        } else {
+            // Still has reads — move to another register.
+            let dest = self.alloc_reg()?;
+            backend.lower(
+                self,
+                IrInst::Move {
+                    dst: dest,
+                    dst_width: width,
+                    src: preg,
+                    src_width: width,
+                },
+                Emit::Immediate,
+            )?;
+            self.bindings[dest.0 as usize] = Some(victim);
+            self.bindings[preg.0 as usize] = None;
+            self.entry_mut(victim)?.loc = VRegLoc::Reg(dest);
         }
         Ok(preg)
     }

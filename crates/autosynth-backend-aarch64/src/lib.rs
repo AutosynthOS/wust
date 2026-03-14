@@ -202,11 +202,7 @@ impl Aarch64Backend {
             ) => {
                 // subs goes under the Comp's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(pending.dbg_group_idx));
-                let (lhs_preg, lhs_width) = ctx.into_preg(*lhs, self)?;
-                let (dst_preg, dst_width) = ctx.define_vreg(*dst, self)?;
-                lower_cmp(
-                    ctx, *c, dst_preg, dst_width, lhs_preg, lhs_width, *rhs, self,
-                )?;
+                lower_cmp(ctx, *c, *dst, *lhs, *rhs, self)?;
                 // b.cond goes under the BrIf's group.
                 autosynth_lower::dbg(|dbg| dbg.set_current_group(dbg_group_idx));
                 let cond = comp_op_to_cond(*c).invert();
@@ -436,22 +432,11 @@ fn lower_alu(
     lhs: VReg,
     rhs: VReg,
 ) -> Result<(), LowerError> {
-    let (lhs_preg, lhs_width) = ctx.into_preg(lhs, backend)?;
-    let (dst_preg, dst_width) = ctx.define_vreg(dst, backend)?;
-
     match op {
-        AluOp::Comp(c) => lower_cmp(
-            ctx, c, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend,
-        ),
-        AluOp::Add => lower_add(ctx, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend),
-        AluOp::Sub => lower_sub(ctx, dst_preg, dst_width, lhs_preg, lhs_width, rhs, backend),
-        AluOp::Mul => todo!("mul not yet in ISA crate"),
-        AluOp::And => todo!("and not yet in ISA crate"),
-        AluOp::Or => todo!("or not yet in ISA crate"),
-        AluOp::Xor => todo!("xor not yet in ISA crate"),
-        AluOp::Shl => todo!("shl not yet in ISA crate"),
-        AluOp::ShrS => todo!("shr_s not yet in ISA crate"),
-        AluOp::ShrU => todo!("shr_u not yet in ISA crate"),
+        AluOp::Comp(c) => lower_cmp(ctx, c, dst, lhs, rhs, backend),
+        AluOp::Add => lower_add(ctx, dst, lhs, rhs, backend),
+        AluOp::Sub => lower_sub(ctx, dst, lhs, rhs, backend),
+        _ => todo!("{op:?} not yet in ISA crate"),
     }
 }
 
@@ -468,21 +453,22 @@ fn lower_call(backend: &mut Aarch64Backend, func_idx: FunctionIdx) -> Result<(),
 fn lower_cmp(
     ctx: &mut impl LowerCtx,
     _op: CompOp,
-    dst: PReg,
-    dst_width: Width,
-    lhs: PReg,
-    lhs_width: Width,
+    dst: VReg,
+    lhs: VReg,
     rhs: VReg,
     backend: &mut Aarch64Backend,
 ) -> Result<(), LowerError> {
-    let rd = to_gpr_or_zr(dst, dst_width);
-    match ctx.try_imm_or_preg::<UImm12>(rhs, backend)? {
+    let (lhs_preg, lhs_width) = ctx.into_preg(lhs, backend)?;
+    let rhs_resolved = ctx.try_imm_or_preg::<UImm12>(rhs, backend)?;
+    let (dst_preg, dst_width) = ctx.define_vreg(dst, backend)?;
+    let rd = to_gpr_or_zr(dst_preg, dst_width);
+    match rhs_resolved {
         PRegOr::Imm(imm) => {
-            let rn = to_gpr_or_sp(lhs, lhs_width);
+            let rn = to_gpr_or_sp(lhs_preg, lhs_width);
             emit_inst(backend, SubsImm { rd, rn, imm })
         }
         PRegOr::PReg(rhs_preg, rhs_width) => {
-            let rn = to_gpr_or_zr(lhs, lhs_width);
+            let rn = to_gpr_or_zr(lhs_preg, lhs_width);
             let rm = to_gpr_or_zr(rhs_preg, rhs_width);
             emit_inst(backend, SubsReg { rd, rn, rm })
         }
@@ -491,22 +477,23 @@ fn lower_cmp(
 
 fn lower_add(
     ctx: &mut impl LowerCtx,
-    dst: PReg,
-    dst_width: Width,
-    lhs: PReg,
-    lhs_width: Width,
+    dst: VReg,
+    lhs: VReg,
     rhs: VReg,
     backend: &mut Aarch64Backend,
 ) -> Result<(), LowerError> {
-    match ctx.try_imm_or_preg::<UImm12>(rhs, backend)? {
+    let (lhs_preg, lhs_width) = ctx.into_preg(lhs, backend)?;
+    let rhs_resolved = ctx.try_imm_or_preg::<UImm12>(rhs, backend)?;
+    let (dst_preg, dst_width) = ctx.define_vreg(dst, backend)?;
+    match rhs_resolved {
         PRegOr::Imm(imm) => {
-            let rd = to_gpr_or_sp(dst, dst_width);
-            let rn = to_gpr_or_sp(lhs, lhs_width);
+            let rd = to_gpr_or_sp(dst_preg, dst_width);
+            let rn = to_gpr_or_sp(lhs_preg, lhs_width);
             emit_inst(backend, AddImm { rd, rn, imm })
         }
         PRegOr::PReg(rhs_preg, width) => {
-            let rd = to_gpr_or_zr(dst, dst_width);
-            let rn = to_gpr_or_zr(lhs, lhs_width);
+            let rd = to_gpr_or_zr(dst_preg, dst_width);
+            let rn = to_gpr_or_zr(lhs_preg, lhs_width);
             let rm = to_gpr_or_zr(rhs_preg, width);
             emit_inst(backend, AddReg { rd, rn, rm })
         }
@@ -515,22 +502,23 @@ fn lower_add(
 
 fn lower_sub(
     ctx: &mut impl LowerCtx,
-    dst: PReg,
-    dst_width: Width,
-    lhs: PReg,
-    lhs_width: Width,
+    dst: VReg,
+    lhs: VReg,
     rhs: VReg,
     backend: &mut Aarch64Backend,
 ) -> Result<(), LowerError> {
-    match ctx.try_imm_or_preg::<UImm12>(rhs, backend)? {
+    let (lhs_preg, lhs_width) = ctx.into_preg(lhs, backend)?;
+    let rhs_resolved = ctx.try_imm_or_preg::<UImm12>(rhs, backend)?;
+    let (dst_preg, dst_width) = ctx.define_vreg(dst, backend)?;
+    match rhs_resolved {
         PRegOr::Imm(imm) => {
-            let rd = to_gpr_or_sp(dst, dst_width);
-            let rn = to_gpr_or_sp(lhs, lhs_width);
+            let rd = to_gpr_or_sp(dst_preg, dst_width);
+            let rn = to_gpr_or_sp(lhs_preg, lhs_width);
             emit_inst(backend, SubImm { rd, rn, imm })
         }
         PRegOr::PReg(rhs_preg, width) => {
-            let rd = to_gpr_or_zr(dst, dst_width);
-            let rn = to_gpr_or_zr(lhs, lhs_width);
+            let rd = to_gpr_or_zr(dst_preg, dst_width);
+            let rn = to_gpr_or_zr(lhs_preg, lhs_width);
             let rm = to_gpr_or_zr(rhs_preg, width);
             emit_inst(backend, SubReg { rd, rn, rm })
         }
