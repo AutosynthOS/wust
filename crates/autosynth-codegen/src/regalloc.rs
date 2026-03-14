@@ -1,8 +1,5 @@
 //! Register allocator — running state machine that tracks vreg
 //! locations and manages physical register bindings.
-//!
-//! Uses a reference count (`remaining_uses`) per vreg to know when
-//! a vreg is dead and its register can be freed.
 
 use std::collections::HashMap;
 
@@ -30,43 +27,23 @@ struct VRegEntry {
     slots: Vec<SlotState>,
 }
 
+/// The mutable per-path state. Cloned for block snapshots.
 #[derive(Clone)]
-pub(crate) struct RegAllocSnapshot {
-    entries: Vec<Option<VRegEntry>>,
-    bindings: Vec<Option<VReg>>,
-}
-
-pub(crate) struct RegAlloc {
-    config: MachineConfig,
-    vreg_defs: Vec<VRegDef>,
+pub(crate) struct MachineState {
     entries: Vec<Option<VRegEntry>>,
     bindings: Vec<Option<VReg>>,
     remaining: HashMap<VReg, usize>,
     results: Vec<VReg>,
 }
 
-impl RegAlloc {
-    pub(crate) fn new(config: &MachineConfig, vreg_defs: &[VRegDef]) -> Self {
+impl MachineState {
+    pub(crate) fn new(num_vregs: usize, num_regs: usize) -> Self {
         Self {
-            config: config.clone(),
-            vreg_defs: vreg_defs.to_vec(),
-            entries: vec![None; vreg_defs.len()],
-            bindings: vec![None; config.num_regs()],
+            entries: vec![None; num_vregs],
+            bindings: vec![None; num_regs],
             remaining: HashMap::new(),
             results: Vec::new(),
         }
-    }
-
-    pub(crate) fn snapshot(&self) -> RegAllocSnapshot {
-        RegAllocSnapshot {
-            entries: self.entries.clone(),
-            bindings: self.bindings.clone(),
-        }
-    }
-
-    pub(crate) fn restore(&mut self, snapshot: &RegAllocSnapshot) {
-        self.entries = snapshot.entries.clone();
-        self.bindings = snapshot.bindings.clone();
     }
 
     pub(crate) fn begin_block(
@@ -77,38 +54,53 @@ impl RegAlloc {
         self.remaining = remaining_uses.clone();
         self.results = results.iter().copied().collect();
     }
+}
+
+pub(crate) struct RegAlloc {
+    config: MachineConfig,
+    vreg_defs: Vec<VRegDef>,
+    pub(crate) state: MachineState,
+}
+
+impl RegAlloc {
+    pub(crate) fn new(config: &MachineConfig, vreg_defs: &[VRegDef]) -> Self {
+        Self {
+            config: config.clone(),
+            vreg_defs: vreg_defs.to_vec(),
+            state: MachineState::new(vreg_defs.len(), config.num_regs()),
+        }
+    }
 
     pub(crate) fn vreg_width(&self, vreg: VReg) -> Width {
         self.vreg_defs[vreg.0 as usize].width
     }
 
     fn entry(&self, vreg: VReg) -> Result<&VRegEntry, LowerError> {
-        self.entries[vreg.0 as usize]
+        self.state.entries[vreg.0 as usize]
             .as_ref()
             .ok_or(LowerError::UndefinedVReg(vreg))
     }
 
     fn entry_mut(&mut self, vreg: VReg) -> Result<&mut VRegEntry, LowerError> {
-        self.entries[vreg.0 as usize]
+        self.state.entries[vreg.0 as usize]
             .as_mut()
             .ok_or(LowerError::UndefinedVReg(vreg))
     }
 
     fn is_live(&self, vreg: VReg) -> bool {
-        if self.results.contains(&vreg) {
+        if self.state.results.contains(&vreg) {
             return true;
         }
-        self.remaining.get(&vreg).map(|&n| n > 0).unwrap_or(false)
+        self.state.remaining.get(&vreg).map(|&n| n > 0).unwrap_or(false)
     }
 
     fn consume(&mut self, vreg: VReg) {
-        if let Some(count) = self.remaining.get_mut(&vreg) {
+        if let Some(count) = self.state.remaining.get_mut(&vreg) {
             *count = count.saturating_sub(1);
         }
     }
 
     /// Allocate a register for a vreg, respecting its target constraint.
-    /// Acquires the target if set, otherwise picks from the free pool.
     fn alloc_for(
         &mut self,
         vreg: VReg,
@@ -119,7 +111,7 @@ impl RegAlloc {
             Some(t) => { self.acquire(t, backend)?; t }
             None => self.alloc_reg()?,
         };
-        self.bindings[preg.0 as usize] = Some(vreg);
+        self.state.bindings[preg.0 as usize] = Some(vreg);
         Ok(preg)
     }
 
@@ -152,19 +144,19 @@ impl RegAlloc {
         match inst {
             RegInst::Define { vreg, value } => {
                 let idx = vreg.0 as usize;
-                if self.entries[idx].is_some() {
+                if self.state.entries[idx].is_some() {
                     return Err(LowerError::DuplicateDefine(*vreg));
                 }
                 let loc = match value {
                     VInit::Const(val) => VRegLoc::Const(*val),
                     VInit::PReg(preg) => {
                         self.acquire(*preg, backend)?;
-                        self.bindings[preg.0 as usize] = Some(*vreg);
+                        self.state.bindings[preg.0 as usize] = Some(*vreg);
                         VRegLoc::Reg(*preg)
                     }
                     VInit::InstDst => VRegLoc::Pending,
                 };
-                self.entries[idx] = Some(VRegEntry {
+                self.state.entries[idx] = Some(VRegEntry {
                     loc,
                     slots: Vec::new(),
                 });
@@ -196,7 +188,7 @@ impl RegAlloc {
                         self.flush_vreg(*vreg, preg, width, backend)?;
                     } else {
                         self.entry_mut(*vreg)?.loc = VRegLoc::Mem;
-                        self.bindings[preg.0 as usize] = None;
+                        self.state.bindings[preg.0 as usize] = None;
                     }
                 }
                 Ok(())
@@ -215,19 +207,19 @@ impl RegAlloc {
         preg: PReg,
         backend: &mut impl BackendEmitter,
     ) -> Result<PReg, LowerError> {
-        let victim = match self.bindings[preg.0 as usize] {
+        let victim = match self.state.bindings[preg.0 as usize] {
             Some(v) => v,
             None => return Ok(preg),
         };
 
         let loc = self.entry(victim)?.loc;
         if !self.is_live(victim) || matches!(loc, VRegLoc::Const(_)) {
-            self.bindings[preg.0 as usize] = None;
+            self.state.bindings[preg.0 as usize] = None;
             return Ok(preg);
         }
 
         let width = self.vreg_width(victim);
-        let has_remaining = self.remaining.get(&victim).map(|&n| n > 0).unwrap_or(false);
+        let has_remaining = self.state.remaining.get(&victim).map(|&n| n > 0).unwrap_or(false);
         if !has_remaining {
             self.flush_vreg(victim, preg, width, backend)?;
         } else {
@@ -236,8 +228,8 @@ impl RegAlloc {
                 dst: dest, dst_width: width,
                 src: preg, src_width: width,
             }, Emit::Immediate)?;
-            self.bindings[dest.0 as usize] = Some(victim);
-            self.bindings[preg.0 as usize] = None;
+            self.state.bindings[dest.0 as usize] = Some(victim);
+            self.state.bindings[preg.0 as usize] = None;
             self.entry_mut(victim)?.loc = VRegLoc::Reg(dest);
         }
         Ok(preg)
@@ -262,7 +254,7 @@ impl RegAlloc {
             s.dirty = false;
         }
         entry.loc = VRegLoc::Mem;
-        self.bindings[preg.0 as usize] = None;
+        self.state.bindings[preg.0 as usize] = None;
         Ok(())
     }
 }
@@ -307,8 +299,8 @@ impl LowerCtx for RegAlloc {
                             dst: t, dst_width: width,
                             src: preg, src_width: width,
                         }, Emit::Immediate)?;
-                        self.bindings[t.0 as usize] = Some(vreg);
-                        self.bindings[preg.0 as usize] = None;
+                        self.state.bindings[t.0 as usize] = Some(vreg);
+                        self.state.bindings[preg.0 as usize] = None;
                         self.entry_mut(vreg)?.loc = VRegLoc::Reg(t);
                         return Ok((t, width));
                     }
@@ -321,13 +313,13 @@ impl LowerCtx for RegAlloc {
 
     fn alloc_reg(&mut self) -> Result<PReg, LowerError> {
         let pool = self.config.scratch_pool();
-        if let Some(&preg) = pool.iter().find(|p| self.bindings[p.0 as usize].is_none()) {
+        if let Some(&preg) = pool.iter().find(|p| self.state.bindings[p.0 as usize].is_none()) {
             return Ok(preg);
         }
         for &preg in pool {
-            if let Some(vreg) = self.bindings[preg.0 as usize] {
+            if let Some(vreg) = self.state.bindings[preg.0 as usize] {
                 if !self.is_live(vreg) {
-                    self.bindings[preg.0 as usize] = None;
+                    self.state.bindings[preg.0 as usize] = None;
                     return Ok(preg);
                 }
             }
