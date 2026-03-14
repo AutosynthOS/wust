@@ -99,12 +99,19 @@ impl RegAlloc {
         self.remaining.get(&vreg).map(|&n| n > 0).unwrap_or(false)
     }
 
-    /// Decrement remaining uses. If it hits zero and the vreg isn't
-    /// in results, free its register.
+    /// Decrement remaining uses. Dead vregs are queued for freeing —
+    /// call `free_dead()` after the current IR instruction finishes.
     fn consume(&mut self, vreg: VReg) {
         if let Some(count) = self.remaining.get_mut(&vreg) {
             *count = count.saturating_sub(1);
-            if *count == 0 && !self.results.contains(&vreg) {
+        }
+    }
+
+    /// Free registers for vregs whose remaining count hit zero.
+    /// Called by the lowerer after each IR instruction finishes.
+    pub(crate) fn free_dead(&mut self) {
+        for (&vreg, &count) in &self.remaining {
+            if count == 0 && !self.results.contains(&vreg) {
                 if let Some(entry) = &self.entries[vreg.0 as usize] {
                     if let VRegLoc::Reg(preg) = entry.loc {
                         self.bindings[preg.0 as usize] = None;
@@ -154,6 +161,9 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::Clobber { vreg } => {
+                // Flush the backend first — a buffered instruction may
+                // move this vreg to a different register.
+                backend.flush(self)?;
                 let entry = self.entry(*vreg)?;
                 if let VRegLoc::Reg(preg) = entry.loc {
                     let has_dirty = entry.slots.iter().any(|s| s.dirty);

@@ -34,6 +34,7 @@ impl Lowerer {
                 match inst {
                     LowerInst::Ir(ir) => {
                         backend.lower(&mut self.regalloc, ir.clone(), autosynth_lower::Emit::Fuse)?;
+                        self.regalloc.free_dead();
                     }
                     LowerInst::Reg(reg) => {
                         self.regalloc.process(reg, backend)?;
