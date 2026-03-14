@@ -2,8 +2,7 @@
 //! locations and manages physical register bindings.
 //!
 //! Uses a reference count (`remaining_uses`) per vreg to know when
-//! a vreg is dead and its register can be freed. No instruction
-//! index tracking needed.
+//! a vreg is dead and its register can be freed.
 
 use std::collections::HashMap;
 
@@ -11,7 +10,7 @@ use autosynth_ir::{IrInst, RegInst, SlotRef, VInit, VReg, VRegDef};
 use autosynth_isa::{PReg, Width};
 use autosynth_lower::{BackendEmitter, Emit, LowerCtx, LowerError, MachineConfig, ResolvedVReg};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 enum VRegLoc {
     Const(i64),
     Pending,
@@ -31,7 +30,6 @@ struct VRegEntry {
     slots: Vec<SlotState>,
 }
 
-/// Snapshot of allocator state at a block boundary.
 #[derive(Clone)]
 pub(crate) struct RegAllocSnapshot {
     entries: Vec<Option<VRegEntry>>,
@@ -67,7 +65,6 @@ impl RegAlloc {
         self.entries.resize(count, None);
     }
 
-    /// Snapshot the current allocator state (entries + bindings).
     pub(crate) fn snapshot(&self) -> RegAllocSnapshot {
         RegAllocSnapshot {
             entries: self.entries.clone(),
@@ -75,7 +72,6 @@ impl RegAlloc {
         }
     }
 
-    /// Restore allocator state from a snapshot.
     pub(crate) fn restore(&mut self, snapshot: &RegAllocSnapshot) {
         self.entries = snapshot.entries.clone();
         self.bindings = snapshot.bindings.clone();
@@ -113,12 +109,45 @@ impl RegAlloc {
         self.remaining.get(&vreg).map(|&n| n > 0).unwrap_or(false)
     }
 
-    /// Decrement remaining uses. Dead vregs are queued for freeing —
-    /// call `free_dead()` after the current IR instruction finishes.
     fn consume(&mut self, vreg: VReg) {
         if let Some(count) = self.remaining.get_mut(&vreg) {
             *count = count.saturating_sub(1);
         }
+    }
+
+    /// Allocate a register for a vreg, respecting its target constraint.
+    /// Acquires the target if set, otherwise picks from the free pool.
+    fn alloc_for(
+        &mut self,
+        vreg: VReg,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<PReg, LowerError> {
+        let target = self.vreg_defs[vreg.0 as usize].target;
+        let preg = match target {
+            Some(t) => { self.acquire(t, backend)?; t }
+            None => self.alloc_reg()?,
+        };
+        self.bindings[preg.0 as usize] = Some(vreg);
+        Ok(preg)
+    }
+
+    /// Load a Mem vreg from a clean slot into a register (target-aware).
+    fn reload(
+        &mut self,
+        vreg: VReg,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<PReg, LowerError> {
+        let width = self.vreg_width(vreg);
+        let slot = self.entry(vreg)?
+            .slots.iter().find(|s| !s.dirty).map(|s| s.slot)
+            .ok_or(LowerError::UndefinedVReg(vreg))?;
+        let preg = self.alloc_for(vreg, backend)?;
+        backend.lower(self, IrInst::Load {
+            dst: preg, width,
+            base: slot.base, offset: slot.offset,
+        }, Emit::Immediate)?;
+        self.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
+        Ok(preg)
     }
 
     // --- RegInst processing ---
@@ -157,30 +186,16 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::ClearSlot { vreg, slot } => {
-                // If the vreg is in Mem and this is a clean slot we could
-                // reload from, load it into a register before losing the slot.
                 let entry = self.entry(*vreg)?;
-                if matches!(entry.loc, VRegLoc::Mem) && entry.slots.iter().any(|s| s.slot == *slot && !s.dirty) {
-                    let width = self.vreg_width(*vreg);
-                    let target = self.vreg_defs[vreg.0 as usize].target;
-                    let preg = match target {
-                        Some(t) => { self.acquire(t, backend)?; t }
-                        None => self.alloc_reg()?,
-                    };
-                    backend.flush(self)?;
-                    backend.lower(self, IrInst::Load {
-                        dst: preg, width,
-                        base: slot.base, offset: slot.offset,
-                    }, Emit::Immediate)?;
-                    self.bindings[preg.0 as usize] = Some(*vreg);
-                    self.entry_mut(*vreg)?.loc = VRegLoc::Reg(preg);
+                if matches!(entry.loc, VRegLoc::Mem)
+                    && entry.slots.iter().any(|s| s.slot == *slot && !s.dirty)
+                {
+                    self.reload(*vreg, backend)?;
                 }
                 self.entry_mut(*vreg)?.slots.retain(|s| s.slot != *slot);
                 Ok(())
             }
             RegInst::Clobber { vreg } => {
-                // Flush the backend first — a buffered instruction may
-                // move this vreg to a different register.
                 backend.flush(self)?;
                 let entry = self.entry(*vreg)?;
                 if let VRegLoc::Reg(preg) = entry.loc {
@@ -189,7 +204,6 @@ impl RegAlloc {
                         let width = self.vreg_width(*vreg);
                         self.flush_vreg(*vreg, preg, width, backend)?;
                     } else {
-                        // Already stored (or no slots) — just clear the binding.
                         self.entry_mut(*vreg)?.loc = VRegLoc::Mem;
                         self.bindings[preg.0 as usize] = None;
                     }
@@ -220,25 +234,16 @@ impl RegAlloc {
             return Ok(preg);
         }
 
-        // Live vreg — if no more reads, store directly. Otherwise move.
         let width = self.vreg_width(victim);
         let has_remaining = self.remaining.get(&victim).map(|&n| n > 0).unwrap_or(false);
         if !has_remaining {
-            // Only alive for results — store and transition to Mem.
             self.flush_vreg(victim, preg, width, backend)?;
         } else {
-            // Still has reads — move to another register.
             let dest = self.alloc_reg()?;
-            backend.lower(
-                self,
-                IrInst::Move {
-                    dst: dest,
-                    dst_width: width,
-                    src: preg,
-                    src_width: width,
-                },
-                Emit::Immediate,
-            )?;
+            backend.lower(self, IrInst::Move {
+                dst: dest, dst_width: width,
+                src: preg, src_width: width,
+            }, Emit::Immediate)?;
             self.bindings[dest.0 as usize] = Some(victim);
             self.bindings[preg.0 as usize] = None;
             self.entry_mut(victim)?.loc = VRegLoc::Reg(dest);
@@ -253,23 +258,13 @@ impl RegAlloc {
         width: Width,
         backend: &mut impl BackendEmitter,
     ) -> Result<(), LowerError> {
-        let slot = self
-            .entry(vreg)?
-            .slots
-            .iter()
-            .find(|s| s.dirty)
-            .map(|s| s.slot)
+        let slot = self.entry(vreg)?
+            .slots.iter().find(|s| s.dirty).map(|s| s.slot)
             .ok_or(LowerError::UndefinedVReg(vreg))?;
-        backend.lower(
-            self,
-            IrInst::Store {
-                src: preg,
-                width,
-                base: slot.base,
-                offset: slot.offset,
-            },
-            Emit::Immediate,
-        )?;
+        backend.lower(self, IrInst::Store {
+            src: preg, width,
+            base: slot.base, offset: slot.offset,
+        }, Emit::Immediate)?;
         let entry = self.entry_mut(vreg)?;
         for s in &mut entry.slots {
             s.dirty = false;
@@ -291,30 +286,7 @@ impl LowerCtx for RegAlloc {
             VRegLoc::Const(val) => ResolvedVReg::Const(*val, width),
             VRegLoc::Reg(preg) => ResolvedVReg::PReg(*preg, width),
             VRegLoc::Mem => {
-                let slot = self
-                    .entry(vreg)?
-                    .slots
-                    .iter()
-                    .find(|s| !s.dirty)
-                    .map(|s| s.slot)
-                    .ok_or(LowerError::UndefinedVReg(vreg))?;
-                let target = self.vreg_defs[vreg.0 as usize].target;
-                let preg = match target {
-                    Some(t) => { self.acquire(t, backend)?; t }
-                    None => self.alloc_reg()?,
-                };
-                backend.lower(
-                    self,
-                    IrInst::Load {
-                        dst: preg,
-                        width,
-                        base: slot.base,
-                        offset: slot.offset,
-                    },
-                    Emit::Immediate,
-                )?;
-                self.bindings[preg.0 as usize] = Some(vreg);
-                self.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
+                let preg = self.reload(vreg, backend)?;
                 ResolvedVReg::PReg(preg, width)
             }
             VRegLoc::Pending => return Err(LowerError::UndefinedVReg(vreg)),
@@ -329,20 +301,15 @@ impl LowerCtx for RegAlloc {
         backend: &mut impl BackendEmitter,
     ) -> Result<(PReg, Width), LowerError> {
         let width = self.vreg_width(vreg);
-        let target = self.vreg_defs[vreg.0 as usize].target;
         match &self.entry(vreg)?.loc {
             VRegLoc::Pending => {
-                let preg = match target {
-                    Some(t) => self.acquire(t, backend)?,
-                    None => self.alloc_reg()?,
-                };
-                self.bindings[preg.0 as usize] = Some(vreg);
+                let preg = self.alloc_for(vreg, backend)?;
                 self.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
                 Ok((preg, width))
             }
             VRegLoc::Reg(preg) => {
                 let preg = *preg;
-                if let Some(t) = target {
+                if let Some(t) = self.vreg_defs[vreg.0 as usize].target {
                     if preg != t {
                         self.acquire(t, backend)?;
                         backend.flush(self)?;
@@ -364,11 +331,9 @@ impl LowerCtx for RegAlloc {
 
     fn alloc_reg(&mut self) -> Result<PReg, LowerError> {
         let pool = self.config.scratch_pool();
-        // First try: find an unoccupied register.
         if let Some(&preg) = pool.iter().find(|p| self.bindings[p.0 as usize].is_none()) {
             return Ok(preg);
         }
-        // Second try: reclaim a dead vreg's register.
         for &preg in pool {
             if let Some(vreg) = self.bindings[preg.0 as usize] {
                 if !self.is_live(vreg) {
