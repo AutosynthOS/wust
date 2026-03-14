@@ -180,84 +180,83 @@ impl<T: LowerCtx> LowerCtxExt for T {}
 
 /// Machine configuration — register pool and architectural register mapping.
 ///
-/// Created by the backend with the full register pool and
-/// arch-specific register roles. The frontend reserves registers
-/// via [`reserve`](Self::reserve), which removes them from the
-/// available pool and returns the physical register.
+/// A physical register with its reservation state.
+#[derive(Debug, Clone, Copy)]
+pub struct PRegEntry {
+    pub preg: PReg,
+    pub reserved: bool,
+}
+
+/// Machine configuration — physical register pool and architecture info.
+///
+/// Created by the backend with all registers unreserved except ISA-fixed
+/// ones. The frontend reserves registers via [`reserve`](Self::reserve).
 #[derive(Debug, Clone)]
 pub struct MachineConfig {
-    /// Available (unreserved) registers.
-    pool: Vec<PReg>,
-    /// Architectural register mapping — arch-agnostic roles to physical registers.
+    regs: Vec<PRegEntry>,
     isa_regs: HashMap<IsaReg, PReg>,
-    /// Required stack pointer alignment in bytes (e.g. 16 for ARM64/x86_64).
     stack_alignment: u32,
 }
 
 impl MachineConfig {
-    pub fn new(pool: Vec<PReg>, isa_regs: HashMap<IsaReg, PReg>, stack_alignment: u32) -> Self {
-        // Remove ISA-mapped registers from the pool up front.
-        let mut pool = pool;
-        for preg in isa_regs.values() {
-            pool.retain(|r| r != preg);
-        }
-        Self { pool, isa_regs, stack_alignment }
+    pub fn new(all_regs: Vec<PReg>, isa_regs: HashMap<IsaReg, PReg>, stack_alignment: u32) -> Self {
+        let mut regs: Vec<PRegEntry> = all_regs
+            .into_iter()
+            .map(|preg| PRegEntry {
+                preg,
+                reserved: isa_regs.values().any(|&r| r == preg),
+            })
+            .collect();
+        // Sort by preg number for consistent indexing.
+        regs.sort_by_key(|r| r.preg.0);
+        Self { regs, isa_regs, stack_alignment }
     }
 
-    /// Reserve a register by architectural role, removing it from the
-    /// available pool.
-    ///
-    /// For fixed roles (FramePointer, StackPointer, etc.), looks up the
-    /// arch-specific PReg from the isa_regs mapping. For `FromEnd`/`FromStart`,
-    /// allocates from the pool directly.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the role has no mapping or the pool is empty.
+    /// Reserve a register by role. ISA roles look up the mapping,
+    /// FromEnd/FromStart pick from the unreserved pool.
     pub fn reserve(&mut self, role: IsaReg) -> PReg {
         match role {
-            IsaReg::FromEnd => self.pool.pop().expect("no registers left in pool"),
-            IsaReg::FromStart => self.pool.remove(0),
+            IsaReg::FromEnd => {
+                let entry = self.regs.iter_mut().rev()
+                    .find(|r| !r.reserved)
+                    .expect("no registers left");
+                entry.reserved = true;
+                entry.preg
+            }
+            IsaReg::FromStart => {
+                let entry = self.regs.iter_mut()
+                    .find(|r| !r.reserved)
+                    .expect("no registers left");
+                entry.reserved = true;
+                entry.preg
+            }
             role => {
-                let preg = *self
-                    .isa_regs
-                    .get(&role)
+                let preg = *self.isa_regs.get(&role)
                     .unwrap_or_else(|| panic!("no ISA register mapping for {role:?}"));
-                self.pool.retain(|r| *r != preg);
+                if let Some(entry) = self.regs.iter_mut().find(|r| r.preg == preg) {
+                    entry.reserved = true;
+                }
                 preg
             }
         }
     }
 
-    /// Look up an architectural register by role (read-only).
-    ///
-    /// # Panics
-    ///
-    /// Panics if the role has no mapping for this architecture.
-    pub fn isa_reg(&self, role: IsaReg) -> PReg {
-        *self
-            .isa_regs
-            .get(&role)
-            .unwrap_or_else(|| panic!("no ISA register mapping for {role:?}"))
+    /// The unreserved (scratch) registers.
+    pub fn scratch_pool(&self) -> Vec<PReg> {
+        self.regs.iter().filter(|r| !r.reserved).map(|r| r.preg).collect()
     }
 
-    /// The remaining unreserved registers (scratch pool).
-    pub fn scratch_pool(&self) -> &[PReg] {
-        &self.pool
+    /// All register entries.
+    pub fn regs(&self) -> &[PRegEntry] {
+        &self.regs
     }
 
-    /// Required stack pointer alignment in bytes.
     pub fn stack_alignment(&self) -> u32 {
         self.stack_alignment
     }
 
-    /// Total number of physical registers (including reserved).
     pub fn num_regs(&self) -> usize {
-        // Pool originally had all registers before ISA removal,
-        // but we need the full count. Use the max PReg seen + 1.
-        let max_pool = self.pool.iter().map(|p| p.0 as usize).max().unwrap_or(0);
-        let max_isa = self.isa_regs.values().map(|p| p.0 as usize).max().unwrap_or(0);
-        max_pool.max(max_isa) + 1
+        self.regs.len()
     }
 }
 
@@ -315,9 +314,11 @@ pub enum Emit {
 /// The orchestrator calls [`flush`](Self::flush) at block boundaries
 /// to ensure all buffered instructions are emitted.
 pub trait BackendEmitter: Sized {
-    /// Create a new backend instance with the machine configuration
-    /// for this architecture.
-    fn new() -> (Self, MachineConfig);
+    /// Create a new backend instance.
+    fn new() -> Self;
+
+    /// Return the default machine configuration for this architecture.
+    fn machine_config() -> MachineConfig;
 
     /// Lower a single IR instruction into machine code.
     ///

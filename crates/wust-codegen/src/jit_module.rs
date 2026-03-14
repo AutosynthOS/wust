@@ -31,7 +31,8 @@ pub struct JitModule<B: BackendEmitter> {
 impl<B: BackendEmitter> JitModule<B> {
     /// Compile all functions in the parsed WASM module to native code.
     pub fn new(module: ParsedModule) -> Result<Self, anyhow::Error> {
-        let (mut backend, config) = B::new();
+        let mut backend = B::new();
+        let config = B::machine_config();
         let mut compiler = CodeBuilder::new();
 
         let signatures = build_signatures(&module);
@@ -46,13 +47,13 @@ impl<B: BackendEmitter> JitModule<B> {
         for (func_idx, func) in module.funcs.iter().enumerate() {
             Self::compile_func(
                 &mut compiler,
-                &mut config.clone(),
+                config.clone(),
                 func_idx as i32,
                 &module.funcs,
             )?;
 
             let ir_func = &compiler.functions()[compiler.functions().len() - 1];
-            let body_bytes = autosynth_codegen::compile(&config, ir_func, &mut backend)
+            let body_bytes = autosynth_codegen::compile(ir_func, &mut backend)
                 .map_err(|e| anyhow::anyhow!(e))?;
 
             let trampoline_bytes = emit_entry_trampoline(func);
@@ -85,7 +86,7 @@ impl<B: BackendEmitter> JitModule<B> {
     /// source-level annotations are recorded automatically.
     pub fn compile_func(
         cb: &mut CodeBuilder,
-        config: &mut autosynth_lower::MachineConfig,
+        mut config: autosynth_lower::MachineConfig,
         func_idx: i32,
         all_funcs: &[FuncMeta],
     ) -> anyhow::Result<()> {
@@ -99,7 +100,7 @@ impl<B: BackendEmitter> JitModule<B> {
         let fsp_preg = config.reserve(IsaReg::StackPointer);
         let stack_alignment = config.stack_alignment();
 
-        let mut f = FunctionBuilder::new(cb, sig);
+        let mut f = FunctionBuilder::new(cb, config, sig);
 
         // Entry block must be active before defining vstacks,
         // since vstack state lives on the block.

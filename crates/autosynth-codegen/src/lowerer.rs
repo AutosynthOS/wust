@@ -7,14 +7,13 @@ use autosynth_ir::{BlockId, LowerInst};
 
 use crate::ir_function::IRFunction;
 use crate::regalloc::{MachineState, RegAlloc};
-use autosynth_lower::{BackendEmitter, LowerError, MachineConfig};
+use autosynth_lower::{BackendEmitter, LowerError};
 
 pub fn compile(
-    config: &MachineConfig,
     func: &IRFunction,
     backend: &mut impl BackendEmitter,
 ) -> Result<Vec<u8>, LowerError> {
-    let mut regalloc = RegAlloc::new(config, &func.vreg_defs);
+    let mut regalloc = RegAlloc::new(&func.config, &func.vreg_defs);
     let mut snapshots: HashMap<BlockId, MachineState> = HashMap::new();
     let mut ir_index = 0;
 

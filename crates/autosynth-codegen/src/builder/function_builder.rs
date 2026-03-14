@@ -16,6 +16,9 @@ pub struct FunctionBuilder<'a> {
     /// The code builder that collects finalized functions.
     cb: &'a mut CodeBuilder,
 
+    /// Machine configuration (register pool, reservations).
+    config: autosynth_lower::MachineConfig,
+
     /// The function's type signature and calling convention.
     signature: FunctionSignature,
 
@@ -41,7 +44,11 @@ pub struct FunctionBuilder<'a> {
 }
 
 impl<'a> FunctionBuilder<'a> {
-    pub fn new(cb: &'a mut CodeBuilder, signature: FunctionSignature) -> Self {
+    pub fn new(
+        cb: &'a mut CodeBuilder,
+        config: autosynth_lower::MachineConfig,
+        signature: FunctionSignature,
+    ) -> Self {
         debugger::dbg(|dbg| {
             dbg.add_source_column("pc", Align::Right);
             dbg.add_source_column("label", Align::Left);
@@ -49,6 +56,7 @@ impl<'a> FunctionBuilder<'a> {
 
         Self {
             cb,
+            config,
             signature,
             regions: Vec::new(),
             vreg_defs: Vec::new(),
@@ -465,6 +473,7 @@ impl<'a> FunctionBuilder<'a> {
         }
 
         let func = IRFunction {
+            config: self.config,
             regions: self.regions,
             vreg_defs,
             block_order,

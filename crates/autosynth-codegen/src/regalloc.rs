@@ -320,10 +320,10 @@ impl LowerCtx for RegAlloc {
 
     fn alloc_reg(&mut self) -> Result<PReg, LowerError> {
         let pool = self.config.scratch_pool();
-        if let Some(&preg) = pool.iter().find(|p| self.state.bindings[p.0 as usize].is_none()) {
-            return Ok(preg);
+        if let Some(preg) = pool.iter().find(|p| self.state.bindings[p.0 as usize].is_none()) {
+            return Ok(*preg);
         }
-        for &preg in pool {
+        for &preg in &pool {
             if let Some(vreg) = self.state.bindings[preg.0 as usize] {
                 if !self.state.is_live(vreg) {
                     self.state.bindings[preg.0 as usize] = None;

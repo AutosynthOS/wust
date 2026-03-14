@@ -4,10 +4,13 @@
 use std::collections::{HashMap, HashSet};
 
 use autosynth_ir::{BlockId, LowerInst, VReg, VRegDef, VRegion};
+use autosynth_lower::MachineConfig;
 
 /// A complete IR function — the finalized output of FunctionBuilder.
 #[derive(Debug)]
 pub struct IRFunction {
+    /// Machine configuration (register pool, reservations).
+    pub config: MachineConfig,
     /// Virtual region configurations, indexed by VRegionId.
     pub regions: Vec<VRegion>,
     /// All VReg definitions, indexed by VReg id.

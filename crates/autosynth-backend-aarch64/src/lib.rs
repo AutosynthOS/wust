@@ -62,22 +62,24 @@ enum CompoundOperation {
 }
 
 impl BackendEmitter for Aarch64Backend {
-    fn new() -> (Self, MachineConfig) {
-        let pool = (0u8..=30).map(PReg).collect();
+    fn new() -> Self {
+        Self {
+            code: Vec::new(),
+            labels: HashMap::new(),
+            pending: None,
+            patches: Vec::new(),
+        }
+    }
+
+    fn machine_config() -> MachineConfig {
+        let pool = (0u8..=31).map(PReg).collect();
         let isa_regs = HashMap::from([
             (IsaReg::FramePointer, PReg(29)),
             (IsaReg::StackPointer, PReg(31)),
             (IsaReg::ReturnAddress, PReg(30)),
             (IsaReg::PlatformReserved, PReg(18)),
         ]);
-        let config = MachineConfig::new(pool, isa_regs, 16);
-        let backend = Self {
-            code: Vec::new(),
-            labels: HashMap::new(),
-            pending: None,
-            patches: Vec::new(),
-        };
-        (backend, config)
+        MachineConfig::new(pool, isa_regs, 16)
     }
 
     fn lower(
