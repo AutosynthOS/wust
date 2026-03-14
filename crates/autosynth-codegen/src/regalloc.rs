@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use autosynth_ir::{IrInst, RegInst, SlotRef, VInit, VReg, VRegDef};
 use autosynth_isa::{PReg, Width};
-use autosynth_lower::{BackendEmitter, Emit, LowerCtx, LowerError, ResolvedVReg};
+use autosynth_lower::{BackendEmitter, Emit, LowerCtx, LowerError, MachineConfig, ResolvedVReg};
 
 #[derive(Debug, Clone)]
 enum VRegLoc {
@@ -32,29 +32,22 @@ struct VRegEntry {
 }
 
 pub(crate) struct RegAlloc {
+    config: MachineConfig,
     vreg_defs: Vec<VRegDef>,
     entries: Vec<Option<VRegEntry>>,
     bindings: Vec<Option<VReg>>,
-    allocatable: Vec<PReg>,
-    /// Per-vreg remaining use count. Decremented on resolve.
-    /// Zero = dead, register can be freed.
     remaining: HashMap<VReg, usize>,
-    /// VRegs that must stay alive until block exit.
     results: Vec<VReg>,
 }
 
 impl RegAlloc {
-    pub(crate) fn new(scratch_pool: &[PReg]) -> Self {
-        let max_reg = scratch_pool
-            .iter()
-            .map(|p| p.0 as usize)
-            .max()
-            .unwrap_or(31);
+    pub(crate) fn new(config: MachineConfig) -> Self {
+        let num_regs = config.num_regs();
         Self {
+            config,
             vreg_defs: Vec::new(),
             entries: Vec::new(),
-            bindings: vec![None; max_reg + 1],
-            allocatable: scratch_pool.to_vec(),
+            bindings: vec![None; num_regs],
             remaining: HashMap::new(),
             results: Vec::new(),
         }
@@ -104,20 +97,6 @@ impl RegAlloc {
     fn consume(&mut self, vreg: VReg) {
         if let Some(count) = self.remaining.get_mut(&vreg) {
             *count = count.saturating_sub(1);
-        }
-    }
-
-    /// Free registers for vregs whose remaining count hit zero.
-    /// Called by the lowerer after each IR instruction finishes.
-    pub(crate) fn free_dead(&mut self) {
-        for (&vreg, &count) in &self.remaining {
-            if count == 0 && !self.results.contains(&vreg) {
-                if let Some(entry) = &self.entries[vreg.0 as usize] {
-                    if let VRegLoc::Reg(preg) = entry.loc {
-                        self.bindings[preg.0 as usize] = None;
-                    }
-                }
-            }
         }
     }
 
@@ -320,10 +299,20 @@ impl LowerCtx for RegAlloc {
     }
 
     fn alloc_reg(&mut self) -> Result<PReg, LowerError> {
-        self.allocatable
-            .iter()
-            .find(|p| self.bindings[p.0 as usize].is_none())
-            .copied()
-            .ok_or(LowerError::RegPoolExhausted)
+        let pool = self.config.scratch_pool();
+        // First try: find an unoccupied register.
+        if let Some(&preg) = pool.iter().find(|p| self.bindings[p.0 as usize].is_none()) {
+            return Ok(preg);
+        }
+        // Second try: reclaim a dead vreg's register.
+        for &preg in pool {
+            if let Some(vreg) = self.bindings[preg.0 as usize] {
+                if !self.is_live(vreg) {
+                    self.bindings[preg.0 as usize] = None;
+                    return Ok(preg);
+                }
+            }
+        }
+        Err(LowerError::RegPoolExhausted)
     }
 }

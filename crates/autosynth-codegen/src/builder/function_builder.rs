@@ -294,20 +294,6 @@ impl<'a> FunctionBuilder<'a> {
         self.current_block = None;
     }
 
-    pub fn emit_return(&mut self, operands: VRegionId) {
-        match self.signature.abi {
-            Abi::NativeWasm => {
-                let results = self.signature.results.clone();
-                for i in (0..results.len()).rev() {
-                    let vreg = self.pop(operands, results[i].width());
-                    self.set_target(vreg, PReg(i as u8));
-                }
-            }
-            Abi::StackWasm => {}
-        }
-        self.ret();
-    }
-
     pub fn is_finalized(&self) -> bool {
         self.current_block.is_none()
     }

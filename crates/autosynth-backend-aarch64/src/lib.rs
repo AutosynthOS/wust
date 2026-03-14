@@ -70,7 +70,7 @@ impl BackendEmitter for Aarch64Backend {
             (IsaReg::ReturnAddress, PReg(30)),
             (IsaReg::PlatformReserved, PReg(18)),
         ]);
-        let config = MachineConfig::new(pool, isa_regs);
+        let config = MachineConfig::new(pool, isa_regs, 16);
         let backend = Self {
             code: Vec::new(),
             labels: HashMap::new(),

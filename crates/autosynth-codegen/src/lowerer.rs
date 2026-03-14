@@ -13,7 +13,7 @@ pub struct Lowerer {
 impl Lowerer {
     pub fn new(config: MachineConfig) -> Self {
         Self {
-            regalloc: RegAlloc::new(config.scratch_pool()),
+            regalloc: RegAlloc::new(config),
         }
     }
 
@@ -27,18 +27,18 @@ impl Lowerer {
 
         for &block_id in &func.block_order {
             let block = &func.blocks[&block_id];
-            self.regalloc.begin_block(&block.remaining_uses, &block.results);
+            self.regalloc
+                .begin_block(&block.remaining_uses, &block.results);
 
             for inst in &block.instructions {
                 autosynth_lower::dbg(|dbg| dbg.begin_ir_inst(ir_index));
                 match inst {
-                    LowerInst::Ir(ir) => {
-                        backend.lower(&mut self.regalloc, ir.clone(), autosynth_lower::Emit::Fuse)?;
-                        self.regalloc.free_dead();
-                    }
-                    LowerInst::Reg(reg) => {
-                        self.regalloc.process(reg, backend)?;
-                    }
+                    LowerInst::Ir(ir) => backend.lower(
+                        &mut self.regalloc,
+                        ir.clone(),
+                        autosynth_lower::Emit::Fuse,
+                    )?,
+                    LowerInst::Reg(reg) => self.regalloc.process(reg, backend)?,
                 }
                 ir_index += 1;
             }

@@ -96,10 +96,11 @@ impl<B: BackendEmitter> JitModule<B> {
         let sig = func_signature(func);
 
         let lbp_preg = config.reserve(IsaReg::FramePointer);
-        let _lr_preg = config.reserve(IsaReg::ReturnAddress);
+        let lr_preg = config.reserve(IsaReg::ReturnAddress);
         let fuel_preg = config.reserve(IsaReg::FromEnd);
         let _ctx_preg = config.reserve(IsaReg::FromEnd);
         let fsp_preg = config.reserve(IsaReg::StackPointer);
+        let stack_alignment = config.stack_alignment();
 
         let mut f = FunctionBuilder::new(cb, sig);
 
@@ -125,7 +126,7 @@ impl<B: BackendEmitter> JitModule<B> {
             base_offset: locals_header_size,
             slots: Vec::new(),
         });
-        let _fibre = f.define_region(VRegion {
+        let fibre = f.define_region(VRegion {
             label: "fibre",
             base: fsp_preg,
             base_offset: 0,
@@ -152,6 +153,20 @@ impl<B: BackendEmitter> JitModule<B> {
             let v = f.alloc_vreg(w, VInit::Const(0));
             f.push_vreg(locals, v);
         }
+
+        // Allocate native stack space for the fibre (lr save slot).
+        let sp = f.alloc_vreg(Width::W64, VInit::PReg(fsp_preg));
+        let frame_size = f.alloc_vreg(Width::W64, VInit::Const(stack_alignment as i64));
+        f.emit(IrInst::Alu {
+            op: AluOp::Sub,
+            dst: sp,
+            lhs: sp,
+            rhs: frame_size,
+        });
+
+        // Save link register onto fibre.
+        let lr = f.alloc_vreg(Width::W64, VInit::PReg(lr_preg));
+        f.push_vreg(fibre, lr);
 
         f.begin_op("--", "prologue");
 
@@ -222,7 +237,7 @@ impl<B: BackendEmitter> JitModule<B> {
                 OpCode::End => {
                     let block_idx = inline_op.immediate_u32();
                     if block_idx == 0 {
-                        f.emit_return(operands);
+                        Self::emit_epilogue(&mut f, operands, fibre, lr_preg, fsp_preg, stack_alignment, func);
                         break;
                     }
                     // Wasm block end — finalize current block if not already done.
@@ -232,7 +247,7 @@ impl<B: BackendEmitter> JitModule<B> {
                     f.start_block(BlockId::User(pc as u32));
                 }
 
-                OpCode::Return => f.emit_return(operands),
+                OpCode::Return => Self::emit_epilogue(&mut f, operands, fibre, lr_preg, fsp_preg, stack_alignment, func),
 
                 OpCode::Call => {
                     let callee_idx = inline_op.immediate_i32();
@@ -253,6 +268,7 @@ impl<B: BackendEmitter> JitModule<B> {
                     // Clobber all live vregs — call will destroy registers.
                     f.clobber_region(locals);
                     f.clobber_region(operands);
+                    f.clobber_region(fibre);
 
                     f.emit(IrInst::Call { func_idx });
 
@@ -276,6 +292,36 @@ impl<B: BackendEmitter> JitModule<B> {
 
         f.build();
         Ok(())
+    }
+
+    fn emit_epilogue(
+        f: &mut FunctionBuilder,
+        operands: VRegionId,
+        fibre: VRegionId,
+        lr_preg: PReg,
+        fsp_preg: PReg,
+        stack_alignment: u32,
+        func: &FuncMeta,
+    ) {
+        // Pop results into CC registers.
+        for i in (0..func.results.len()).rev() {
+            let width = valtype_to_width(&func.results[i]);
+            let vreg = f.pop(operands, width);
+            f.set_target(vreg, PReg(i as u8));
+        }
+        // Restore lr from fibre.
+        let lr = f.pop(fibre, Width::W64);
+        f.set_target(lr, lr_preg);
+        // Restore native stack pointer.
+        let sp = f.alloc_vreg(Width::W64, VInit::PReg(fsp_preg));
+        let frame_size = f.alloc_vreg(Width::W64, VInit::Const(stack_alignment as i64));
+        f.emit(IrInst::Alu {
+            op: AluOp::Add,
+            dst: sp,
+            lhs: sp,
+            rhs: frame_size,
+        });
+        f.ret();
     }
 
     fn emit_fuel_check(f: &mut FunctionBuilder, fuel: VReg, pending_fuel: &mut u32, pc: usize) {

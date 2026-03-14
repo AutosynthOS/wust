@@ -190,16 +190,18 @@ pub struct MachineConfig {
     pool: Vec<PReg>,
     /// Architectural register mapping — arch-agnostic roles to physical registers.
     isa_regs: HashMap<IsaReg, PReg>,
+    /// Required stack pointer alignment in bytes (e.g. 16 for ARM64/x86_64).
+    stack_alignment: u32,
 }
 
 impl MachineConfig {
-    pub fn new(pool: Vec<PReg>, isa_regs: HashMap<IsaReg, PReg>) -> Self {
+    pub fn new(pool: Vec<PReg>, isa_regs: HashMap<IsaReg, PReg>, stack_alignment: u32) -> Self {
         // Remove ISA-mapped registers from the pool up front.
         let mut pool = pool;
         for preg in isa_regs.values() {
             pool.retain(|r| r != preg);
         }
-        Self { pool, isa_regs }
+        Self { pool, isa_regs, stack_alignment }
     }
 
     /// Reserve a register by architectural role, removing it from the
@@ -242,6 +244,20 @@ impl MachineConfig {
     /// The remaining unreserved registers (scratch pool).
     pub fn scratch_pool(&self) -> &[PReg] {
         &self.pool
+    }
+
+    /// Required stack pointer alignment in bytes.
+    pub fn stack_alignment(&self) -> u32 {
+        self.stack_alignment
+    }
+
+    /// Total number of physical registers (including reserved).
+    pub fn num_regs(&self) -> usize {
+        // Pool originally had all registers before ISA removal,
+        // but we need the full count. Use the max PReg seen + 1.
+        let max_pool = self.pool.iter().map(|p| p.0 as usize).max().unwrap_or(0);
+        let max_isa = self.isa_regs.values().map(|p| p.0 as usize).max().unwrap_or(0);
+        max_pool.max(max_isa) + 1
     }
 }
 
