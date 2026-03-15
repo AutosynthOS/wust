@@ -83,6 +83,7 @@
 					<PReg id={b.preg} />
 					{#if b.vreg}
 						{@const init = initDisplay(b.vreg)}
+						<span class="bind-arrow">→</span>
 						<VReg id={b.vreg} /><span class="slot-type">:{vregWidth(b.vreg)}</span>
 						{#if init}
 							<span class="init-eq">=</span>
@@ -214,6 +215,7 @@
 		color: var(--accent-teal);
 	}
 
+	.bind-arrow { color: var(--text-faint); }
 	.free { opacity: 0.35; }
 	.free-label {
 		color: var(--text-faint);
