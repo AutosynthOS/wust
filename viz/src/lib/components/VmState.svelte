@@ -113,6 +113,24 @@
 			{/each}
 		</div>
 	{/if}
+
+	<!-- Bindings: ordered by preg -->
+	{#if snapshot}
+		<h3>bindings</h3>
+		<div class="stack">
+			{#each snapshot.bindings as b}
+				<div class="slot" class:free={!b.vreg}>
+					<PReg id={b.preg} />
+					<span class="spacer"></span>
+					{#if b.vreg}
+						<VReg id={b.vreg} />
+					{:else}
+						<span class="free-label">free</span>
+					{/if}
+				</div>
+			{/each}
+		</div>
+	{/if}
 {:else}
 	<div class="placeholder">click an op to inspect</div>
 {/if}
@@ -186,6 +204,13 @@
 	.const-badge {
 		font-size: var(--font-size-xxs);
 		color: var(--accent-teal);
+	}
+
+	.free { opacity: 0.35; }
+	.free-label {
+		color: var(--text-faint);
+		font-size: var(--font-size-xs);
+		font-style: italic;
 	}
 
 	.empty {
