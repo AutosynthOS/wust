@@ -210,17 +210,44 @@ impl<B: BackendEmitter> JitModule<B> {
                     let val = f.pop(operands, Width::W32);
                     f.set_field(locals, idx, val);
                 }
+                OpCode::I32Eqz => {
+                    let val = f.pop(operands, Width::W32);
+                    let zero = f.alloc_vreg(Width::W32, VInit::Const(0));
+                    let dst = f.alloc_vreg(Width::W32, VInit::InstDst);
+                    f.emit(IrInst::Alu {
+                        op: AluOp::Comp(CompOp::Eq),
+                        dst,
+                        lhs: val,
+                        rhs: zero,
+                    });
+                    f.push_vreg(operands, dst);
+                }
                 OpCode::I32Add => f.binop(AluOp::Add, operands, Width::W32),
                 OpCode::I32Sub => f.binop(AluOp::Sub, operands, Width::W32),
                 OpCode::I32LeS => f.binop(AluOp::Comp(CompOp::LeS), operands, Width::W32),
                 OpCode::If => {
                     let block_idx = inline_op.immediate_u32();
+                    let block = &func.body.blocks[block_idx as usize];
                     let cond = f.pop(operands, Width::W32);
                     let then_block = BlockId::User(pc as u32 + 1);
-                    let end_pc = func.body.blocks[block_idx as usize].end_pc;
-                    let cont_block = BlockId::User(end_pc);
-                    f.br_if(cond, then_block, cont_block);
+                    // If there's an else branch, false goes to else_pc+1;
+                    // otherwise false skips to end_pc.
+                    let false_target = if block.else_pc != 0 {
+                        BlockId::User(block.else_pc + 1)
+                    } else {
+                        BlockId::User(block.end_pc)
+                    };
+                    f.br_if(cond, then_block, false_target);
                     f.start_block(then_block);
+                }
+                OpCode::Else => {
+                    let block_idx = inline_op.immediate_u32();
+                    let end_pc = func.body.blocks[block_idx as usize].end_pc;
+                    // End of then-branch — jump over the else body.
+                    if !f.is_finalized() {
+                        f.br(BlockId::User(end_pc));
+                    }
+                    f.start_block(BlockId::User(pc as u32 + 1));
                 }
                 OpCode::BrIf => {
                     let block_idx = inline_op.immediate_u32();
