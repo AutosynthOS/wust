@@ -467,7 +467,7 @@
 	.block {
 		position: absolute;
 		border-radius: 6px;
-		background: rgba(24, 24, 46, 0.6);
+		background: rgba(22, 22, 32, 0.7);
 		z-index: 1;
 		overflow: hidden;
 		user-select: none;
