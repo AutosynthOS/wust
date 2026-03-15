@@ -483,7 +483,7 @@
 
 	.block-grid {
 		display: grid;
-		gap: 24px 60px;
+		gap: 40px 80px;
 		position: relative;
 		width: max-content;
 		align-items: start;
