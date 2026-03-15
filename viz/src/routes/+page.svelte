@@ -283,6 +283,7 @@
 		align-items: center;
 		gap: 8px;
 		padding: 6px 14px;
+		min-height: 28px;
 		border-bottom: 1px solid var(--border);
 		background: var(--bg-panel);
 		flex-shrink: 0;

@@ -1,6 +1,6 @@
 <script lang="ts">
 	import type { ModuleTrace, FunctionTrace } from '$lib/types';
-	import { app, toggleWatLine, toggleVreg } from '$lib/state.svelte';
+	import { app, toggleSourceLine, toggleVreg } from '$lib/state.svelte';
 	import VReg from './VReg.svelte';
 
 	let { trace, func }: { trace: ModuleTrace; func: FunctionTrace } = $props();
@@ -16,8 +16,8 @@
 		{#each source as line}
 			<button
 				class="line"
-				class:active={app.hoveredWatLine === line.pc}
-				onclick={() => toggleWatLine(line)}
+				class:active={app.selectedWasmPc === line.pc}
+				onclick={() => toggleSourceLine(line)}
 			>
 				<span class="pc">{line.pc}</span>
 				<code class="text" style="padding-left: {line.indent * 12}px">{line.text}</code>
@@ -85,10 +85,7 @@
 		color: var(--text-dim);
 		min-width: 16px;
 		text-align: right;
-		font-size: var(--font-size-xs);
-		background: var(--bg-elevated);
-		padding: 0 3px;
-		border-radius: 2px;
+		font-size: var(--font-size-base);
 	}
 
 	.text {
