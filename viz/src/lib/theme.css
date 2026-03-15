@@ -35,11 +35,11 @@
 
 	/* Font */
 	--font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
-	--font-size-sm: 10px;
-	--font-size-base: 11px;
-	--font-size-xs: 9px;
-	--font-size-xxs: 8px;
+	--font-size-sm: 12px;
+	--font-size-base: 13px;
+	--font-size-xs: 11px;
+	--font-size-xxs: 10px;
 
 	/* Layout */
-	--row-h: 20px;
+	--row-h: 22px;
 }
