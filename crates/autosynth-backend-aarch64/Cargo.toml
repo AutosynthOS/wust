@@ -3,6 +3,9 @@ name = "autosynth-backend-aarch64"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+trace = ["autosynth-lower/trace"]
+
 [dependencies]
 autosynth-ir = { path = "../autosynth-ir" }
 autosynth-isa = { path = "../autosynth-isa" }

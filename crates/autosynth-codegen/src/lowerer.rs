@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use autosynth_ir::{BlockId, IrInst, LowerInst};
+use autosynth_lower::{trace, trace_ctx, trace_do};
 
 use crate::ir_function::IRFunction;
 use crate::regalloc::{MachineState, RegAlloc};
@@ -13,6 +14,8 @@ pub fn compile(
     func: &IRFunction,
     backend: &mut impl BackendEmitter,
 ) -> Result<Vec<u8>, LowerError> {
+    trace_ctx!("phase", "lower");
+
     let mut regalloc = RegAlloc::new(&func.config, &func.vreg_defs);
     let mut snapshots: HashMap<BlockId, MachineState> = HashMap::new();
     let mut ir_index = 0;
@@ -28,14 +31,29 @@ pub fn compile(
         regalloc.state.begin_block(&block.remaining_uses, &block.results);
         backend.bind_label(block_id);
 
+        trace_ctx!("block", format!("{block_id:?}"));
+        trace!({"type": "lower_block_start", "block": format!("{block_id:?}")});
+
         for inst in &block.instructions {
             autosynth_lower::dbg(|dbg| dbg.begin_ir_inst(ir_index));
+
+            trace_do! {
+                autosynth_lower::trace::set_parent(ir_index as u32);
+                let inst_json = autosynth_lower::__serde_json::to_value(inst).ok();
+                trace!({
+                    "type": "lower_inst",
+                    "ir_index": ir_index,
+                    "inst": inst_json
+                });
+            }
+
             match inst {
                 // Skip fall-through branches — the next block is already
                 // laid out immediately after, so no jump is needed.
                 LowerInst::Ir(IrInst::Branch { target })
                     if Some(*target) == next_block => {}
                 LowerInst::Ir(ir) => {
+                    trace_ctx!("origin", "lower");
                     backend.lower(&mut regalloc, ir.clone(), autosynth_lower::Emit::Fuse)?
                 }
                 LowerInst::Reg(reg) => regalloc.process(reg, backend)?,
@@ -52,6 +70,8 @@ pub fn compile(
     }
 
     backend.finalize(&mut regalloc)?;
+
+    trace!({"type": "lower_end", "code_size": backend.code().len()});
 
     Ok(backend.code().to_vec())
 }

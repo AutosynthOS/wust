@@ -22,6 +22,7 @@ pub trait Instruction: Sized {
 
 /// Access width for loads, stores, and other memory operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum Width {
     W32,
     W64,
@@ -51,6 +52,7 @@ impl core::fmt::Display for Width {
 /// Architecture-neutral — just an index. The backend maps this to
 /// concrete hardware registers (e.g. `x9` on ARM64, `rax` on x86).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub struct PReg(pub u8);
 
 /// Architecture-abstract register role, resolved to a physical register

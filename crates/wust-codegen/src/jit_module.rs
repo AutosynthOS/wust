@@ -5,7 +5,7 @@ use autosynth_codegen::{
     VInit, VReg, VRegion, VRegionId, Width, debugger,
 };
 use autosynth_isa::{IsaReg, PReg};
-use autosynth_lower::{BackendEmitter, MachineConfig};
+use autosynth_lower::{BackendEmitter, MachineConfig, trace, trace_ctx};
 
 use wust_core::exec::ModuleExecutor;
 use wust_core::{FRAME_HEADER_SIZE, FuncMeta, OpCode, Outcome, ParsedModule, Task, slot_size};
@@ -92,6 +92,17 @@ impl<B: BackendEmitter> JitModule<B> {
         let func = &all_funcs[func_idx as usize];
         let sig = func_signature(func);
 
+        trace_ctx!("phase", "build");
+        trace_ctx!("function", func_idx);
+        trace!({
+            "type": "function_start",
+            "index": func_idx,
+            "params": func.params.len(),
+            "results": func.results.len(),
+            "locals": func.locals.len(),
+            "body_len": func.body.ops.len()
+        });
+
         let lbp_preg = config.reserve(IsaReg::FramePointer);
         let lr_preg = config.reserve(IsaReg::ReturnAddress);
         let fuel_preg = config.reserve(IsaReg::FromEnd);
@@ -131,6 +142,13 @@ impl<B: BackendEmitter> JitModule<B> {
             base: fsp_preg,
             base_offset: 0,
             slots: Vec::new(),
+        });
+
+        trace!({
+            "type": "regions",
+            "locals": { "base": format!("x{}", lbp_preg.0), "offset": 0 },
+            "operands": { "base": format!("x{}", lbp_preg.0), "offset": locals_header_size },
+            "fibre": { "base": format!("x{}", fsp_preg.0), "offset": 0 }
         });
 
         // "operation" column registered after all vstacks so it appears rightmost.
@@ -190,6 +208,14 @@ impl<B: BackendEmitter> JitModule<B> {
             let op = inline_op.opcode();
 
             f.begin_op(&pc.to_string(), &inline_op.display_label());
+
+            trace_ctx!("pc", pc as u32);
+            trace!({
+                "type": "wasm_op",
+                "pc": pc,
+                "opcode": format!("{op:?}"),
+                "label": inline_op.display_label()
+            });
 
             // Accrue fuel cost for this opcode.
             pending_fuel += op.fuel_cost();
@@ -369,6 +395,7 @@ impl<B: BackendEmitter> JitModule<B> {
         }
 
         f.build();
+        trace!({ "type": "function_end" });
         Ok(())
     }
 

@@ -5,11 +5,13 @@ use std::collections::HashMap;
 
 use autosynth_ir::{IrInst, RegInst, SlotRef, VInit, VReg, VRegDef};
 use autosynth_isa::{PReg, Width};
+use autosynth_lower::{trace, trace_ctx, trace_do};
 use autosynth_lower::{BackendEmitter, Emit, LowerCtx, LowerError, MachineConfig, ResolvedVReg};
 
 // --- Types ---
 
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 enum VRegLoc {
     Const(i64),
     Pending,
@@ -18,12 +20,14 @@ enum VRegLoc {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 struct SlotState {
     slot: SlotRef,
     dirty: bool,
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 struct VRegEntry {
     loc: VRegLoc,
     slots: Vec<SlotState>,
@@ -31,6 +35,7 @@ struct VRegEntry {
 
 /// The mutable per-path state. Cloned for block snapshots.
 #[derive(Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub(crate) struct MachineState {
     entries: Vec<Option<VRegEntry>>,
     bindings: Vec<Option<VReg>>,
@@ -126,6 +131,7 @@ impl RegAlloc {
         vreg: VReg,
         backend: &mut impl BackendEmitter,
     ) -> Result<PReg, LowerError> {
+        trace_ctx!("origin", "regalloc");
         let width = self.vreg_width(vreg);
         let slot = self.state.entry(vreg)?
             .slots.iter().find(|s| !s.dirty).map(|s| s.slot)
@@ -142,6 +148,24 @@ impl RegAlloc {
     // --- RegInst processing ---
 
     pub(crate) fn process(
+        &mut self,
+        inst: &RegInst,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<(), LowerError> {
+        let result = self.process_inner(inst, backend);
+        trace_do! {
+            let state_json = autosynth_lower::__serde_json::to_value(&self.state).unwrap();
+            let inst_json = autosynth_lower::__serde_json::to_value(inst).unwrap();
+            trace!({
+                "type": "regalloc_state",
+                "inst": inst_json,
+                "state": state_json
+            });
+        }
+        result
+    }
+
+    fn process_inner(
         &mut self,
         inst: &RegInst,
         backend: &mut impl BackendEmitter,
@@ -185,6 +209,7 @@ impl RegAlloc {
             }
             RegInst::Clobber { vreg } => {
                 backend.flush(self)?;
+                trace_ctx!("origin", "regalloc");
                 let loc = self.state.entry(*vreg)?.loc;
                 if let VRegLoc::Reg(preg) = loc {
                     let has_dirty = self.state.entry(*vreg)?.slots.iter().any(|s| s.dirty);
@@ -277,10 +302,17 @@ impl LowerCtx for RegAlloc {
         let result = match loc {
             VRegLoc::Const(val) => ResolvedVReg::Const(val, width),
             VRegLoc::Reg(preg) => ResolvedVReg::PReg(preg, width),
-            VRegLoc::Mem => ResolvedVReg::PReg(self.reload(vreg, backend)?, width),
+            VRegLoc::Mem => {
+                trace!({"type": "reload", "vreg": vreg.0});
+                ResolvedVReg::PReg(self.reload(vreg, backend)?, width)
+            }
             VRegLoc::Pending => return Err(LowerError::UndefinedVReg(vreg)),
         };
         self.state.consume(vreg);
+        trace_do! {
+            let result_json = autosynth_lower::__serde_json::to_value(&result).unwrap();
+            trace!({"type": "resolve_vreg", "vreg": vreg.0, "result": result_json});
+        }
         Ok(result)
     }
 
@@ -295,6 +327,7 @@ impl LowerCtx for RegAlloc {
             VRegLoc::Pending => {
                 let preg = self.alloc_for(vreg, backend)?;
                 self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
+                trace!({"type": "define_vreg", "vreg": vreg.0, "preg": preg.0});
                 Ok((preg, width))
             }
             VRegLoc::Reg(preg) => {

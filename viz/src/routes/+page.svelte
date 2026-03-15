@@ -1,31 +1,43 @@
 <script lang="ts">
 	import '$lib/theme.css';
 	import { onMount } from 'svelte';
-	import { mockTrace } from '$lib/mock';
-	import type { BlockView, OpView } from '$lib/types';
-	import { assembleBlocks } from '$lib/assemble';
-	import { app, toggleSourceLine } from '$lib/state.svelte';
+	import { transformTrace, type FunctionView, type BlockView, type OpView } from '$lib/transform';
+	import { app } from '$lib/state.svelte';
 	import BlockNode from '$lib/components/BlockNode.svelte';
 	import VmState from '$lib/components/VmState.svelte';
 	import VReg from '$lib/components/VReg.svelte';
 	import PReg from '$lib/components/PReg.svelte';
+	import rawTrace from '$lib/trace.json';
 
-	const trace = mockTrace;
-	const func = trace.functions[0];
-	const blocks = assembleBlocks(func);
+	const functions = transformTrace(rawTrace);
+	const func = functions[0] ?? null;
+	const blocks = func?.blocks ?? [];
 	const allOps = blocks.flatMap(b => b.groups.flatMap(g => g.ops));
 	const blockMap = new Map(blocks.map(b => [b.id, b]));
 
 	// Vreg initial values from define events
-	const vregInits = new Map<string, string>();
-	for (const e of func.events) {
-		if (e.type === 'define') {
-			const v = e.value;
-			if (v === 'pending') vregInits.set(e.vreg, 'dst');
-			else if ('preg' in v) vregInits.set(e.vreg, v.preg);
-			else vregInits.set(e.vreg, `#${v.const}`);
+	const vregInits = $derived.by(() => {
+		const m = new Map<string, string>();
+		if (!func) return m;
+		for (const block of func.blocks) {
+			for (const group of block.groups) {
+				for (const op of group.ops) {
+					if (op.kind !== 'reg' || typeof op.inst !== 'object' || op.inst === null) continue;
+					if ('Define' in op.inst) {
+						const d = (op.inst as { Define: { vreg: number; value: unknown } }).Define;
+						const val = d.value;
+						const id = `v${d.vreg}`;
+						if (val === 'InstDst') m.set(id, 'dst');
+						else if (typeof val === 'object' && val !== null) {
+							if ('Const' in val) m.set(id, `#${(val as { Const: number }).Const}`);
+							if ('PReg' in val) m.set(id, `x${(val as { PReg: number }).PReg}`);
+						}
+					}
+				}
+			}
 		}
-	}
+		return m;
+	});
 
 	// --- Graph layout: assign grid col/row per block ---
 	const blockPos = new Map<string, { col: number; row: number }>();
@@ -167,6 +179,9 @@
 	});
 </script>
 
+{#if !func}
+	<div class="loading">no functions in trace</div>
+{:else}
 <div class="layout">
 	<aside class="panel left">
 		<VmState {func} {allOps} />
@@ -195,38 +210,12 @@
 					<!-- Source sidebar -->
 					<div class="func-sidebar">
 						<div class="func-header">
-							<span class="func-name">{func.name ?? `func[${func.index}]`}</span>
-							<div class="func-params">
-								{#each func.params as p, i}
-									<span class="func-param">
-										{#if p.preg}<PReg id={p.preg} />{/if}<span class="fp-colon">:</span><span class="fp-type">{p.width}</span>{#if i < func.params.length - 1}<span class="fp-sep">,</span>{/if}
-									</span>
-								{/each}
-								<span class="fp-arrow">→</span>
-								{#each func.results as r, i}
-									<span class="func-param">
-										{#if r.preg}<PReg id={r.preg} />{/if}<span class="fp-colon">:</span><span class="fp-type">{r.width}</span>{#if i < func.results.length - 1}<span class="fp-sep">,</span>{/if}
-									</span>
-								{/each}
-							</div>
-						</div>
-						<div class="func-source">
-							{#each trace.source.filter(l => l.func_index === func.index) as line}
-								<button
-									class="src-line"
-									class:src-active={app.selectedWasmPc === line.pc}
-									class:src-match={app.highlightedWasmPcs.has(line.pc)}
-									onclick={() => toggleSourceLine(line)}
-								>
-									<span class="src-pc">{line.pc >= 0 ? line.pc : ''}</span>
-									<code class="src-text" style="padding-left: {line.indent * 10}px">{line.text}</code>
-								</button>
-							{/each}
+							<span class="func-name">func[{func.index}]</span>
 						</div>
 
 						<div class="func-defs">
 							<h3>vreg definitions</h3>
-							{#each func.vregs as def}
+							{#each func.vreg_defs as def}
 								{@const init = vregInits.get(def.id)}
 								<div class="def-row" class:def-active={app.highlightedVreg === def.id}>
 									<VReg id={def.id} /><span class="def-sep">:</span><span class="def-w">{def.width}</span>
@@ -288,8 +277,14 @@
 		</div>
 	</main>
 </div>
+{/if}
 
 <style>
+	.loading {
+		color: var(--text-dim);
+		padding: 40px;
+		text-align: center;
+	}
 	:global(*, *::before, *::after) {
 		box-sizing: border-box;
 	}
@@ -338,7 +333,7 @@
 		align-items: center;
 		gap: 8px;
 		padding: 6px 14px;
-		min-height: 28px;
+		min-height: 34px;
 		border-bottom: 1px solid var(--border);
 		background: var(--bg-panel);
 		flex-shrink: 0;

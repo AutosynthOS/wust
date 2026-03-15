@@ -13,7 +13,7 @@ use autosynth_isa_aarch64::{
     SubReg, SubsImm, SubsReg, UImm16,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
-use autosynth_lower::{self, LowerCtx, LowerCtxExt};
+use autosynth_lower::{self, trace, trace_do, LowerCtx, LowerCtxExt};
 use autosynth_lower::{BackendEmitter, LowerError, MachineConfig};
 
 /// A saved patch point — the byte offset of an instruction that needs
@@ -92,7 +92,6 @@ impl BackendEmitter for Aarch64Backend {
         autosynth_lower::dbg(|dbg| dbg_group_idx = dbg.current_group());
 
         if emit == autosynth_lower::Emit::Immediate {
-            // Flush pending first, then emit immediately (no buffering).
             self.flush(ctx)?;
             let op = Operation {
                 dbg_group_idx,
@@ -103,13 +102,17 @@ impl BackendEmitter for Aarch64Backend {
 
         match self.pending.take() {
             None => {
+                trace!({"type": "defer", "inst": format!("{inst}")});
                 self.pending = Some(Operation {
                     dbg_group_idx,
                     op: CompoundOperation::Base(inst),
                 });
                 Ok(())
             }
-            Some(pending) => self.fuse(ctx, pending, inst, dbg_group_idx),
+            Some(pending) => {
+                trace!({"type": "fuse_attempt", "inst": format!("{inst}")});
+                self.fuse(ctx, pending, inst, dbg_group_idx)
+            }
         }
     }
 
@@ -364,6 +367,16 @@ fn emit_inst_at(
     backend: &mut Aarch64Backend,
     inst: impl Aarch64Inst + core::fmt::Display,
 ) -> Result<usize, LowerError> {
+    trace_do! {
+        let mut parent = 0usize;
+        autosynth_lower::dbg(|dbg| parent = dbg.current_group());
+        trace!({
+            "type": "asm",
+            "addr": backend.code.len(),
+            "text": format!("{inst}"),
+            "parent": parent
+        });
+    }
     autosynth_lower::dbg(|dbg| {
         dbg.emit_machine_inst();
         dbg.set_machine("asm", &format!("{inst}"));

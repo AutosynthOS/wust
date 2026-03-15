@@ -1,11 +1,11 @@
 <script lang="ts">
-	import type { BlockView, FunctionTrace, OpView, AsmEvent } from '$lib/types';
-	import { app, selectOp, selectGroup, toggleVreg, toggleSourceLine } from '$lib/state.svelte';
-	import { vregsRead, vregsDefined } from '$lib/assemble';
+	import type { BlockView, FunctionView, OpView, AsmView, RegAllocSnapshotView } from '$lib/transform';
+	import { app, selectOp, selectGroup, toggleVreg } from '$lib/state.svelte';
+	import { fmtVreg } from '$lib/transform';
 	import VReg from './VReg.svelte';
 	import PReg from './PReg.svelte';
 
-	let { block, func }: { block: BlockView; func: FunctionTrace } = $props();
+	let { block, func }: { block: BlockView; func: FunctionView } = $props();
 
 	const ROW_H = 22;
 
@@ -32,8 +32,9 @@
 		return tokens;
 	}
 
+	/** Does this op reference a given vreg (in its text)? */
 	function opTouches(op: OpView, vreg: string): boolean {
-		return vregsRead(op.event).includes(vreg) || vregsDefined(op.event).includes(vreg);
+		return op.text.includes(vreg);
 	}
 
 	function originLabel(o: string): string {
@@ -47,7 +48,7 @@
 	// Flatten into grid rows
 	interface GridRow {
 		op: OpView;
-		asm: AsmEvent | null;
+		asm: AsmView | null;
 		opStart: boolean;
 		opSpan: number;
 		groupStart: boolean;
@@ -94,27 +95,45 @@
 		groupSeqs.set(g.pc, g.ops.map(o => o.seq));
 	}
 
-	// Get vreg target preg for param display
+	// Get vreg target preg
 	function vregTarget(vreg: string): string | null {
-		return func.vregs.find(v => v.id === vreg)?.target ?? null;
+		return func.vreg_defs.find(v => v.id === vreg)?.target ?? null;
+	}
+
+	// Build snapshot lookup: find nearest regalloc snapshot at or before each op
+	const opSnapshots = new Map<number, RegAllocSnapshotView>();
+	{
+		let lastSnapshot: RegAllocSnapshotView | undefined = undefined;
+		for (const block of func.blocks) {
+			for (const group of block.groups) {
+				for (const op of group.ops) {
+					if (op.regalloc_snapshot) lastSnapshot = op.regalloc_snapshot;
+					opSnapshots.set(op.seq, lastSnapshot!);
+				}
+			}
+		}
+	}
+
+	// Normalize preg aliases to register number
+	function normalizePReg(preg: string): string {
+		if (preg === 'sp') return '31';
+		const m = preg.match(/^[wx](\d+)$/);
+		return m ? m[1] : preg;
+	}
+
+	// Look up which vreg a preg is bound to at a given op
+	function pregBoundVreg(opSeq: number, preg: string): string | null {
+		const snap = opSnapshots.get(opSeq);
+		if (!snap) return null;
+		const norm = normalizePReg(preg);
+		const binding = snap.bindings.find(b => normalizePReg(b.preg) === norm);
+		return binding?.vreg ?? null;
 	}
 </script>
 
 <!-- Header -->
 <div class="header">
 	<span class="block-id">{block.id}</span>
-	{#if block.params.length > 0}
-		<div class="params">
-			{#each block.params as p, i}
-				<span class="param">
-					<VReg id={p} />
-					{#if vregTarget(p)}
-						<span class="param-arrow">→</span><PReg id={vregTarget(p) ?? ''} />
-					{/if}
-				</span>
-			{/each}
-		</div>
-	{/if}
 </div>
 
 <!-- Grid body -->
@@ -142,7 +161,6 @@
 				onclick={() => {
 					const seqs = groupSeqs.get(row.groupPc) ?? [];
 					if (seqs.length) selectGroup(seqs);
-					if (row.groupPc !== null) toggleSourceLine({ pc: row.groupPc, text: '', indent: 0, func_index: func.index });
 				}}
 			>
 				<span class="label-text">{row.groupLabel}</span>
@@ -156,7 +174,7 @@
 				class:row-hov={app.hoveredOp === row.op.seq}
 				class:row-sel={app.selectedOps.has(row.op.seq)}
 				class:row-hl={app.highlightedVreg !== null && opTouches(row.op, app.highlightedVreg)}
-				class:row-dim={app.highlightedVreg !== null && !opTouches(row.op, app.highlightedVreg)}
+				class:row-dim={app.highlightedVreg !== null && !opTouches(row.op, app.highlightedVreg) && !app.selectedOps.has(row.op.seq)}
 				class:wat-match={app.highlightedWasmPcs.size > 0 && row.groupPc !== null && app.highlightedWasmPcs.has(row.groupPc)}
 				style="grid-row: {ri + 1} / span {row.opSpan}; grid-column: 3;"
 				onmouseenter={() => app.hoveredOp = row.op.seq}
@@ -173,11 +191,15 @@
 			</div>
 		{/if}
 
+		{@const isDimmed = app.highlightedVreg !== null && !opTouches(row.op, app.highlightedVreg) && !app.selectedOps.has(row.op.seq)}
 		<div
 			class="cell cell-addr"
 			class:group-border={!row.firstGroup && row.groupStart}
 			class:row-hov={app.hoveredOp === row.op.seq}
+			class:row-sel={app.selectedOps.has(row.op.seq)}
+			class:row-dim={isDimmed}
 			style="grid-row: {ri + 1}; grid-column: 4;"
+			onclick={(e) => { e.stopPropagation(); selectOp(row.op.seq); }}
 		>
 			{#if row.asm}<span class="addr-text">{formatAddr(row.asm.addr)}</span>{/if}
 		</div>
@@ -186,7 +208,10 @@
 			class="cell cell-origin"
 			class:group-border={!row.firstGroup && row.groupStart}
 			class:row-hov={app.hoveredOp === row.op.seq}
+			class:row-sel={app.selectedOps.has(row.op.seq)}
+			class:row-dim={isDimmed}
 			style="grid-row: {ri + 1}; grid-column: 5;"
+			onclick={(e) => { e.stopPropagation(); selectOp(row.op.seq); }}
 		>
 			{#if row.asm}<span class="origin {row.asm.origin}">{originLabel(row.asm.origin)}</span>{/if}
 		</div>
@@ -195,13 +220,16 @@
 			class="cell cell-asm"
 			class:group-border={!row.firstGroup && row.groupStart}
 			class:row-hov={app.hoveredOp === row.op.seq}
+			class:row-sel={app.selectedOps.has(row.op.seq)}
+			class:row-dim={isDimmed}
 			style="grid-row: {ri + 1}; grid-column: 6;"
+			onclick={(e) => { e.stopPropagation(); selectOp(row.op.seq); }}
 		>
 			{#if row.asm}
 				<code>
 					{#each parseAsm(row.asm.text) as tok}
 						{#if tok.kind === 'reg'}
-							<PReg id={tok.text} />
+							<PReg id={tok.text} boundVreg={pregBoundVreg(row.op.seq, tok.text)} />
 						{:else}
 							<span class="t-{tok.kind}">{tok.text}</span>
 						{/if}
@@ -237,23 +265,6 @@
 		color: var(--text);
 	}
 
-	.params {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		font-size: var(--font-size-base);
-	}
-
-	.param {
-		display: flex;
-		align-items: center;
-		gap: 2px;
-	}
-
-	.param-arrow {
-		color: var(--text-faint);
-	}
-
 	.footer {
 		display: flex;
 		align-items: center;
@@ -269,11 +280,11 @@
 	.grid {
 		display: grid;
 		grid-template-columns:
-			[pc] 30px
+			[pc] max-content
 			[label] minmax(90px, 140px)
 			[op] 1fr
-			[addr] 40px
-			[origin] 24px
+			[addr] max-content
+			[origin] max-content
 			[asm] minmax(140px, 1fr);
 	}
 
@@ -351,6 +362,14 @@
 		&.lower { background: var(--accent-blue); }
 		&.regalloc { background: var(--accent-yellow); }
 		&.fuse { background: var(--accent-purple); }
+	}
+
+	.cell-addr, .cell-origin, .cell-asm {
+		cursor: pointer;
+		&.row-sel { background: var(--selected-bg); }
+		&.row-hov { background: rgba(137, 180, 250, 0.04); }
+		&.row-dim { opacity: var(--dim-opacity); }
+		&.row-dim.row-sel { opacity: 1; }
 	}
 
 	.cell-asm {

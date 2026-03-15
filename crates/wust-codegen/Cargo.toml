@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 inspect = ["disarm64"]
+trace = ["autosynth-codegen/trace", "autosynth-lower/trace", "autosynth-backend-aarch64/trace"]
 
 [dependencies]
 anyhow = "1"

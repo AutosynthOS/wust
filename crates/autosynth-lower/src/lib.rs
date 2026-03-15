@@ -4,10 +4,19 @@
 //! - [`LowerCtx`] — the context trait that the orchestrator implements
 //! - Operand resolution functions that query the context to fold
 //!   immediates or allocate physical registers
+//! - [`trace!`] / [`trace_do!`] — feature-gated structured trace emission
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
+
+pub mod trace;
+
+// Re-export serde_json so the trace! macro can reference it from
+// downstream crates via $crate::__serde_json::json!().
+#[cfg(feature = "trace")]
+#[doc(hidden)]
+pub use serde_json as __serde_json;
 
 use autosynth_ir::VReg;
 use autosynth_isa::{IsaReg, PReg, PRegOr, Width};
@@ -80,6 +89,7 @@ pub fn dbg(f: impl FnOnce(&mut dyn DbgSink)) {
 /// Result of resolving a virtual register — either already in a
 /// physical register, or a known constant whose materialization
 /// can be deferred.
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum ResolvedVReg {
     /// Value is in a physical register, ready to use.
     PReg(PReg, Width),

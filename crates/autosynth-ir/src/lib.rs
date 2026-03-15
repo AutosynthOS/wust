@@ -17,6 +17,7 @@ use autosynth_isa::{PReg, Width};
 /// Assigned during IR construction. The lowerer resolves these to
 /// physical registers via the register allocator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub struct VReg(pub u32);
 
 impl fmt::Display for VReg {
@@ -27,6 +28,7 @@ impl fmt::Display for VReg {
 
 /// Identifies a basic block within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum BlockId {
     /// Function entry / prologue block.
     Entry,
@@ -51,6 +53,7 @@ impl fmt::Display for BlockId {
 
 /// Index identifying a function in the compilation unit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum FunctionIdx {
     /// A user-defined function, indexed by its position in the module.
     User(u32),
@@ -58,6 +61,7 @@ pub enum FunctionIdx {
 
 /// WASM value type for the IR layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum IrType {
     I32,
     I64,
@@ -88,6 +92,7 @@ impl fmt::Display for IrType {
 /// The Abi determines whether params and results are *also* passed
 /// in registers as an optimization, or exclusively through the stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum Abi {
     /// Params and results are passed in scratch registers, indexed
     /// by position. Param 0 and result 0 share the same register.
@@ -133,6 +138,7 @@ impl fmt::Display for FunctionIdx {
 /// Comparison ops emit flag-setting instructions (e.g. `subs`) whose
 /// condition codes are consumed by [`IrInst::BrIf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum AluOp {
     // --- Arithmetic ---
     Add,
@@ -159,6 +165,7 @@ pub enum AluOp {
 /// flag-setting instructions (e.g. `subs` on ARM64) whose condition
 /// codes are consumed by [`IrInst::BrIf`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum CompOp {
     Eq,
     Ne,
@@ -212,6 +219,7 @@ impl fmt::Display for AluOp {
 /// registers through the register cache to get physical registers or
 /// constants, selecting immediate vs register forms accordingly.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum IrInst {
     /// Arithmetic, logic, or comparison: dst = lhs op rhs.
     ///
@@ -291,6 +299,7 @@ pub enum IrInst {
 /// The register allocator processes these to maintain its internal state
 /// (vreg definitions, slot assignments, liveness, dirtiness).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum RegInst {
     /// Define a new vreg with its initial value origin.
     /// Panics if the vreg has already been defined.
@@ -315,6 +324,7 @@ pub enum RegInst {
 /// are forwarded to the backend after vreg resolution. `Reg` instructions
 /// update the allocator's internal state (no code emitted).
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum LowerInst {
     /// An IR instruction — the backend selects machine instructions for this.
     Ir(IrInst),
@@ -331,6 +341,7 @@ pub struct VRegionId(pub u32);
 /// The builder computes the byte offset at emit time from the
 /// region's base register, base offset, and preceding slot widths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub struct SlotRef {
     /// Base physical register (e.g. frame pointer).
     pub base: PReg,
@@ -344,6 +355,7 @@ pub struct SlotRef {
 /// tells the lowerer how to obtain the value (rematerialize a const,
 /// look up a register binding, resolve via the register allocator).
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum VInit {
     /// A compile-time constant (sign-extended to 64 bits). Rematerializable.
     Const(i64),
@@ -359,6 +371,7 @@ pub enum VInit {
 /// was produced) is communicated via `RegInst::Define` in the
 /// instruction stream.
 #[derive(Debug, Clone, Copy)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub struct VRegDef {
     /// The unique virtual register identifier.
     pub id: VReg,
@@ -375,6 +388,7 @@ pub struct VRegDef {
 /// (indexed field access). The access pattern is determined by which
 /// builder methods the caller uses, not by this config.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub struct VRegion {
     /// Display label (e.g. "locals", "operands").
     pub label: &'static str,

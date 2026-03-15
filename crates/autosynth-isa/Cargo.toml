@@ -2,3 +2,9 @@
 name = "autosynth-isa"
 version = "0.1.0"
 edition = "2024"
+
+[features]
+trace = ["serde"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive"], optional = true }

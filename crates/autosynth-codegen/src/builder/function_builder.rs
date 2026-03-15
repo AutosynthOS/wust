@@ -5,6 +5,7 @@ use autosynth_ir::{
     VRegDef, VRegion, VRegionId,
 };
 use autosynth_isa::{PReg, Width};
+use autosynth_lower::{trace, trace_ctx, trace_do};
 
 use super::code_builder::CodeBuilder;
 use crate::debugger::{self, Align};
@@ -110,20 +111,13 @@ impl<'a> FunctionBuilder<'a> {
         id
     }
 
-    /// Format a debug label for a region slot, e.g. "locals[0]".
-    fn slot_label(&self, region: VRegionId, index: u32) -> String {
-        let label = self.regions[region.0 as usize].label;
-        format!("{label}[{index}]")
-    }
-
     /// Push a vreg onto a region. Emits `RegInst::SetSlot`.
     pub fn push_vreg(&mut self, region: VRegionId, vreg: VReg) {
         self.record_use(vreg);
         let index = self.regions[region.0 as usize].slots.len() as u32;
         let slot = self.slot_offset(region, index);
-        let desc = format!("{} <- {}", self.slot_label(region, index), self.fmt_vreg(vreg));
         self.regions[region.0 as usize].slots.push(vreg);
-        self.emit_reg_with(RegInst::SetSlot { vreg, slot }, desc);
+        self.emit_reg(RegInst::SetSlot { vreg, slot });
     }
 
     /// Pop the top vreg from a region. Asserts the vreg's width matches
@@ -141,8 +135,7 @@ impl<'a> FunctionBuilder<'a> {
             "pop: expected {expected} but vreg {vreg} is {actual}"
         );
         self.record_use(vreg);
-        let desc = format!("{}:pop -> {}", self.slot_label(region, index), self.fmt_vreg(vreg));
-        self.emit_reg_with(RegInst::ClearSlot { vreg, slot }, desc);
+        self.emit_reg(RegInst::ClearSlot { vreg, slot });
         vreg
     }
 
@@ -150,10 +143,7 @@ impl<'a> FunctionBuilder<'a> {
     /// ensure all values are stored to memory.
     pub fn clobber_region(&mut self, region: VRegionId) {
         for vreg in self.regions[region.0 as usize].slots.clone() {
-            self.emit_reg_with(
-                RegInst::Clobber { vreg },
-                format!("clobber {}", self.fmt_vreg(vreg)),
-            );
+            self.emit_reg(RegInst::Clobber { vreg });
         }
     }
 
@@ -171,12 +161,10 @@ impl<'a> FunctionBuilder<'a> {
         // Clear the old occupant's slot association before overwriting.
         let old = self.regions[region.0 as usize].slots[index];
         if old != vreg {
-            let clear_desc = format!("{} clear {}", self.slot_label(region, index as u32), self.fmt_vreg(old));
-            self.emit_reg_with(RegInst::ClearSlot { vreg: old, slot }, clear_desc);
+            self.emit_reg(RegInst::ClearSlot { vreg: old, slot });
         }
-        let desc = format!("{} <- {}", self.slot_label(region, index as u32), self.fmt_vreg(vreg));
         self.regions[region.0 as usize].slots[index] = vreg;
-        self.emit_reg_with(RegInst::SetSlot { vreg, slot }, desc);
+        self.emit_reg(RegInst::SetSlot { vreg, slot });
     }
 
     // --- VReg allocation ---
@@ -248,6 +236,8 @@ impl<'a> FunctionBuilder<'a> {
     pub fn entry_block(&mut self, block: BlockId) {
         self.ensure_block(block);
         self.current_block = Some(block);
+        trace_ctx!("block", format!("{block:?}"));
+        trace!({"type": "block_start", "block": format!("{block:?}")});
         debugger::dbg(|dbg| dbg.mark_block_start(block));
     }
 
@@ -257,6 +247,8 @@ impl<'a> FunctionBuilder<'a> {
             self.regions = snapshot;
         }
         self.current_block = Some(block);
+        trace_ctx!("block", format!("{block:?}"));
+        trace!({"type": "block_start", "block": format!("{block:?}")});
         debugger::dbg(|dbg| dbg.mark_block_start(block));
     }
 
@@ -278,6 +270,21 @@ impl<'a> FunctionBuilder<'a> {
             block_if,
             block_else,
         };
+
+        // Count vreg operands for remaining_uses.
+        let block = self.blocks.get_mut(&id).unwrap();
+        *block.remaining_uses.entry(cond).or_insert(0) += 1;
+
+        trace_do! {
+            let seq = autosynth_lower::trace::next_seq();
+            let inst_json = autosynth_lower::__serde_json::to_value(&inst).unwrap();
+            trace!({
+                "type": "ir",
+                "seq": seq,
+                "inst": inst_json
+            });
+        }
+
         self.snapshot_debug();
         debugger::dbg(|dbg| {
             dbg.record_ir_emit();
@@ -336,6 +343,16 @@ impl<'a> FunctionBuilder<'a> {
             _ => {}
         }
 
+        trace_do! {
+            let seq = autosynth_lower::trace::next_seq();
+            let inst_json = autosynth_lower::__serde_json::to_value(&inst).unwrap();
+            trace!({
+                "type": "ir",
+                "seq": seq,
+                "inst": inst_json
+            });
+        }
+
         self.snapshot_debug();
         debugger::dbg(|dbg| {
             dbg.record_ir_emit();
@@ -352,18 +369,6 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Emit a register allocation instruction into the currently active block.
     pub fn emit_reg(&mut self, inst: RegInst) {
-        let desc = match &inst {
-            RegInst::Define { vreg, value } => match value {
-                VInit::Const(val) => format!("{}=#{}", self.fmt_vreg(*vreg), val),
-                VInit::PReg(preg) => format!("{} = p{}", self.fmt_vreg(*vreg), preg.0),
-                VInit::InstDst => format!("{} = <pending>", self.fmt_vreg(*vreg)),
-            },
-            _ => String::new(),
-        };
-        self.emit_reg_with(inst, desc);
-    }
-
-    fn emit_reg_with(&mut self, inst: RegInst, desc: String) {
         let id = self.current_block.expect("emit_reg: no active block");
         let block = self.blocks.get(&id).unwrap();
         assert!(
@@ -371,8 +376,27 @@ impl<'a> FunctionBuilder<'a> {
             "cannot emit into finalized block {:?}",
             id
         );
+
+        trace_do! {
+            let seq = autosynth_lower::trace::next_seq();
+            let inst_json = autosynth_lower::__serde_json::to_value(&inst).unwrap();
+            let regions: Vec<_> = self.regions.iter().map(|r| {
+                autosynth_lower::__serde_json::json!({
+                    "label": r.label,
+                    "slots": r.slots.iter().map(|v| v.0).collect::<Vec<_>>()
+                })
+            }).collect();
+            trace!({
+                "type": "reg",
+                "seq": seq,
+                "inst": inst_json,
+                "regions": regions
+            });
+        }
+
         self.snapshot_debug();
         debugger::dbg(|dbg| {
+            let desc = format!("{inst:?}");
             dbg.record_ir_emit();
             dbg.set_source("operation", &desc);
         });
@@ -391,6 +415,16 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Finalize — produce the IRFunction.
     pub fn build(self) {
+        trace_do! {
+            let defs_json = autosynth_lower::__serde_json::to_value(&self.vreg_defs).unwrap();
+            let regions_json = autosynth_lower::__serde_json::to_value(&self.regions).unwrap();
+            trace!({
+                "type": "build_end",
+                "vreg_defs": defs_json,
+                "regions": regions_json
+            });
+        }
+
         let block_order = self.block_order;
         let mut blocks = self.blocks;
         let vreg_defs = self.vreg_defs;

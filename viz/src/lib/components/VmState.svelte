@@ -1,108 +1,98 @@
 <script lang="ts">
-	import type { FunctionTrace, OpView, RegAllocSnapshot, VRegLoc } from '$lib/types';
+	import type { FunctionView, OpView, RegAllocSnapshotView, RegionSnapshotView } from '$lib/transform';
 	import { app } from '$lib/state.svelte';
-	import { computeStateDiff, computeStateAt, type SlotDiff } from '$lib/assemble';
 	import VReg from './VReg.svelte';
 	import PReg from './PReg.svelte';
 	import DirtyBadge from './DirtyBadge.svelte';
 
 	let { func, allOps }: {
-		func: FunctionTrace;
+		func: FunctionView;
 		allOps: OpView[];
 	} = $props();
 
-	const selectedEvent = $derived(
+	const selectedOp = $derived(
 		app.selectedOp !== null ? allOps.find(o => o.seq === app.selectedOp) : null
 	);
 
-	const diff = $derived(
-		app.selectedOp !== null ? computeStateDiff(func, app.selectedOp) : null
-	);
-
-	const state = $derived(
-		app.selectedOp !== null ? computeStateAt(func, app.selectedOp) : null
-	);
-
-	const snapshot = $derived.by((): RegAllocSnapshot | null => {
+	// Find nearest regalloc snapshot at or before selected op
+	const snapshot = $derived.by((): RegAllocSnapshotView | null => {
 		if (app.selectedOp === null) return null;
-		let best: RegAllocSnapshot | null = null;
+		let best: RegAllocSnapshotView | null = null;
 		for (const op of allOps) {
 			if (op.seq > app.selectedOp) break;
-			if (op.event.snapshot) best = op.event.snapshot;
+			if (op.regalloc_snapshot) best = op.regalloc_snapshot;
 		}
 		return best;
 	});
 
-	function vregLoc(vreg: string): VRegLoc | null {
-		return snapshot?.vreg_locs.find(vl => vl.vreg === vreg) ?? null;
-	}
+	// Find nearest region snapshot at or before selected op
+	const regionSnapshot = $derived.by((): RegionSnapshotView[] | null => {
+		if (app.selectedOp === null) return null;
+		let best: RegionSnapshotView[] | null = null;
+		for (const op of allOps) {
+			if (op.seq > app.selectedOp) break;
+			if (op.region_snapshot) best = op.region_snapshot;
+		}
+		return best;
+	});
 
 	function vregWidth(vreg: string): string {
-		return func.vregs.find(d => d.id === vreg)?.width ?? '?';
-	}
-
-	function slotOffset(regionId: string, index: number): number {
-		const region = func.regions.find(r => r.id === regionId);
-		return (region?.base_offset ?? 0) + index * 4;
+		return func.vreg_defs.find(d => d.id === vreg)?.width ?? '?';
 	}
 </script>
 
-{#if selectedEvent && diff && state}
+{#if selectedOp && snapshot}
 	<h2>state @ seq {app.selectedOp}</h2>
-	<div class="op-preview">{selectedEvent.text}</div>
+	<div class="op-preview">{selectedOp.text}</div>
 
 	<!-- Bindings -->
-	{#if snapshot}
-		<h3>bindings</h3>
-		<div class="bindings-grid">
-			{#each snapshot.bindings as b}
-				<div class="bind-preg" class:free={!b.vreg}>
-					<PReg id={b.preg} />
-				</div>
-				<div class="bind-vreg" class:free={!b.vreg}>
-					{#if b.vreg}
-						{@const vl = vregLoc(b.vreg)}
-						<VReg id={b.vreg} /><span class="type">:{vregWidth(b.vreg)}</span>
-						{#if vl}
-							<span class="spacer"></span>
-							<DirtyBadge dirty={vl.dirty !== false} />
-						{/if}
-					{:else}
-						<span class="free-label">free</span>
-					{/if}
-				</div>
-			{/each}
-		</div>
-	{/if}
-
-	<!-- Regions -->
-	{#each func.regions as region}
-		{@const slots = region.id === 'locals' ? diff.locals : region.id === 'operands' ? diff.ops : diff.fibre}
-		<h3>{region.label}</h3>
-		<div class="slots-grid">
-			{#each slots as slot, i}
-				{@const vl = vregLoc(slot.vreg)}
-				<div class="slot-mark {slot.action}">
-					{#if slot.action === 'pushed'}+{:else if slot.action === 'popped'}−{:else}{i}{/if}
-				</div>
-				<div class="slot-data {slot.action}">
-					<span class="offset">+{slotOffset(region.id, i)}</span>
-					<VReg id={slot.vreg} /><span class="type">:{vregWidth(slot.vreg)}</span>
-					<span class="spacer"></span>
-					{#if vl?.preg}
-						<PReg id={vl.preg} />
-					{/if}
+	<h3>bindings</h3>
+	<div class="bindings-grid">
+		{#each snapshot.bindings as b}
+			<div class="bind-preg" class:free={!b.vreg}>
+				<PReg id={b.preg} />
+			</div>
+			<div class="bind-vreg" class:free={!b.vreg}>
+				{#if b.vreg}
+					{@const vl = snapshot.vreg_locs.find(v => v.vreg === b.vreg)}
+					<VReg id={b.vreg} /><span class="type">:{vregWidth(b.vreg)}</span>
 					{#if vl}
+						<span class="spacer"></span>
 						<DirtyBadge dirty={vl.dirty !== false} />
 					{/if}
-				</div>
-			{/each}
-			{#if slots.length === 0}
-				<div class="empty-mark"></div>
-				<div class="empty">—</div>
-			{/if}
-		</div>
-	{/each}
+				{:else}
+					<span class="free-label">free</span>
+				{/if}
+			</div>
+		{/each}
+	</div>
+
+	<!-- Regions -->
+	{#if regionSnapshot}
+		{#each regionSnapshot as region}
+			<h3>{region.label}</h3>
+			<div class="slots-grid">
+				{#each region.slots as vreg, i}
+					{@const vl = snapshot.vreg_locs.find(v => v.vreg === vreg)}
+					<div class="slot-mark">{i}</div>
+					<div class="slot-data">
+						<VReg id={vreg} /><span class="type">:{vregWidth(vreg)}</span>
+						<span class="spacer"></span>
+						{#if vl?.preg}
+							<PReg id={vl.preg} />
+						{/if}
+						{#if vl}
+							<DirtyBadge dirty={vl.dirty !== false} />
+						{/if}
+					</div>
+				{/each}
+				{#if region.slots.length === 0}
+					<div class="empty-mark"></div>
+					<div class="empty">—</div>
+				{/if}
+			</div>
+		{/each}
+	{/if}
 {:else}
 	<div class="placeholder">click an op to inspect</div>
 {/if}
@@ -131,7 +121,6 @@
 		word-break: break-all;
 	}
 
-	/* Bindings grid */
 	.bindings-grid {
 		display: grid;
 		grid-template-columns: auto 1fr;
@@ -163,7 +152,6 @@
 		font-style: italic;
 	}
 
-	/* Slots grid */
 	.slots-grid {
 		display: grid;
 		grid-template-columns: 18px 1fr;
@@ -177,9 +165,6 @@
 		font-size: var(--font-size-sm);
 		font-weight: bold;
 		color: var(--text-faint);
-
-		&.pushed { color: var(--accent-green); }
-		&.popped { color: var(--accent-red); }
 	}
 
 	.slot-data {
@@ -190,16 +175,6 @@
 		background: var(--bg-surface);
 		border-radius: 3px;
 		font-size: var(--font-size-base);
-
-		&.pushed { background: rgba(166, 227, 161, 0.1); }
-		&.popped { background: rgba(243, 139, 168, 0.1); }
-		&.set { background: rgba(250, 179, 135, 0.1); }
-	}
-
-	.offset {
-		color: var(--text-dim);
-		font-size: var(--font-size-sm);
-		min-width: 22px;
 	}
 
 	.type {

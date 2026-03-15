@@ -138,6 +138,7 @@ dependencies = [
  "autosynth-isa-riscv64",
  "autosynth-isa-x86_64",
  "autosynth-lower",
+ "serde",
 ]
 
 [[package]]
@@ -145,11 +146,15 @@ name = "autosynth-ir"
 version = "0.1.0"
 dependencies = [
  "autosynth-isa",
+ "serde",
 ]
 
 [[package]]
 name = "autosynth-isa"
 version = "0.1.0"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "autosynth-isa-aarch64"
@@ -178,6 +183,8 @@ version = "0.1.0"
 dependencies = [
  "autosynth-ir",
  "autosynth-isa",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

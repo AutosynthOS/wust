@@ -3,10 +3,14 @@ name = "autosynth-codegen"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+trace = ["autosynth-lower/trace", "autosynth-ir/trace", "autosynth-isa/trace", "serde"]
+
 [dependencies]
 autosynth-ir = { path = "../autosynth-ir" }
 autosynth-isa = { path = "../autosynth-isa" }
 autosynth-lower = { path = "../autosynth-lower" }
+serde = { version = "1", features = ["derive"], optional = true }
 autosynth-isa-aarch64 = { path = "../autosynth-isa-aarch64" }
 autosynth-isa-riscv64 = { path = "../autosynth-isa-riscv64" }
 autosynth-isa-x86_64 = { path = "../autosynth-isa-x86_64" }
