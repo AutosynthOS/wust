@@ -1,45 +1,120 @@
 <script lang="ts">
-	import type { Block, FunctionData } from '$lib/types';
-	import { app, groupHasWasmPc, blockColor } from '$lib/state.svelte';
+	import type { BlockView, FunctionTrace } from '$lib/types';
+	import { app } from '$lib/state.svelte';
 	import OpRow from './OpRow.svelte';
 
-	let { block, data }: { block: Block; data: FunctionData } = $props();
+	let { block, func }: { block: BlockView; func: FunctionTrace } = $props();
+
 	const ROW_H = 20;
+
+	function groupHeight(group: typeof block.groups[0]): number {
+		let rows = 0;
+		for (const op of group.ops) {
+			rows += Math.max(1, op.asm.length);
+		}
+		return Math.max(1, rows) * ROW_H;
+	}
 </script>
 
-<div class="bh">
-	<span class="bi" style="color:{blockColor(block.id)}">{block.id}</span>
-	<span class="bl">{block.label}</span>
-	{#if block.successors.length}<span class="bs">→ {block.successors.join(', ')}</span>{/if}
+<div class="header">
+	<span class="block-id">{block.id}</span>
+	{#if block.successors.length}
+		<span class="successors">→ {block.successors.join(', ')}</span>
+	{/if}
 </div>
-<div class="bb">
-	<div class="c-wat">
-		{#each block.groups as g}
-			{@const opCount = g.ops.reduce((sum, op) => sum + Math.max(1, block.asmEvents.filter(a => a.parentOp === op.id).length), 0)}
-			<div class="wat-cell" class:wat-match={app.highlightedWasmPcs.size > 0 && groupHasWasmPc(g, app.highlightedWasmPcs)} style="height:{opCount * ROW_H}px">
-				{#if g.wasmPc !== null}<span class="wpc2">{g.wasmPc}</span>{/if}
-				<span class="wat-lbl">{g.label}</span>
+
+<div class="body">
+	<!-- WAT/label column -->
+	<div class="col-label">
+		{#each block.groups as group}
+			<div class="label-cell" style="height: {groupHeight(group)}px"
+				class:wat-match={app.highlightedWasmPcs.size > 0 && group.pc !== null && app.highlightedWasmPcs.has(group.pc)}>
+				{#if group.pc !== null}
+					<span class="pc">{group.pc}</span>
+				{/if}
+				<span class="label-text">{group.label}</span>
 			</div>
 		{/each}
 	</div>
-	<div class="c-main">
-		{#each block.groups as g}
-			{#each g.ops as op}
-				<OpRow {op} asmList={block.asmEvents.filter(a => a.parentOp === op.id)} blockId={block.id} {data} />
+
+	<!-- Ops + ASM columns -->
+	<div class="col-main">
+		{#each block.groups as group}
+			{#each group.ops as op}
+				<OpRow {op} />
 			{/each}
 		{/each}
 	</div>
 </div>
 
 <style>
-	.bh { display:flex; gap:6px; padding:3px 8px; background:#141420; border-bottom:1px solid #313244; align-items:center; }
-	.bi { font-weight:bold; font-size:11px; } .bl { color:#6c7086; font-size:10px; } .bs { margin-left:auto; color:#45475a; font-size:9px; }
-	.bb { display:flex; }
-	.c-wat { min-width:100px; max-width:130px; display:flex; flex-direction:column; border-right:1px solid #313244; }
-	.wat-cell { display:flex; align-items:center; gap:3px; padding:0 6px; border-bottom:1px solid rgba(49,50,68,0.3); box-sizing:border-box; overflow:hidden; }
-	.wat-cell:last-child { border-bottom:none; }
-	.wat-match { background:rgba(137,180,250,0.1); }
-	.wpc2 { color:#585b70; font-size:8px; background:#313244; padding:0 2px; border-radius:2px; min-width:10px; text-align:center; }
-	.wat-lbl { color:#cdd6f4; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-	.c-main { flex:1; display:flex; flex-direction:column; }
+	.header {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		padding: 3px 8px;
+		background: var(--bg-block-header);
+		border-bottom: 1px solid var(--border);
+	}
+
+	.block-id {
+		font-weight: bold;
+		font-size: var(--font-size-base);
+		color: var(--text);
+	}
+
+	.successors {
+		margin-left: auto;
+		color: var(--text-faint);
+		font-size: var(--font-size-xs);
+	}
+
+	.body {
+		display: flex;
+	}
+
+	.col-label {
+		min-width: 110px;
+		max-width: 140px;
+		display: flex;
+		flex-direction: column;
+		border-right: 1px solid var(--border);
+	}
+
+	.label-cell {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		padding: 0 6px;
+		border-bottom: 1px solid var(--border-subtle);
+		box-sizing: border-box;
+		overflow: hidden;
+
+		&:last-child { border-bottom: none; }
+		&.wat-match { background: rgba(137, 180, 250, 0.08); }
+	}
+
+	.pc {
+		color: var(--text-dim);
+		font-size: var(--font-size-xxs);
+		background: var(--bg-elevated);
+		padding: 0 3px;
+		border-radius: 2px;
+		min-width: 12px;
+		text-align: center;
+	}
+
+	.label-text {
+		color: var(--text);
+		font-size: var(--font-size-sm);
+		white-space: nowrap;
+		overflow: hidden;
+		text-overflow: ellipsis;
+	}
+
+	.col-main {
+		flex: 1;
+		display: flex;
+		flex-direction: column;
+	}
 </style>

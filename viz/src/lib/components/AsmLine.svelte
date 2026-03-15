@@ -1,25 +1,43 @@
 <script lang="ts">
-	import { toggleVreg, formatAddr, originBadge } from '$lib/state.svelte';
+	import type { AsmEvent } from '$lib/types';
 
-	interface AsmToken { text: string; kind: 'mnemonic' | 'reg' | 'imm' | 'mem' | 'label' | 'punct'; preg?: string; }
+	let { asm }: { asm: AsmEvent } = $props();
 
-	let { asm, addr, origin }: { asm: string; addr: number; origin: string } = $props();
+	interface Token {
+		text: string;
+		kind: 'mnemonic' | 'reg' | 'imm' | 'mem' | 'label' | 'punct';
+	}
 
-	function parseAsm(text: string): AsmToken[] {
-		const tokens: AsmToken[] = [];
+	function parse(text: string): Token[] {
+		const tokens: Token[] = [];
 		const parts = text.split(/(\s+|,\s*|\[|\]|#)/);
 		let first = true;
+
 		for (const part of parts) {
-			if (!part || part.match(/^[\s,]+$/)) { tokens.push({ text: part, kind: 'punct' }); continue; }
-			if (part === '[' || part === ']') { tokens.push({ text: part, kind: 'mem' }); continue; }
-			if (part === '#') { tokens.push({ text: part, kind: 'imm' }); continue; }
-			if (first && part.match(/^[a-z]/)) { tokens.push({ text: part, kind: 'mnemonic' }); first = false; continue; }
+			if (!part || part.match(/^[\s,]+$/)) {
+				tokens.push({ text: part, kind: 'punct' });
+				continue;
+			}
+			if (part === '[' || part === ']') {
+				tokens.push({ text: part, kind: 'mem' });
+				continue;
+			}
+			if (part === '#') {
+				tokens.push({ text: part, kind: 'imm' });
+				continue;
+			}
+			if (first && part.match(/^[a-z]/)) {
+				tokens.push({ text: part, kind: 'mnemonic' });
+				first = false;
+				continue;
+			}
 			first = false;
+
 			if (part.match(/^[xw]\d+$/) || part === 'sp') {
-				tokens.push({ text: part, kind: 'reg', preg: part });
+				tokens.push({ text: part, kind: 'reg' });
 			} else if (part.match(/^-?\d+$/)) {
 				tokens.push({ text: part, kind: 'imm' });
-			} else if (part.match(/^[A-Z]|^fib$/)) {
+			} else if (part.match(/^[A-Z]/) || part === 'fib') {
 				tokens.push({ text: part, kind: 'label' });
 			} else {
 				tokens.push({ text: part, kind: 'punct' });
@@ -28,38 +46,61 @@
 		return tokens;
 	}
 
-	const tokens = parseAsm(asm);
+	function formatAddr(a: number): string {
+		return a.toString(16).padStart(4, '0');
+	}
+
+	function originLabel(o: string): string {
+		return o === 'lower' ? 'lo' : o === 'regalloc' ? 'ra' : 'fu';
+	}
+
+	const tokens = parse(asm.text);
 </script>
 
-<div class="aln">
-	<span class="aa">{formatAddr(addr)}</span>
-	<span class="ab {origin}">{originBadge(origin)}</span>
-	<code class="at">
+<div class="line">
+	<span class="addr">{formatAddr(asm.addr)}</span>
+	<span class="origin {asm.origin}">{originLabel(asm.origin)}</span>
+	<code class="inst">
 		{#each tokens as tok}
-			{#if tok.kind === 'reg'}
-				<span class="asm-reg">{tok.text}</span>
-			{:else if tok.kind === 'imm'}
-				<span class="asm-imm">{tok.text}</span>
-			{:else if tok.kind === 'mnemonic'}
-				<span class="asm-mn">{tok.text}</span>
-			{:else if tok.kind === 'mem'}
-				<span class="asm-mem">{tok.text}</span>
-			{:else if tok.kind === 'label'}
-				<span class="asm-lbl">{tok.text}</span>
-			{:else}{tok.text}{/if}
+			<span class={tok.kind}>{tok.text}</span>
 		{/each}
 	</code>
 </div>
 
 <style>
-	.aln { display:flex; align-items:center; gap:4px; height:18px; }
-	.aa { color:#585b70; font-size:9px; min-width:28px; }
-	.ab { font-size:7px; padding:0 3px; border-radius:2px; color:#1e1e2e; font-weight:bold; }
-	.ab.lower { background:#61afef; } .ab.regalloc { background:#e5c07b; } .ab.fuse { background:#c678dd; }
-	.at { font-size:11px; color:#cdd6f4; }
-	.asm-mn { color:#7f849c; }
-	.asm-reg { color:#89b4fa; }
-	.asm-imm { color:#f9e2af; }
-	.asm-mem { color:#94e2d5; }
-	.asm-lbl { color:#f38ba8; font-style:italic; }
+	.line {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		height: var(--row-h);
+	}
+
+	.addr {
+		color: var(--text-faint);
+		font-size: var(--font-size-xs);
+		min-width: 28px;
+	}
+
+	.origin {
+		font-size: 7px;
+		padding: 0 3px;
+		border-radius: 2px;
+		color: var(--bg-base);
+		font-weight: bold;
+
+		&.lower { background: var(--accent-blue); }
+		&.regalloc { background: var(--accent-yellow); }
+		&.fuse { background: var(--accent-purple); }
+	}
+
+	.inst {
+		font-size: var(--font-size-base);
+	}
+
+	.mnemonic { color: var(--text-muted); }
+	.reg { color: var(--accent-blue); }
+	.imm { color: var(--accent-yellow); }
+	.mem { color: var(--accent-teal); }
+	.label { color: var(--accent-red); font-style: italic; }
+	.punct { color: var(--text-dim); }
 </style>
