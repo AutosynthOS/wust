@@ -11,6 +11,26 @@
 		allOps: OpView[];
 	} = $props();
 
+	// Compute init values from define events
+	const vregInits = new Map<string, string>();
+	for (const e of func.events) {
+		if (e.type === 'define') {
+			const v = e.value;
+			if (v === 'pending') vregInits.set(e.vreg, 'dst');
+			else if ('preg' in v) vregInits.set(e.vreg, v.preg);
+			else vregInits.set(e.vreg, `#${v.const}`);
+		}
+	}
+
+	function initDisplay(vreg: string): string | null {
+		return vregInits.get(vreg) ?? null;
+	}
+
+	function initIsPReg(vreg: string): boolean {
+		const init = vregInits.get(vreg);
+		return !!init && !init.startsWith('#') && init !== 'dst';
+	}
+
 	const selectedEvent = $derived(
 		app.selectedOp !== null ? allOps.find(o => o.seq === app.selectedOp) : null
 	);
@@ -63,7 +83,16 @@
 					<PReg id={b.preg} />
 					<span class="spacer"></span>
 					{#if b.vreg}
-						<VReg id={b.vreg} />
+						<VReg id={b.vreg} /><span class="slot-type">:{vregWidth(b.vreg)}</span>
+						{@const init = initDisplay(b.vreg)}
+						{#if init}
+							<span class="init-eq">=</span>
+							{#if initIsPReg(b.vreg)}
+								<PReg id={init} />
+							{:else}
+								<span class="init-val">{init}</span>
+							{/if}
+						{/if}
 					{:else}
 						<span class="free-label">free</span>
 					{/if}
@@ -84,8 +113,16 @@
 						{#if slot.action === 'pushed'}+{:else if slot.action === 'popped'}−{:else if slot.action === 'set'}~{:else}&nbsp;{/if}
 					</span>
 					<span class="slot-offset">+{slotOffset(region.id, i)}</span>
-					<VReg id={slot.vreg} />
-					<span class="slot-type">:{vregWidth(slot.vreg)}</span>
+					<VReg id={slot.vreg} /><span class="slot-type">:{vregWidth(slot.vreg)}</span>
+					{@const init = initDisplay(slot.vreg)}
+					{#if init}
+						<span class="init-eq">=</span>
+						{#if initIsPReg(slot.vreg)}
+							<PReg id={init} />
+						{:else}
+							<span class="init-val">{init}</span>
+						{/if}
+					{/if}
 					<span class="spacer"></span>
 					{#if vl?.preg}
 						<PReg id={vl.preg} />
@@ -167,6 +204,9 @@
 		color: var(--text-faint);
 		font-size: var(--font-size-xs);
 	}
+
+	.init-eq { color: var(--text-faint); margin: 0 2px; }
+	.init-val { color: var(--accent-teal); }
 
 	.spacer { flex: 1; }
 
