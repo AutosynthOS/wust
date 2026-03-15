@@ -202,6 +202,43 @@
 	}
 	function blockColor(id: string) { return id.startsWith('G') ? '#f38ba8' : id === 'Ep' ? '#a6e3a1' : '#89b4fa'; }
 
+	// Parse ASM text into colored tokens
+	interface AsmToken { text: string; kind: 'mnemonic' | 'reg' | 'imm' | 'mem' | 'label' | 'punct'; preg?: string; }
+
+	function parseAsm(asm: string): AsmToken[] {
+		const tokens: AsmToken[] = [];
+		// Split on whitespace and commas, keep delimiters
+		const parts = asm.split(/(\s+|,\s*|\[|\]|#)/);
+		let first = true;
+		for (const part of parts) {
+			if (!part || part.match(/^[\s,]+$/)) { tokens.push({ text: part, kind: 'punct' }); continue; }
+			if (part === '[' || part === ']') { tokens.push({ text: part, kind: 'mem' }); continue; }
+			if (part === '#') { tokens.push({ text: part, kind: 'imm' }); continue; }
+			if (first && part.match(/^[a-z]/)) {
+				tokens.push({ text: part, kind: 'mnemonic' });
+				first = false;
+				continue;
+			}
+			first = false;
+			// Register: x0-x31, w0-w31, sp
+			if (part.match(/^[xw]\d+$/) || part === 'sp') {
+				tokens.push({ text: part, kind: 'reg', preg: part });
+			}
+			// Immediate: number
+			else if (part.match(/^-?\d+$/)) {
+				tokens.push({ text: part, kind: 'imm' });
+			}
+			// Label: block/function name
+			else if (part.match(/^[A-Z]|^fib$/)) {
+				tokens.push({ text: part, kind: 'label' });
+			}
+			else {
+				tokens.push({ text: part, kind: 'punct' });
+			}
+		}
+		return tokens;
+	}
+
 	function kindColor(kind: string) {
 		switch (kind) {
 			case 'define': return '#a6e3a1';
@@ -325,7 +362,25 @@
 												<div class="aln">
 													<span class="aa">{formatAddr(asm.addr)}</span>
 													<span class="ab {asm.origin}">{originBadge(asm.origin)}</span>
-													<code class="at">{asm.asm}</code>
+													<code class="at">
+														{#each parseAsm(asm.asm) as tok}
+															{#if tok.kind === 'reg'}
+																<button class="asm-reg" style="color:{pregColor(tok.preg ?? '')}"
+																	onclick={(e) => { e.stopPropagation(); }}
+																	title={tok.preg}>{tok.text}</button>
+															{:else if tok.kind === 'imm'}
+																<span class="asm-imm">{tok.text}</span>
+															{:else if tok.kind === 'mnemonic'}
+																<span class="asm-mn">{tok.text}</span>
+															{:else if tok.kind === 'mem'}
+																<span class="asm-mem">{tok.text}</span>
+															{:else if tok.kind === 'label'}
+																<span class="asm-lbl">{tok.text}</span>
+															{:else}
+																{tok.text}
+															{/if}
+														{/each}
+													</code>
 												</div>
 											{/each}
 										</div>
@@ -406,10 +461,10 @@
 </div>
 
 <style>
-	:global(body) { margin:0; background:#1e1e2e; color:#cdd6f4; font-family:'SF Mono','Fira Code',monospace; font-size:12px; overflow:hidden; }
+	:global(body) { margin:0; background:#11111b; color:#cdd6f4; font-family:'SF Mono','Fira Code',monospace; font-size:12px; overflow:hidden; }
 	.layout { display:flex; height:100vh; }
 
-	.panel { background:#181825; padding:12px; overflow-y:auto; display:flex; flex-direction:column; gap:12px; flex-shrink:0; }
+	.panel { background:#141420; padding:12px; overflow-y:auto; display:flex; flex-direction:column; gap:12px; flex-shrink:0; }
 	.panel.left { width:240px; border-right:1px solid #313244; }
 	.panel.right { width:200px; border-left:1px solid #313244; }
 	.panel h2 { font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#6c7086; margin:0; }
@@ -431,20 +486,19 @@
 	.bdg { display:inline-block; padding:0 4px; border-radius:3px; color:#1e1e2e; font-size:8px; font-weight:bold; }
 
 	.graph { flex:1; display:flex; flex-direction:column; overflow:hidden; }
-	.tbar { display:flex; align-items:center; gap:8px; padding:6px 14px; border-bottom:1px solid #313244; background:#181825; flex-shrink:0; }
+	.tbar { display:flex; align-items:center; gap:8px; padding:6px 14px; border-bottom:1px solid #313244; background:#141420; flex-shrink:0; }
 	h1 { font-size:15px; margin:0; color:#cba6f7; }
 	.sig { color:#6c7086; font-size:11px; } .zi { color:#585b70; font-size:10px; }
 	.tb { background:#313244; border:1px solid #45475a; color:#cdd6f4; padding:1px 6px; border-radius:3px; cursor:pointer; font-family:inherit; font-size:10px; }
 	.tb:hover { background:#45475a; }
 	.hint { margin-left:auto; color:#45475a; font-size:9px; }
 
-	.vp { flex:1; overflow:hidden; cursor:grab; position:relative; }
-	.vp:active { cursor:grabbing; }
+	.vp { flex:1; overflow:hidden; position:relative; }
 	.cv { position:absolute; top:0; left:0; transform-origin:0 0; }
 	.arr { position:absolute; top:0; left:0; pointer-events:none; z-index:0; }
 
-	.blk { position:absolute; border:1px solid #313244; border-left:3px solid; border-radius:6px; background:#1e1e2e; z-index:1; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,0.3); }
-	.bh { display:flex; gap:6px; padding:3px 8px; background:#181825; border-bottom:1px solid #313244; align-items:center; }
+	.blk { position:absolute; border:1px solid #313244; border-left:3px solid; border-radius:6px; background:#181825; z-index:1; overflow:hidden; box-shadow:0 2px 12px rgba(0,0,0,0.4); }
+	.bh { display:flex; gap:6px; padding:3px 8px; background:#141420; border-bottom:1px solid #313244; align-items:center; }
 	.bi { font-weight:bold; font-size:11px; } .bl { color:#6c7086; font-size:10px; } .bs { margin-left:auto; color:#45475a; font-size:9px; }
 	.bb { display:flex; }
 
@@ -454,18 +508,18 @@
 	.wat-cell:last-child { border-bottom:none; }
 	.wat-match { background:rgba(137,180,250,0.1); }
 	.wpc2 { color:#585b70; font-size:8px; background:#313244; padding:0 2px; border-radius:2px; min-width:10px; text-align:center; }
-	.wat-lbl { color:#bac2de; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+	.wat-lbl { color:#cdd6f4; font-size:10px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 
 	/* Col 2: Ops */
 	.c-ops { flex:1; display:flex; flex-direction:column; border-right:1px solid #313244; min-width:0; }
-	.op-row { display:flex; align-items:center; padding:0 6px; border-bottom:1px solid rgba(49,50,68,0.3); border-left:2px solid transparent; box-sizing:border-box; overflow:hidden; }
+	.op-row { display:flex; align-items:center; padding:0 6px; border-bottom:1px solid rgba(49,50,68,0.3); border-left:2px solid transparent; box-sizing:border-box; overflow:hidden; cursor:pointer; }
 	.op-row:last-child { border-bottom:none; }
-	.op-row:hover { background:rgba(255,255,255,0.02); }
+	.op-row:hover { background:rgba(255,255,255,0.04); }
 	.op-hov { background:rgba(137,180,250,0.06)!important; }
 	.op-sel { background:rgba(203,166,247,0.1)!important; border-left-color:#cba6f7 !important; }
 	.op-hl { background:rgba(250,179,135,0.06)!important; }
 	.op-dim { opacity:0.2; }
-	.op-text { color:#a6adc8; font-size:10px; white-space:nowrap; }
+	.op-text { color:#bac2de; font-size:11px; white-space:nowrap; }
 	.vr { background:none; border:none; color:#fab387; padding:0; cursor:pointer; font-family:inherit; font-size:inherit; }
 	.vr:hover { text-decoration:underline; } .vr-hl { color:#fab387; background:rgba(250,179,135,0.15); border-radius:2px; padding:0 2px; }
 
@@ -478,16 +532,22 @@
 	.aa { color:#45475a; font-size:9px; min-width:28px; }
 	.ab { font-size:7px; padding:0 3px; border-radius:2px; color:#1e1e2e; font-weight:bold; }
 	.ab.lower { background:#61afef; } .ab.regalloc { background:#e5c07b; } .ab.fuse { background:#c678dd; }
-	.at { color:#a6e3a1; font-size:10px; }
+	.at { font-size:11px; color:#cdd6f4; }
+	.asm-mn { color:#89b4fa; }
+	.asm-reg { background:none; border:none; cursor:pointer; font-family:inherit; font-size:inherit; font-weight:bold; padding:0; }
+	.asm-reg:hover { text-decoration:underline; }
+	.asm-imm { color:#f9e2af; }
+	.asm-mem { color:#94e2d5; }
+	.asm-lbl { color:#f38ba8; font-style:italic; }
 
 	/* Right panel: VM state */
 	.panel.right h2 { font-size:10px; text-transform:uppercase; letter-spacing:1px; color:#6c7086; margin:0; }
 	.panel.right h3 { font-size:9px; color:#585b70; margin:8px 0 3px 0; display:flex; align-items:center; gap:4px; }
 	.rb { font-size:8px; color:#45475a; font-weight:normal; }
-	.vm-op { font-size:10px; color:#bac2de; background:#313244; padding:3px 6px; border-radius:4px; border-left:2px solid transparent; word-break:break-all; }
+	.vm-op { font-size:11px; color:#cdd6f4; background:#1e1e2e; padding:4px 8px; border-radius:4px; border-left:2px solid transparent; word-break:break-all; }
 	.vm-empty { color:#45475a; font-size:10px; padding:30px 0; text-align:center; }
 	.stk { display:flex; flex-direction:column; gap:1px; }
-	.sl { display:flex; align-items:center; gap:3px; padding:2px 5px; background:#313244; border-radius:3px; border-left:2px solid transparent; font-size:10px; }
+	.sl { display:flex; align-items:center; gap:3px; padding:3px 6px; background:#1e1e2e; border-radius:3px; border-left:2px solid transparent; font-size:11px; }
 	.sl-push { border-left-color:#a6e3a1; background:rgba(166,227,161,0.06); }
 	.sl-set { border-left-color:#fab387; background:rgba(250,179,135,0.06); }
 	.sl-hl { border-left-color:#fab387; background:rgba(250,179,135,0.12); }
