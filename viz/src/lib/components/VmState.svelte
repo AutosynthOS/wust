@@ -100,11 +100,10 @@
 					{#if vl.preg}
 						<PReg id={vl.preg} />
 					{/if}
-					{#if vl.dirty !== undefined}
-						<span class="dirty-badge" class:is-dirty={vl.dirty}>
-							{vl.dirty ? 'dirty' : 'clean'}
-						</span>
-					{/if}
+					<span class="spacer"></span>
+					<span class="dirty-badge" class:is-dirty={vl.dirty !== false}>
+						{vl.dirty === false ? 'clean' : 'dirty'}
+					</span>
 				</div>
 			{/each}
 		</div>
@@ -228,6 +227,10 @@
 	.loc-badge {
 		font-size: var(--font-size-xs);
 		font-weight: bold;
+	}
+
+	.spacer {
+		flex: 1;
 	}
 
 	.dirty-badge {

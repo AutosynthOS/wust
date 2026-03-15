@@ -81,8 +81,8 @@ export const mockTrace: ModuleTrace = {
 				],
 				vreg_locs: [
 					{ vreg: 'v0', loc: 'reg', preg: 'x0', dirty: true },
-					{ vreg: 'v1', loc: 'const' },
-					{ vreg: 'v2', loc: 'const' },
+					{ vreg: 'v1', loc: 'const', dirty: true },
+					{ vreg: 'v2', loc: 'const', dirty: true },
 					{ vreg: 'v5', loc: 'reg', preg: 'x30', dirty: true },
 				],
 			}},

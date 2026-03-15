@@ -156,10 +156,9 @@
 		<div class="vreg-list">
 			{#each func.vregs as def}
 				<div class="vreg-row" class:vreg-active={app.highlightedVreg === def.id}>
-					<VReg id={def.id} width={def.width} target={def.target} />
-					<span class="vreg-w">{def.width}</span>
+					<VReg id={def.id} /><span class="vreg-sep">:</span><span class="vreg-w">{def.width}</span>
 					{#if def.target}
-						<span class="vreg-t">→</span><PReg id={def.target} />
+						<span class="vreg-eq">=</span><PReg id={def.target} />
 					{/if}
 				</div>
 			{/each}
@@ -478,8 +477,9 @@
 		&.vreg-active { background: var(--highlight-bg); }
 	}
 
-	.vreg-w { color: var(--text-dim); font-size: var(--font-size-sm); }
-	.vreg-t { color: var(--text-dim); font-size: var(--font-size-sm); }
+	.vreg-sep { color: var(--text-faint); }
+	.vreg-w { color: var(--text-muted); }
+	.vreg-eq { color: var(--text-faint); margin: 0 2px; }
 
 	.arrows {
 		position: absolute;
