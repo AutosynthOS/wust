@@ -77,13 +77,14 @@
 	<!-- Bindings: ordered by preg — constant height -->
 	{#if snapshot}
 		<h3>bindings</h3>
-		<div class="stack">
+		<div class="bindings-grid">
 			{#each snapshot.bindings as b}
-				<div class="slot" class:free={!b.vreg}>
-					<PReg id={b.preg} />
+				<div class="bind-preg" class:free={!b.vreg}>
+					<PReg id={b.preg} /><span class="bind-arrow">→</span>
+				</div>
+				<div class="bind-vreg" class:free={!b.vreg}>
 					{#if b.vreg}
 						{@const init = initDisplay(b.vreg)}
-						<span class="bind-arrow">→</span>
 						<VReg id={b.vreg} /><span class="slot-type">:{vregWidth(b.vreg)}</span>
 						{#if init}
 							<span class="init-eq">=</span>
@@ -213,6 +214,30 @@
 	.const-badge {
 		font-size: var(--font-size-xxs);
 		color: var(--accent-teal);
+	}
+
+	.bindings-grid {
+		display: grid;
+		grid-template-columns: auto 1fr;
+		gap: 1px;
+	}
+
+	.bind-preg {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		padding: 2px 6px;
+		font-size: var(--font-size-base);
+	}
+
+	.bind-vreg {
+		display: flex;
+		align-items: center;
+		gap: 3px;
+		padding: 2px 6px;
+		background: var(--bg-surface);
+		border-radius: 3px;
+		font-size: var(--font-size-base);
 	}
 
 	.bind-arrow { color: var(--text-faint); }
