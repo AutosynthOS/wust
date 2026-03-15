@@ -477,7 +477,7 @@
 	/* Graph area */
 	.func-graph {
 		position: relative;
-		background: rgba(0, 0, 0, 0.15);
+		background: rgba(0, 0, 0, 0.25);
 		padding: 48px;
 	}
 

@@ -100,15 +100,20 @@
 	}
 </script>
 
-<!-- Header: block ID + params -->
+<!-- Header -->
 <div class="header">
 	<span class="block-id">{block.id}</span>
 	{#if block.params.length > 0}
-		<span class="params">
+		<div class="params">
 			{#each block.params as p, i}
-				<VReg id={p} />{#if vregTarget(p)}→<PReg id={vregTarget(p) ?? ''} />{/if}{#if i < block.params.length - 1}<span class="sep">,</span>{/if}
+				<span class="param">
+					<VReg id={p} />
+					{#if vregTarget(p)}
+						<span class="param-arrow">→</span><PReg id={vregTarget(p) ?? ''} />
+					{/if}
+				</span>
 			{/each}
-		</span>
+		</div>
 	{/if}
 </div>
 
@@ -221,26 +226,33 @@
 	.header {
 		display: flex;
 		align-items: center;
-		gap: 6px;
-		padding: 4px 8px;
+		gap: 8px;
+		padding: 6px 10px;
 		background: rgba(49, 50, 68, 0.3);
 	}
 
 	.block-id {
 		font-weight: bold;
-		font-size: var(--font-size-base);
+		font-size: 14px;
 		color: var(--text);
 	}
 
 	.params {
 		display: flex;
 		align-items: center;
-		gap: 2px;
-		font-size: var(--font-size-sm);
-		color: var(--text-muted);
+		gap: 6px;
+		font-size: var(--font-size-base);
 	}
 
-	.sep { color: var(--text-faint); margin: 0 2px; }
+	.param {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+	}
+
+	.param-arrow {
+		color: var(--text-faint);
+	}
 
 	.footer {
 		display: flex;
