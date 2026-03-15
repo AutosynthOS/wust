@@ -241,8 +241,8 @@
 		color: var(--accent-green);
 
 		&.is-dirty {
-			background: rgba(250, 179, 135, 0.15);
-			color: var(--accent-vreg);
+			background: rgba(243, 139, 168, 0.15);
+			color: var(--accent-red);
 		}
 	}
 
