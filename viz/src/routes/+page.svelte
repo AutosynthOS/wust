@@ -9,7 +9,6 @@
 	import VmState from '$lib/components/VmState.svelte';
 	import VReg from '$lib/components/VReg.svelte';
 	import PReg from '$lib/components/PReg.svelte';
-	import DirtyBadge from '$lib/components/DirtyBadge.svelte';
 
 	const trace = mockTrace;
 	const func = trace.functions[0];
@@ -169,26 +168,6 @@
 
 <div class="layout">
 	<aside class="panel left">
-		<h2>vregs</h2>
-		<div class="vreg-list">
-			{#each func.vregs as def}
-				{@const init = vregInits.get(def.id)}
-				<div class="vreg-row" class:vreg-active={app.highlightedVreg === def.id}>
-					<VReg id={def.id} /><span class="vreg-sep">:</span><span class="vreg-w">{def.width}</span>
-					{#if init}
-						<span class="vreg-eq">=</span>
-						{#if def.target}
-							<PReg id={def.target} />
-						{:else}
-							<span class="vreg-init">{init}</span>
-						{/if}
-					{/if}
-					<span class="vreg-spacer"></span>
-					<DirtyBadge dirty={true} />
-				</div>
-			{/each}
-		</div>
-
 		<VmState {func} {allOps} />
 	</aside>
 
@@ -241,6 +220,24 @@
 									<span class="src-pc">{line.pc >= 0 ? line.pc : ''}</span>
 									<code class="src-text" style="padding-left: {line.indent * 10}px">{line.text}</code>
 								</button>
+							{/each}
+						</div>
+
+						<div class="func-defs">
+							<h3>vreg definitions</h3>
+							{#each func.vregs as def}
+								{@const init = vregInits.get(def.id)}
+								<div class="def-row" class:def-active={app.highlightedVreg === def.id}>
+									<VReg id={def.id} /><span class="def-sep">:</span><span class="def-w">{def.width}</span>
+									{#if init}
+										<span class="def-eq">=</span>
+										{#if def.target}
+											<PReg id={def.target} />
+										{:else}
+											<span class="def-init">{init}</span>
+										{/if}
+									{/if}
+								</div>
 							{/each}
 						</div>
 					</div>
@@ -323,35 +320,6 @@
 		}
 	}
 
-	h2 {
-		font-size: var(--font-size-sm);
-		text-transform: uppercase;
-		letter-spacing: 1px;
-		color: var(--text-muted);
-		margin: 0;
-	}
-
-	.vreg-list {
-		display: flex;
-		flex-direction: column;
-		gap: 1px;
-	}
-
-	.vreg-row {
-		display: flex;
-		align-items: center;
-		gap: 2px;
-		padding: 1px 6px;
-		border-radius: 3px;
-		font-size: var(--font-size-base);
-		&.vreg-active { background: var(--highlight-bg); }
-	}
-
-	.vreg-sep { color: var(--text-faint); }
-	.vreg-w { color: var(--text-muted); }
-	.vreg-eq { color: var(--text-faint); margin: 0 2px; }
-	.vreg-init { color: var(--accent-teal); }
-	.vreg-spacer { flex: 1; }
 
 	.graph {
 		flex: 1;
@@ -476,6 +444,34 @@
 
 	.src-text { color: var(--text-secondary); white-space: pre; }
 	.src-active .src-text { color: var(--text); }
+
+	.func-defs {
+		padding: 4px 6px;
+		border-top: 1px solid var(--border-subtle);
+
+		h3 {
+			font-size: var(--font-size-xs);
+			color: var(--text-dim);
+			margin: 0 0 4px 0;
+			text-transform: uppercase;
+			letter-spacing: 0.5px;
+		}
+	}
+
+	.def-row {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		padding: 1px 4px;
+		border-radius: 3px;
+		font-size: var(--font-size-sm);
+		&.def-active { background: var(--highlight-bg); }
+	}
+
+	.def-sep { color: var(--text-faint); }
+	.def-w { color: var(--text-muted); }
+	.def-eq { color: var(--text-faint); margin: 0 2px; }
+	.def-init { color: var(--accent-teal); }
 
 	/* Graph area */
 	.func-graph {

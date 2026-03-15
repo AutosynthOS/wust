@@ -1,7 +1,7 @@
 <script lang="ts">
-	import type { FunctionTrace, OpView, RegAllocSnapshot } from '$lib/types';
+	import type { FunctionTrace, OpView, RegAllocSnapshot, VRegLoc } from '$lib/types';
 	import { app } from '$lib/state.svelte';
-	import { computeStateDiff, type SlotDiff } from '$lib/assemble';
+	import { computeStateDiff, computeStateAt, type SlotDiff } from '$lib/assemble';
 	import VReg from './VReg.svelte';
 	import PReg from './PReg.svelte';
 	import DirtyBadge from './DirtyBadge.svelte';
@@ -14,14 +14,18 @@
 	const selectedEvent = $derived(
 		app.selectedOp !== null ? allOps.find(o => o.seq === app.selectedOp) : null
 	);
+
 	const diff = $derived(
 		app.selectedOp !== null ? computeStateDiff(func, app.selectedOp) : null
 	);
 
-	// Find the most recent snapshot at or before the selected event
+	const state = $derived(
+		app.selectedOp !== null ? computeStateAt(func, app.selectedOp) : null
+	);
+
+	// Find most recent snapshot at or before selected event
 	const snapshot = $derived.by((): RegAllocSnapshot | null => {
 		if (app.selectedOp === null) return null;
-		// Walk backwards through allOps to find nearest snapshot
 		let best: RegAllocSnapshot | null = null;
 		for (const op of allOps) {
 			if (op.seq > app.selectedOp) break;
@@ -30,44 +34,38 @@
 		return best;
 	});
 
-	function locLabel(loc: string): string {
-		switch (loc) {
-			case 'reg': return 'reg';
-			case 'mem': return 'mem';
-			case 'const': return 'const';
-			case 'pending': return 'pending';
-			default: return loc;
-		}
-	}
-
-	function vregLoc(vreg: string) {
+	// Look up a vreg's location from the snapshot
+	function vregLoc(vreg: string): VRegLoc | null {
 		return snapshot?.vreg_locs.find(vl => vl.vreg === vreg) ?? null;
 	}
 
-	function slotOffset(region: typeof func.regions[0], index: number): number {
-		// Approximate: assume 4 bytes per slot (i32). Real data would have actual widths.
-		return region.base_offset + index * 4;
+	// Find vreg width from func defs
+	function vregWidth(vreg: string): string {
+		return func.vregs.find(d => d.id === vreg)?.width ?? '?';
 	}
 
-	function locColor(loc: string): string {
-		switch (loc) {
-			case 'reg': return 'var(--accent-green)';
-			case 'mem': return 'var(--accent-yellow)';
-			case 'const': return 'var(--accent-teal)';
-			case 'pending': return 'var(--text-dim)';
-			default: return 'var(--text-muted)';
-		}
+	// Get all vregs that are in the snapshot but NOT in any stack slot = "free floating"
+	const freeFloating = $derived.by((): VRegLoc[] => {
+		if (!snapshot || !state) return [];
+		const inSlots = new Set([...state.locals, ...state.ops, ...state.fibre]);
+		return snapshot.vreg_locs.filter(vl => !inSlots.has(vl.vreg));
+	});
+
+	function slotOffset(regionId: string, index: number): number {
+		const region = func.regions.find(r => r.id === regionId);
+		return (region?.base_offset ?? 0) + index * 4; // approximate
 	}
 </script>
 
-{#if selectedEvent && diff}
+{#if selectedEvent && diff && state}
 	<h2>state @ seq {app.selectedOp}</h2>
 	<div class="op-preview">{selectedEvent.text}</div>
 
-	<!-- Stack diffs -->
+	<!-- Regions: unified vreg view per slot -->
 	{#each func.regions as region}
 		{@const slots = region.id === 'locals' ? diff.locals : region.id === 'operands' ? diff.ops : diff.fibre}
-		<h3>{region.label} <span class="region-base">{region.base_preg}+{region.base_offset}</span></h3>
+		{@const stateSlots = region.id === 'locals' ? state.locals : region.id === 'operands' ? state.ops : state.fibre}
+		<h3>{region.label}</h3>
 		<div class="stack">
 			{#each slots as slot, i}
 				{@const vl = vregLoc(slot.vreg)}
@@ -75,9 +73,13 @@
 					<span class="diff-mark">
 						{#if slot.action === 'pushed'}+{:else if slot.action === 'popped'}−{:else if slot.action === 'set'}~{:else}&nbsp;{/if}
 					</span>
-					<span class="slot-offset">+{slotOffset(region, i)}</span>
+					<span class="slot-offset">+{slotOffset(region.id, i)}</span>
 					<VReg id={slot.vreg} />
+					<span class="slot-type">:{vregWidth(slot.vreg)}</span>
 					<span class="spacer"></span>
+					{#if vl?.preg}
+						<PReg id={vl.preg} />
+					{/if}
 					{#if vl}
 						<DirtyBadge dirty={vl.dirty !== false} />
 					{/if}
@@ -89,33 +91,23 @@
 		</div>
 	{/each}
 
-	<!-- RegAlloc snapshot -->
-	{#if snapshot}
-		<h3>bindings</h3>
-		<div class="bindings">
-			{#each snapshot.bindings as b}
-				<div class="binding" class:free={!b.vreg}>
-					<PReg id={b.preg} />
-					{#if b.vreg}
-						<span class="bind-arrow">←</span>
-						<VReg id={b.vreg} />
-					{:else}
-						<span class="bind-free">free</span>
-					{/if}
-				</div>
-			{/each}
-		</div>
-
-		<h3>vreg locations</h3>
-		<div class="locs">
-			{#each snapshot.vreg_locs as vl}
-				<div class="loc-row">
+	<!-- Free floating: vregs in pregs but not in any slot -->
+	{#if freeFloating.length > 0}
+		<h3>temp</h3>
+		<div class="stack">
+			{#each freeFloating as vl}
+				<div class="slot">
+					<span class="diff-mark">&nbsp;</span>
+					<span class="slot-offset"></span>
 					<VReg id={vl.vreg} />
-					<span class="loc-badge" style="color: {locColor(vl.loc)}">{locLabel(vl.loc)}</span>
+					<span class="slot-type">:{vregWidth(vl.vreg)}</span>
+					<span class="spacer"></span>
 					{#if vl.preg}
 						<PReg id={vl.preg} />
 					{/if}
-					<span class="spacer"></span>
+					{#if vl.loc === 'const'}
+						<span class="const-badge">const</span>
+					{/if}
 					<DirtyBadge dirty={vl.dirty !== false} />
 				</div>
 			{/each}
@@ -138,12 +130,6 @@
 		font-size: var(--font-size-xs);
 		color: var(--text-dim);
 		margin: 10px 0 3px 0;
-
-		.region-base {
-			color: var(--text-faint);
-			font-weight: normal;
-			font-size: var(--font-size-xxs);
-		}
 	}
 
 	.op-preview {
@@ -164,7 +150,7 @@
 	.slot {
 		display: flex;
 		align-items: center;
-		gap: 4px;
+		gap: 3px;
 		padding: 2px 6px;
 		background: var(--bg-surface);
 		border-radius: 3px;
@@ -172,18 +158,17 @@
 
 		&.pushed { background: rgba(166, 227, 161, 0.1); }
 		&.popped { background: rgba(243, 139, 168, 0.1); opacity: 0.6; }
-		&.replaced { background: rgba(250, 179, 135, 0.1); }
+		&.set { background: rgba(250, 179, 135, 0.1); }
 	}
 
 	.diff-mark {
 		min-width: 10px;
 		font-weight: bold;
-		font-size: var(--font-size-base);
 	}
 
 	.pushed .diff-mark { color: var(--accent-green); }
 	.popped .diff-mark { color: var(--accent-red); }
-	.replaced .diff-mark { color: var(--accent-vreg); }
+	.set .diff-mark { color: var(--accent-vreg); }
 
 	.slot-offset {
 		color: var(--text-faint);
@@ -191,68 +176,23 @@
 		min-width: 20px;
 	}
 
+	.slot-type {
+		color: var(--text-faint);
+		font-size: var(--font-size-xs);
+	}
+
+	.spacer { flex: 1; }
+
+	.const-badge {
+		font-size: var(--font-size-xxs);
+		color: var(--accent-teal);
+	}
 
 	.empty {
 		color: var(--text-faint);
 		font-size: var(--font-size-xs);
 		padding: 2px 6px;
 	}
-
-	/* Bindings */
-	.bindings {
-		display: flex;
-		flex-direction: column;
-		gap: 1px;
-	}
-
-	.binding {
-		display: flex;
-		align-items: center;
-		gap: 4px;
-		padding: 2px 6px;
-		background: var(--bg-surface);
-		border-radius: 3px;
-		font-size: var(--font-size-base);
-
-		&.free { opacity: 0.4; }
-	}
-
-	.bind-arrow {
-		color: var(--text-faint);
-	}
-
-	.bind-free {
-		color: var(--text-faint);
-		font-size: var(--font-size-xs);
-		font-style: italic;
-	}
-
-	/* VReg locations */
-	.locs {
-		display: flex;
-		flex-direction: column;
-		gap: 1px;
-	}
-
-	.loc-row {
-		display: flex;
-		align-items: center;
-		gap: 4px;
-		padding: 2px 6px;
-		background: var(--bg-surface);
-		border-radius: 3px;
-		font-size: var(--font-size-base);
-	}
-
-	.loc-badge {
-		font-size: var(--font-size-xs);
-		font-weight: bold;
-	}
-
-	.spacer {
-		flex: 1;
-	}
-
 
 	.placeholder {
 		color: var(--text-dim);
