@@ -45,9 +45,6 @@ thread_local! {
     static SEQ: Cell<u32> = const { Cell::new(0) };
     static CONTEXT: RefCell<serde_json::Map<String, serde_json::Value>> =
         RefCell::new(serde_json::Map::new());
-    /// The build-phase seq of the instruction currently being lowered.
-    /// Set by the lowerer, read by the backend when creating Operations.
-    static CURRENT_PARENT: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Get the next monotonic sequence number.
@@ -109,26 +106,12 @@ pub fn take_trace() -> Vec<serde_json::Value> {
     EVENTS.with(|e| std::mem::take(&mut *e.borrow_mut()))
 }
 
-/// Set the build-phase seq of the instruction currently being lowered.
-/// The backend reads this when buffering an Operation.
-#[cfg(feature = "trace")]
-pub fn set_parent(seq: u32) {
-    CURRENT_PARENT.with(|p| p.set(seq));
-}
-
-/// Get the current parent seq.
-#[cfg(feature = "trace")]
-pub fn parent() -> u32 {
-    CURRENT_PARENT.with(|p| p.get())
-}
-
 /// Clear the thread-local buffer, reset the sequence counter, and
 /// clear all ambient context.
 #[cfg(feature = "trace")]
 pub fn reset() {
     EVENTS.with(|e| e.borrow_mut().clear());
     SEQ.with(|s| s.set(0));
-    CURRENT_PARENT.with(|p| p.set(0));
     clear_all_context();
 }
 

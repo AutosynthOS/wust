@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use autosynth_codegen::{
-    Align, AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, RegInst,
-    VInit, VReg, VRegion, VRegionId, Width, debugger,
+    AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, RegInst,
+    VInit, VReg, VRegion, VRegionId, Width,
 };
 use autosynth_isa::{IsaReg, PReg};
 use autosynth_lower::{BackendEmitter, MachineConfig, trace, trace_ctx};
@@ -80,9 +80,6 @@ impl<B: BackendEmitter> JitModule<B> {
     }
 
     /// Compile a single WASM function into autosynth IR.
-    ///
-    /// If a debugger is installed via [`autosynth_codegen::debugger::install`],
-    /// source-level annotations are recorded automatically.
     pub fn compile_func(
         cb: &mut CodeBuilder,
         mut config: MachineConfig,
@@ -151,12 +148,8 @@ impl<B: BackendEmitter> JitModule<B> {
             "fibre": { "base": format!("x{}", fsp_preg.0), "offset": 0 }
         });
 
-        // "operation" column registered after all vstacks so it appears rightmost.
-        debugger::dbg(|dbg| dbg.add_source_column("operation", Align::Left));
-
         // Declare parameters — each starts in its CC register (PReg(i)).
         for (i, param) in func.params.iter().enumerate() {
-            f.begin_op(&format!("p{i}"), &format!("param {i} = {param}"));
             let w = valtype_to_width(param);
             let preg = PReg(i as u8);
             let v = f.alloc_vreg(w, VInit::PReg(preg));
@@ -166,7 +159,7 @@ impl<B: BackendEmitter> JitModule<B> {
         // Declare zero-initialized locals
         for (i, local) in func.locals.iter().enumerate() {
             let idx = i + func.params.len();
-            f.begin_op(&format!("l{idx}"), &format!("local {idx} = {local}"));
+
             let w = valtype_to_width(&local);
             let v = f.alloc_vreg(w, VInit::Const(0));
             f.push_vreg(locals, v);
@@ -186,12 +179,12 @@ impl<B: BackendEmitter> JitModule<B> {
         let lr = f.alloc_vreg(Width::W64, VInit::PReg(lr_preg));
         f.push_vreg(fibre, lr);
 
-        f.begin_op("--", "prologue");
+
 
         // Finalize entry block, branch to first user block.
         f.br(BlockId::User(0));
         f.start_block(BlockId::User(0));
-        f.begin_op("--", "body");
+
 
         // Fuel tracking: accumulate cost per opcode, flush before calls.
         let mut pending_fuel: u32 = 0;
@@ -206,8 +199,6 @@ impl<B: BackendEmitter> JitModule<B> {
             );
             let inline_op = unsafe { func.body.ops.get_unchecked(pc) };
             let op = inline_op.opcode();
-
-            f.begin_op(&pc.to_string(), &inline_op.display_label());
 
             trace_ctx!("pc", pc as u32);
             trace!({
@@ -329,7 +320,6 @@ impl<B: BackendEmitter> JitModule<B> {
                         f.set_target(vreg, PReg(i as u8));
                     }
 
-                    f.begin_op("--", "clobber call");
 
                     // Clobber all live vregs — call will destroy registers.
                     f.clobber_region(locals);
@@ -351,7 +341,7 @@ impl<B: BackendEmitter> JitModule<B> {
                     let advance = locals_header_size
                         + (caller_operand_depth - callee_param_slots) * 4;
 
-                    f.begin_op("--", &format!("advance g.lb +{advance}"));
+
 
                     // TODO: when callee has more params than CC registers,
                     // overflow params stay on the stack instead of moving
@@ -367,7 +357,7 @@ impl<B: BackendEmitter> JitModule<B> {
 
                     f.emit(IrInst::Call { func_idx });
 
-                    f.begin_op("--", &format!("restore g.lb -{advance}"));
+
 
                     // Restore g.lb after call returns.
                     let lb = f.alloc_vreg(Width::W64, VInit::PReg(lbp_preg));

@@ -7,8 +7,6 @@
 //! layouts, and register roles.
 
 mod builder;
-/// Debug trace collector for the codegen pipeline.
-pub mod debugger;
 /// IR function and block types.
 mod ir_function;
 /// Lowerer — drives the backend with register allocation decisions.
@@ -21,5 +19,4 @@ pub use autosynth_ir::{
 };
 pub use autosynth_isa::Width;
 pub use builder::{CodeBuilder, FunctionBuilder};
-pub use debugger::{Align, Debugger};
 pub use lowerer::compile;

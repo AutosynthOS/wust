@@ -33,13 +33,6 @@ fn main() {
         std::process::exit(1);
     });
 
-    // Install debugger so dbg_group_idx flows through the backend.
-    // The trace reads current_group() for ASM parent attribution.
-    let mut dbg = autosynth_codegen::debugger::Debugger::new();
-    dbg.add_machine_column("addr", autosynth_codegen::Align::Right);
-    dbg.add_machine_column("asm", autosynth_codegen::Align::Left);
-    autosynth_codegen::debugger::install(dbg);
-
     let module = wust_core::ParsedModule::new(&wasm).unwrap_or_else(|e| {
         eprintln!("error: module parse failed: {e}");
         std::process::exit(1);

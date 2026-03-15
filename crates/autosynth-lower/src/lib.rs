@@ -6,7 +6,7 @@
 //!   immediates or allocate physical registers
 //! - [`trace!`] / [`trace_do!`] — feature-gated structured trace emission
 
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -21,61 +21,31 @@ pub use serde_json as __serde_json;
 use autosynth_ir::VReg;
 use autosynth_isa::{IsaReg, PReg, PRegOr, Width};
 
-/// Minimal debug sink for machine instruction annotation.
-///
-/// Implemented by the concrete `Debugger` in `autosynth-codegen`.
-/// Access via the thread-local [`dbg`] function — when no debugger
-/// is installed, the closure never runs (zero cost).
-pub trait DbgSink: core::any::Any {
-    /// Activate the group for an IR instruction index.
-    ///
-    /// Subsequent `emit_machine_inst` / `set_machine` calls will
-    /// attach to this group.
-    fn begin_ir_inst(&mut self, ir_index: usize);
-    /// Begin a new machine instruction row in the current group.
-    fn emit_machine_inst(&mut self);
-    /// Set a column value on the last machine instruction.
-    fn set_machine(&mut self, col: &str, value: &str);
-
-    /// Get the current group index.
-    ///
-    /// Used by the backend to save the group when deferring an instruction,
-    /// so it can be restored later via [`set_current_group`](Self::set_current_group).
-    fn current_group(&self) -> usize;
-
-    /// Set the current group index directly.
-    ///
-    /// Used by the backend to restore a saved group before emitting
-    /// a deferred instruction's machine code.
-    fn set_current_group(&mut self, group: usize);
-
-    /// Upcast to `Any` for downcasting back to the concrete type.
-    fn as_any(self: Box<Self>) -> Box<dyn core::any::Any>;
-}
+// --- Instruction group tracking ---
+//
+// The lowerer sets the current group index before processing each
+// instruction. The backend saves/restores it on deferred Operations
+// so that ASM events carry the identity of the instruction that
+// produced them. This is the only mechanism needed for correct
+// ASM parent attribution through deferred/fused instruction paths.
 
 thread_local! {
-    static DBG_SINK: RefCell<Option<Box<dyn DbgSink>>> = const { RefCell::new(None) };
+    static CURRENT_GROUP: Cell<usize> = const { Cell::new(0) };
 }
 
-/// Install a debug sink as the thread-local instance.
-pub fn install_dbg(sink: Box<dyn DbgSink>) {
-    DBG_SINK.with(|d| *d.borrow_mut() = Some(sink));
-}
-
-/// Remove and return the thread-local debug sink.
-pub fn take_dbg() -> Option<Box<dyn DbgSink>> {
-    DBG_SINK.with(|d| d.borrow_mut().take())
-}
-
-/// Run a closure with the thread-local debug sink, if one is installed.
+/// Set the current instruction group index.
 ///
-/// When no debugger is installed the closure never runs — zero cost.
-pub fn dbg(f: impl FnOnce(&mut dyn DbgSink)) {
-    DBG_SINK.with(|d| {
-        if let Some(sink) = d.borrow_mut().as_mut() {
-            f(sink.as_mut());
-        }
-    });
+/// Called by the lowerer before processing each instruction.
+pub fn set_group(index: usize) {
+    CURRENT_GROUP.with(|g| g.set(index));
+}
+
+/// Get the current instruction group index.
+///
+/// Called by the backend when deferring instructions (save) and
+/// before emitting ASM (read parent for trace events).
+pub fn current_group() -> usize {
+    CURRENT_GROUP.with(|g| g.get())
 }
 
 /// The context a backend uses to resolve operands and emit machine code.

@@ -35,10 +35,9 @@ pub fn compile(
         trace!({"type": "lower_block_start", "block": format!("{block_id:?}")});
 
         for inst in &block.instructions {
-            autosynth_lower::dbg(|dbg| dbg.begin_ir_inst(ir_index));
+            autosynth_lower::set_group(ir_index);
 
             trace_do! {
-                autosynth_lower::trace::set_parent(ir_index as u32);
                 let inst_json = autosynth_lower::__serde_json::to_value(inst).ok();
                 trace!({
                     "type": "lower_inst",

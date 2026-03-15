@@ -8,7 +8,6 @@ use autosynth_isa::{PReg, Width};
 use autosynth_lower::{trace, trace_ctx, trace_do};
 
 use super::code_builder::CodeBuilder;
-use crate::debugger::{self, Align};
 use crate::ir_function::{IRFunction, IrBlock};
 
 /// Incrementally builds an [`IRFunction`] by emitting instructions
@@ -50,11 +49,6 @@ impl<'a> FunctionBuilder<'a> {
         config: autosynth_lower::MachineConfig,
         signature: FunctionSignature,
     ) -> Self {
-        debugger::dbg(|dbg| {
-            dbg.add_source_column("pc", Align::Right);
-            dbg.add_source_column("label", Align::Left);
-        });
-
         Self {
             cb,
             config,
@@ -106,7 +100,6 @@ impl<'a> FunctionBuilder<'a> {
     /// Register a new virtual region.
     pub fn define_region(&mut self, region: VRegion) -> VRegionId {
         let id = VRegionId(self.regions.len() as u32);
-        debugger::dbg(|dbg| dbg.add_source_column(region.label, Align::Left));
         self.regions.push(region);
         id
     }
@@ -197,40 +190,6 @@ impl<'a> FunctionBuilder<'a> {
         self.vreg_defs[vreg.0 as usize].target = Some(preg);
     }
 
-    // --- Debug helpers ---
-
-    pub fn begin_op(&mut self, pc: &str, label: &str) {
-        debugger::dbg(|dbg| {
-            dbg.set_pending("pc", pc);
-            dbg.set_pending("label", label);
-        });
-    }
-
-    /// Format a vreg for debug display.
-    fn fmt_vreg(&self, vreg: VReg) -> String {
-        let def = &self.vreg_defs[vreg.0 as usize];
-        let ty = match def.width {
-            Width::W32 => "i32",
-            Width::W64 => "i64",
-        };
-        format!("{vreg}:{ty}")
-    }
-
-    /// Snapshot all region slot states into the debugger's pending columns.
-    fn snapshot_debug(&self) {
-        debugger::dbg(|dbg| {
-            for region in &self.regions {
-                let display: String = region
-                    .slots
-                    .iter()
-                    .map(|v| self.fmt_vreg(*v))
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                dbg.set_pending(region.label, &display);
-            }
-        });
-    }
-
     // --- Block lifecycle ---
 
     pub fn entry_block(&mut self, block: BlockId) {
@@ -238,7 +197,6 @@ impl<'a> FunctionBuilder<'a> {
         self.current_block = Some(block);
         trace_ctx!("block", format!("{block:?}"));
         trace!({"type": "block_start", "block": format!("{block:?}")});
-        debugger::dbg(|dbg| dbg.mark_block_start(block));
     }
 
     pub fn start_block(&mut self, block: BlockId) {
@@ -249,7 +207,6 @@ impl<'a> FunctionBuilder<'a> {
         self.current_block = Some(block);
         trace_ctx!("block", format!("{block:?}"));
         trace!({"type": "block_start", "block": format!("{block:?}")});
-        debugger::dbg(|dbg| dbg.mark_block_start(block));
     }
 
     pub fn br(&mut self, target: BlockId) {
@@ -285,11 +242,6 @@ impl<'a> FunctionBuilder<'a> {
             });
         }
 
-        self.snapshot_debug();
-        debugger::dbg(|dbg| {
-            dbg.record_ir_emit();
-            dbg.set_source("operation", &format!("{inst}"));
-        });
         let block = self.blocks.get_mut(&id).unwrap();
         assert!(
             !block.finalized,
@@ -353,11 +305,6 @@ impl<'a> FunctionBuilder<'a> {
             });
         }
 
-        self.snapshot_debug();
-        debugger::dbg(|dbg| {
-            dbg.record_ir_emit();
-            dbg.set_source("operation", &format!("{inst}"));
-        });
         let block = self.blocks.get_mut(&id).unwrap();
         assert!(
             !block.finalized,
@@ -394,12 +341,6 @@ impl<'a> FunctionBuilder<'a> {
             });
         }
 
-        self.snapshot_debug();
-        debugger::dbg(|dbg| {
-            let desc = format!("{inst:?}");
-            dbg.record_ir_emit();
-            dbg.set_source("operation", &desc);
-        });
         let block = self.blocks.get_mut(&id).unwrap();
         block.instructions.push(LowerInst::Reg(inst));
     }
@@ -454,34 +395,6 @@ impl<'a> FunctionBuilder<'a> {
             }
             blocks.get_mut(id).unwrap().results = results;
         }
-
-        // Emit block metadata to debugger.
-        debugger::dbg(|dbg| {
-            for id in &block_order {
-                let block = &blocks[id];
-                let fmt = |vreg: &VReg| -> String {
-                    let def = &vreg_defs[vreg.0 as usize];
-                    let ty = match def.width {
-                        Width::W32 => "i32",
-                        Width::W64 => "i64",
-                    };
-                    let target = match def.target {
-                        Some(p) => format!("→p{}", p.0),
-                        None => String::new(),
-                    };
-                    format!("{vreg}:{ty}{target}")
-                };
-                let mut params: Vec<_> = block.params.iter().collect();
-                params.sort_by_key(|v| v.0);
-                let params: Vec<String> = params.into_iter().map(fmt).collect();
-
-                let mut results: Vec<_> = block.results.iter().collect();
-                results.sort_by_key(|v| v.0);
-                let results: Vec<String> = results.into_iter().map(fmt).collect();
-
-                dbg.set_block_meta(*id, params, results);
-            }
-        });
 
         // Implicit fallthrough for non-finalized blocks.
         for i in 0..block_order.len() {

@@ -1,8 +1,4 @@
 use autosynth_backend_aarch64::Aarch64Backend;
-use autosynth_codegen::{
-    Align,
-    debugger::{self, Debugger},
-};
 use wust_codegen::JitModule;
 
 const WAT: &str = r#"
@@ -35,16 +31,8 @@ fn ack_lower() -> anyhow::Result<()> {
     let bytes = wat::parse_str(WAT)?;
     let module = wust_core::ParsedModule::new(&bytes)?;
 
-    let mut dbg = Debugger::new();
-    dbg.add_machine_column("addr", Align::Right);
-    dbg.add_machine_column("asm", Align::Left);
-    debugger::install(dbg);
-
     type Jit = JitModule<Aarch64Backend>;
     let _jit = Jit::new(module)?;
-
-    let dbg = debugger::take().unwrap();
-    eprintln!("\n{}", dbg.render());
     Ok(())
 }
 

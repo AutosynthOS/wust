@@ -13,7 +13,7 @@ use autosynth_isa_aarch64::{
     SubReg, SubsImm, SubsReg, UImm16,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
-use autosynth_lower::{self, trace, trace_do, LowerCtx, LowerCtxExt};
+use autosynth_lower::{trace, LowerCtx, LowerCtxExt};
 use autosynth_lower::{BackendEmitter, LowerError, MachineConfig};
 
 /// A saved patch point — the byte offset of an instruction that needs
@@ -47,11 +47,13 @@ pub struct Aarch64Backend {
     patches: Vec<Patch>,
 }
 
-/// A deferred operation with its debugger group index.
+/// A deferred operation with its saved group index for correct
+/// ASM parent attribution through deferred/fused paths.
 #[derive(Debug)]
 struct Operation {
-    /// The debugger group this operation belongs to — restored when emitting.
-    dbg_group_idx: usize,
+    /// The instruction group this operation belongs to — restored
+    /// before emitting so ASM events carry the right parent.
+    group: usize,
     op: CompoundOperation,
 }
 
@@ -88,13 +90,12 @@ impl BackendEmitter for Aarch64Backend {
         inst: IrInst,
         emit: autosynth_lower::Emit,
     ) -> Result<(), LowerError> {
-        let mut dbg_group_idx = 0;
-        autosynth_lower::dbg(|dbg| dbg_group_idx = dbg.current_group());
+        let group = autosynth_lower::current_group();
 
         if emit == autosynth_lower::Emit::Immediate {
             self.flush(ctx)?;
             let op = Operation {
-                dbg_group_idx,
+                group,
                 op: CompoundOperation::Base(inst),
             };
             return self.emit(ctx, op);
@@ -104,14 +105,14 @@ impl BackendEmitter for Aarch64Backend {
             None => {
                 trace!({"type": "defer", "inst": format!("{inst}")});
                 self.pending = Some(Operation {
-                    dbg_group_idx,
+                    group,
                     op: CompoundOperation::Base(inst),
                 });
                 Ok(())
             }
             Some(pending) => {
                 trace!({"type": "fuse_attempt", "inst": format!("{inst}")});
-                self.fuse(ctx, pending, inst, dbg_group_idx)
+                self.fuse(ctx, pending, inst, group)
             }
         }
     }
@@ -204,7 +205,6 @@ impl BackendEmitter for Aarch64Backend {
 impl Aarch64Backend {
     fn emit_code(&mut self, bytes: &[u8]) -> usize {
         let offset = self.code.len();
-        autosynth_lower::dbg(|dbg| dbg.set_machine("addr", &format!("{offset:04x}")));
         self.code.extend_from_slice(bytes);
         offset
     }
@@ -226,7 +226,7 @@ impl Aarch64Backend {
         ctx: &mut impl LowerCtx,
         pending: Operation,
         inst: IrInst,
-        dbg_group_idx: usize,
+        group: usize,
     ) -> Result<(), LowerError> {
         match (&pending.op, &inst) {
             // Comp + BrIf → subs + b.cond (fused compare-and-branch)
@@ -240,13 +240,13 @@ impl Aarch64Backend {
                 IrInst::BrIf { cond: cond_vreg, .. },
             ) => {
                 // subs goes under the Comp's group.
-                autosynth_lower::dbg(|dbg| dbg.set_current_group(pending.dbg_group_idx));
+                autosynth_lower::set_group(pending.group);
                 lower_cmp(ctx, *c, *dst, *lhs, *rhs, self)?;
                 // Consume the cond vreg's remaining use — only the flags
                 // matter, but the register needs to be freed.
                 let _ = ctx.resolve_vreg(*cond_vreg, self)?;
                 // b.cond goes under the BrIf's group.
-                autosynth_lower::dbg(|dbg| dbg.set_current_group(dbg_group_idx));
+                autosynth_lower::set_group(group);
                 let cond = comp_op_to_cond(*c).invert();
                 let offset = emit_inst_at(self, BCond { cond, offset: SImm19::try_from(0).unwrap() })?;
                 self.patches.push(Patch {
@@ -261,7 +261,7 @@ impl Aarch64Backend {
             _ => {
                 self.emit(ctx, pending)?;
                 self.pending = Some(Operation {
-                    dbg_group_idx,
+                    group,
                     op: CompoundOperation::Base(inst),
                 });
                 Ok(())
@@ -317,8 +317,7 @@ impl Aarch64Backend {
     }
 
     fn emit(&mut self, ctx: &mut impl LowerCtx, pending: Operation) -> Result<(), LowerError> {
-        let group = pending.dbg_group_idx;
-        autosynth_lower::dbg(|dbg| dbg.set_current_group(group));
+        autosynth_lower::set_group(pending.group);
         match pending.op {
             CompoundOperation::Base(inst) => self.emit_base(ctx, inst),
         }
@@ -367,19 +366,11 @@ fn emit_inst_at(
     backend: &mut Aarch64Backend,
     inst: impl Aarch64Inst + core::fmt::Display,
 ) -> Result<usize, LowerError> {
-    trace_do! {
-        let mut parent = 0usize;
-        autosynth_lower::dbg(|dbg| parent = dbg.current_group());
-        trace!({
-            "type": "asm",
-            "addr": backend.code.len(),
-            "text": format!("{inst}"),
-            "parent": parent
-        });
-    }
-    autosynth_lower::dbg(|dbg| {
-        dbg.emit_machine_inst();
-        dbg.set_machine("asm", &format!("{inst}"));
+    trace!({
+        "type": "asm",
+        "addr": backend.code.len(),
+        "text": format!("{inst}"),
+        "parent": autosynth_lower::current_group()
     });
     let word = inst.encode_word();
     Ok(backend.emit_code(&word.to_le_bytes()))
