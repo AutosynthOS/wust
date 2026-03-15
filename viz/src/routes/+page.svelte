@@ -151,8 +151,6 @@
 
 <div class="layout">
 	<aside class="panel left">
-		<VmState {func} {allOps} />
-
 		<h2>vregs</h2>
 		<div class="vreg-list">
 			{#each func.vregs as def}
@@ -165,6 +163,8 @@
 				</div>
 			{/each}
 		</div>
+
+		<VmState {func} {allOps} />
 	</aside>
 
 	<main
@@ -354,7 +354,7 @@
 	}
 
 	.func-sidebar {
-		min-width: 160px;
+		min-width: 200px;
 		border-right: 1px solid var(--border-subtle);
 		display: flex;
 		flex-direction: column;
@@ -466,10 +466,9 @@
 	.block {
 		position: absolute;
 		border-radius: 6px;
-		background: var(--bg-block);
+		background: rgba(17, 17, 27, 0.7);
 		z-index: 1;
 		overflow: hidden;
-		box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
 		user-select: none;
 		-webkit-user-select: none;
 	}

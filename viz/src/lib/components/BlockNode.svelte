@@ -209,7 +209,7 @@
 		align-items: center;
 		gap: 8px;
 		padding: 4px 8px;
-		background: var(--bg-block-header);
+		background: rgba(49, 50, 68, 0.3);
 	}
 
 	.block-id {
