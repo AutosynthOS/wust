@@ -396,6 +396,7 @@
 	.canvas {
 		transform-origin: 0 0;
 		padding: 20px;
+		width: max-content;
 	}
 
 	/* Function container */
@@ -404,7 +405,8 @@
 		background: rgba(24, 24, 37, 0.3);
 		border: 1px solid rgba(49, 50, 68, 0.4);
 		border-radius: 10px;
-		overflow: hidden;
+		overflow: visible;
+		width: max-content;
 	}
 
 	.func-sidebar {
@@ -498,6 +500,7 @@
 		gap: 24px 60px;
 		position: relative;
 		z-index: 1;
+		width: max-content;
 	}
 
 	.block {
