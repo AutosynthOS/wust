@@ -3,6 +3,7 @@
 	import { app, toggleVreg } from '$lib/state.svelte';
 	import { computeStateAt } from '$lib/assemble';
 	import VReg from './VReg.svelte';
+	import PReg from './PReg.svelte';
 
 	let { func, allOps }: {
 		func: FunctionTrace;

@@ -7,6 +7,7 @@
 	import BlockNode from '$lib/components/BlockNode.svelte';
 	import VmState from '$lib/components/VmState.svelte';
 	import VReg from '$lib/components/VReg.svelte';
+	import PReg from '$lib/components/PReg.svelte';
 
 	const trace = mockTrace;
 	const func = trace.functions[0];
@@ -158,7 +159,7 @@
 					<VReg id={def.id} width={def.width} target={def.target} />
 					<span class="vreg-w">{def.width}</span>
 					{#if def.target}
-						<span class="vreg-t">→{def.target}</span>
+						<span class="vreg-t">→</span><PReg id={def.target} />
 					{/if}
 				</div>
 			{/each}
@@ -198,13 +199,13 @@
 							<div class="func-params">
 								{#each func.params as p, i}
 									<span class="func-param">
-										<span class="fp-preg">{p.preg}</span><span class="fp-colon">:</span><span class="fp-type">{p.width}</span>{#if i < func.params.length - 1}<span class="fp-sep">,</span>{/if}
+										{#if p.preg}<PReg id={p.preg} />{/if}<span class="fp-colon">:</span><span class="fp-type">{p.width}</span>{#if i < func.params.length - 1}<span class="fp-sep">,</span>{/if}
 									</span>
 								{/each}
 								<span class="fp-arrow">→</span>
 								{#each func.results as r, i}
 									<span class="func-param">
-										<span class="fp-preg">{r.preg}</span><span class="fp-colon">:</span><span class="fp-type">{r.width}</span>{#if i < func.results.length - 1}<span class="fp-sep">,</span>{/if}
+										{#if r.preg}<PReg id={r.preg} />{/if}<span class="fp-colon">:</span><span class="fp-type">{r.width}</span>{#if i < func.results.length - 1}<span class="fp-sep">,</span>{/if}
 									</span>
 								{/each}
 							</div>

@@ -3,6 +3,7 @@
 	import { app, selectOp, toggleVreg } from '$lib/state.svelte';
 	import { vregsRead, vregsDefined } from '$lib/assemble';
 	import VReg from './VReg.svelte';
+	import PReg from './PReg.svelte';
 
 	let { block, func }: { block: BlockView; func: FunctionTrace } = $props();
 
@@ -131,6 +132,7 @@
 			<div
 				class="cell cell-label"
 				class:group-border={!row.firstGroup}
+				class:wat-match={app.highlightedWasmPcs.size > 0 && row.groupPc !== null && app.highlightedWasmPcs.has(row.groupPc)}
 				style="grid-row: {ri + 1} / span {row.groupSpan}; grid-column: 2;"
 			>
 				<span class="label-text">{row.groupLabel}</span>
@@ -146,6 +148,7 @@
 				class:row-sel={app.selectedOp === row.op.seq}
 				class:row-hl={app.highlightedVreg !== null && opTouches(row.op, app.highlightedVreg)}
 				class:row-dim={app.highlightedVreg !== null && !opTouches(row.op, app.highlightedVreg)}
+				class:wat-match={app.highlightedWasmPcs.size > 0 && row.groupPc !== null && app.highlightedWasmPcs.has(row.groupPc)}
 				style="grid-row: {ri + 1} / span {row.opSpan}; grid-column: 3;"
 				onmouseenter={() => app.hoveredOp = row.op.seq}
 				onmouseleave={() => app.hoveredOp = null}
@@ -195,7 +198,11 @@
 			{#if row.asm}
 				<code>
 					{#each parseAsm(row.asm.text) as tok}
-						<span class="t-{tok.kind}">{tok.text}</span>
+						{#if tok.kind === 'reg'}
+							<PReg id={tok.text} />
+						{:else}
+							<span class="t-{tok.kind}">{tok.text}</span>
+						{/if}
 					{/each}
 				</code>
 			{/if}
