@@ -81,10 +81,9 @@
 			{#each snapshot.bindings as b}
 				<div class="slot" class:free={!b.vreg}>
 					<PReg id={b.preg} />
-					<span class="spacer"></span>
 					{#if b.vreg}
-						<VReg id={b.vreg} /><span class="slot-type">:{vregWidth(b.vreg)}</span>
 						{@const init = initDisplay(b.vreg)}
+						<VReg id={b.vreg} /><span class="slot-type">:{vregWidth(b.vreg)}</span>
 						{#if init}
 							<span class="init-eq">=</span>
 							{#if initIsPReg(b.vreg)}
@@ -108,13 +107,13 @@
 		<div class="stack">
 			{#each slots as slot, i}
 				{@const vl = vregLoc(slot.vreg)}
+				{@const init = initDisplay(slot.vreg)}
 				<div class="slot {slot.action}">
 					<span class="diff-mark">
 						{#if slot.action === 'pushed'}+{:else if slot.action === 'popped'}−{:else if slot.action === 'set'}~{:else}&nbsp;{/if}
 					</span>
 					<span class="slot-offset">+{slotOffset(region.id, i)}</span>
 					<VReg id={slot.vreg} /><span class="slot-type">:{vregWidth(slot.vreg)}</span>
-					{@const init = initDisplay(slot.vreg)}
 					{#if init}
 						<span class="init-eq">=</span>
 						{#if initIsPReg(slot.vreg)}
