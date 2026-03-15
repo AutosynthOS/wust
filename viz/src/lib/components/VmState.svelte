@@ -11,26 +11,6 @@
 		allOps: OpView[];
 	} = $props();
 
-	// Compute init values from define events
-	const vregInits = new Map<string, string>();
-	for (const e of func.events) {
-		if (e.type === 'define') {
-			const v = e.value;
-			if (v === 'pending') vregInits.set(e.vreg, 'dst');
-			else if ('preg' in v) vregInits.set(e.vreg, v.preg);
-			else vregInits.set(e.vreg, `#${v.const}`);
-		}
-	}
-
-	function initDisplay(vreg: string): string | null {
-		return vregInits.get(vreg) ?? null;
-	}
-
-	function initIsPReg(vreg: string): boolean {
-		const init = vregInits.get(vreg);
-		return !!init && !init.startsWith('#') && init !== 'dst';
-	}
-
 	const selectedEvent = $derived(
 		app.selectedOp !== null ? allOps.find(o => o.seq === app.selectedOp) : null
 	);
@@ -43,7 +23,6 @@
 		app.selectedOp !== null ? computeStateAt(func, app.selectedOp) : null
 	);
 
-	// Find most recent snapshot at or before selected event
 	const snapshot = $derived.by((): RegAllocSnapshot | null => {
 		if (app.selectedOp === null) return null;
 		let best: RegAllocSnapshot | null = null;
@@ -54,19 +33,17 @@
 		return best;
 	});
 
-	// Look up a vreg's location from the snapshot
 	function vregLoc(vreg: string): VRegLoc | null {
 		return snapshot?.vreg_locs.find(vl => vl.vreg === vreg) ?? null;
 	}
 
-	// Find vreg width from func defs
 	function vregWidth(vreg: string): string {
 		return func.vregs.find(d => d.id === vreg)?.width ?? '?';
 	}
 
 	function slotOffset(regionId: string, index: number): number {
 		const region = func.regions.find(r => r.id === regionId);
-		return (region?.base_offset ?? 0) + index * 4; // approximate
+		return (region?.base_offset ?? 0) + index * 4;
 	}
 </script>
 
@@ -74,25 +51,21 @@
 	<h2>state @ seq {app.selectedOp}</h2>
 	<div class="op-preview">{selectedEvent.text}</div>
 
-	<!-- Bindings: ordered by preg — constant height -->
+	<!-- Bindings -->
 	{#if snapshot}
 		<h3>bindings</h3>
 		<div class="bindings-grid">
 			{#each snapshot.bindings as b}
 				<div class="bind-preg" class:free={!b.vreg}>
-					<PReg id={b.preg} /><span class="bind-arrow">→</span>
+					<PReg id={b.preg} />
 				</div>
 				<div class="bind-vreg" class:free={!b.vreg}>
 					{#if b.vreg}
-						{@const init = initDisplay(b.vreg)}
-						<VReg id={b.vreg} /><span class="slot-type">:{vregWidth(b.vreg)}</span>
-						{#if init}
-							<span class="init-eq">=</span>
-							{#if initIsPReg(b.vreg)}
-								<PReg id={init} />
-							{:else}
-								<span class="init-val">{init}</span>
-							{/if}
+						{@const vl = vregLoc(b.vreg)}
+						<VReg id={b.vreg} /><span class="type">:{vregWidth(b.vreg)}</span>
+						{#if vl}
+							<span class="spacer"></span>
+							<DirtyBadge dirty={vl.dirty !== false} />
 						{/if}
 					{:else}
 						<span class="free-label">free</span>
@@ -102,28 +75,19 @@
 		</div>
 	{/if}
 
-	<!-- Regions: unified vreg view per slot -->
+	<!-- Regions -->
 	{#each func.regions as region}
 		{@const slots = region.id === 'locals' ? diff.locals : region.id === 'operands' ? diff.ops : diff.fibre}
 		<h3>{region.label}</h3>
-		<div class="stack">
+		<div class="slots-grid">
 			{#each slots as slot, i}
 				{@const vl = vregLoc(slot.vreg)}
-				{@const init = initDisplay(slot.vreg)}
-				<div class="slot {slot.action}">
-					<span class="diff-mark">
-						{#if slot.action === 'pushed'}+{:else if slot.action === 'popped'}−{:else if slot.action === 'set'}~{:else}&nbsp;{/if}
-					</span>
-					<span class="slot-offset">+{slotOffset(region.id, i)}</span>
-					<VReg id={slot.vreg} /><span class="slot-type">:{vregWidth(slot.vreg)}</span>
-					{#if init}
-						<span class="init-eq">=</span>
-						{#if initIsPReg(slot.vreg)}
-							<PReg id={init} />
-						{:else}
-							<span class="init-val">{init}</span>
-						{/if}
-					{/if}
+				<div class="slot-mark {slot.action}">
+					{#if slot.action === 'pushed'}+{:else if slot.action === 'popped'}−{:else}{i}{/if}
+				</div>
+				<div class="slot-data {slot.action}">
+					<span class="offset">+{slotOffset(region.id, i)}</span>
+					<VReg id={slot.vreg} /><span class="type">:{vregWidth(slot.vreg)}</span>
 					<span class="spacer"></span>
 					{#if vl?.preg}
 						<PReg id={vl.preg} />
@@ -134,6 +98,7 @@
 				</div>
 			{/each}
 			{#if slots.length === 0}
+				<div class="empty-mark"></div>
 				<div class="empty">—</div>
 			{/if}
 		</div>
@@ -166,56 +131,7 @@
 		word-break: break-all;
 	}
 
-	.stack {
-		display: flex;
-		flex-direction: column;
-		gap: 1px;
-	}
-
-	.slot {
-		display: flex;
-		align-items: center;
-		gap: 3px;
-		padding: 2px 6px;
-		background: var(--bg-surface);
-		border-radius: 3px;
-		font-size: var(--font-size-base);
-
-		&.pushed { background: rgba(166, 227, 161, 0.1); }
-		&.popped { background: rgba(243, 139, 168, 0.1); opacity: 0.6; }
-		&.set { background: rgba(250, 179, 135, 0.1); }
-	}
-
-	.diff-mark {
-		min-width: 10px;
-		font-weight: bold;
-	}
-
-	.pushed .diff-mark { color: var(--accent-green); }
-	.popped .diff-mark { color: var(--accent-red); }
-	.set .diff-mark { color: var(--accent-vreg); }
-
-	.slot-offset {
-		color: var(--text-faint);
-		font-size: var(--font-size-xxs);
-		min-width: 20px;
-	}
-
-	.slot-type {
-		color: var(--text-faint);
-		font-size: var(--font-size-xs);
-	}
-
-	.init-eq { color: var(--text-faint); margin: 0 2px; }
-	.init-val { color: var(--accent-teal); }
-
-	.spacer { flex: 1; }
-
-	.const-badge {
-		font-size: var(--font-size-xxs);
-		color: var(--accent-teal);
-	}
-
+	/* Bindings grid */
 	.bindings-grid {
 		display: grid;
 		grid-template-columns: auto 1fr;
@@ -225,9 +141,9 @@
 	.bind-preg {
 		display: flex;
 		align-items: center;
-		gap: 2px;
 		padding: 2px 6px;
 		font-size: var(--font-size-base);
+		&.free { opacity: 0.35; }
 	}
 
 	.bind-vreg {
@@ -238,16 +154,62 @@
 		background: var(--bg-surface);
 		border-radius: 3px;
 		font-size: var(--font-size-base);
+		&.free { opacity: 0.35; }
 	}
 
-	.bind-arrow { color: var(--text-faint); }
-	.free { opacity: 0.35; }
 	.free-label {
 		color: var(--text-faint);
 		font-size: var(--font-size-xs);
 		font-style: italic;
 	}
 
+	/* Slots grid */
+	.slots-grid {
+		display: grid;
+		grid-template-columns: 18px 1fr;
+		gap: 1px;
+	}
+
+	.slot-mark {
+		display: flex;
+		align-items: center;
+		justify-content: center;
+		font-size: var(--font-size-sm);
+		font-weight: bold;
+		color: var(--text-faint);
+
+		&.pushed { color: var(--accent-green); }
+		&.popped { color: var(--accent-red); }
+	}
+
+	.slot-data {
+		display: flex;
+		align-items: center;
+		gap: 3px;
+		padding: 2px 6px;
+		background: var(--bg-surface);
+		border-radius: 3px;
+		font-size: var(--font-size-base);
+
+		&.pushed { background: rgba(166, 227, 161, 0.1); }
+		&.popped { background: rgba(243, 139, 168, 0.1); }
+		&.set { background: rgba(250, 179, 135, 0.1); }
+	}
+
+	.offset {
+		color: var(--text-dim);
+		font-size: var(--font-size-sm);
+		min-width: 22px;
+	}
+
+	.type {
+		color: var(--text-dim);
+		font-size: var(--font-size-xs);
+	}
+
+	.spacer { flex: 1; }
+
+	.empty-mark { }
 	.empty {
 		color: var(--text-faint);
 		font-size: var(--font-size-xs);
