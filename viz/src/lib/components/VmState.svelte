@@ -39,6 +39,15 @@
 		}
 	}
 
+	function vregLoc(vreg: string) {
+		return snapshot?.vreg_locs.find(vl => vl.vreg === vreg) ?? null;
+	}
+
+	function slotOffset(region: typeof func.regions[0], index: number): number {
+		// Approximate: assume 4 bytes per slot (i32). Real data would have actual widths.
+		return region.base_offset + index * 4;
+	}
+
 	function locColor(loc: string): string {
 		switch (loc) {
 			case 'reg': return 'var(--accent-green)';
@@ -57,15 +66,22 @@
 	<!-- Stack diffs -->
 	{#each func.regions as region}
 		{@const slots = region.id === 'locals' ? diff.locals : region.id === 'operands' ? diff.ops : diff.fibre}
-		<h3>{region.label}</h3>
+		<h3>{region.label} <span class="region-base">{region.base_preg}+{region.base_offset}</span></h3>
 		<div class="stack">
 			{#each slots as slot, i}
+				{@const vl = vregLoc(slot.vreg)}
 				<div class="slot {slot.action}">
 					<span class="diff-mark">
 						{#if slot.action === 'pushed'}+{:else if slot.action === 'popped'}−{:else if slot.action === 'set'}~{:else}&nbsp;{/if}
 					</span>
-					<span class="slot-idx">{i}</span>
+					<span class="slot-offset">+{slotOffset(region, i)}</span>
 					<VReg id={slot.vreg} />
+					<span class="spacer"></span>
+					{#if vl}
+						<span class="slot-dirty" class:is-dirty={vl.dirty !== false}>
+							{vl.dirty === false ? 'clean' : 'dirty'}
+						</span>
+					{/if}
 				</div>
 			{/each}
 			{#if slots.length === 0}
@@ -125,6 +141,12 @@
 		font-size: var(--font-size-xs);
 		color: var(--text-dim);
 		margin: 10px 0 3px 0;
+
+		.region-base {
+			color: var(--text-faint);
+			font-weight: normal;
+			font-size: var(--font-size-xxs);
+		}
 	}
 
 	.op-preview {
@@ -166,10 +188,23 @@
 	.popped .diff-mark { color: var(--accent-red); }
 	.replaced .diff-mark { color: var(--accent-vreg); }
 
-	.slot-idx {
+	.slot-offset {
 		color: var(--text-faint);
 		font-size: var(--font-size-xxs);
-		min-width: 8px;
+		min-width: 20px;
+	}
+
+	.slot-dirty {
+		font-size: var(--font-size-xxs);
+		padding: 0 3px;
+		border-radius: 2px;
+		background: rgba(166, 227, 161, 0.15);
+		color: var(--accent-green);
+
+		&.is-dirty {
+			background: rgba(243, 139, 168, 0.15);
+			color: var(--accent-red);
+		}
 	}
 
 	.empty {
