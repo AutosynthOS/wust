@@ -4,6 +4,7 @@
 	import { computeStateDiff, type SlotDiff } from '$lib/assemble';
 	import VReg from './VReg.svelte';
 	import PReg from './PReg.svelte';
+	import DirtyBadge from './DirtyBadge.svelte';
 
 	let { func, allOps }: {
 		func: FunctionTrace;
@@ -78,9 +79,7 @@
 					<VReg id={slot.vreg} />
 					<span class="spacer"></span>
 					{#if vl}
-						<span class="slot-dirty" class:is-dirty={vl.dirty !== false}>
-							{vl.dirty === false ? 'clean' : 'dirty'}
-						</span>
+						<DirtyBadge dirty={vl.dirty !== false} />
 					{/if}
 				</div>
 			{/each}
@@ -117,9 +116,7 @@
 						<PReg id={vl.preg} />
 					{/if}
 					<span class="spacer"></span>
-					<span class="dirty-badge" class:is-dirty={vl.dirty !== false}>
-						{vl.dirty === false ? 'clean' : 'dirty'}
-					</span>
+					<DirtyBadge dirty={vl.dirty !== false} />
 				</div>
 			{/each}
 		</div>
@@ -194,18 +191,6 @@
 		min-width: 20px;
 	}
 
-	.slot-dirty {
-		font-size: var(--font-size-xxs);
-		padding: 0 3px;
-		border-radius: 2px;
-		background: rgba(166, 227, 161, 0.15);
-		color: var(--accent-green);
-
-		&.is-dirty {
-			background: rgba(243, 139, 168, 0.15);
-			color: var(--accent-red);
-		}
-	}
 
 	.empty {
 		color: var(--text-faint);
@@ -268,18 +253,6 @@
 		flex: 1;
 	}
 
-	.dirty-badge {
-		font-size: var(--font-size-xxs);
-		padding: 0 3px;
-		border-radius: 2px;
-		background: rgba(166, 227, 161, 0.15);
-		color: var(--accent-green);
-
-		&.is-dirty {
-			background: rgba(243, 139, 168, 0.15);
-			color: var(--accent-red);
-		}
-	}
 
 	.placeholder {
 		color: var(--text-dim);

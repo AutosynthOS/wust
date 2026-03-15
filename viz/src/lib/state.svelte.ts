@@ -4,6 +4,8 @@ class AppState {
 	highlightedVreg: string | null = $state(null);
 	hoveredOp: number | null = $state(null);
 	selectedOp: number | null = $state(null);
+	/** Selected seq numbers (multiple when a group/label is clicked) */
+	selectedOps: Set<number> = $state(new Set());
 	highlightedWasmPcs: Set<number> = $state(new Set());
 	selectedWasmPc: number | null = $state(null);
 }
@@ -15,7 +17,24 @@ export function toggleVreg(v: string) {
 }
 
 export function selectOp(seq: number) {
-	app.selectedOp = app.selectedOp === seq ? null : seq;
+	if (app.selectedOp === seq) {
+		app.selectedOp = null;
+		app.selectedOps = new Set();
+	} else {
+		app.selectedOp = seq;
+		app.selectedOps = new Set([seq]);
+	}
+}
+
+export function selectGroup(seqs: number[]) {
+	const first = seqs[0];
+	if (app.selectedOp === first) {
+		app.selectedOp = null;
+		app.selectedOps = new Set();
+	} else {
+		app.selectedOp = first;
+		app.selectedOps = new Set(seqs);
+	}
 }
 
 export function toggleSourceLine(line: WasmSourceLine) {

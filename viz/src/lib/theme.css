@@ -34,7 +34,7 @@
 	--dim-opacity: 0.2;
 
 	/* Font */
-	--font-mono: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+	--font-mono: 'Fira Code', 'SF Mono', 'Cascadia Code', monospace;
 	--font-size-sm: 12px;
 	--font-size-base: 13px;
 	--font-size-xs: 11px;

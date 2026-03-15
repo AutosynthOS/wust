@@ -8,11 +8,23 @@
 	import VmState from '$lib/components/VmState.svelte';
 	import VReg from '$lib/components/VReg.svelte';
 	import PReg from '$lib/components/PReg.svelte';
+	import DirtyBadge from '$lib/components/DirtyBadge.svelte';
 
 	const trace = mockTrace;
 	const func = trace.functions[0];
 	const blocks = assembleBlocks(func);
 	const allOps = blocks.flatMap(b => b.groups.flatMap(g => g.ops));
+
+	// Build vreg initial values from define events
+	const vregInits = new Map<string, string>();
+	for (const e of func.events) {
+		if (e.type === 'define') {
+			const v = e.value;
+			if (v === 'pending') vregInits.set(e.vreg, 'dst');
+			else if ('preg' in v) vregInits.set(e.vreg, v.preg);
+			else vregInits.set(e.vreg, `#${v.const}`);
+		}
+	}
 
 	// --- Pan/zoom ---
 	let zoom = $state(0.85);
@@ -89,11 +101,22 @@
 		};
 	}
 
+	const HEADER_H = 28;
+	const FOOTER_H = 24;
+
 	function computeArrows() {
 		const res: { fall: boolean; path: string }[] = [];
 		for (const block of blocks) {
 			const fr = getRect(block.id);
 			const is2 = block.successors.length === 2;
+
+			// Y position of the last instruction (branch) in the block
+			let totalRows = 0;
+			for (const g of block.groups) {
+				for (const op of g.ops) totalRows += Math.max(1, op.asm.length);
+			}
+			const branchY = fr.y + HEADER_H + (totalRows - 1) * ROW_H + ROW_H / 2;
+
 			for (let i = 0; i < block.successors.length; i++) {
 				const s = block.successors[i];
 				if (!blockPos.has(s)) continue;
@@ -104,7 +127,7 @@
 					res.push({ fall: true, path: `M${x},${fr.y + fr.h} L${x},${tr.y}` });
 				} else {
 					const fx = fr.x + fr.w;
-					const fy = fr.y + fr.h * 0.45;
+					const fy = branchY;
 					const tx = tr.x;
 					const ty = tr.y + 12;
 					res.push({ fall: false, path: `M${fx},${fy} C${(fx + tx) / 2},${fy} ${(fx + tx) / 2},${ty} ${tx},${ty}` });
@@ -155,11 +178,19 @@
 		<h2>vregs</h2>
 		<div class="vreg-list">
 			{#each func.vregs as def}
+				{@const init = vregInits.get(def.id)}
 				<div class="vreg-row" class:vreg-active={app.highlightedVreg === def.id}>
 					<VReg id={def.id} /><span class="vreg-sep">:</span><span class="vreg-w">{def.width}</span>
-					{#if def.target}
-						<span class="vreg-eq">=</span><PReg id={def.target} />
+					{#if init}
+						<span class="vreg-eq">=</span>
+						{#if def.target}
+							<PReg id={def.target} />
+						{:else}
+							<span class="vreg-init">{init}</span>
+						{/if}
 					{/if}
+					<span class="vreg-spacer"></span>
+					<DirtyBadge dirty={true} />
 				</div>
 			{/each}
 		</div>
@@ -480,6 +511,8 @@
 	.vreg-sep { color: var(--text-faint); }
 	.vreg-w { color: var(--text-muted); }
 	.vreg-eq { color: var(--text-faint); margin: 0 2px; }
+	.vreg-init { color: var(--accent-teal); }
+	.vreg-spacer { flex: 1; }
 
 	.arrows {
 		position: absolute;

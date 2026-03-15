@@ -84,7 +84,7 @@ export function assembleBlocks(func: FunctionTrace): BlockView[] {
 
 	for (const event of func.events) {
 		if (event.type === 'block_start') {
-			currentBlock = { id: event.block, successors: event.successors, groups: [] };
+			currentBlock = { id: event.block, successors: event.successors, groups: [], params: [], results: [] };
 			blocks.push(currentBlock);
 			currentGroup = null;
 			continue;
@@ -107,6 +107,21 @@ export function assembleBlocks(func: FunctionTrace): BlockView[] {
 			asm: asmByParent.get(event.seq) ?? [],
 		};
 		currentGroup.ops.push(op);
+	}
+
+	// Compute params: vregs read in block but not defined in it
+	for (const block of blocks) {
+		const defined = new Set<string>();
+		const read = new Set<string>();
+		for (const g of block.groups) {
+			for (const op of g.ops) {
+				for (const v of vregsDefined(op.event)) defined.add(v);
+				for (const v of vregsRead(op.event)) {
+					if (!defined.has(v)) read.add(v);
+				}
+			}
+		}
+		block.params = [...read];
 	}
 
 	return blocks;

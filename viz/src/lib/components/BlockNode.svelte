@@ -1,84 +1,13 @@
 <script lang="ts">
 	import type { BlockView, FunctionTrace, OpView, AsmEvent } from '$lib/types';
-	import { app, selectOp, toggleVreg } from '$lib/state.svelte';
+	import { app, selectOp, selectGroup, toggleVreg, toggleSourceLine } from '$lib/state.svelte';
 	import { vregsRead, vregsDefined } from '$lib/assemble';
 	import VReg from './VReg.svelte';
 	import PReg from './PReg.svelte';
 
 	let { block, func }: { block: BlockView; func: FunctionTrace } = $props();
 
-	const ROW_H = 20;
-
-	// Flatten into grid rows: each row = one op (or one asm sub-line)
-	interface GridRow {
-		op: OpView;
-		asm: AsmEvent | null;
-		/** Is this the first row for this op? */
-		opStart: boolean;
-		/** Total rows this op spans (only set on opStart) */
-		opSpan: number;
-		/** Group info — set on first row of group */
-		groupStart: boolean;
-		groupSpan: number;
-		groupPc: number | null;
-		groupLabel: string;
-		/** Is this the first group? (no top border) */
-		firstGroup: boolean;
-	}
-
-	function buildRows(): GridRow[] {
-		const rows: GridRow[] = [];
-		let isFirst = true;
-
-		for (const group of block.groups) {
-			let groupRowCount = 0;
-			const groupStartIdx = rows.length;
-
-			for (const op of group.ops) {
-				const asmList = op.asm;
-				const opRowCount = Math.max(1, asmList.length);
-				groupRowCount += opRowCount;
-
-				for (let i = 0; i < opRowCount; i++) {
-					rows.push({
-						op,
-						asm: asmList[i] ?? null,
-						opStart: i === 0,
-						opSpan: opRowCount,
-						groupStart: false,
-						groupSpan: 0,
-						groupPc: group.pc,
-						groupLabel: group.label,
-						firstGroup: isFirst,
-					});
-				}
-			}
-
-			// Patch group start
-			if (groupStartIdx < rows.length) {
-				rows[groupStartIdx].groupStart = true;
-				rows[groupStartIdx].groupSpan = groupRowCount;
-			}
-			isFirst = false;
-		}
-		return rows;
-	}
-
-	const gridRows = buildRows();
-
-	function opTouches(op: OpView, vreg: string): boolean {
-		const r = vregsRead(op.event);
-		const d = vregsDefined(op.event);
-		return r.includes(vreg) || d.includes(vreg);
-	}
-
-	function originLabel(o: string): string {
-		return o === 'lower' ? 'lo' : o === 'regalloc' ? 'ra' : 'fu';
-	}
-
-	function formatAddr(a: number): string {
-		return a.toString(16).padStart(4, '0');
-	}
+	const ROW_H = 22;
 
 	interface AsmToken {
 		text: string;
@@ -102,18 +31,90 @@
 		}
 		return tokens;
 	}
+
+	function opTouches(op: OpView, vreg: string): boolean {
+		return vregsRead(op.event).includes(vreg) || vregsDefined(op.event).includes(vreg);
+	}
+
+	function originLabel(o: string): string {
+		return o === 'lower' ? 'lo' : o === 'regalloc' ? 'ra' : 'fu';
+	}
+
+	function formatAddr(a: number): string {
+		return a.toString(16).padStart(4, '0');
+	}
+
+	// Flatten into grid rows
+	interface GridRow {
+		op: OpView;
+		asm: AsmEvent | null;
+		opStart: boolean;
+		opSpan: number;
+		groupStart: boolean;
+		groupSpan: number;
+		groupPc: number | null;
+		groupLabel: string;
+		firstGroup: boolean;
+	}
+
+	function buildRows(): GridRow[] {
+		const rows: GridRow[] = [];
+		let isFirst = true;
+		for (const group of block.groups) {
+			let groupRowCount = 0;
+			const groupStartIdx = rows.length;
+			for (const op of group.ops) {
+				const asmList = op.asm;
+				const opRowCount = Math.max(1, asmList.length);
+				groupRowCount += opRowCount;
+				for (let i = 0; i < opRowCount; i++) {
+					rows.push({
+						op, asm: asmList[i] ?? null,
+						opStart: i === 0, opSpan: opRowCount,
+						groupStart: false, groupSpan: 0,
+						groupPc: group.pc, groupLabel: group.label,
+						firstGroup: isFirst,
+					});
+				}
+			}
+			if (groupStartIdx < rows.length) {
+				rows[groupStartIdx].groupStart = true;
+				rows[groupStartIdx].groupSpan = groupRowCount;
+			}
+			isFirst = false;
+		}
+		return rows;
+	}
+
+	const gridRows = buildRows();
+
+	// Group seqs by wasm PC for group selection
+	const groupSeqs = new Map<number | null, number[]>();
+	for (const g of block.groups) {
+		groupSeqs.set(g.pc, g.ops.map(o => o.seq));
+	}
+
+	// Get vreg target preg for param display
+	function vregTarget(vreg: string): string | null {
+		return func.vregs.find(v => v.id === vreg)?.target ?? null;
+	}
 </script>
 
+<!-- Header: block ID + params -->
 <div class="header">
 	<span class="block-id">{block.id}</span>
-	{#if block.successors.length}
-		<span class="successors">→ {block.successors.join(', ')}</span>
+	{#if block.params.length > 0}
+		<span class="params">
+			{#each block.params as p, i}
+				<VReg id={p} />{#if vregTarget(p)}→<PReg id={vregTarget(p) ?? ''} />{/if}{#if i < block.params.length - 1}<span class="sep">,</span>{/if}
+			{/each}
+		</span>
 	{/if}
 </div>
 
+<!-- Grid body -->
 <div class="grid" style="grid-template-rows: repeat({gridRows.length}, {ROW_H}px);">
 	{#each gridRows as row, ri}
-		<!-- PC cell (spans group) -->
 		{#if row.groupStart}
 			<div
 				class="cell cell-pc"
@@ -127,25 +128,28 @@
 			</div>
 		{/if}
 
-		<!-- Label cell (spans group) -->
 		{#if row.groupStart}
 			<div
 				class="cell cell-label"
 				class:group-border={!row.firstGroup}
 				class:wat-match={app.highlightedWasmPcs.size > 0 && row.groupPc !== null && app.highlightedWasmPcs.has(row.groupPc)}
 				style="grid-row: {ri + 1} / span {row.groupSpan}; grid-column: 2;"
+				onclick={() => {
+					const seqs = groupSeqs.get(row.groupPc) ?? [];
+					if (seqs.length) selectGroup(seqs);
+					if (row.groupPc !== null) toggleSourceLine({ pc: row.groupPc, text: '', indent: 0, func_index: func.index });
+				}}
 			>
 				<span class="label-text">{row.groupLabel}</span>
 			</div>
 		{/if}
 
-		<!-- Op cell (spans op) -->
 		{#if row.opStart}
 			<div
 				class="cell cell-op"
 				class:group-border={!row.firstGroup && row.groupStart}
 				class:row-hov={app.hoveredOp === row.op.seq}
-				class:row-sel={app.selectedOp === row.op.seq}
+				class:row-sel={app.selectedOps.has(row.op.seq)}
 				class:row-hl={app.highlightedVreg !== null && opTouches(row.op, app.highlightedVreg)}
 				class:row-dim={app.highlightedVreg !== null && !opTouches(row.op, app.highlightedVreg)}
 				class:wat-match={app.highlightedWasmPcs.size > 0 && row.groupPc !== null && app.highlightedWasmPcs.has(row.groupPc)}
@@ -164,31 +168,24 @@
 			</div>
 		{/if}
 
-		<!-- Addr cell -->
 		<div
 			class="cell cell-addr"
 			class:group-border={!row.firstGroup && row.groupStart}
 			class:row-hov={app.hoveredOp === row.op.seq}
 			style="grid-row: {ri + 1}; grid-column: 4;"
 		>
-			{#if row.asm}
-				<span class="addr-text">{formatAddr(row.asm.addr)}</span>
-			{/if}
+			{#if row.asm}<span class="addr-text">{formatAddr(row.asm.addr)}</span>{/if}
 		</div>
 
-		<!-- Origin badge -->
 		<div
 			class="cell cell-origin"
 			class:group-border={!row.firstGroup && row.groupStart}
 			class:row-hov={app.hoveredOp === row.op.seq}
 			style="grid-row: {ri + 1}; grid-column: 5;"
 		>
-			{#if row.asm}
-				<span class="origin {row.asm.origin}">{originLabel(row.asm.origin)}</span>
-			{/if}
+			{#if row.asm}<span class="origin {row.asm.origin}">{originLabel(row.asm.origin)}</span>{/if}
 		</div>
 
-		<!-- ASM instruction -->
 		<div
 			class="cell cell-asm"
 			class:group-border={!row.firstGroup && row.groupStart}
@@ -210,11 +207,21 @@
 	{/each}
 </div>
 
+<!-- Footer: successors -->
+{#if block.successors.length > 0}
+	<div class="footer">
+		<span class="footer-label">→</span>
+		{#each block.successors as s, i}
+			<span class="footer-target">{s}</span>{#if i < block.successors.length - 1}<span class="sep">,</span>{/if}
+		{/each}
+	</div>
+{/if}
+
 <style>
 	.header {
 		display: flex;
 		align-items: center;
-		gap: 8px;
+		gap: 6px;
 		padding: 4px 8px;
 		background: rgba(49, 50, 68, 0.3);
 	}
@@ -225,20 +232,36 @@
 		color: var(--text);
 	}
 
-	.successors {
-		margin-left: auto;
-		color: var(--text-faint);
-		font-size: var(--font-size-xs);
+	.params {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		font-size: var(--font-size-sm);
+		color: var(--text-muted);
 	}
+
+	.sep { color: var(--text-faint); margin: 0 2px; }
+
+	.footer {
+		display: flex;
+		align-items: center;
+		gap: 4px;
+		padding: 3px 8px;
+		background: rgba(49, 50, 68, 0.15);
+		font-size: var(--font-size-sm);
+	}
+
+	.footer-label { color: var(--text-faint); }
+	.footer-target { color: var(--text-muted); }
 
 	.grid {
 		display: grid;
 		grid-template-columns:
 			[pc] 30px
-			[label] minmax(90px, 130px)
+			[label] minmax(90px, 140px)
 			[op] 1fr
-			[addr] 36px
-			[origin] 22px
+			[addr] 40px
+			[origin] 24px
 			[asm] minmax(140px, 1fr);
 	}
 
@@ -250,28 +273,23 @@
 		box-sizing: border-box;
 		font-size: var(--font-size-base);
 
-		&.group-border {
-			border-top: 1px solid var(--border-subtle);
-		}
+		&.group-border { border-top: 1px solid var(--border-subtle); }
 	}
 
-	/* Column-specific */
 	.cell-pc {
 		justify-content: center;
 		border-right: 1px solid var(--border-subtle);
-
-		&.wat-match {
-			background: rgba(137, 180, 250, 0.08);
-		}
+		&.wat-match { background: rgba(137, 180, 250, 0.08); }
 	}
 
-	.pc-text {
-		color: var(--text-muted);
-	}
+	.pc-text { color: var(--text-muted); }
 
 	.cell-label {
 		border-right: 1px solid var(--border-subtle);
 		overflow: hidden;
+		cursor: pointer;
+		&:hover { background: var(--hover-bg); }
+		&.wat-match { background: rgba(137, 180, 250, 0.08); }
 	}
 
 	.label-text {
@@ -292,6 +310,7 @@
 		&.row-sel { background: var(--selected-bg); }
 		&.row-hl { background: var(--highlight-bg); }
 		&.row-dim { opacity: var(--dim-opacity); }
+		&.wat-match { background: rgba(137, 180, 250, 0.08); }
 	}
 
 	.op-text {
@@ -304,13 +323,9 @@
 		color: var(--text-muted);
 	}
 
-	.addr-text {
-		font-variant-numeric: tabular-nums;
-	}
+	.addr-text { font-variant-numeric: tabular-nums; }
 
-	.cell-origin {
-		justify-content: center;
-	}
+	.cell-origin { justify-content: center; }
 
 	.origin {
 		font-size: 7px;
@@ -318,7 +333,6 @@
 		border-radius: 2px;
 		color: var(--bg-base);
 		font-weight: bold;
-
 		&.lower { background: var(--accent-blue); }
 		&.regalloc { background: var(--accent-yellow); }
 		&.fuse { background: var(--accent-purple); }
@@ -326,21 +340,14 @@
 
 	.cell-asm {
 		overflow: hidden;
-
-		code {
-			white-space: nowrap;
-		}
+		code { white-space: nowrap; }
 	}
 
 	.t-mnemonic { color: var(--text-muted); }
-	.t-reg { color: var(--accent-blue); }
 	.t-imm { color: var(--accent-yellow); }
 	.t-mem { color: var(--accent-teal); }
 	.t-label { color: var(--accent-red); font-style: italic; }
 	.t-punct { color: var(--text-dim); }
 
-	/* Hover linking: when op is hovered, highlight addr/origin/asm too */
-	.row-hov {
-		background: rgba(137, 180, 250, 0.04);
-	}
+	.row-hov { background: rgba(137, 180, 250, 0.04); }
 </style>

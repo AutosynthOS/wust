@@ -25,7 +25,7 @@
 		background: none;
 		border: none;
 		color: var(--accent-vreg);
-		padding: 0 2px;
+		padding: 0 1px;
 		cursor: pointer;
 		font-family: inherit;
 		font-size: inherit;

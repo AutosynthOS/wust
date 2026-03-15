@@ -146,6 +146,10 @@ export interface BlockView {
 	id: string;
 	successors: string[];
 	groups: WasmGroupView[];
+	/** VRegs this block expects from predecessors */
+	params: string[];
+	/** VRegs this block produces for successors */
+	results: string[];
 }
 
 export interface WasmGroupView {
