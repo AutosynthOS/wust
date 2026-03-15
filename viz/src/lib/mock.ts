@@ -74,7 +74,18 @@ export const mockTrace: ModuleTrace = {
 			{ seq: 13, type: 'ir', inst: { alu: { op: 'sub', dst: 'v3', lhs: 'v3', rhs: 'v4' } } },
 			{ seq: 14, type: 'asm', addr: 0x0000, text: 'sub sp, sp, #16', origin: 'lower', parent: 13 },
 			{ seq: 15, type: 'define', vreg: 'v5', value: { preg: 'x30' } },
-			{ seq: 16, type: 'setslot', vreg: 'v5', region: 'fibre', index: 0 },
+			{ seq: 16, type: 'setslot', vreg: 'v5', region: 'fibre', index: 0, snapshot: {
+				bindings: [
+					{ preg: 'x0', vreg: 'v0' },
+					{ preg: 'x30', vreg: 'v5' },
+				],
+				vreg_locs: [
+					{ vreg: 'v0', loc: 'reg', preg: 'x0', dirty: true },
+					{ vreg: 'v1', loc: 'const' },
+					{ vreg: 'v2', loc: 'const' },
+					{ vreg: 'v5', loc: 'reg', preg: 'x30', dirty: true },
+				],
+			}},
 
 			// ---- U0: compare n <= 1 ----
 			{ seq: 20, type: 'block_start', block: 'U0', successors: ['U4', 'U6'] },
@@ -128,7 +139,20 @@ export const mockTrace: ModuleTrace = {
 			{ seq: 73, type: 'clobber', vreg: 'v0' },
 			{ seq: 74, type: 'clobber', vreg: 'v1' },
 			{ seq: 75, type: 'clobber', vreg: 'v2' },
-			{ seq: 76, type: 'clobber', vreg: 'v5' },
+			{ seq: 76, type: 'clobber', vreg: 'v5', snapshot: {
+				bindings: [
+					{ preg: 'x0', vreg: null },
+					{ preg: 'x1', vreg: null },
+					{ preg: 'x30', vreg: null },
+				],
+				vreg_locs: [
+					{ vreg: 'v0', loc: 'mem', dirty: false },
+					{ vreg: 'v1', loc: 'const' },
+					{ vreg: 'v2', loc: 'const' },
+					{ vreg: 'v5', loc: 'mem', dirty: false },
+					{ vreg: 'v11', loc: 'reg', preg: 'x0' },
+				],
+			}},
 			{ seq: 77, type: 'asm', addr: 0x001c, text: 'str x30, [sp]', origin: 'regalloc', parent: 76 },
 			// advance g.lb
 			{ seq: 78, type: 'ir', inst: { alu: { op: 'add', dst: 'v12', lhs: 'v12', rhs: 'v13' } } },
@@ -139,7 +163,18 @@ export const mockTrace: ModuleTrace = {
 			{ seq: 82, type: 'ir', inst: { alu: { op: 'sub', dst: 'v14', lhs: 'v14', rhs: 'v15' } } },
 			{ seq: 83, type: 'asm', addr: 0x0028, text: 'sub x29, x29, #24', origin: 'lower', parent: 82 },
 			// result
-			{ seq: 84, type: 'define', vreg: 'v16', value: { preg: 'x0' } },
+			{ seq: 84, type: 'define', vreg: 'v16', value: { preg: 'x0' }, snapshot: {
+				bindings: [
+					{ preg: 'x0', vreg: 'v16' },
+				],
+				vreg_locs: [
+					{ vreg: 'v0', loc: 'mem', dirty: false },
+					{ vreg: 'v1', loc: 'const' },
+					{ vreg: 'v2', loc: 'const' },
+					{ vreg: 'v5', loc: 'mem', dirty: false },
+					{ vreg: 'v16', loc: 'reg', preg: 'x0', dirty: true },
+				],
+			}},
 			{ seq: 85, type: 'setslot', vreg: 'v16', region: 'operands', index: 0 },
 			// fuel check
 			{ seq: 86, type: 'ir', inst: { alu: { op: 'le_s', dst: 'v17', lhs: 'v17', rhs: 'v18' } } },
