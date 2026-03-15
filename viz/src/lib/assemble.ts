@@ -149,4 +149,50 @@ export function computeStateAt(func: FunctionTrace, targetSeq: number): StackSta
 	return state;
 }
 
+/** Slot diff entry for a single stack slot. */
+export interface SlotDiff {
+	vreg: string;
+	action: 'unchanged' | 'pushed' | 'popped' | 'set';
+}
+
+/** Diff for all three stacks at a given event. */
+export interface StackDiff {
+	locals: SlotDiff[];
+	ops: SlotDiff[];
+	fibre: SlotDiff[];
+}
+
+/** Compute stack state before and after a given seq, return the diff. */
+export function computeStateDiff(func: FunctionTrace, targetSeq: number): StackDiff {
+	const before = computeStateAt(func, targetSeq - 1);
+	const after = computeStateAt(func, targetSeq);
+
+	function diffStack(b: string[], a: string[]): SlotDiff[] {
+		const result: SlotDiff[] = [];
+		const maxLen = Math.max(b.length, a.length);
+
+		for (let i = 0; i < maxLen; i++) {
+			if (i >= b.length) {
+				// New slot — pushed
+				result.push({ vreg: a[i], action: 'pushed' });
+			} else if (i >= a.length) {
+				// Removed slot — popped
+				result.push({ vreg: b[i], action: 'popped' });
+			} else if (b[i] !== a[i]) {
+				// Changed — set/replaced
+				result.push({ vreg: a[i], action: 'set' });
+			} else {
+				result.push({ vreg: a[i], action: 'unchanged' });
+			}
+		}
+		return result;
+	}
+
+	return {
+		locals: diffStack(before.locals, after.locals),
+		ops: diffStack(before.ops, after.ops),
+		fibre: diffStack(before.fibre, after.fibre),
+	};
+}
+
 export { vregsRead, vregsDefined };

@@ -1,47 +1,50 @@
 <script lang="ts">
-	import type { FunctionTrace, OpView, StackState } from '$lib/types';
-	import { app, toggleVreg } from '$lib/state.svelte';
-	import { computeStateAt } from '$lib/assemble';
+	import type { FunctionTrace, OpView } from '$lib/types';
+	import { app } from '$lib/state.svelte';
+	import { computeStateDiff, type SlotDiff } from '$lib/assemble';
 	import VReg from './VReg.svelte';
-	import PReg from './PReg.svelte';
 
 	let { func, allOps }: {
 		func: FunctionTrace;
 		allOps: OpView[];
 	} = $props();
 
-	const selectedSeq = $derived(app.selectedOp);
 	const selectedEvent = $derived(
-		selectedSeq !== null ? allOps.find(o => o.seq === selectedSeq) : null
+		app.selectedOp !== null ? allOps.find(o => o.seq === app.selectedOp) : null
 	);
-	const state = $derived(
-		selectedSeq !== null ? computeStateAt(func, selectedSeq) : null
+	const diff = $derived(
+		app.selectedOp !== null ? computeStateDiff(func, app.selectedOp) : null
 	);
+
+	function renderStack(slots: SlotDiff[]): SlotDiff[] {
+		return slots;
+	}
 </script>
 
-{#if selectedEvent && state}
-	<h2>state @ seq {selectedSeq}</h2>
+{#if selectedEvent && diff}
+	<h2>state @ seq {app.selectedOp}</h2>
 	<div class="op-preview">{selectedEvent.text}</div>
 
 	{#each func.regions as region}
-		{@const stack = region.id === 'locals' ? state.locals : region.id === 'operands' ? state.ops : state.fibre}
-		<h3>{region.label} <span class="base">{region.base_preg}+{region.base_offset}</span></h3>
+		{@const slots = region.id === 'locals' ? diff.locals : region.id === 'operands' ? diff.ops : diff.fibre}
+		<h3>{region.label}</h3>
 		<div class="stack">
-			{#each stack as v, i}
-				<div class="slot" class:slot-hl={app.highlightedVreg === v}>
-					<span class="idx">{i}</span>
-					<VReg id={v} />
+			{#each slots as slot, i}
+				<div class="slot" class:pushed={slot.action === 'pushed'} class:popped={slot.action === 'popped'} class:replaced={slot.action === 'set'}>
+					<span class="diff-mark">
+						{#if slot.action === 'pushed'}+{:else if slot.action === 'popped'}−{:else if slot.action === 'set'}~{:else}&nbsp;{/if}
+					</span>
+					<span class="slot-idx">{i}</span>
+					<VReg id={slot.vreg} />
 				</div>
 			{/each}
-			{#if stack.length === 0}
+			{#if slots.length === 0}
 				<div class="empty">—</div>
 			{/if}
 		</div>
 	{/each}
 {:else}
-	<div class="placeholder">
-		click an op to inspect
-	</div>
+	<div class="placeholder">click an op to inspect</div>
 {/if}
 
 <style>
@@ -57,15 +60,6 @@
 		font-size: var(--font-size-xs);
 		color: var(--text-dim);
 		margin: 10px 0 3px 0;
-		display: flex;
-		align-items: center;
-		gap: 4px;
-	}
-
-	.base {
-		font-size: var(--font-size-xxs);
-		color: var(--text-faint);
-		font-weight: normal;
 	}
 
 	.op-preview {
@@ -87,19 +81,37 @@
 		display: flex;
 		align-items: center;
 		gap: 4px;
-		padding: 3px 6px;
+		padding: 2px 6px;
 		background: var(--bg-surface);
 		border-radius: 3px;
-		border-left: 2px solid transparent;
 		font-size: var(--font-size-base);
 
-		&.slot-hl {
-			border-left-color: var(--accent-vreg);
-			background: var(--highlight-bg);
+		&.pushed {
+			background: rgba(166, 227, 161, 0.1);
+		}
+
+		&.popped {
+			background: rgba(243, 139, 168, 0.1);
+			text-decoration: line-through;
+			opacity: 0.6;
+		}
+
+		&.replaced {
+			background: rgba(250, 179, 135, 0.1);
 		}
 	}
 
-	.idx {
+	.diff-mark {
+		min-width: 10px;
+		font-weight: bold;
+		font-size: var(--font-size-base);
+	}
+
+	.pushed .diff-mark { color: var(--accent-green); }
+	.popped .diff-mark { color: var(--accent-red); }
+	.replaced .diff-mark { color: var(--accent-vreg); }
+
+	.slot-idx {
 		color: var(--text-faint);
 		font-size: var(--font-size-xxs);
 		min-width: 8px;
@@ -114,7 +126,7 @@
 	.placeholder {
 		color: var(--text-dim);
 		font-size: var(--font-size-base);
-		padding: 30px 0;
+		padding: 20px 0;
 		text-align: center;
 	}
 </style>
