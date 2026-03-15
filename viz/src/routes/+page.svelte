@@ -203,12 +203,12 @@
 <style>
 	:global(body) { margin:0; background:#11111b; color:#cdd6f4; font-family:'SF Mono','Fira Code',monospace; font-size:12px; overflow:hidden; }
 	.layout { display:flex; height:100vh; }
-	.panel { background:#141420; padding:12px; overflow-y:auto; display:flex; flex-direction:column; gap:12px; flex-shrink:0; }
+	.panel { background:#141420; padding:12px; overflow-y:auto; display:flex; flex-direction:column; gap:12px; flex-shrink:0; user-select:none; -webkit-user-select:none; }
 	.panel.left { width:240px; border-right:1px solid #313244; }
 	.panel.right { width:200px; border-left:1px solid #313244; }
 
 	.graph { flex:1; display:flex; flex-direction:column; overflow:hidden; }
-	.tbar { display:flex; align-items:center; gap:8px; padding:6px 14px; border-bottom:1px solid #313244; background:#141420; flex-shrink:0; }
+	.tbar { display:flex; align-items:center; gap:8px; padding:6px 14px; border-bottom:1px solid #313244; background:#141420; flex-shrink:0; user-select:none; -webkit-user-select:none; }
 	h1 { font-size:15px; margin:0; color:#cba6f7; }
 	.sig { color:#6c7086; font-size:11px; } .zi { color:#585b70; font-size:10px; }
 	.tb { background:#313244; border:1px solid #45475a; color:#cdd6f4; padding:1px 6px; border-radius:3px; cursor:pointer; font-family:inherit; font-size:10px; }
@@ -219,5 +219,5 @@
 	.cv { position:absolute; top:0; left:0; transform-origin:0 0; }
 	.arr { position:absolute; top:0; left:0; pointer-events:none; z-index:0; }
 
-	.blk { position:absolute; border:1px solid #313244; border-left:3px solid; border-radius:6px; background:#181825; z-index:1; overflow:hidden; box-shadow:0 2px 12px rgba(0,0,0,0.4); }
+	.blk { position:absolute; border:1px solid #313244; border-left:3px solid; border-radius:6px; background:#181825; z-index:1; overflow:hidden; box-shadow:0 2px 12px rgba(0,0,0,0.4); user-select:none; -webkit-user-select:none; }
 </style>
