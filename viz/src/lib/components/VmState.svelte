@@ -92,7 +92,6 @@
 
 		&.popped {
 			background: rgba(243, 139, 168, 0.1);
-			text-decoration: line-through;
 			opacity: 0.6;
 		}
 

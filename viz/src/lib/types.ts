@@ -68,6 +68,8 @@ export type TraceEvent =
 
 interface BaseEvent {
 	seq: number;
+	/** Regalloc state after this event (compiler-authoritative). */
+	snapshot?: RegAllocSnapshot;
 }
 
 export interface BlockStartEvent extends BaseEvent {
@@ -164,4 +166,21 @@ export interface StackState {
 	locals: string[];
 	ops: string[];
 	fibre: string[];
+}
+
+/** Authoritative regalloc state snapshot, emitted by the compiler. */
+export interface RegAllocSnapshot {
+	/** PReg → VReg bindings (null = free) */
+	bindings: { preg: string; vreg: string | null }[];
+	/** Per-vreg location + dirty state */
+	vreg_locs: VRegLoc[];
+}
+
+export interface VRegLoc {
+	vreg: string;
+	loc: 'reg' | 'mem' | 'const' | 'pending';
+	/** Which preg, if loc === 'reg' */
+	preg?: string;
+	/** Has value been stored to its canonical slot? */
+	dirty?: boolean;
 }
