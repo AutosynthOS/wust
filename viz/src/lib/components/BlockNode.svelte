@@ -333,7 +333,7 @@
 	.cell-addr {
 		justify-content: flex-end;
 		color: var(--text-muted);
-		border-left: 1px solid var(--border-subtle);
+		border-right: 1px solid var(--border-subtle);
 	}
 
 	.addr-text { font-variant-numeric: tabular-nums; }
