@@ -108,44 +108,45 @@
 		};
 	}
 
+	function getBlockRect(el: HTMLElement) {
+		// Use offsetLeft/offsetTop which are relative to offsetParent (the grid),
+		// not affected by CSS transforms
+		return {
+			left: el.offsetLeft,
+			top: el.offsetTop,
+			width: el.offsetWidth,
+			height: el.offsetHeight,
+			right: el.offsetLeft + el.offsetWidth,
+			bottom: el.offsetTop + el.offsetHeight,
+		};
+	}
+
 	function recomputeArrows() {
 		if (!graphEl) return;
-		const graphRect = graphEl.getBoundingClientRect();
 		const res: typeof arrowPaths = [];
 
 		for (const block of blocks) {
 			const fromEl = blockEls.get(block.id);
 			if (!fromEl) continue;
-			const fr = fromEl.getBoundingClientRect();
+			const fr = getBlockRect(fromEl);
 			const is2 = block.successors.length === 2;
 
 			for (let i = 0; i < block.successors.length; i++) {
 				const s = block.successors[i];
 				const toEl = blockEls.get(s);
 				if (!toEl) continue;
-				const tr = toEl.getBoundingClientRect();
+				const tr = getBlockRect(toEl);
 				const fall = !is2 || i === 1;
 
-				// Coordinates relative to graphEl
-				const fLeft = fr.left - graphRect.left;
-				const fRight = fr.right - graphRect.left;
-				const fTop = fr.top - graphRect.top;
-				const fBottom = fr.bottom - graphRect.top;
-				const fCx = fLeft + fr.width * 0.4;
-
-				const tLeft = tr.left - graphRect.left;
-				const tTop = tr.top - graphRect.top;
-				const tCx = tLeft + tr.width * 0.4;
-
 				if (fall) {
-					res.push({ fall: true, path: `M${fCx},${fBottom} L${tCx},${tTop}` });
+					const fx = fr.left + fr.width * 0.4;
+					const tx = tr.left + tr.width * 0.4;
+					res.push({ fall: true, path: `M${fx},${fr.bottom} L${tx},${tr.top}` });
 				} else {
-					// Branch: from right edge at bottom area, curve to target top
-					const fy = fTop + fr.height * 0.7;
-					const tx = tLeft;
-					const ty = tTop + 12;
-					const cpx = (fRight + tx) / 2;
-					res.push({ fall: false, path: `M${fRight},${fy} C${cpx},${fy} ${cpx},${ty} ${tx},${ty}` });
+					const fy = fr.top + fr.height * 0.7;
+					const cpx = (fr.right + tr.left) / 2;
+					const ty = tr.top + 12;
+					res.push({ fall: false, path: `M${fr.right},${fy} C${cpx},${fy} ${cpx},${ty} ${tr.left},${ty}` });
 				}
 			}
 		}
@@ -243,33 +244,33 @@
 					</div>
 
 					<!-- Graph grid + SVG arrows -->
-					<div class="func-graph" bind:this={graphEl}>
-						<!-- SVG arrow overlay -->
-						<svg class="arrows">
-							<defs>
-								<marker id="af" viewBox="0 0 10 10" refX="10" refY="5"
-									markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-									<path d="M0 0L10 5L0 10z" fill="var(--text-dim)" />
-								</marker>
-								<marker id="ab" viewBox="0 0 10 10" refX="10" refY="5"
-									markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-									<path d="M0 0L10 5L0 10z" fill="var(--accent-red)" />
-								</marker>
-							</defs>
-							{#each arrowPaths as a}
-								<path
-									d={a.path}
-									fill="none"
-									stroke={a.fall ? 'var(--text-dim)' : 'var(--accent-red)'}
-									stroke-width={a.fall ? 1.5 : 2}
-									stroke-dasharray={a.fall ? '' : '6,3'}
-									marker-end="url(#{a.fall ? 'af' : 'ab'})"
-								/>
-							{/each}
-						</svg>
-
+					<div class="func-graph">
 						<!-- Blocks in CSS grid -->
-						<div class="block-grid" style="grid-template-columns: repeat({maxCol + 1}, auto); grid-template-rows: repeat({maxRow + 1}, auto);">
+						<div class="block-grid" bind:this={graphEl} style="grid-template-columns: repeat({maxCol + 1}, auto); grid-template-rows: repeat({maxRow + 1}, auto);">
+							<!-- SVG arrow overlay -->
+							<svg class="arrows">
+								<defs>
+									<marker id="af" viewBox="0 0 10 10" refX="10" refY="5"
+										markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+										<path d="M0 0L10 5L0 10z" fill="var(--text-dim)" />
+									</marker>
+									<marker id="ab" viewBox="0 0 10 10" refX="10" refY="5"
+										markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+										<path d="M0 0L10 5L0 10z" fill="var(--accent-red)" />
+									</marker>
+								</defs>
+								{#each arrowPaths as a}
+									<path
+										d={a.path}
+										fill="none"
+										stroke={a.fall ? 'var(--text-dim)' : 'var(--accent-red)'}
+										stroke-width={a.fall ? 1.5 : 2}
+										stroke-dasharray={a.fall ? '' : '6,3'}
+										marker-end="url(#{a.fall ? 'af' : 'ab'})"
+									/>
+								{/each}
+							</svg>
+
 							{#each blocks as block}
 								{@const pos = blockPos.get(block.id)!}
 								<div
@@ -480,6 +481,14 @@
 		padding: 16px;
 	}
 
+	.block-grid {
+		display: grid;
+		gap: 24px 60px;
+		position: relative;
+		width: max-content;
+		align-items: start;
+	}
+
 	.arrows {
 		position: absolute;
 		top: 0;
@@ -487,16 +496,8 @@
 		width: 100%;
 		height: 100%;
 		pointer-events: none;
-		z-index: 0;
+		z-index: 2;
 		overflow: visible;
-	}
-
-	.block-grid {
-		display: grid;
-		gap: 24px 60px;
-		position: relative;
-		z-index: 1;
-		width: max-content;
 	}
 
 	.block {
