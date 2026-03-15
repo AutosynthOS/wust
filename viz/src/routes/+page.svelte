@@ -187,71 +187,67 @@
 		<div class="viewport">
 			<div
 				class="canvas"
-				style="
-					transform: translate({panX}px, {panY}px) scale({zoom});
-					width: {canvasW}px;
-					height: {canvasH}px;
-				"
+				style="transform: translate({panX}px, {panY}px) scale({zoom});"
 			>
-				<!-- Function container -->
-				<div class="func-container" style="width: {canvasW - 10}px; height: {canvasH - 10}px;">
-					<div class="func-header">
-						<span class="func-name">{func.name ?? `func[${func.index}]`}</span>
-						<span class="func-sig">({func.params.map(p => p.width).join(', ')}) → ({func.results.map(r => r.width).join(', ')})</span>
+				<!-- Function container: flex row [source | graph] -->
+				<div class="func-container">
+					<!-- Source column -->
+					<div class="func-sidebar">
+						<div class="func-header">
+							<span class="func-name">{func.name ?? `func[${func.index}]`}</span>
+							<span class="func-sig">({func.params.map(p => p.width).join(', ')}) → ({func.results.map(r => r.width).join(', ')})</span>
+						</div>
+						<div class="func-source">
+							{#each trace.source.filter(l => l.func_index === func.index) as line}
+								<button
+									class="src-line"
+									class:src-active={app.selectedWasmPc === line.pc}
+									class:src-match={app.highlightedWasmPcs.has(line.pc)}
+									onclick={() => toggleSourceLine(line)}
+								>
+									<span class="src-pc">{line.pc}</span>
+									<code class="src-text" style="padding-left: {line.indent * 10}px">{line.text}</code>
+								</button>
+							{/each}
+						</div>
 					</div>
-					<div class="func-source">
-						{#each trace.source.filter(l => l.func_index === func.index) as line}
-							<button
-								class="src-line"
-								class:src-active={app.selectedWasmPc === line.pc}
-								class:src-match={app.highlightedWasmPcs.has(line.pc)}
-								onclick={() => toggleSourceLine(line)}
+
+					<!-- Graph area: blocks + arrows -->
+					<div class="func-graph" style="width: {canvasW}px; height: {canvasH}px;">
+						<svg class="arrows" width={canvasW} height={canvasH}>
+							<defs>
+								<marker id="af" viewBox="0 0 10 10" refX="10" refY="5"
+									markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+									<path d="M0 0L10 5L0 10z" fill="var(--text-dim)" />
+								</marker>
+								<marker id="ab" viewBox="0 0 10 10" refX="10" refY="5"
+									markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+									<path d="M0 0L10 5L0 10z" fill="var(--accent-red)" />
+								</marker>
+							</defs>
+							{#each arrows as a}
+								<path
+									d={a.path}
+									fill="none"
+									stroke={a.fall ? 'var(--text-dim)' : 'var(--accent-red)'}
+									stroke-width={a.fall ? 1.5 : 2}
+									stroke-dasharray={a.fall ? '' : '6,3'}
+									marker-end="url(#{a.fall ? 'af' : 'ab'})"
+								/>
+							{/each}
+						</svg>
+
+						{#each blocks as block}
+							{@const rect = getRect(block.id)}
+							<div
+								class="block"
+								style="left: {rect.x}px; top: {rect.y}px; width: {rect.w}px;"
 							>
-								<span class="src-pc">{line.pc}</span>
-								<code class="src-text" style="padding-left: {line.indent * 10}px">{line.text}</code>
-							</button>
+								<BlockNode {block} {func} />
+							</div>
 						{/each}
 					</div>
 				</div>
-
-				<!-- SVG arrows -->
-				<svg class="arrows" width={canvasW} height={canvasH}>
-					<defs>
-						<marker id="af" viewBox="0 0 10 10" refX="10" refY="5"
-							markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-							<path d="M0 0L10 5L0 10z" fill="var(--text-dim)" />
-						</marker>
-						<marker id="ab" viewBox="0 0 10 10" refX="10" refY="5"
-							markerWidth="7" markerHeight="7" orient="auto-start-reverse">
-							<path d="M0 0L10 5L0 10z" fill="var(--accent-red)" />
-						</marker>
-					</defs>
-					{#each arrows as a}
-						<path
-							d={a.path}
-							fill="none"
-							stroke={a.fall ? 'var(--text-dim)' : 'var(--accent-red)'}
-							stroke-width={a.fall ? 1.5 : 2}
-							stroke-dasharray={a.fall ? '' : '6,3'}
-							marker-end="url(#{a.fall ? 'af' : 'ab'})"
-						/>
-					{/each}
-				</svg>
-
-				<!-- Blocks -->
-				{#each blocks as block}
-					{@const rect = getRect(block.id)}
-					<div
-						class="block"
-						style="
-							left: {rect.x}px;
-							top: {rect.y}px;
-							width: {rect.w}px;
-						"
-					>
-						<BlockNode {block} {func} />
-					</div>
-				{/each}
 			</div>
 		</div>
 	</main>
@@ -349,22 +345,27 @@
 	}
 
 	.func-container {
-		position: absolute;
-		top: 0;
-		left: 0;
+		display: flex;
+		gap: 0;
 		background: rgba(24, 24, 37, 0.3);
 		border: 1px solid rgba(49, 50, 68, 0.4);
 		border-radius: 10px;
-		pointer-events: none;
+		overflow: hidden;
+	}
 
-		& > * { pointer-events: auto; }
+	.func-sidebar {
+		min-width: 160px;
+		border-right: 1px solid var(--border-subtle);
+		display: flex;
+		flex-direction: column;
 	}
 
 	.func-header {
-		padding: 6px 12px;
+		padding: 6px 10px;
 		display: flex;
-		gap: 6px;
-		align-items: baseline;
+		flex-direction: column;
+		gap: 2px;
+		border-bottom: 1px solid var(--border-subtle);
 	}
 
 	.func-name {
@@ -375,20 +376,19 @@
 
 	.func-sig {
 		color: var(--text-muted);
-		font-size: var(--font-size-base);
+		font-size: var(--font-size-sm);
 	}
 
 	.func-source {
 		display: flex;
 		flex-direction: column;
-		padding: 0 8px 8px;
-		max-width: 180px;
+		padding: 4px 0;
 	}
 
 	.src-line {
 		display: flex;
 		gap: 4px;
-		padding: 0 4px;
+		padding: 0 6px;
 		background: none;
 		border: none;
 		border-left: 2px solid transparent;
@@ -422,6 +422,10 @@
 	}
 
 	.src-active .src-text { color: var(--text); }
+
+	.func-graph {
+		position: relative;
+	}
 
 	h2 {
 		font-size: var(--font-size-sm);
