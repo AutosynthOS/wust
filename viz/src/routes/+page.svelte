@@ -163,7 +163,6 @@
 	>
 		<div class="toolbar">
 			<span class="zoom">{Math.round(zoom * 100)}%</span>
-			<button class="btn" onclick={() => { zoom = 0.85; panX = 20; panY = 20; }}>reset</button>
 			{#if app.highlightedVreg}
 				<button class="btn" onclick={() => app.highlightedVreg = null}>
 					✕ {app.highlightedVreg}

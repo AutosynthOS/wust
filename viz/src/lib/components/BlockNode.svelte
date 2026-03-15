@@ -1,11 +1,15 @@
 <script lang="ts">
-	import type { BlockView, FunctionTrace } from '$lib/types';
+	import type { BlockView, FunctionTrace, OpView } from '$lib/types';
 	import { app } from '$lib/state.svelte';
 	import OpRow from './OpRow.svelte';
 
 	let { block, func }: { block: BlockView; func: FunctionTrace } = $props();
 
 	const ROW_H = 20;
+
+	function opHeight(op: OpView): number {
+		return Math.max(1, op.asm.length) * ROW_H;
+	}
 
 	function groupHeight(group: typeof block.groups[0]): number {
 		let rows = 0;
@@ -24,35 +28,29 @@
 </div>
 
 <div class="body">
-	<!-- PC column -->
-	<div class="col-pc">
-		{#each block.groups as group}
-			<div class="pc-cell" style="height: {groupHeight(group)}px"
+	{#each block.groups as group, gi}
+		<div class="group" class:group-border={gi > 0}>
+			<!-- PC -->
+			<div class="col-pc" style="height: {groupHeight(group)}px"
 				class:wat-match={app.highlightedWasmPcs.size > 0 && group.pc !== null && app.highlightedWasmPcs.has(group.pc)}>
 				{#if group.pc !== null}
 					<span class="pc">{group.pc}</span>
 				{/if}
 			</div>
-		{/each}
-	</div>
 
-	<!-- Label column -->
-	<div class="col-label">
-		{#each block.groups as group}
-			<div class="label-cell" style="height: {groupHeight(group)}px">
+			<!-- Label -->
+			<div class="col-label" style="height: {groupHeight(group)}px">
 				<span class="label-text">{group.label}</span>
 			</div>
-		{/each}
-	</div>
 
-	<!-- Ops + ASM -->
-	<div class="col-main">
-		{#each block.groups as group}
-			{#each group.ops as op}
-				<OpRow {op} />
-			{/each}
-		{/each}
-	</div>
+			<!-- Ops + ASM rows -->
+			<div class="col-main">
+				{#each group.ops as op}
+					<OpRow {op} />
+				{/each}
+			</div>
+		</div>
+	{/each}
 </div>
 
 <style>
@@ -78,43 +76,42 @@
 
 	.body {
 		display: flex;
+		flex-direction: column;
+	}
+
+	.group {
+		display: flex;
+
+		&.group-border {
+			border-top: 1px solid var(--border-subtle);
+		}
 	}
 
 	.col-pc {
 		min-width: 28px;
 		display: flex;
-		flex-direction: column;
-		border-right: 1px solid var(--border-subtle);
-	}
-
-	.pc-cell {
-		display: flex;
 		align-items: center;
 		justify-content: center;
 		padding: 0 4px;
-		box-sizing: border-box;
+		border-right: 1px solid var(--border-subtle);
 
-		&.wat-match { background: rgba(137, 180, 250, 0.08); }
+		&.wat-match {
+			background: rgba(137, 180, 250, 0.08);
+		}
 	}
 
 	.pc {
-		color: var(--text-dim);
-		font-size: var(--font-size-xxs);
+		color: var(--text-muted);
+		font-size: var(--font-size-base);
 	}
 
 	.col-label {
 		min-width: 100px;
 		max-width: 130px;
 		display: flex;
-		flex-direction: column;
-		border-right: 1px solid var(--border-subtle);
-	}
-
-	.label-cell {
-		display: flex;
 		align-items: center;
 		padding: 0 6px;
-		box-sizing: border-box;
+		border-right: 1px solid var(--border-subtle);
 		overflow: hidden;
 	}
 
