@@ -1,5 +1,6 @@
 <script lang="ts">
 	import '$lib/theme.css';
+	import { onMount } from 'svelte';
 	import { mockTrace } from '$lib/mock';
 	import type { BlockView, OpView } from '$lib/types';
 	import { assembleBlocks } from '$lib/assemble';
@@ -14,8 +15,9 @@
 	const func = trace.functions[0];
 	const blocks = assembleBlocks(func);
 	const allOps = blocks.flatMap(b => b.groups.flatMap(g => g.ops));
+	const blockMap = new Map(blocks.map(b => [b.id, b]));
 
-	// Build vreg initial values from define events
+	// Vreg initial values from define events
 	const vregInits = new Map<string, string>();
 	for (const e of func.events) {
 		if (e.type === 'define') {
@@ -26,15 +28,7 @@
 		}
 	}
 
-	// --- Pan/zoom ---
-	let zoom = $state(0.85);
-	let panX = $state(20);
-	let panY = $state(20);
-	let isPanning = $state(false);
-	let psx = 0; let psy = 0; let ppx = 0; let ppy = 0;
-
-	// --- Graph layout ---
-	const blockMap = new Map(blocks.map(b => [b.id, b]));
+	// --- Graph layout: assign grid col/row per block ---
 	const blockPos = new Map<string, { col: number; row: number }>();
 
 	function layout() {
@@ -62,90 +56,22 @@
 	}
 	layout();
 
-	const ROW_H = 20;
-	const BLOCK_W = 560;
-	const GAP_X = 80;
-	const GAP_Y = 36;
-
-	function blockHeight(block: BlockView): number {
-		let rows = 0;
-		for (const g of block.groups) {
-			for (const op of g.ops) {
-				rows += Math.max(1, op.asm.length);
-			}
-		}
-		return 24 + Math.max(rows, 1) * ROW_H + 4;
-	}
-
-	const maxRow = Math.max(...[...blockPos.values()].map(p => p.row), 0);
-	const rowY = new Map<number, number>();
-	let yAcc = 0;
-	for (let r = 0; r <= maxRow; r++) {
-		rowY.set(r, yAcc);
-		let mh = 50;
-		for (const [id, pos] of blockPos)
-			if (pos.row === r) mh = Math.max(mh, blockHeight(blockMap.get(id)!));
-		yAcc += mh + GAP_Y;
-	}
 	const maxCol = Math.max(...[...blockPos.values()].map(p => p.col), 0);
-	const canvasW = (maxCol + 1) * (BLOCK_W + GAP_X) + 100;
-	const canvasH = yAcc + 60;
+	const maxRow = Math.max(...[...blockPos.values()].map(p => p.row), 0);
 
-	function getRect(id: string) {
-		const pos = blockPos.get(id)!;
-		return {
-			x: 40 + pos.col * (BLOCK_W + GAP_X),
-			y: 30 + rowY.get(pos.row)!,
-			w: BLOCK_W,
-			h: blockHeight(blockMap.get(id)!),
-		};
-	}
+	// --- Pan/zoom ---
+	let zoom = $state(0.85);
+	let panX = $state(20);
+	let panY = $state(20);
+	let isPanning = $state(false);
+	let psx = 0; let psy = 0; let ppx = 0; let ppy = 0;
 
-	const HEADER_H = 28;
-	const FOOTER_H = 24;
-
-	function computeArrows() {
-		const res: { fall: boolean; path: string }[] = [];
-		for (const block of blocks) {
-			const fr = getRect(block.id);
-			const is2 = block.successors.length === 2;
-
-			// Y position of the last instruction (branch) in the block
-			let totalRows = 0;
-			for (const g of block.groups) {
-				for (const op of g.ops) totalRows += Math.max(1, op.asm.length);
-			}
-			const branchY = fr.y + HEADER_H + (totalRows - 1) * ROW_H + ROW_H / 2;
-
-			for (let i = 0; i < block.successors.length; i++) {
-				const s = block.successors[i];
-				if (!blockPos.has(s)) continue;
-				const tr = getRect(s);
-				const fall = !is2 || i === 1;
-				if (fall) {
-					const x = fr.x + fr.w * 0.4;
-					res.push({ fall: true, path: `M${x},${fr.y + fr.h} L${x},${tr.y}` });
-				} else {
-					const fx = fr.x + fr.w;
-					const fy = branchY;
-					const tx = tr.x;
-					const ty = tr.y + 12;
-					res.push({ fall: false, path: `M${fx},${fy} C${(fx + tx) / 2},${fy} ${(fx + tx) / 2},${ty} ${tx},${ty}` });
-				}
-			}
-		}
-		return res;
-	}
-	const arrows = computeArrows();
-
-	// --- Handlers ---
 	function onWheel(e: WheelEvent) {
 		e.preventDefault();
 		const d = e.deltaY > 0 ? 0.92 : 1.08;
 		const nz = Math.max(0.15, Math.min(3, zoom * d));
 		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-		const cx = e.clientX - r.left;
-		const cy = e.clientY - r.top;
+		const cx = e.clientX - r.left, cy = e.clientY - r.top;
 		panX = cx - (cx - panX) * (nz / zoom);
 		panY = cy - (cy - panY) * (nz / zoom);
 		zoom = nz;
@@ -168,9 +94,77 @@
 		}
 	}
 
-	function onPtrUp() {
-		isPanning = false;
+	function onPtrUp() { isPanning = false; }
+
+	// --- SVG arrows from DOM bounding boxes ---
+	let graphEl: HTMLDivElement;
+	const blockEls = new Map<string, HTMLDivElement>();
+	let arrowPaths: { fall: boolean; path: string }[] = $state([]);
+
+	function registerBlock(node: HTMLDivElement, id: string) {
+		blockEls.set(id, node);
+		requestAnimationFrame(recomputeArrows);
+		return {
+			destroy() { blockEls.delete(id); }
+		};
 	}
+
+	function recomputeArrows() {
+		if (!graphEl) return;
+		const graphRect = graphEl.getBoundingClientRect();
+		const res: typeof arrowPaths = [];
+
+		for (const block of blocks) {
+			const fromEl = blockEls.get(block.id);
+			if (!fromEl) continue;
+			const fr = fromEl.getBoundingClientRect();
+			const is2 = block.successors.length === 2;
+
+			for (let i = 0; i < block.successors.length; i++) {
+				const s = block.successors[i];
+				const toEl = blockEls.get(s);
+				if (!toEl) continue;
+				const tr = toEl.getBoundingClientRect();
+				const fall = !is2 || i === 1;
+
+				// Coordinates relative to graphEl
+				const fLeft = fr.left - graphRect.left;
+				const fRight = fr.right - graphRect.left;
+				const fTop = fr.top - graphRect.top;
+				const fBottom = fr.bottom - graphRect.top;
+				const fCx = fLeft + fr.width * 0.4;
+
+				const tLeft = tr.left - graphRect.left;
+				const tTop = tr.top - graphRect.top;
+				const tCx = tLeft + tr.width * 0.4;
+
+				if (fall) {
+					res.push({ fall: true, path: `M${fCx},${fBottom} L${tCx},${tTop}` });
+				} else {
+					// Branch: from right edge at bottom area, curve to target top
+					const fy = fTop + fr.height * 0.7;
+					const tx = tLeft;
+					const ty = tTop + 12;
+					const cpx = (fRight + tx) / 2;
+					res.push({ fall: false, path: `M${fRight},${fy} C${cpx},${fy} ${cpx},${ty} ${tx},${ty}` });
+				}
+			}
+		}
+		arrowPaths = res;
+	}
+
+	onMount(() => {
+		recomputeArrows();
+	});
+
+	// Recompute arrows whenever blocks might resize
+	$effect(() => {
+		// Touch reactive deps that might cause layout changes
+		app.selectedOp;
+		app.highlightedVreg;
+		// Tick then measure
+		requestAnimationFrame(recomputeArrows);
+	});
 </script>
 
 <div class="layout">
@@ -216,13 +210,9 @@
 		</div>
 
 		<div class="viewport">
-			<div
-				class="canvas"
-				style="transform: translate({panX}px, {panY}px) scale({zoom});"
-			>
-				<!-- Function container: flex row [source | graph] -->
+			<div class="canvas" style="transform: translate({panX}px, {panY}px) scale({zoom});">
 				<div class="func-container">
-					<!-- Source column -->
+					<!-- Source sidebar -->
 					<div class="func-sidebar">
 						<div class="func-header">
 							<span class="func-name">{func.name ?? `func[${func.index}]`}</span>
@@ -255,9 +245,10 @@
 						</div>
 					</div>
 
-					<!-- Graph area: blocks + arrows -->
-					<div class="func-graph" style="width: {canvasW}px; height: {canvasH}px;">
-						<svg class="arrows" width={canvasW} height={canvasH}>
+					<!-- Graph grid + SVG arrows -->
+					<div class="func-graph" bind:this={graphEl}>
+						<!-- SVG arrow overlay -->
+						<svg class="arrows">
 							<defs>
 								<marker id="af" viewBox="0 0 10 10" refX="10" refY="5"
 									markerWidth="7" markerHeight="7" orient="auto-start-reverse">
@@ -268,7 +259,7 @@
 									<path d="M0 0L10 5L0 10z" fill="var(--accent-red)" />
 								</marker>
 							</defs>
-							{#each arrows as a}
+							{#each arrowPaths as a}
 								<path
 									d={a.path}
 									fill="none"
@@ -280,21 +271,24 @@
 							{/each}
 						</svg>
 
-						{#each blocks as block}
-							{@const rect = getRect(block.id)}
-							<div
-								class="block"
-								style="left: {rect.x}px; top: {rect.y}px; width: {rect.w}px;"
-							>
-								<BlockNode {block} {func} />
-							</div>
-						{/each}
+						<!-- Blocks in CSS grid -->
+						<div class="block-grid" style="grid-template-columns: repeat({maxCol + 1}, auto); grid-template-rows: repeat({maxRow + 1}, auto);">
+							{#each blocks as block}
+								{@const pos = blockPos.get(block.id)!}
+								<div
+									class="block"
+									style="grid-column: {pos.col + 1}; grid-row: {pos.row + 1};"
+									use:registerBlock={block.id}
+								>
+									<BlockNode {block} {func} />
+								</div>
+							{/each}
+						</div>
 					</div>
 				</div>
 			</div>
 		</div>
 	</main>
-
 </div>
 
 <style>
@@ -303,7 +297,7 @@
 		background: var(--bg-base);
 		color: var(--text);
 		font-family: var(--font-mono);
-		font-size: 12px;
+		font-size: 13px;
 		overflow: hidden;
 	}
 
@@ -327,8 +321,37 @@
 			width: 240px;
 			border-right: 1px solid var(--border);
 		}
-
 	}
+
+	h2 {
+		font-size: var(--font-size-sm);
+		text-transform: uppercase;
+		letter-spacing: 1px;
+		color: var(--text-muted);
+		margin: 0;
+	}
+
+	.vreg-list {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+
+	.vreg-row {
+		display: flex;
+		align-items: center;
+		gap: 2px;
+		padding: 1px 6px;
+		border-radius: 3px;
+		font-size: var(--font-size-base);
+		&.vreg-active { background: var(--highlight-bg); }
+	}
+
+	.vreg-sep { color: var(--text-faint); }
+	.vreg-w { color: var(--text-muted); }
+	.vreg-eq { color: var(--text-faint); margin: 0 2px; }
+	.vreg-init { color: var(--accent-teal); }
+	.vreg-spacer { flex: 1; }
 
 	.graph {
 		flex: 1;
@@ -350,11 +373,7 @@
 		-webkit-user-select: none;
 	}
 
-	.zoom {
-		color: var(--text-dim);
-		font-size: var(--font-size-sm);
-	}
-
+	.zoom { color: var(--text-dim); font-size: var(--font-size-sm); }
 	.btn {
 		background: var(--bg-elevated);
 		border: 1px solid var(--text-faint);
@@ -364,15 +383,9 @@
 		cursor: pointer;
 		font-family: inherit;
 		font-size: var(--font-size-sm);
-
 		&:hover { background: var(--text-faint); }
 	}
-
-	.hint {
-		margin-left: auto;
-		color: var(--text-faint);
-		font-size: var(--font-size-xs);
-	}
+	.hint { margin-left: auto; color: var(--text-faint); font-size: var(--font-size-xs); }
 
 	.viewport {
 		flex: 1;
@@ -381,15 +394,13 @@
 	}
 
 	.canvas {
-		position: absolute;
-		top: 0;
-		left: 0;
 		transform-origin: 0 0;
+		padding: 20px;
 	}
 
+	/* Function container */
 	.func-container {
 		display: flex;
-		gap: 0;
 		background: rgba(24, 24, 37, 0.3);
 		border: 1px solid rgba(49, 50, 68, 0.4);
 		border-radius: 10px;
@@ -424,11 +435,7 @@
 		flex-wrap: wrap;
 	}
 
-	.func-param {
-		font-size: var(--font-size-base);
-	}
-
-	.fp-preg { color: var(--accent-blue); }
+	.func-param { font-size: var(--font-size-base); }
 	.fp-colon { color: var(--text-faint); }
 	.fp-type { color: var(--text-muted); }
 	.fp-sep { color: var(--text-faint); margin-right: 2px; }
@@ -453,15 +460,9 @@
 		font-size: var(--font-size-sm);
 		text-align: left;
 		line-height: 18px;
-
 		&:hover { background: var(--hover-bg); }
-		&.src-active {
-			background: rgba(137, 180, 250, 0.1);
-			border-left-color: var(--accent-blue);
-		}
-		&.src-match {
-			background: rgba(137, 180, 250, 0.06);
-		}
+		&.src-active { background: rgba(137, 180, 250, 0.1); border-left-color: var(--accent-blue); }
+		&.src-match { background: rgba(137, 180, 250, 0.06); }
 	}
 
 	.src-pc {
@@ -471,62 +472,37 @@
 		font-size: var(--font-size-sm);
 	}
 
-	.src-text {
-		color: var(--text-secondary);
-		white-space: pre;
-	}
-
+	.src-text { color: var(--text-secondary); white-space: pre; }
 	.src-active .src-text { color: var(--text); }
 
+	/* Graph area */
 	.func-graph {
 		position: relative;
 		background: rgba(0, 0, 0, 0.15);
+		padding: 16px;
 	}
-
-	h2 {
-		font-size: var(--font-size-sm);
-		text-transform: uppercase;
-		letter-spacing: 1px;
-		color: var(--text-muted);
-		margin: 0;
-	}
-
-	.vreg-list {
-		display: flex;
-		flex-direction: column;
-		gap: 1px;
-	}
-
-	.vreg-row {
-		display: flex;
-		align-items: center;
-		gap: 6px;
-		padding: 1px 6px;
-		border-radius: 3px;
-		font-size: var(--font-size-base);
-
-		&.vreg-active { background: var(--highlight-bg); }
-	}
-
-	.vreg-sep { color: var(--text-faint); }
-	.vreg-w { color: var(--text-muted); }
-	.vreg-eq { color: var(--text-faint); margin: 0 2px; }
-	.vreg-init { color: var(--accent-teal); }
-	.vreg-spacer { flex: 1; }
 
 	.arrows {
 		position: absolute;
 		top: 0;
 		left: 0;
+		width: 100%;
+		height: 100%;
 		pointer-events: none;
 		z-index: 0;
+		overflow: visible;
+	}
+
+	.block-grid {
+		display: grid;
+		gap: 24px 60px;
+		position: relative;
+		z-index: 1;
 	}
 
 	.block {
-		position: absolute;
 		border-radius: 6px;
 		background: rgba(22, 22, 32, 0.7);
-		z-index: 1;
 		overflow: hidden;
 		user-select: none;
 		-webkit-user-select: none;
