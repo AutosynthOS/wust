@@ -289,7 +289,8 @@
 	}
 
 	.cell-pc {
-		justify-content: center;
+		justify-content: flex-end;
+		padding: 2px 8px;
 		border-right: 1px solid var(--border-subtle);
 		&.wat-match { background: rgba(137, 180, 250, 0.08); }
 	}
@@ -332,6 +333,7 @@
 
 	.cell-addr {
 		justify-content: flex-end;
+		padding: 2px 8px;
 		color: var(--text-muted);
 		border-right: 1px solid var(--border-subtle);
 	}
