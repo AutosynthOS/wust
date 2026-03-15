@@ -2,6 +2,9 @@ import type { ModuleTrace } from './types';
 
 export const mockTrace: ModuleTrace = {
 	source: [
+		{ pc: -3, text: 'param 0: i32', indent: 0, func_index: 0 },
+		{ pc: -2, text: 'local 1: i32', indent: 0, func_index: 0 },
+		{ pc: -1, text: 'local 2: i32', indent: 0, func_index: 0 },
 		{ pc: 0, text: 'local.get 0', indent: 0, func_index: 0 },
 		{ pc: 1, text: 'i32.const 1', indent: 0, func_index: 0 },
 		{ pc: 2, text: 'i32.le_s', indent: 0, func_index: 0 },

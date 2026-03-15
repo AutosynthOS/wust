@@ -195,7 +195,19 @@
 					<div class="func-sidebar">
 						<div class="func-header">
 							<span class="func-name">{func.name ?? `func[${func.index}]`}</span>
-							<span class="func-sig">({func.params.map(p => `${p.width} ${p.preg ?? ''}`).join(', ')}) → ({func.results.map(r => `${r.width} ${r.preg ?? ''}`).join(', ')})</span>
+							<div class="func-params">
+								{#each func.params as p, i}
+									<span class="func-param">
+										<span class="fp-preg">{p.preg}</span><span class="fp-colon">:</span><span class="fp-type">{p.width}</span>{#if i < func.params.length - 1}<span class="fp-sep">,</span>{/if}
+									</span>
+								{/each}
+								<span class="fp-arrow">→</span>
+								{#each func.results as r, i}
+									<span class="func-param">
+										<span class="fp-preg">{r.preg}</span><span class="fp-colon">:</span><span class="fp-type">{r.width}</span>{#if i < func.results.length - 1}<span class="fp-sep">,</span>{/if}
+									</span>
+								{/each}
+							</div>
 						</div>
 						<div class="func-source">
 							{#each trace.source.filter(l => l.func_index === func.index) as line}
@@ -205,7 +217,7 @@
 									class:src-match={app.highlightedWasmPcs.has(line.pc)}
 									onclick={() => toggleSourceLine(line)}
 								>
-									<span class="src-pc">{line.pc}</span>
+									<span class="src-pc">{line.pc >= 0 ? line.pc : ''}</span>
 									<code class="src-text" style="padding-left: {line.indent * 10}px">{line.text}</code>
 								</button>
 							{/each}
@@ -374,10 +386,22 @@
 		font-size: var(--font-size-base);
 	}
 
-	.func-sig {
-		color: var(--text-muted);
-		font-size: var(--font-size-sm);
+	.func-params {
+		display: flex;
+		gap: 4px;
+		align-items: center;
+		flex-wrap: wrap;
 	}
+
+	.func-param {
+		font-size: var(--font-size-base);
+	}
+
+	.fp-preg { color: var(--accent-blue); }
+	.fp-colon { color: var(--text-faint); }
+	.fp-type { color: var(--text-muted); }
+	.fp-sep { color: var(--text-faint); margin-right: 2px; }
+	.fp-arrow { color: var(--text-faint); margin: 0 2px; }
 
 	.func-source {
 		display: flex;
