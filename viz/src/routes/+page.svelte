@@ -3,10 +3,10 @@
 	import { mockTrace } from '$lib/mock';
 	import type { BlockView, OpView } from '$lib/types';
 	import { assembleBlocks } from '$lib/assemble';
-	import { app } from '$lib/state.svelte';
-	import WatPanel from '$lib/components/WatPanel.svelte';
+	import { app, toggleSourceLine } from '$lib/state.svelte';
 	import BlockNode from '$lib/components/BlockNode.svelte';
 	import VmState from '$lib/components/VmState.svelte';
+	import VReg from '$lib/components/VReg.svelte';
 
 	const trace = mockTrace;
 	const func = trace.functions[0];
@@ -151,7 +151,20 @@
 
 <div class="layout">
 	<aside class="panel left">
-		<WatPanel {trace} {func} />
+		<VmState {func} {allOps} />
+
+		<h2>vregs</h2>
+		<div class="vreg-list">
+			{#each func.vregs as def}
+				<div class="vreg-row" class:vreg-active={app.highlightedVreg === def.id}>
+					<VReg id={def.id} width={def.width} target={def.target} />
+					<span class="vreg-w">{def.width}</span>
+					{#if def.target}
+						<span class="vreg-t">→{def.target}</span>
+					{/if}
+				</div>
+			{/each}
+		</div>
 	</aside>
 
 	<main
@@ -183,7 +196,21 @@
 				<!-- Function container -->
 				<div class="func-container" style="width: {canvasW - 10}px; height: {canvasH - 10}px;">
 					<div class="func-header">
-						{func.name ?? `func[${func.index}]`}({func.params.map(p => `${p.name ?? `$${p.index}`}: ${p.width}`).join(', ')}) → {func.results.map(r => r.width).join(', ')}
+						<span class="func-name">{func.name ?? `func[${func.index}]`}</span>
+						<span class="func-sig">({func.params.map(p => p.width).join(', ')}) → ({func.results.map(r => r.width).join(', ')})</span>
+					</div>
+					<div class="func-source">
+						{#each trace.source.filter(l => l.func_index === func.index) as line}
+							<button
+								class="src-line"
+								class:src-active={app.selectedWasmPc === line.pc}
+								class:src-match={app.highlightedWasmPcs.has(line.pc)}
+								onclick={() => toggleSourceLine(line)}
+							>
+								<span class="src-pc">{line.pc}</span>
+								<code class="src-text" style="padding-left: {line.indent * 10}px">{line.text}</code>
+							</button>
+						{/each}
 					</div>
 				</div>
 
@@ -229,9 +256,6 @@
 		</div>
 	</main>
 
-	<aside class="panel right">
-		<VmState {func} {allOps} />
-	</aside>
 </div>
 
 <style>
@@ -265,10 +289,6 @@
 			border-right: 1px solid var(--border);
 		}
 
-		&.right {
-			width: 200px;
-			border-left: 1px solid var(--border);
-		}
 	}
 
 	.graph {
@@ -332,17 +352,104 @@
 		position: absolute;
 		top: 0;
 		left: 0;
-		background: rgba(24, 24, 37, 0.4);
-		border: 1px solid rgba(49, 50, 68, 0.5);
+		background: rgba(24, 24, 37, 0.3);
+		border: 1px solid rgba(49, 50, 68, 0.4);
 		border-radius: 10px;
 		pointer-events: none;
+
+		& > * { pointer-events: auto; }
 	}
 
 	.func-header {
-		padding: 4px 12px;
+		padding: 6px 12px;
+		display: flex;
+		gap: 6px;
+		align-items: baseline;
+	}
+
+	.func-name {
+		color: var(--text);
+		font-weight: bold;
+		font-size: var(--font-size-base);
+	}
+
+	.func-sig {
 		color: var(--text-muted);
 		font-size: var(--font-size-base);
 	}
+
+	.func-source {
+		display: flex;
+		flex-direction: column;
+		padding: 0 8px 8px;
+		max-width: 180px;
+	}
+
+	.src-line {
+		display: flex;
+		gap: 4px;
+		padding: 0 4px;
+		background: none;
+		border: none;
+		border-left: 2px solid transparent;
+		color: var(--text);
+		cursor: pointer;
+		font-family: inherit;
+		font-size: var(--font-size-sm);
+		text-align: left;
+		line-height: 18px;
+
+		&:hover { background: var(--hover-bg); }
+		&.src-active {
+			background: rgba(137, 180, 250, 0.1);
+			border-left-color: var(--accent-blue);
+		}
+		&.src-match {
+			background: rgba(137, 180, 250, 0.06);
+		}
+	}
+
+	.src-pc {
+		color: var(--text-dim);
+		min-width: 16px;
+		text-align: right;
+		font-size: var(--font-size-sm);
+	}
+
+	.src-text {
+		color: var(--text-secondary);
+		white-space: pre;
+	}
+
+	.src-active .src-text { color: var(--text); }
+
+	h2 {
+		font-size: var(--font-size-sm);
+		text-transform: uppercase;
+		letter-spacing: 1px;
+		color: var(--text-muted);
+		margin: 0;
+	}
+
+	.vreg-list {
+		display: flex;
+		flex-direction: column;
+		gap: 1px;
+	}
+
+	.vreg-row {
+		display: flex;
+		align-items: center;
+		gap: 6px;
+		padding: 1px 6px;
+		border-radius: 3px;
+		font-size: var(--font-size-base);
+
+		&.vreg-active { background: var(--highlight-bg); }
+	}
+
+	.vreg-w { color: var(--text-dim); font-size: var(--font-size-sm); }
+	.vreg-t { color: var(--text-dim); font-size: var(--font-size-sm); }
 
 	.arrows {
 		position: absolute;
