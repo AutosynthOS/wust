@@ -24,20 +24,28 @@
 </div>
 
 <div class="body">
-	<!-- WAT/label column -->
-	<div class="col-label">
+	<!-- PC column -->
+	<div class="col-pc">
 		{#each block.groups as group}
-			<div class="label-cell" style="height: {groupHeight(group)}px"
+			<div class="pc-cell" style="height: {groupHeight(group)}px"
 				class:wat-match={app.highlightedWasmPcs.size > 0 && group.pc !== null && app.highlightedWasmPcs.has(group.pc)}>
 				{#if group.pc !== null}
 					<span class="pc">{group.pc}</span>
 				{/if}
+			</div>
+		{/each}
+	</div>
+
+	<!-- Label column -->
+	<div class="col-label">
+		{#each block.groups as group}
+			<div class="label-cell" style="height: {groupHeight(group)}px">
 				<span class="label-text">{group.label}</span>
 			</div>
 		{/each}
 	</div>
 
-	<!-- Ops + ASM columns -->
+	<!-- Ops + ASM -->
 	<div class="col-main">
 		{#each block.groups as group}
 			{#each group.ops as op}
@@ -52,9 +60,8 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
-		padding: 3px 8px;
+		padding: 4px 8px;
 		background: var(--bg-block-header);
-		border-bottom: 1px solid var(--border);
 	}
 
 	.block-id {
@@ -73,35 +80,42 @@
 		display: flex;
 	}
 
-	.col-label {
-		min-width: 110px;
-		max-width: 140px;
+	.col-pc {
+		min-width: 28px;
 		display: flex;
 		flex-direction: column;
-		border-right: 1px solid var(--border);
+		border-right: 1px solid var(--border-subtle);
 	}
 
-	.label-cell {
+	.pc-cell {
 		display: flex;
 		align-items: center;
-		gap: 4px;
-		padding: 0 6px;
-		border-bottom: 1px solid var(--border-subtle);
+		justify-content: center;
+		padding: 0 4px;
 		box-sizing: border-box;
-		overflow: hidden;
 
-		&:last-child { border-bottom: none; }
 		&.wat-match { background: rgba(137, 180, 250, 0.08); }
 	}
 
 	.pc {
 		color: var(--text-dim);
 		font-size: var(--font-size-xxs);
-		background: var(--bg-elevated);
-		padding: 0 3px;
-		border-radius: 2px;
-		min-width: 12px;
-		text-align: center;
+	}
+
+	.col-label {
+		min-width: 100px;
+		max-width: 130px;
+		display: flex;
+		flex-direction: column;
+		border-right: 1px solid var(--border-subtle);
+	}
+
+	.label-cell {
+		display: flex;
+		align-items: center;
+		padding: 0 6px;
+		box-sizing: border-box;
+		overflow: hidden;
 	}
 
 	.label-text {

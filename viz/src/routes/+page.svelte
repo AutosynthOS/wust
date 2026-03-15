@@ -75,14 +75,14 @@
 		yAcc += mh + GAP_Y;
 	}
 	const maxCol = Math.max(...[...blockPos.values()].map(p => p.col), 0);
-	const canvasW = (maxCol + 1) * (BLOCK_W + GAP_X) + 80;
-	const canvasH = yAcc + 40;
+	const canvasW = (maxCol + 1) * (BLOCK_W + GAP_X) + 100;
+	const canvasH = yAcc + 60;
 
 	function getRect(id: string) {
 		const pos = blockPos.get(id)!;
 		return {
-			x: 20 + pos.col * (BLOCK_W + GAP_X),
-			y: rowY.get(pos.row)!,
+			x: 40 + pos.col * (BLOCK_W + GAP_X),
+			y: 30 + rowY.get(pos.row)!,
 			w: BLOCK_W,
 			h: blockHeight(blockMap.get(id)!),
 		};
@@ -162,7 +162,6 @@
 		onpointerup={onPtrUp}
 	>
 		<div class="toolbar">
-			<h1>{func.name ?? `func[${func.index}]`}</h1>
 			<span class="zoom">{Math.round(zoom * 100)}%</span>
 			<button class="btn" onclick={() => { zoom = 0.85; panX = 20; panY = 20; }}>reset</button>
 			{#if app.highlightedVreg}
@@ -290,12 +289,6 @@
 		flex-shrink: 0;
 		user-select: none;
 		-webkit-user-select: none;
-
-		h1 {
-			font-size: 15px;
-			margin: 0;
-			color: var(--accent-purple);
-		}
 	}
 
 	.zoom {
@@ -337,21 +330,18 @@
 
 	.func-container {
 		position: absolute;
-		top: 5px;
-		left: 5px;
-		border: 1px dashed var(--border);
+		top: 0;
+		left: 0;
+		background: rgba(24, 24, 37, 0.4);
+		border: 1px solid rgba(49, 50, 68, 0.5);
 		border-radius: 10px;
 		pointer-events: none;
 	}
 
 	.func-header {
-		position: absolute;
-		top: -10px;
-		left: 16px;
-		background: var(--bg-base);
-		padding: 0 8px;
+		padding: 4px 12px;
 		color: var(--text-muted);
-		font-size: var(--font-size-xs);
+		font-size: var(--font-size-base);
 	}
 
 	.arrows {
@@ -364,7 +354,6 @@
 
 	.block {
 		position: absolute;
-		border: 1px solid var(--border);
 		border-radius: 6px;
 		background: var(--bg-block);
 		z-index: 1;

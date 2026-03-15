@@ -48,11 +48,9 @@
 <style>
 	.row {
 		display: flex;
-		border-bottom: 1px solid var(--border-subtle);
 		box-sizing: border-box;
 		cursor: pointer;
 
-		&:last-child { border-bottom: none; }
 		&:hover { background: var(--hover-bg); }
 		&.hovered { background: rgba(137, 180, 250, 0.06); }
 		&.selected { background: var(--selected-bg); }
@@ -65,7 +63,7 @@
 		display: flex;
 		align-items: center;
 		padding: 0 6px;
-		border-right: 1px solid var(--border);
+		border-right: 1px solid var(--border-subtle);
 		min-width: 0;
 		overflow: hidden;
 	}
@@ -73,7 +71,7 @@
 	.op-text {
 		color: var(--text-secondary);
 		font-size: var(--font-size-base);
-		white-space: nowrap;
+		white-space: pre;
 	}
 
 	.vreg {

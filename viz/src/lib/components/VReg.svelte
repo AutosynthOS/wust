@@ -25,10 +25,11 @@
 		background: none;
 		border: none;
 		color: var(--accent-vreg);
-		padding: 0;
+		padding: 0 2px;
 		cursor: pointer;
 		font-family: inherit;
 		font-size: inherit;
+		border-radius: 2px;
 
 		&:hover {
 			text-decoration: underline;
@@ -36,8 +37,6 @@
 
 		&.active {
 			background: var(--highlight-bg);
-			border-radius: 2px;
-			padding: 0 2px;
 		}
 	}
 </style>

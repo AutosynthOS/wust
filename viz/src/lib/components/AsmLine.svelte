@@ -46,12 +46,12 @@
 		return tokens;
 	}
 
-	function formatAddr(a: number): string {
-		return a.toString(16).padStart(4, '0');
-	}
-
 	function originLabel(o: string): string {
 		return o === 'lower' ? 'lo' : o === 'regalloc' ? 'ra' : 'fu';
+	}
+
+	function formatAddr(a: number): string {
+		return a.toString(16).padStart(4, '0');
 	}
 
 	const tokens = parse(asm.text);
@@ -78,7 +78,8 @@
 	.addr {
 		color: var(--text-faint);
 		font-size: var(--font-size-xs);
-		min-width: 28px;
+		min-width: 30px;
+		text-align: right;
 	}
 
 	.origin {
