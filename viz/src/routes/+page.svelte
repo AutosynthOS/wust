@@ -195,7 +195,7 @@
 					<div class="func-sidebar">
 						<div class="func-header">
 							<span class="func-name">{func.name ?? `func[${func.index}]`}</span>
-							<span class="func-sig">({func.params.map(p => p.width).join(', ')}) → ({func.results.map(r => r.width).join(', ')})</span>
+							<span class="func-sig">({func.params.map(p => `${p.width} ${p.preg ?? ''}`).join(', ')}) → ({func.results.map(r => `${r.width} ${r.preg ?? ''}`).join(', ')})</span>
 						</div>
 						<div class="func-source">
 							{#each trace.source.filter(l => l.func_index === func.index) as line}
@@ -425,6 +425,7 @@
 
 	.func-graph {
 		position: relative;
+		background: rgba(0, 0, 0, 0.15);
 	}
 
 	h2 {
@@ -466,7 +467,7 @@
 	.block {
 		position: absolute;
 		border-radius: 6px;
-		background: rgba(10, 10, 18, 0.85);
+		background: rgba(255, 255, 255, 0.02);
 		z-index: 1;
 		overflow: hidden;
 		user-select: none;
