@@ -54,10 +54,27 @@
 	<h2>state @ seq {app.selectedOp}</h2>
 	<div class="op-preview">{selectedEvent.text}</div>
 
+	<!-- Bindings: ordered by preg — constant height -->
+	{#if snapshot}
+		<h3>bindings</h3>
+		<div class="stack">
+			{#each snapshot.bindings as b}
+				<div class="slot" class:free={!b.vreg}>
+					<PReg id={b.preg} />
+					<span class="spacer"></span>
+					{#if b.vreg}
+						<VReg id={b.vreg} />
+					{:else}
+						<span class="free-label">free</span>
+					{/if}
+				</div>
+			{/each}
+		</div>
+	{/if}
+
 	<!-- Regions: unified vreg view per slot -->
 	{#each func.regions as region}
 		{@const slots = region.id === 'locals' ? diff.locals : region.id === 'operands' ? diff.ops : diff.fibre}
-		{@const stateSlots = region.id === 'locals' ? state.locals : region.id === 'operands' ? state.ops : state.fibre}
 		<h3>{region.label}</h3>
 		<div class="stack">
 			{#each slots as slot, i}
@@ -83,24 +100,6 @@
 			{/if}
 		</div>
 	{/each}
-
-	<!-- Bindings: ordered by preg -->
-	{#if snapshot}
-		<h3>bindings</h3>
-		<div class="stack">
-			{#each snapshot.bindings as b}
-				<div class="slot" class:free={!b.vreg}>
-					<PReg id={b.preg} />
-					<span class="spacer"></span>
-					{#if b.vreg}
-						<VReg id={b.vreg} />
-					{:else}
-						<span class="free-label">free</span>
-					{/if}
-				</div>
-			{/each}
-		</div>
-	{/if}
 {:else}
 	<div class="placeholder">click an op to inspect</div>
 {/if}
