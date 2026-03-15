@@ -478,7 +478,7 @@
 	.func-graph {
 		position: relative;
 		background: rgba(0, 0, 0, 0.15);
-		padding: 16px;
+		padding: 32px;
 	}
 
 	.block-grid {
