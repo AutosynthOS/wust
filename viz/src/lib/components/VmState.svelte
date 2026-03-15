@@ -44,13 +44,6 @@
 		return func.vregs.find(d => d.id === vreg)?.width ?? '?';
 	}
 
-	// Get all vregs that are in the snapshot but NOT in any stack slot = "free floating"
-	const freeFloating = $derived.by((): VRegLoc[] => {
-		if (!snapshot || !state) return [];
-		const inSlots = new Set([...state.locals, ...state.ops, ...state.fibre]);
-		return snapshot.vreg_locs.filter(vl => !inSlots.has(vl.vreg));
-	});
-
 	function slotOffset(regionId: string, index: number): number {
 		const region = func.regions.find(r => r.id === regionId);
 		return (region?.base_offset ?? 0) + index * 4; // approximate
@@ -90,29 +83,6 @@
 			{/if}
 		</div>
 	{/each}
-
-	<!-- Free floating: vregs in pregs but not in any slot -->
-	{#if freeFloating.length > 0}
-		<h3>temp</h3>
-		<div class="stack">
-			{#each freeFloating as vl}
-				<div class="slot">
-					<span class="diff-mark">&nbsp;</span>
-					<span class="slot-offset"></span>
-					<VReg id={vl.vreg} />
-					<span class="slot-type">:{vregWidth(vl.vreg)}</span>
-					<span class="spacer"></span>
-					{#if vl.preg}
-						<PReg id={vl.preg} />
-					{/if}
-					{#if vl.loc === 'const'}
-						<span class="const-badge">const</span>
-					{/if}
-					<DirtyBadge dirty={vl.dirty !== false} />
-				</div>
-			{/each}
-		</div>
-	{/if}
 
 	<!-- Bindings: ordered by preg -->
 	{#if snapshot}
