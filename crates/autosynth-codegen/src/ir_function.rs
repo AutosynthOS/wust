@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use autosynth_ir::{BlockId, LowerInst, VReg, VRegDef, VRegion};
+use autosynth_ir::{BlockId, LowerInst, VReg, VRegDef, VRegRef, VRegion};
 use autosynth_lower::MachineConfig;
 
 /// A complete IR function — the finalized output of FunctionBuilder.
@@ -13,12 +13,14 @@ pub struct IRFunction {
     pub config: MachineConfig,
     /// Virtual region configurations, indexed by VRegionId.
     pub regions: Vec<VRegion>,
-    /// All VReg definitions, indexed by VReg id.
+    /// All VReg definitions, indexed by Def id.
     pub vreg_defs: Vec<VRegDef>,
+    /// All VReg refs, indexed by Ref id.
+    pub vreg_refs: Vec<VRegRef>,
     /// Block layout order.
     pub block_order: Vec<BlockId>,
     /// All blocks, keyed by BlockId.
-    pub blocks: std::collections::HashMap<BlockId, IrBlock>,
+    pub blocks: HashMap<BlockId, IrBlock>,
 }
 
 /// A basic block in the IR.
@@ -38,7 +40,8 @@ pub struct IrBlock {
     pub params: HashSet<VReg>,
     /// VRegs from this block that are needed by successor blocks' params.
     pub results: HashSet<VReg>,
-    /// How many times each vreg is read by IR instructions in this block.
-    /// Decremented during lowering; zero = dead, register can be freed.
+    /// For each vreg (resolved to Def), the number of remaining uses
+    /// in this block. Vregs in `results` have `usize::MAX`.
+    /// Precomputed in `build()`.
     pub remaining_uses: HashMap<VReg, usize>,
 }

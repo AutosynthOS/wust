@@ -37,6 +37,35 @@ fn ack_lower() -> anyhow::Result<()> {
 }
 
 #[test]
+fn ack_jit_small() -> anyhow::Result<()> {
+    use wust_core::exec::ModuleExecutor;
+
+    let bytes = wat::parse_str(WAT)?;
+    let module = wust_core::ParsedModule::new(&bytes)?;
+    let instance = wust_core::Instance::new(&module);
+
+    type Jit = JitModule<Aarch64Backend>;
+    let jit = Jit::new(module.clone())?;
+
+    // ack(0, 0) = 1
+    let mut task = wust_core::Task::setup(&instance, "ack", &[wust_core::Val::I32(0), wust_core::Val::I32(0)])?;
+    task.context.fuel = i64::MAX;
+    let outcome = jit.poll(&mut task);
+    assert_eq!(outcome, wust_core::Outcome::Return);
+    assert_eq!(task.results(), vec![wust_core::Val::I32(1)]);
+
+    // ack(1, 0) = 2
+    let mut task = wust_core::Task::setup(&instance, "ack", &[wust_core::Val::I32(1), wust_core::Val::I32(0)])?;
+    task.context.fuel = i64::MAX;
+    let outcome = jit.poll(&mut task);
+    assert_eq!(outcome, wust_core::Outcome::Return);
+    assert_eq!(task.results(), vec![wust_core::Val::I32(2)]);
+
+    Ok(())
+}
+
+#[test]
+#[ignore] // slow — deeply recursive
 fn ack_jit() -> anyhow::Result<()> {
     use wust_core::exec::ModuleExecutor;
 

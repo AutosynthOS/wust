@@ -1,8 +1,8 @@
 use std::marker::PhantomData;
 
 use autosynth_codegen::{
-    AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, RegInst,
-    VInit, VReg, VRegion, VRegionId, Width,
+    AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, RegInst, VInit,
+    VReg, VRegion, VRegionId, Width,
 };
 use autosynth_isa::{IsaReg, PReg};
 use autosynth_lower::{BackendEmitter, MachineConfig, trace, trace_ctx};
@@ -148,6 +148,8 @@ impl<B: BackendEmitter> JitModule<B> {
             "fibre": { "base": format!("x{}", fsp_preg.0), "offset": 0 }
         });
 
+        trace!({"type": "group", "label": "(prologue)"});
+
         // Declare parameters — each starts in its CC register (PReg(i)).
         for (i, param) in func.params.iter().enumerate() {
             let w = valtype_to_width(param);
@@ -158,8 +160,6 @@ impl<B: BackendEmitter> JitModule<B> {
 
         // Declare zero-initialized locals
         for (i, local) in func.locals.iter().enumerate() {
-            let idx = i + func.params.len();
-
             let w = valtype_to_width(&local);
             let v = f.alloc_vreg(w, VInit::Const(0));
             f.push_vreg(locals, v);
@@ -179,12 +179,9 @@ impl<B: BackendEmitter> JitModule<B> {
         let lr = f.alloc_vreg(Width::W64, VInit::PReg(lr_preg));
         f.push_vreg(fibre, lr);
 
-
-
         // Finalize entry block, branch to first user block.
         f.br(BlockId::User(0));
         f.start_block(BlockId::User(0));
-
 
         // Fuel tracking: accumulate cost per opcode, flush before calls.
         let mut pending_fuel: u32 = 0;
@@ -320,7 +317,6 @@ impl<B: BackendEmitter> JitModule<B> {
                         f.set_target(vreg, PReg(i as u8));
                     }
 
-
                     // Clobber all live vregs — call will destroy registers.
                     f.clobber_region(locals);
                     f.clobber_region(operands);
@@ -334,14 +330,11 @@ impl<B: BackendEmitter> JitModule<B> {
                     //
                     // advance = locals_header_size
                     //         + (operand_depth[pc] - callee_param_slots) * 4
-                    let callee_param_slots: u32 = callee.params.iter()
-                        .map(|t| slot_size(*t) as u32)
-                        .sum();
+                    let callee_param_slots: u32 =
+                        callee.params.iter().map(|t| slot_size(*t) as u32).sum();
                     let caller_operand_depth = func.body.operand_depth[pc] as u32;
-                    let advance = locals_header_size
-                        + (caller_operand_depth - callee_param_slots) * 4;
-
-
+                    let advance =
+                        locals_header_size + (caller_operand_depth - callee_param_slots) * 4;
 
                     // TODO: when callee has more params than CC registers,
                     // overflow params stay on the stack instead of moving
@@ -356,8 +349,6 @@ impl<B: BackendEmitter> JitModule<B> {
                     });
 
                     f.emit(IrInst::Call { func_idx });
-
-
 
                     // Restore g.lb after call returns.
                     let lb = f.alloc_vreg(Width::W64, VInit::PReg(lbp_preg));
@@ -375,6 +366,7 @@ impl<B: BackendEmitter> JitModule<B> {
                         f.push_vreg(operands, v);
                     }
 
+                    trace!({"type": "group", "label": "(fuel check)"});
                     let fuel = f.alloc_vreg(Width::W64, VInit::PReg(fuel_preg));
                     Self::emit_fuel_check(&mut f, fuel, &mut pending_fuel, pc);
                 }

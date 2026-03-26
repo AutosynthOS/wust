@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use autosynth_ir::{BlockId, IrInst, LowerInst};
+use autosynth_ir::{BlockId, IrInst, LowerInst, VReg};
 use autosynth_lower::{trace, trace_ctx, trace_do};
 
 use crate::ir_function::IRFunction;
@@ -16,19 +16,17 @@ pub fn compile(
 ) -> Result<Vec<u8>, LowerError> {
     trace_ctx!("phase", "lower");
 
-    let mut regalloc = RegAlloc::new(&func.config, &func.vreg_defs);
+    let mut regalloc = RegAlloc::new(&func.config, &func.vreg_defs, &func.vreg_refs);
     let mut snapshots: HashMap<BlockId, MachineState> = HashMap::new();
+    snapshots.insert(func.block_order[0], regalloc.state.clone());
     let mut ir_index = 0;
 
     for (idx, &block_id) in func.block_order.iter().enumerate() {
         let block = &func.blocks[&block_id];
         let next_block = func.block_order.get(idx + 1).copied();
 
-        if let Some(snapshot) = snapshots.get(&block_id) {
-            regalloc.state = snapshot.clone();
-        }
-
-        regalloc.state.begin_block(&block.remaining_uses, &block.results);
+        regalloc.state = snapshots[&block_id].clone();
+        regalloc.begin_block(&block.remaining_uses);
         backend.bind_label(block_id);
 
         trace_ctx!("block", format!("{block_id:?}"));
@@ -37,20 +35,16 @@ pub fn compile(
         for inst in &block.instructions {
             autosynth_lower::set_group(ir_index);
 
-            trace_do! {
-                let inst_json = autosynth_lower::__serde_json::to_value(inst).ok();
-                trace!({
-                    "type": "lower_inst",
-                    "ir_index": ir_index,
-                    "inst": inst_json
-                });
-            }
+            trace!({
+                "type": "lower_inst",
+                "ir_index": ir_index,
+                "inst": autosynth_lower::__serde_json::to_value(inst).ok()
+            });
 
             match inst {
                 // Skip fall-through branches — the next block is already
                 // laid out immediately after, so no jump is needed.
-                LowerInst::Ir(IrInst::Branch { target })
-                    if Some(*target) == next_block => {}
+                LowerInst::Ir(IrInst::Branch { target }) if Some(*target) == next_block => {}
                 LowerInst::Ir(ir) => {
                     trace_ctx!("origin", "lower");
                     backend.lower(&mut regalloc, ir.clone(), autosynth_lower::Emit::Fuse)?
@@ -60,12 +54,16 @@ pub fn compile(
             ir_index += 1;
         }
 
-        backend.flush(&mut regalloc)?;
-
-        let snapshot = regalloc.state.clone();
         for &succ in &block.successors {
-            snapshots.entry(succ).or_insert_with(|| snapshot.clone());
+            let into_params = &func.blocks[&succ].params;
+            let target = snapshots.get(&succ);
+            regalloc.converge_into(block_id, into_params, target, backend)?;
+            if !snapshots.contains_key(&succ) {
+                snapshots.insert(succ, regalloc.state.clone());
+            }
         }
+
+        backend.flush(&mut regalloc)?;
     }
 
     backend.finalize(&mut regalloc)?;

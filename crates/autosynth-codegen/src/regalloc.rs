@@ -3,10 +3,12 @@
 
 use std::collections::HashMap;
 
-use autosynth_ir::{IrInst, RegInst, SlotRef, VInit, VReg, VRegDef};
+use autosynth_ir::{
+    BlockId, IrInst, RegInst, SlotRef, VInit, VReg, VRegDef, VRegRef, VRegRefSource,
+};
 use autosynth_isa::{PReg, Width};
-use autosynth_lower::{trace, trace_ctx, trace_do};
 use autosynth_lower::{BackendEmitter, Emit, LowerCtx, LowerError, MachineConfig, ResolvedVReg};
+use autosynth_lower::{trace, trace_ctx, trace_do};
 
 // --- Types ---
 
@@ -37,79 +39,93 @@ struct VRegEntry {
 #[derive(Clone)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub(crate) struct MachineState {
-    entries: Vec<Option<VRegEntry>>,
+    def_entries: Vec<Option<VRegEntry>>,
+    ref_entries: Vec<Option<VRegEntry>>,
     bindings: Vec<Option<VReg>>,
-    remaining: HashMap<VReg, usize>,
-    results: Vec<VReg>,
 }
 
 /// The register allocator. Immutable config + vreg_defs, mutable MachineState.
 pub(crate) struct RegAlloc {
     config: MachineConfig,
     vreg_defs: Vec<VRegDef>,
+    vreg_refs: Vec<VRegRef>,
     pub(crate) state: MachineState,
+    /// Per-block remaining use counts for each vreg.
+    /// `usize::MAX` for vregs needed by successor blocks.
+    /// Cloned from `IrBlock.remaining_uses` at each `begin_block`.
+    remaining_uses: HashMap<VReg, usize>,
 }
 
 // --- MachineState impl ---
 
 impl MachineState {
-    pub(crate) fn new(num_vregs: usize, num_regs: usize) -> Self {
+    pub(crate) fn new(num_defs: usize, num_refs: usize, num_regs: usize) -> Self {
         Self {
-            entries: vec![None; num_vregs],
+            def_entries: vec![None; num_defs],
+            ref_entries: vec![None; num_refs],
             bindings: vec![None; num_regs],
-            remaining: HashMap::new(),
-            results: Vec::new(),
         }
-    }
-
-    pub(crate) fn begin_block(
-        &mut self,
-        remaining_uses: &HashMap<VReg, usize>,
-        results: &std::collections::HashSet<VReg>,
-    ) {
-        self.remaining = remaining_uses.clone();
-        self.results = results.iter().copied().collect();
     }
 
     fn entry(&self, vreg: VReg) -> Result<&VRegEntry, LowerError> {
-        self.entries[vreg.0 as usize]
-            .as_ref()
-            .ok_or(LowerError::UndefinedVReg(vreg))
+        let table = match vreg {
+            VReg::Def(id) => &self.def_entries[id as usize],
+            VReg::Ref(id) => &self.ref_entries[id as usize],
+        };
+        table.as_ref().ok_or(LowerError::UndefinedVReg(vreg))
     }
 
     fn entry_mut(&mut self, vreg: VReg) -> Result<&mut VRegEntry, LowerError> {
-        self.entries[vreg.0 as usize]
-            .as_mut()
-            .ok_or(LowerError::UndefinedVReg(vreg))
-    }
-
-    fn is_live(&self, vreg: VReg) -> bool {
-        if self.results.contains(&vreg) {
-            return true;
-        }
-        self.remaining.get(&vreg).map(|&n| n > 0).unwrap_or(false)
-    }
-
-    fn consume(&mut self, vreg: VReg) {
-        if let Some(count) = self.remaining.get_mut(&vreg) {
-            *count = count.saturating_sub(1);
-        }
+        let table = match vreg {
+            VReg::Def(id) => &mut self.def_entries[id as usize],
+            VReg::Ref(id) => &mut self.ref_entries[id as usize],
+        };
+        table.as_mut().ok_or(LowerError::UndefinedVReg(vreg))
     }
 }
 
 // --- RegAlloc impl ---
 
 impl RegAlloc {
-    pub(crate) fn new(config: &MachineConfig, vreg_defs: &[VRegDef]) -> Self {
+    pub(crate) fn new(
+        config: &MachineConfig,
+        vreg_defs: &[VRegDef],
+        vreg_refs: &[VRegRef],
+    ) -> Self {
         Self {
             config: config.clone(),
             vreg_defs: vreg_defs.to_vec(),
-            state: MachineState::new(vreg_defs.len(), config.num_regs()),
+            vreg_refs: vreg_refs.to_vec(),
+            state: MachineState::new(vreg_defs.len(), vreg_refs.len(), config.num_regs()),
+            remaining_uses: HashMap::new(),
         }
     }
 
+    pub(crate) fn begin_block(&mut self, remaining_uses: &HashMap<VReg, usize>) {
+        self.remaining_uses = remaining_uses.clone();
+    }
+
+    fn is_live(&self, vreg: VReg) -> bool {
+        self.remaining_uses.get(&vreg).map(|&n| n > 0).unwrap_or(false)
+    }
+
+    fn consume(&mut self, vreg: VReg) {
+        if let Some(count) = self.remaining_uses.get_mut(&vreg) {
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    /// Resolve a VReg to its underlying Def, chasing through Direct refs.
+    /// Phi refs are first-class and don't alias through.
+    fn resolve_to_def(&self, vreg: VReg) -> VReg {
+        autosynth_ir::resolve_ref(vreg, &self.vreg_refs)
+    }
+
     pub(crate) fn vreg_width(&self, vreg: VReg) -> Width {
-        self.vreg_defs[vreg.0 as usize].width
+        match vreg {
+            VReg::Def(id) => self.vreg_defs[id as usize].width,
+            VReg::Ref(id) => self.vreg_refs[id as usize].width,
+        }
     }
 
     fn alloc_for(
@@ -117,9 +133,16 @@ impl RegAlloc {
         vreg: VReg,
         backend: &mut impl BackendEmitter,
     ) -> Result<PReg, LowerError> {
-        let target = self.vreg_defs[vreg.0 as usize].target;
+        let resolved = self.resolve_to_def(vreg);
+        let VReg::Def(def_id) = resolved else {
+            unreachable!()
+        };
+        let target = self.vreg_defs[def_id as usize].target;
         let preg = match target {
-            Some(t) => { self.acquire(t, backend)?; t }
+            Some(t) => {
+                self.acquire(t, backend)?;
+                t
+            }
             None => self.alloc_reg()?,
         };
         self.state.bindings[preg.0 as usize] = Some(vreg);
@@ -133,14 +156,25 @@ impl RegAlloc {
     ) -> Result<PReg, LowerError> {
         trace_ctx!("origin", "regalloc");
         let width = self.vreg_width(vreg);
-        let slot = self.state.entry(vreg)?
-            .slots.iter().find(|s| !s.dirty).map(|s| s.slot)
+        let slot = self
+            .state
+            .entry(vreg)?
+            .slots
+            .iter()
+            .find(|s| !s.dirty)
+            .map(|s| s.slot)
             .ok_or(LowerError::UndefinedVReg(vreg))?;
         let preg = self.alloc_for(vreg, backend)?;
-        backend.lower(self, IrInst::Load {
-            dst: preg, width,
-            base: slot.base, offset: slot.offset,
-        }, Emit::Immediate)?;
+        backend.lower(
+            self,
+            IrInst::Load {
+                dst: preg,
+                width,
+                base: slot.base,
+                offset: slot.offset,
+            },
+            Emit::Immediate,
+        )?;
         self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
         Ok(preg)
     }
@@ -170,10 +204,31 @@ impl RegAlloc {
         inst: &RegInst,
         backend: &mut impl BackendEmitter,
     ) -> Result<(), LowerError> {
+        // Resolve any Ref VRegs to their underlying Def before processing.
+        let inst = &match inst {
+            RegInst::SetSlot { vreg, slot } => RegInst::SetSlot {
+                vreg: self.resolve_to_def(*vreg),
+                slot: *slot,
+            },
+            RegInst::ClearSlot { vreg, slot } => RegInst::ClearSlot {
+                vreg: self.resolve_to_def(*vreg),
+                slot: *slot,
+            },
+            RegInst::Clobber { vreg } => RegInst::Clobber {
+                vreg: self.resolve_to_def(*vreg),
+            },
+            RegInst::Resolve { vreg } => RegInst::Resolve {
+                vreg: self.resolve_to_def(*vreg),
+            },
+            other => other.clone(),
+        };
         match inst {
             RegInst::Define { vreg, value } => {
-                let idx = vreg.0 as usize;
-                if self.state.entries[idx].is_some() {
+                let VReg::Def(idx) = *vreg else {
+                    panic!("RegInst::Define expects VReg::Def, got {vreg}");
+                };
+                let idx = idx as usize;
+                if self.state.def_entries[idx].is_some() {
                     return Err(LowerError::DuplicateDefine(*vreg));
                 }
                 let loc = match value {
@@ -185,7 +240,7 @@ impl RegAlloc {
                     }
                     VInit::InstDst => VRegLoc::Pending,
                 };
-                self.state.entries[idx] = Some(VRegEntry {
+                self.state.def_entries[idx] = Some(VRegEntry {
                     loc,
                     slots: Vec::new(),
                 });
@@ -200,11 +255,19 @@ impl RegAlloc {
             }
             RegInst::ClearSlot { vreg, slot } => {
                 let loc = self.state.entry(*vreg)?.loc;
-                let is_clean = self.state.entry(*vreg)?.slots.iter().any(|s| s.slot == *slot && !s.dirty);
+                let is_clean = self
+                    .state
+                    .entry(*vreg)?
+                    .slots
+                    .iter()
+                    .any(|s| s.slot == *slot && !s.dirty);
                 if matches!(loc, VRegLoc::Mem) && is_clean {
                     self.reload(*vreg, backend)?;
                 }
-                self.state.entry_mut(*vreg)?.slots.retain(|s| s.slot != *slot);
+                self.state
+                    .entry_mut(*vreg)?
+                    .slots
+                    .retain(|s| s.slot != *slot);
                 Ok(())
             }
             RegInst::Clobber { vreg } => {
@@ -243,21 +306,28 @@ impl RegAlloc {
         };
 
         let loc = self.state.entry(victim)?.loc;
-        if !self.state.is_live(victim) || matches!(loc, VRegLoc::Const(_)) {
+        if !self.is_live(victim) || matches!(loc, VRegLoc::Const(_)) {
             self.state.bindings[preg.0 as usize] = None;
             return Ok(preg);
         }
 
         let width = self.vreg_width(victim);
-        let has_remaining = self.state.remaining.get(&victim).map(|&n| n > 0).unwrap_or(false);
-        if !has_remaining {
+        let remaining = self.remaining_uses.get(&victim).copied().unwrap_or(0);
+        let used_again_in_block = remaining > 0 && remaining < usize::MAX;
+        if !used_again_in_block {
             self.flush_vreg(victim, preg, width, backend)?;
         } else {
             let dest = self.alloc_reg()?;
-            backend.lower(self, IrInst::Move {
-                dst: dest, dst_width: width,
-                src: preg, src_width: width,
-            }, Emit::Immediate)?;
+            backend.lower(
+                self,
+                IrInst::Move {
+                    dst: dest,
+                    dst_width: width,
+                    src: preg,
+                    src_width: width,
+                },
+                Emit::Immediate,
+            )?;
             self.state.bindings[dest.0 as usize] = Some(victim);
             self.state.bindings[preg.0 as usize] = None;
             self.state.entry_mut(victim)?.loc = VRegLoc::Reg(dest);
@@ -272,19 +342,83 @@ impl RegAlloc {
         width: Width,
         backend: &mut impl BackendEmitter,
     ) -> Result<(), LowerError> {
-        let slot = self.state.entry(vreg)?
-            .slots.iter().find(|s| s.dirty).map(|s| s.slot)
+        let slot = self
+            .state
+            .entry(vreg)?
+            .slots
+            .iter()
+            .find(|s| s.dirty)
+            .map(|s| s.slot)
             .ok_or(LowerError::UndefinedVReg(vreg))?;
-        backend.lower(self, IrInst::Store {
-            src: preg, width,
-            base: slot.base, offset: slot.offset,
-        }, Emit::Immediate)?;
+        backend.lower(
+            self,
+            IrInst::Store {
+                src: preg,
+                width,
+                base: slot.base,
+                offset: slot.offset,
+            },
+            Emit::Immediate,
+        )?;
         let entry = self.state.entry_mut(vreg)?;
         for s in &mut entry.slots {
             s.dirty = false;
         }
         entry.loc = VRegLoc::Mem;
         self.state.bindings[preg.0 as usize] = None;
+        Ok(())
+    }
+
+    /// Materialize phi ref values at a merge point.
+    ///
+    /// For each phi ref in `into_params`, finds this predecessor's source
+    /// Def, ensures it's in a register, and creates a ref_entry for it.
+    /// If `target` is Some, the phi must end up in the same register as
+    /// the existing snapshot. If None, this predecessor defines the contract.
+    pub(crate) fn converge_into(
+        &mut self,
+        from: BlockId,
+        into_params: &std::collections::HashSet<VReg>,
+        target: Option<&MachineState>,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<(), LowerError> {
+        for &param in into_params {
+            let VReg::Ref(ref_id) = param else { continue };
+            let VRegRefSource::Phi(sources) = &self.vreg_refs[ref_id as usize].source else {
+                continue;
+            };
+            let Some((_, src_def)) = sources.iter().find(|(pred, _)| *pred == from) else {
+                continue;
+            };
+            let src_def = self.resolve_to_def(*src_def);
+            let width = self.vreg_width(src_def);
+
+            trace!({
+                "type": "converge",
+                "parent": autosynth_lower::current_group(),
+                "phi": format!("{param}"),
+                "src": format!("{src_def}")
+            });
+
+            // Materialize the source into a register.
+            let preg = match self.state.entry(src_def)?.loc {
+                VRegLoc::Reg(preg) => preg,
+                VRegLoc::Const(val) => {
+                    let preg = self.alloc_for(src_def, backend)?;
+                    self.state.entry_mut(src_def)?.loc = VRegLoc::Reg(preg);
+                    backend.materialize_const(preg, val, width)?;
+                    preg
+                }
+                VRegLoc::Mem => self.reload(src_def, backend)?,
+                VRegLoc::Pending => return Err(LowerError::UndefinedVReg(src_def)),
+            };
+
+            // Create the phi ref's entry at this register.
+            self.state.ref_entries[ref_id as usize] = Some(VRegEntry {
+                loc: VRegLoc::Reg(preg),
+                slots: Vec::new(),
+            });
+        }
         Ok(())
     }
 }
@@ -297,21 +431,22 @@ impl LowerCtx for RegAlloc {
         vreg: VReg,
         backend: &mut impl BackendEmitter,
     ) -> Result<ResolvedVReg, LowerError> {
+        let vreg = self.resolve_to_def(vreg);
         let width = self.vreg_width(vreg);
         let loc = self.state.entry(vreg)?.loc;
         let result = match loc {
             VRegLoc::Const(val) => ResolvedVReg::Const(val, width),
             VRegLoc::Reg(preg) => ResolvedVReg::PReg(preg, width),
             VRegLoc::Mem => {
-                trace!({"type": "reload", "vreg": vreg.0});
+                trace!({"type": "reload", "vreg": format!("{vreg}")});
                 ResolvedVReg::PReg(self.reload(vreg, backend)?, width)
             }
             VRegLoc::Pending => return Err(LowerError::UndefinedVReg(vreg)),
         };
-        self.state.consume(vreg);
+        self.consume(vreg);
         trace_do! {
             let result_json = autosynth_lower::__serde_json::to_value(&result).unwrap();
-            trace!({"type": "resolve_vreg", "vreg": vreg.0, "result": result_json});
+            trace!({"type": "resolve_vreg", "vreg": format!("{vreg}"), "result": result_json});
         }
         Ok(result)
     }
@@ -327,18 +462,29 @@ impl LowerCtx for RegAlloc {
             VRegLoc::Pending => {
                 let preg = self.alloc_for(vreg, backend)?;
                 self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
-                trace!({"type": "define_vreg", "vreg": vreg.0, "preg": preg.0});
+                trace!({"type": "define_vreg", "vreg": format!("{vreg}"), "preg": preg.0});
                 Ok((preg, width))
             }
             VRegLoc::Reg(preg) => {
-                if let Some(t) = self.vreg_defs[vreg.0 as usize].target {
+                let resolved = self.resolve_to_def(vreg);
+                let VReg::Def(def_id) = resolved else {
+                    unreachable!()
+                };
+                let target = self.vreg_defs[def_id as usize].target;
+                if let Some(t) = target {
                     if preg != t {
                         self.acquire(t, backend)?;
                         backend.flush(self)?;
-                        backend.lower(self, IrInst::Move {
-                            dst: t, dst_width: width,
-                            src: preg, src_width: width,
-                        }, Emit::Immediate)?;
+                        backend.lower(
+                            self,
+                            IrInst::Move {
+                                dst: t,
+                                dst_width: width,
+                                src: preg,
+                                src_width: width,
+                            },
+                            Emit::Immediate,
+                        )?;
                         self.state.bindings[t.0 as usize] = Some(vreg);
                         self.state.bindings[preg.0 as usize] = None;
                         self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(t);
@@ -353,12 +499,15 @@ impl LowerCtx for RegAlloc {
 
     fn alloc_reg(&mut self) -> Result<PReg, LowerError> {
         let pool = self.config.scratch_pool();
-        if let Some(preg) = pool.iter().find(|p| self.state.bindings[p.0 as usize].is_none()) {
+        if let Some(preg) = pool
+            .iter()
+            .find(|p| self.state.bindings[p.0 as usize].is_none())
+        {
             return Ok(*preg);
         }
         for &preg in &pool {
             if let Some(vreg) = self.state.bindings[preg.0 as usize] {
-                if !self.state.is_live(vreg) {
+                if !self.is_live(vreg) {
                     self.state.bindings[preg.0 as usize] = None;
                     return Ok(preg);
                 }

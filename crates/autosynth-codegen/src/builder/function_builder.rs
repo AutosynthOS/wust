@@ -2,13 +2,14 @@ use std::collections::{HashMap, HashSet};
 
 use autosynth_ir::{
     Abi, AluOp, BlockId, FunctionSignature, IrInst, LowerInst, RegInst, SlotRef, VInit, VReg,
-    VRegDef, VRegion, VRegionId,
+    VRegDef, VRegRef, VRegRefSource, VRegion, VRegionId, resolve_ref,
 };
 use autosynth_isa::{PReg, Width};
 use autosynth_lower::{trace, trace_ctx, trace_do};
 
 use super::code_builder::CodeBuilder;
 use crate::ir_function::{IRFunction, IrBlock};
+
 
 /// Incrementally builds an [`IRFunction`] by emitting instructions
 /// into blocks and managing VReg allocation.
@@ -25,10 +26,15 @@ pub struct FunctionBuilder<'a> {
     /// Virtual region configurations.
     pub regions: Vec<VRegion>,
 
-    /// Per-vreg metadata, indexed by VReg id. Function-global.
+    /// Per-def metadata, indexed by Def id.
     vreg_defs: Vec<VRegDef>,
-    /// Next vreg id for allocation.
+    /// Next def id for allocation.
     next_vreg: u32,
+
+    /// Per-ref metadata, indexed by Ref id.
+    vreg_refs: Vec<VRegRef>,
+    /// Next ref id for allocation.
+    next_ref: u32,
 
     /// Block layout order.
     block_order: Vec<BlockId>,
@@ -40,7 +46,8 @@ pub struct FunctionBuilder<'a> {
     next_gen_id: u32,
 
     /// Region snapshots saved at branch points, keyed by target block.
-    region_snapshots: HashMap<BlockId, Vec<VRegion>>,
+    /// Accumulates one snapshot per predecessor for merge detection.
+    region_snapshots: HashMap<BlockId, Vec<(BlockId, Vec<VRegion>)>>,
 }
 
 impl<'a> FunctionBuilder<'a> {
@@ -56,6 +63,8 @@ impl<'a> FunctionBuilder<'a> {
             regions: Vec::new(),
             vreg_defs: Vec::new(),
             next_vreg: 0,
+            vreg_refs: Vec::new(),
+            next_ref: 0,
             block_order: Vec::new(),
             blocks: HashMap::new(),
             current_block: None,
@@ -89,7 +98,7 @@ impl<'a> FunctionBuilder<'a> {
         let mut offset = r.base_offset;
         for i in 0..index as usize {
             let vreg = r.slots[i];
-            offset += self.vreg_defs[vreg.0 as usize].width.bytes();
+            offset += self.vreg_width(vreg).bytes();
         }
         SlotRef {
             base: r.base,
@@ -167,7 +176,7 @@ impl<'a> FunctionBuilder<'a> {
     /// Emits a `RegInst::Define` so the lowerer knows about the vreg
     /// and its initial value origin.
     pub fn alloc_vreg(&mut self, width: Width, origin: VInit) -> VReg {
-        let id = VReg(self.next_vreg);
+        let id = VReg::Def(self.next_vreg);
         self.next_vreg += 1;
         self.vreg_defs.push(VRegDef {
             id,
@@ -179,15 +188,46 @@ impl<'a> FunctionBuilder<'a> {
         id
     }
 
-    /// Get the width of a vreg.
+    /// Allocate a new ref vreg with the given width and source.
+    fn alloc_ref(&mut self, width: Width, source: VRegRefSource) -> VReg {
+        let id = VReg::Ref(self.next_ref);
+        self.next_ref += 1;
+        self.vreg_refs.push(VRegRef {
+            id,
+            width,
+            source,
+        });
+        id
+    }
+
+    /// Get the width of a vreg (any kind).
     pub fn vreg_width(&self, vreg: VReg) -> Width {
-        self.vreg_defs[vreg.0 as usize].width
+        match vreg {
+            VReg::Def(id) => self.vreg_defs[id as usize].width,
+            VReg::Ref(id) => self.vreg_refs[id as usize].width,
+        }
     }
 
     /// Set the target physical register for a vreg.
+    ///
+    /// For Ref VRegs, propagates the target to the underlying source.
     pub fn set_target(&mut self, vreg: VReg, preg: PReg) {
         self.record_use(vreg);
-        self.vreg_defs[vreg.0 as usize].target = Some(preg);
+        match vreg {
+            VReg::Def(id) => self.vreg_defs[id as usize].target = Some(preg),
+            VReg::Ref(id) => {
+                let source = &self.vreg_refs[id as usize].source;
+                match source {
+                    VRegRefSource::Direct(src) => self.set_target(*src, preg),
+                    VRegRefSource::Phi(sources) => {
+                        let sources = sources.clone();
+                        for (_, src) in &sources {
+                            self.set_target(*src, preg);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // --- Block lifecycle ---
@@ -201,12 +241,71 @@ impl<'a> FunctionBuilder<'a> {
 
     pub fn start_block(&mut self, block: BlockId) {
         self.ensure_block(block);
-        if let Some(snapshot) = self.region_snapshots.remove(&block) {
-            self.regions = snapshot;
+        let snapshots = self.region_snapshots.remove(&block).unwrap_or_default();
+
+        if let Some(first) = snapshots.first() {
+            self.regions = first.1.clone();
+            self.wrap_region_slots_in_refs(&snapshots);
         }
+
         self.current_block = Some(block);
         trace_ctx!("block", format!("{block:?}"));
         trace!({"type": "block_start", "block": format!("{block:?}")});
+    }
+
+    /// Replace each region slot with a Ref vreg.
+    ///
+    /// For slots that already hold a Ref, keep as-is.
+    /// For Defs, wrap in a Direct ref (single predecessor) or
+    /// diff across all predecessors to decide Direct vs Phi.
+    fn wrap_region_slots_in_refs(
+        &mut self,
+        snapshots: &[(BlockId, Vec<VRegion>)],
+    ) {
+        for region_idx in 0..self.regions.len() {
+            for slot_idx in 0..self.regions[region_idx].slots.len() {
+                let slot = self.regions[region_idx].slots[slot_idx];
+                if matches!(slot, VReg::Ref(_)) {
+                    continue;
+                }
+
+                let width = self.vreg_width(slot);
+                let source = self.merge_slot(snapshots, region_idx, slot_idx);
+                let ref_vreg = self.alloc_ref(width, source);
+                self.regions[region_idx].slots[slot_idx] = ref_vreg;
+            }
+        }
+    }
+
+    /// Determine the VRegRefSource for a single region slot across
+    /// all predecessor snapshots.
+    ///
+    /// If every predecessor has the same root vreg at this position,
+    /// returns Direct. Otherwise returns Phi with per-predecessor sources.
+    fn merge_slot(
+        &self,
+        snapshots: &[(BlockId, Vec<VRegion>)],
+        region_idx: usize,
+        slot_idx: usize,
+    ) -> VRegRefSource {
+        let refs = &self.vreg_refs;
+        let first_root = resolve_ref(snapshots[0].1[region_idx].slots[slot_idx], refs);
+
+        let all_same = snapshots.iter().all(|(_, regions)| {
+            resolve_ref(regions[region_idx].slots[slot_idx], refs) == first_root
+        });
+
+        if all_same {
+            VRegRefSource::Direct(first_root)
+        } else {
+            let sources = snapshots
+                .iter()
+                .map(|(pred_block, regions)| {
+                    (*pred_block, resolve_ref(regions[region_idx].slots[slot_idx], refs))
+                })
+                .collect();
+            VRegRefSource::Phi(sources)
+        }
     }
 
     pub fn br(&mut self, target: BlockId) {
@@ -227,10 +326,6 @@ impl<'a> FunctionBuilder<'a> {
             block_if,
             block_else,
         };
-
-        // Count vreg operands for remaining_uses.
-        let block = self.blocks.get_mut(&id).unwrap();
-        *block.remaining_uses.entry(cond).or_insert(0) += 1;
 
         trace_do! {
             let seq = autosynth_lower::trace::next_seq();
@@ -282,19 +377,6 @@ impl<'a> FunctionBuilder<'a> {
     pub fn emit(&mut self, inst: IrInst) {
         let id = self.current_block.expect("emit: no active block");
 
-        // Count vreg operands for remaining_uses.
-        let block = self.blocks.get_mut(&id).unwrap();
-        match &inst {
-            IrInst::Alu { lhs, rhs, .. } => {
-                *block.remaining_uses.entry(*lhs).or_insert(0) += 1;
-                *block.remaining_uses.entry(*rhs).or_insert(0) += 1;
-            }
-            IrInst::BrIf { cond, .. } => {
-                *block.remaining_uses.entry(*cond).or_insert(0) += 1;
-            }
-            _ => {}
-        }
-
         trace_do! {
             let seq = autosynth_lower::trace::next_seq();
             let inst_json = autosynth_lower::__serde_json::to_value(&inst).unwrap();
@@ -330,7 +412,7 @@ impl<'a> FunctionBuilder<'a> {
             let regions: Vec<_> = self.regions.iter().map(|r| {
                 autosynth_lower::__serde_json::json!({
                     "label": r.label,
-                    "slots": r.slots.iter().map(|v| v.0).collect::<Vec<_>>()
+                    "slots": r.slots.iter().map(|v| autosynth_lower::__serde_json::to_value(v).unwrap()).collect::<Vec<_>>()
                 })
             }).collect();
             trace!({
@@ -358,10 +440,12 @@ impl<'a> FunctionBuilder<'a> {
     pub fn build(self) {
         trace_do! {
             let defs_json = autosynth_lower::__serde_json::to_value(&self.vreg_defs).unwrap();
+            let refs_json = autosynth_lower::__serde_json::to_value(&self.vreg_refs).unwrap();
             let regions_json = autosynth_lower::__serde_json::to_value(&self.regions).unwrap();
             trace!({
                 "type": "build_end",
                 "vreg_defs": defs_json,
+                "vreg_refs": refs_json,
                 "regions": regions_json
             });
         }
@@ -369,6 +453,7 @@ impl<'a> FunctionBuilder<'a> {
         let block_order = self.block_order;
         let mut blocks = self.blocks;
         let vreg_defs = self.vreg_defs;
+        let vreg_refs = self.vreg_refs;
 
         // Compute params: uses that aren't defs (must come from predecessors).
         for id in &block_order {
@@ -376,24 +461,78 @@ impl<'a> FunctionBuilder<'a> {
             block.params = block.uses.difference(&block.defs).copied().collect();
         }
 
-        // Compute results: vregs defined (or live-through) in this block
-        // that are params of any successor block.
+        // Compute results: vregs that must stay live at this block's exit
+        // because a successor needs them.
+        //
+        // Successor params may be Ref VRegs. Resolve them to find which
+        // Def this specific predecessor is responsible for:
+        //   - Direct ref → resolve to the underlying Def
+        //   - Phi ref → find the source for THIS predecessor block
         for id in &block_order {
             let successors = blocks[id].successors.clone();
             let mut results = HashSet::new();
             for succ_id in &successors {
                 if let Some(succ) = blocks.get(succ_id) {
-                    for &vreg in &succ.params {
-                        // If this block defines or uses (live-through) the vreg,
-                        // it's responsible for making it available.
+                    for &param in &succ.params {
+                        let needed = match param {
+                            VReg::Def(_) => param,
+                            VReg::Ref(ref_id) => {
+                                match &vreg_refs[ref_id as usize].source {
+                                    VRegRefSource::Direct(src) => *src,
+                                    VRegRefSource::Phi(sources) => {
+                                        // Find the source VReg for this predecessor.
+                                        match sources.iter().find(|(pred, _)| pred == id) {
+                                            Some((_, src)) => *src,
+                                            None => continue,
+                                        }
+                                    }
+                                }
+                            }
+                        };
                         let block = &blocks[id];
-                        if block.defs.contains(&vreg) || block.uses.contains(&vreg) {
-                            results.insert(vreg);
+                        if block.defs.contains(&needed) || block.uses.contains(&needed) {
+                            results.insert(needed);
                         }
                     }
                 }
             }
             blocks.get_mut(id).unwrap().results = results;
+        }
+
+        // Compute remaining_uses per block: count how many times each
+        // vreg (resolved to Def) is referenced. Vregs in results get
+        // usize::MAX (done last to avoid wrapping).
+        for id in &block_order {
+            let block = blocks.get_mut(id).unwrap();
+            let mut remaining = HashMap::new();
+
+            for inst in block.instructions.iter() {
+                let mut mark = |vreg: VReg| {
+                    let resolved = resolve_ref(vreg, &vreg_refs);
+                    *remaining.entry(resolved).or_insert(0usize) += 1;
+                };
+                match inst {
+                    LowerInst::Ir(ir) => match ir {
+                        IrInst::Alu { lhs, rhs, .. } => { mark(*lhs); mark(*rhs); }
+                        IrInst::BrIf { cond, .. } => { mark(*cond); }
+                        _ => {}
+                    },
+                    LowerInst::Reg(reg) => match reg {
+                        RegInst::SetSlot { vreg, .. }
+                        | RegInst::ClearSlot { vreg, .. }
+                        | RegInst::Clobber { vreg }
+                        | RegInst::Resolve { vreg } => { mark(*vreg); }
+                        RegInst::Define { .. } => {}
+                    },
+                }
+            }
+
+            for &vreg in &block.results {
+                let resolved = resolve_ref(vreg, &vreg_refs);
+                remaining.insert(resolved, usize::MAX);
+            }
+
+            block.remaining_uses = remaining;
         }
 
         // Implicit fallthrough for non-finalized blocks.
@@ -429,6 +568,7 @@ impl<'a> FunctionBuilder<'a> {
             config: self.config,
             regions: self.regions,
             vreg_defs,
+            vreg_refs,
             block_order,
             blocks,
         };
@@ -459,6 +599,10 @@ impl<'a> FunctionBuilder<'a> {
 
     fn snapshot_regions_onto(&mut self, target: BlockId) {
         self.ensure_block(target);
-        self.region_snapshots.insert(target, self.regions.clone());
+        let source_block = self.current_block.expect("snapshot: no active block");
+        self.region_snapshots
+            .entry(target)
+            .or_default()
+            .push((source_block, self.regions.clone()));
     }
 }

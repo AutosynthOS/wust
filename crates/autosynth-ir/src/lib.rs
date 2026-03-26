@@ -14,17 +14,32 @@ use autosynth_isa::{PReg, Width};
 
 /// Virtual register identifier.
 ///
-/// Assigned during IR construction. The lowerer resolves these to
-/// physical registers via the register allocator.
+/// Tagged by kind: [`Def`](VReg::Def) is a real value produced by an
+/// instruction, [`Ref`](VReg::Ref) is an indirection created at block
+/// entry when cloning region state from a predecessor.
+///
+/// Each variant's `u32` indexes into a separate metadata table
+/// (`vreg_defs`, `vreg_refs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
-pub struct VReg(pub u32);
+pub enum VReg {
+    /// A real definition — produced by an instruction, constant, or physical register.
+    Def(u32),
+    /// Indirection — created at block entry when cloning region state.
+    /// Metadata in [`VRegRef`] determines whether this is a direct
+    /// alias or a phi (merge of multiple predecessors).
+    Ref(u32),
+}
 
 impl fmt::Display for VReg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "v{}", self.0)
+        match self {
+            VReg::Def(id) => write!(f, "v{id}"),
+            VReg::Ref(id) => write!(f, "r{id}"),
+        }
     }
 }
+
 
 /// Identifies a basic block within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -380,6 +395,63 @@ pub struct VRegDef {
     /// If set, the allocator should place this vreg in this preg.
     /// Used for call args and return values.
     pub target: Option<PReg>,
+}
+
+/// How a [`VRegRef`] obtains its value.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
+pub enum VRegRefSource {
+    /// Direct alias — single predecessor, resolves straight through.
+    Direct(VReg),
+    /// Merge point — multiple predecessors provide different values.
+    /// Each entry is (predecessor_block, source_vreg).
+    Phi(Vec<(BlockId, VReg)>),
+}
+
+/// Metadata for a [`VReg::Ref`] — an indirection to another VReg.
+///
+/// Created at block entry when cloning predecessor region state.
+/// Starts as [`VRegRefSource::Direct`] and may be upgraded to
+/// [`VRegRefSource::Phi`] when additional predecessors merge in.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
+pub struct VRegRef {
+    /// The ref's own identifier (always [`VReg::Ref`]).
+    pub id: VReg,
+    /// Register width.
+    pub width: Width,
+    /// How this ref obtains its value.
+    pub source: VRegRefSource,
+}
+
+impl fmt::Display for VRegRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.source {
+            VRegRefSource::Direct(src) => write!(f, "{}->{}", self.id, src),
+            VRegRefSource::Phi(sources) => {
+                write!(f, "{}\u{2192}", self.id)?;
+                for (i, (_, vreg)) in sources.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ",")?;
+                    }
+                    write!(f, "{vreg}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Chase through Direct refs to find the root VReg.
+/// Phi refs are first-class and returned as-is.
+pub fn resolve_ref(vreg: VReg, refs: &[VRegRef]) -> VReg {
+    match vreg {
+        VReg::Def(_) => vreg,
+        VReg::Ref(id) => match &refs[id as usize].source {
+            VRegRefSource::Direct(src) => resolve_ref(*src, refs),
+            VRegRefSource::Phi(_) => vreg,
+        },
+    }
 }
 
 /// A named region of memory anchored to a register + offset.
