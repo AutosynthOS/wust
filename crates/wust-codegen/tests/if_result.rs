@@ -6,19 +6,7 @@ use wust_codegen::JitModule;
 /// Tests if-with-results: the if block produces a value that
 /// gets consumed by i32.add. Uses i32.eqz so the condition
 /// goes through Comp+BrIf fusion.
-const WAT: &str = r#"(module
-  (func $test (export "test") (result i32)
-    i32.const 5
-    i32.const 0
-    i32.eqz
-    if (result i32)
-      i32.const 10
-    else
-      i32.const 20
-    end
-    i32.add
-  )
-)"#;
+const WAT: &str = include_str!("if_result.wat");
 
 #[test]
 fn if_result_lower() -> anyhow::Result<()> {

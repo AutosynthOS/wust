@@ -1,20 +1,7 @@
 use autosynth_backend_aarch64::Aarch64Backend;
 use wust_codegen::JitModule;
 
-const WAT: &str = r#"
-(module
-  (func $f (export "f") (param $x i32) (result i32)
-    (if (result i32) (i32.eqz (local.get $x))
-      (then
-        (i32.const 99)
-      )
-      (else
-        (call $f (i32.const 0))
-      )
-    )
-  )
-)
-"#;
+const WAT: &str = include_str!("const_arg.wat");
 
 #[test]
 fn const_arg_lower() -> anyhow::Result<()> {

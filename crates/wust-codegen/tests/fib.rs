@@ -1,20 +1,7 @@
 use autosynth_backend_aarch64::Aarch64Backend;
 use wust_codegen::JitModule;
 
-const WAT: &str = r#"
-(module
-  (func $fib (export "fib") (param $n i32) (result i32)
-    (local $a i32)
-    (local $b i32)
-    (if (i32.le_s (local.get $n) (i32.const 1))
-      (then (return (local.get $n)))
-    )
-    (local.set $a (call $fib (i32.sub (local.get $n) (i32.const 1))))
-    (local.set $b (call $fib (i32.sub (local.get $n) (i32.const 2))))
-    (i32.add (local.get $a) (local.get $b))
-  )
-)
-"#;
+const WAT: &str = include_str!("fib.wat");
 
 // fn fib<0>(w9<i32>) -> w9<i32>
 // 0000 │  str   g.lr, [g.sp, #-16]!            prologue
