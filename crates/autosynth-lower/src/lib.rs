@@ -6,7 +6,6 @@
 //!   immediates or allocate physical registers
 //! - [`trace!`] / [`trace_do!`] — feature-gated structured trace emission
 
-use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 
@@ -17,9 +16,6 @@ pub mod trace;
 #[cfg(feature = "trace")]
 #[doc(hidden)]
 pub use serde_json as __serde_json;
-
-#[cfg(feature = "trace")]
-use std::cell::RefCell;
 
 use autosynth_ir::VReg;
 use autosynth_isa::{IsaReg, PReg, PRegOr, Width};
@@ -37,6 +33,9 @@ use autosynth_isa::{IsaReg, PReg, PRegOr, Width};
 // carry the correct parent through fused instruction paths.
 //
 // All group tracking compiles to nothing without the `trace` feature.
+
+#[cfg(feature = "trace")]
+use std::cell::RefCell;
 
 #[cfg(feature = "trace")]
 struct GroupLevel {

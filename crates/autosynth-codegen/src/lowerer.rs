@@ -36,7 +36,11 @@ pub fn compile(
         });
 
         for inst in &block.instructions {
-            trace_do! { autosynth_lower::set_group(&format!("ir:{ir_index}")); }
+            trace_do! {
+                autosynth_lower::set_group(
+                    &format!("block:{block_id:?}:ir:{ir_index}")
+                );
+            }
 
             trace!({
                 "type": "lower_inst",
@@ -57,9 +61,10 @@ pub fn compile(
             ir_index += 1;
         }
 
-        // Set convergence group at block level — convergence ops
-        // aren't tied to a specific IR instruction.
-        trace_do! { autosynth_lower::set_group(&format!("block:{block_id:?}")); }
+        // Convergence group — block-level, not tied to a specific IR instruction.
+        trace_do! {
+            autosynth_lower::set_group(&format!("block:{block_id:?}"));
+        }
 
         for &succ in &block.successors {
             let into_params = &func.blocks[&succ].params;

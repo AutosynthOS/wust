@@ -305,22 +305,21 @@ export function transformTrace(raw: any[]): FunctionView[] {
 	}
 
 	// Pre-pass 2: collect regalloc snapshots, ASM, and converge ops.
-	// ASM parents use structured keys like "ir:18" or "block:User(5):conv:3".
-	// Converge events are collected per block for rendering.
+	//
+	// ASM parents use structured keys:
+	//   "block:User(5):ir:22"   — instruction-level asm
+	//   "block:User(5):conv:1"  — convergence asm
+	//
+	// Converge events carry {block, phi, src} for labels.
 	const regAllocByIrIndex = new Map<number, RegAllocSnapshotView>();
 	const asmByParent = new Map<string, AsmView[]>();
-	type ConvergeOp = { phi: string; src: string; block: string; index: number };
+	type ConvergeOp = { phi: string; src: string };
 	const convergeByBlock = new Map<string, ConvergeOp[]>();
 	let lastIrIndex = -1;
-	let lastBlock = '';
-	let convergeCounter = 0;
 
 	for (const e of raw) {
 		if (e.type === 'lower_inst') {
 			lastIrIndex = e.ir_index;
-		} else if (e.type === 'lower_block_start') {
-			lastBlock = e.block;
-			convergeCounter = 0;
 		} else if (e.type === 'regalloc_state') {
 			regAllocByIrIndex.set(lastIrIndex, convertRegAllocState(e.state));
 		} else if (e.type === 'asm' && e.parent !== undefined) {
@@ -328,12 +327,10 @@ export function transformTrace(raw: any[]): FunctionView[] {
 			const list = asmByParent.get(parent) ?? [];
 			list.push({ addr: e.addr, text: e.text, origin: e.origin ?? 'lower' });
 			asmByParent.set(parent, list);
-		} else if (e.type === 'converge') {
-			const block = e.block ?? lastBlock;
-			const list = convergeByBlock.get(block) ?? [];
-			const index = convergeCounter++;
-			list.push({ phi: e.phi, src: e.src, block, index });
-			convergeByBlock.set(block, list);
+		} else if (e.type === 'converge' && e.block) {
+			const list = convergeByBlock.get(e.block) ?? [];
+			list.push({ phi: e.phi, src: e.src });
+			convergeByBlock.set(e.block, list);
 		}
 	}
 
@@ -341,6 +338,7 @@ export function transformTrace(raw: any[]): FunctionView[] {
 	// refs is always available from pre-pass 1.
 	let buildIrIndex = 0;
 	let refs: VRegRefView[] = [];
+	let currentBlockId = '';
 
 	for (const e of raw) {
 		if (e.phase !== 'build' && e.type !== 'build_end' && e.type !== 'function_start') continue;
@@ -371,6 +369,7 @@ export function transformTrace(raw: any[]): FunctionView[] {
 			}
 			case 'block_start': {
 				if (!currentFunc) break;
+				currentBlockId = e.block;
 				currentBlock = { id: e.block, groups: [], successors: [] };
 				currentFunc.blocks.push(currentBlock);
 				currentGroup = null;
@@ -390,12 +389,13 @@ export function transformTrace(raw: any[]): FunctionView[] {
 				}
 				if (!currentGroup) { buildIrIndex++; break; }
 				const irIdx = buildIrIndex++;
+				const regKey = `block:${currentBlockId}:ir:${irIdx}`;
 				currentGroup.ops.push({
 					seq: e.seq,
 					kind: 'reg',
 					inst: e.inst,
 					text: fmtRegInst(e.inst, refs),
-					asm: asmByParent.get(irIdx) ?? [],
+					asm: asmByParent.get(regKey) ?? [],
 					region_snapshot: e.regions ? convertRegionSnapshot(e.regions, refs) : null,
 					regalloc_snapshot: regAllocByIrIndex.get(irIdx) ?? null,
 				});
@@ -408,8 +408,27 @@ export function transformTrace(raw: any[]): FunctionView[] {
 				}
 				if (!currentGroup) { buildIrIndex++; break; }
 				const irIdx = buildIrIndex++;
-				const irKey = `ir:${irIdx}`;
+				const irKey = `block:${currentBlockId}:ir:${irIdx}`;
 				const instrAsm = asmByParent.get(irKey) ?? [];
+				const isBranch = typeof e.inst === 'object' && e.inst !== null
+					&& ('Branch' in e.inst || 'BrIf' in e.inst || 'Skipped' in e.inst);
+
+				// Convergence ops go before the branch — they're emitted
+				// by the lowerer between instructions and flush.
+				if (isBranch) {
+					const convOps = convergeByBlock.get(currentBlockId) ?? [];
+					for (let i = 0; i < convOps.length; i++) {
+						const convKey = `block:${currentBlockId}:conv:${i}`;
+						const convAsm = asmByParent.get(convKey) ?? [];
+						currentGroup.ops.push({
+							seq: -1, kind: 'ir', inst: null,
+							text: `materialize ${convOps[i].src} \u2192 ${convOps[i].phi}`,
+							asm: convAsm,
+							region_snapshot: null, regalloc_snapshot: null,
+						});
+					}
+				}
+
 				currentGroup.ops.push({
 					seq: e.seq,
 					kind: 'ir',
