@@ -369,57 +369,150 @@ impl RegAlloc {
         Ok(())
     }
 
-    /// Materialize phi ref values at a merge point.
+    /// Reconcile this predecessor's machine state with the merge block's
+    /// expected state (`into_state`).
     ///
-    /// For each phi ref in `into_params`, finds this predecessor's source
-    /// Def, ensures it's in a register, and creates a ref_entry for it.
-    /// If `target` is Some, the phi must end up in the same register as
-    /// the existing snapshot. If None, this predecessor defines the contract.
+    /// For the first predecessor, `into_state` is its own state — phi
+    /// refs get entries created freely, everything else is already in
+    /// place. For subsequent predecessors, every param must be moved,
+    /// reloaded, or materialized to match `into_state`'s register
+    /// assignments.
     pub(crate) fn converge_into(
         &mut self,
         from: BlockId,
         into_params: &std::collections::HashSet<VReg>,
-        target: Option<&MachineState>,
+        into_state: &MachineState,
         backend: &mut impl BackendEmitter,
     ) -> Result<(), LowerError> {
         for &param in into_params {
-            let VReg::Ref(ref_id) = param else { continue };
-            let VRegRefSource::Phi(sources) = &self.vreg_refs[ref_id as usize].source else {
-                continue;
-            };
-            let Some((_, src_def)) = sources.iter().find(|(pred, _)| *pred == from) else {
-                continue;
-            };
-            let src_def = self.resolve_to_def(*src_def);
-            let width = self.vreg_width(src_def);
+            match param {
+                VReg::Ref(ref_id) => {
+                    let source = self.vreg_refs[ref_id as usize].source.clone();
+                    match &source {
+                        VRegRefSource::Phi(sources) => {
+                            let Some((_, src)) = sources.iter().find(|(pred, _)| *pred == from) else {
+                                continue;
+                            };
+                            let src_def = self.resolve_to_def(*src);
+                            let width = self.vreg_width(src_def);
+                            let expected = Self::expected_ref_preg(into_state, ref_id);
 
-            trace!({
-                "type": "converge",
-                "parent": autosynth_lower::current_group(),
-                "phi": format!("{param}"),
-                "src": format!("{src_def}")
-            });
+                            trace!({
+                                "type": "converge",
+                                "parent": autosynth_lower::current_group(),
+                                "phi": format!("{param}"),
+                                "src": format!("{src_def}")
+                            });
 
-            // Materialize the source into a register.
-            let preg = match self.state.entry(src_def)?.loc {
-                VRegLoc::Reg(preg) => preg,
-                VRegLoc::Const(val) => {
-                    let preg = self.alloc_for(src_def, backend)?;
-                    self.state.entry_mut(src_def)?.loc = VRegLoc::Reg(preg);
-                    backend.materialize_const(preg, val, width)?;
-                    preg
+                            let preg = self.ensure_in_reg(src_def, expected, width, backend)?;
+                            self.state.ref_entries[ref_id as usize] = Some(VRegEntry {
+                                loc: VRegLoc::Reg(preg),
+                                slots: Vec::new(),
+                            });
+                        }
+                        VRegRefSource::Direct(src) => {
+                            let def = self.resolve_to_def(*src);
+                            self.reconcile_def(def, into_state, backend)?;
+                        }
+                    }
                 }
-                VRegLoc::Mem => self.reload(src_def, backend)?,
-                VRegLoc::Pending => return Err(LowerError::UndefinedVReg(src_def)),
-            };
-
-            // Create the phi ref's entry at this register.
-            self.state.ref_entries[ref_id as usize] = Some(VRegEntry {
-                loc: VRegLoc::Reg(preg),
-                slots: Vec::new(),
-            });
+                VReg::Def(_) => {
+                    self.reconcile_def(param, into_state, backend)?;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Ensure a def vreg's location matches `into_state`.
+    fn reconcile_def(
+        &mut self,
+        vreg: VReg,
+        into_state: &MachineState,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<(), LowerError> {
+        let VReg::Def(def_id) = vreg else { return Ok(()) };
+        // Skip vregs not in our state — they belong to another
+        // predecessor's phi source, not ours.
+        if self.state.def_entries[def_id as usize].is_none() {
+            return Ok(());
+        }
+        let expected = into_state.def_entries[def_id as usize]
+            .as_ref()
+            .and_then(|e| match e.loc {
+                VRegLoc::Reg(p) => Some(p),
+                _ => None,
+            });
+        let Some(expected_preg) = expected else { return Ok(()) };
+        let width = self.vreg_width(vreg);
+        self.ensure_in_reg(vreg, Some(expected_preg), width, backend)?;
+        Ok(())
+    }
+
+    /// Look up the expected register for a ref in the target state.
+    fn expected_ref_preg(into_state: &MachineState, ref_id: u32) -> Option<PReg> {
+        into_state.ref_entries[ref_id as usize]
+            .as_ref()
+            .and_then(|e| match e.loc {
+                VRegLoc::Reg(p) => Some(p),
+                _ => None,
+            })
+    }
+
+    /// Ensure a vreg is in a specific register (or any register if
+    /// `expected` is None). Handles Reg, Const, and Mem locations.
+    fn ensure_in_reg(
+        &mut self,
+        vreg: VReg,
+        expected: Option<PReg>,
+        width: Width,
+        backend: &mut impl BackendEmitter,
+    ) -> Result<PReg, LowerError> {
+        let loc = self.state.entry(vreg)?.loc;
+        match (loc, expected) {
+            (VRegLoc::Reg(cur), Some(want)) if cur == want => Ok(cur),
+            (VRegLoc::Reg(cur), Some(want)) => {
+                self.acquire(want, backend)?;
+                backend.lower(
+                    self,
+                    IrInst::Move { dst: want, dst_width: width, src: cur, src_width: width },
+                    Emit::Immediate,
+                )?;
+                self.state.bindings[cur.0 as usize] = None;
+                self.state.bindings[want.0 as usize] = Some(vreg);
+                self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(want);
+                Ok(want)
+            }
+            (VRegLoc::Reg(cur), None) => Ok(cur),
+            (VRegLoc::Const(val), expected) => {
+                let preg = match expected {
+                    Some(p) => { self.acquire(p, backend)?; self.state.bindings[p.0 as usize] = Some(vreg); p }
+                    None => self.alloc_for(vreg, backend)?,
+                };
+                self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
+                backend.materialize_const(preg, val, width)?;
+                Ok(preg)
+            }
+            (VRegLoc::Mem, expected) => {
+                let slot = self.state.entry(vreg)?
+                    .slots.iter()
+                    .find(|s| !s.dirty)
+                    .map(|s| s.slot)
+                    .ok_or(LowerError::UndefinedVReg(vreg))?;
+                let preg = match expected {
+                    Some(p) => { self.acquire(p, backend)?; self.state.bindings[p.0 as usize] = Some(vreg); p }
+                    None => self.alloc_for(vreg, backend)?,
+                };
+                backend.lower(
+                    self,
+                    IrInst::Load { dst: preg, width, base: slot.base, offset: slot.offset },
+                    Emit::Immediate,
+                )?;
+                self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
+                Ok(preg)
+            }
+            (VRegLoc::Pending, _) => Err(LowerError::UndefinedVReg(vreg)),
+        }
     }
 }
 
@@ -491,6 +584,29 @@ impl LowerCtx for RegAlloc {
                         return Ok((t, width));
                     }
                 }
+                Ok((preg, width))
+            }
+            VRegLoc::Const(val) => {
+                let preg = self.alloc_for(vreg, backend)?;
+                self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
+                backend.materialize_const(preg, val, width)?;
+                trace!({"type": "define_vreg", "vreg": format!("{vreg}"), "preg": preg.0});
+                Ok((preg, width))
+            }
+            VRegLoc::Mem => {
+                let preg = self.alloc_for(vreg, backend)?;
+                let slot = self.state.entry(vreg)?
+                    .slots.iter()
+                    .find(|s| !s.dirty)
+                    .map(|s| s.slot)
+                    .ok_or(LowerError::UndefinedVReg(vreg))?;
+                backend.lower(
+                    self,
+                    IrInst::Load { dst: preg, width, base: slot.base, offset: slot.offset },
+                    Emit::Immediate,
+                )?;
+                self.state.entry_mut(vreg)?.loc = VRegLoc::Reg(preg);
+                trace!({"type": "define_vreg", "vreg": format!("{vreg}"), "preg": preg.0});
                 Ok((preg, width))
             }
             _ => Err(LowerError::UnexpectedDefine(vreg)),

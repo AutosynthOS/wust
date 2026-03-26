@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 
-use autosynth_ir::{BlockId, IrInst, LowerInst, VReg};
-use autosynth_lower::{trace, trace_ctx, trace_do};
+use autosynth_ir::{BlockId, IrInst, LowerInst};
+use autosynth_lower::{trace, trace_ctx};
 
 use crate::ir_function::IRFunction;
 use crate::regalloc::{MachineState, RegAlloc};
@@ -30,7 +30,10 @@ pub fn compile(
         backend.bind_label(block_id);
 
         trace_ctx!("block", format!("{block_id:?}"));
-        trace!({"type": "lower_block_start", "block": format!("{block_id:?}")});
+        trace!({
+            "type": "lower_block_start",
+            "block": format!("{block_id:?}")
+        });
 
         for inst in &block.instructions {
             autosynth_lower::set_group(ir_index);
@@ -56,8 +59,11 @@ pub fn compile(
 
         for &succ in &block.successors {
             let into_params = &func.blocks[&succ].params;
-            let target = snapshots.get(&succ);
-            regalloc.converge_into(block_id, into_params, target, backend)?;
+            let into_state = snapshots
+                .get(&succ)
+                .cloned()
+                .unwrap_or_else(|| regalloc.state.clone());
+            regalloc.converge_into(block_id, into_params, &into_state, backend)?;
             if !snapshots.contains_key(&succ) {
                 snapshots.insert(succ, regalloc.state.clone());
             }
@@ -68,7 +74,10 @@ pub fn compile(
 
     backend.finalize(&mut regalloc)?;
 
-    trace!({"type": "lower_end", "code_size": backend.code().len()});
+    trace!({
+        "type": "lower_end",
+        "code_size": backend.code().len()
+    });
 
     Ok(backend.code().to_vec())
 }

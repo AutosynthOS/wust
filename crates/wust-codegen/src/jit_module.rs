@@ -14,6 +14,10 @@ use crate::CodeBuffer;
 use crate::conversion::{build_signatures, func_signature, valtype_to_width};
 use crate::trampoline::{call_trampoline, emit_entry_trampoline};
 
+/// Toggle fuel checks in generated code. Set to `false` to emit
+/// straight-line code without fuel subtraction or suspend branches.
+const EMIT_FUEL_CHECKS: bool = false;
+
 /// A JIT-compiled WASM module, generic over the backend.
 ///
 /// Owns the parsed module, the autosynth IR compiler state, and an
@@ -312,15 +316,22 @@ impl<B: BackendEmitter> JitModule<B> {
                     let callee_sig = func_signature(callee);
 
                     // Pop args and constrain each to its CC register.
+                    let mut args = Vec::new();
                     for i in (0..callee_sig.params.len()).rev() {
                         let vreg = f.pop(operands, callee_sig.params[i].width());
                         f.set_target(vreg, PReg(i as u8));
+                        args.push(vreg);
                     }
 
                     // Clobber all live vregs — call will destroy registers.
                     f.clobber_region(locals);
                     f.clobber_region(operands);
                     f.clobber_region(fibre);
+
+                    // Resolve args AFTER clobbers so they don't get evicted.
+                    for vreg in args {
+                        f.emit_reg(RegInst::Resolve { vreg });
+                    }
 
                     // Frame advance: the caller's top-of-stack operands
                     // become the callee's params (same stack slots). We
@@ -366,9 +377,11 @@ impl<B: BackendEmitter> JitModule<B> {
                         f.push_vreg(operands, v);
                     }
 
-                    trace!({"type": "group", "label": "(fuel check)"});
-                    let fuel = f.alloc_vreg(Width::W64, VInit::PReg(fuel_preg));
-                    Self::emit_fuel_check(&mut f, fuel, &mut pending_fuel, pc);
+                    if EMIT_FUEL_CHECKS {
+                        trace!({"type": "group", "label": "(fuel check)"});
+                        let fuel = f.alloc_vreg(Width::W64, VInit::PReg(fuel_preg));
+                        Self::emit_fuel_check(&mut f, fuel, &mut pending_fuel, pc);
+                    }
                 }
                 _ => todo!("unhandled opcode: {:?}", op),
             }

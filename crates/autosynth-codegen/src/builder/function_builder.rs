@@ -241,14 +241,13 @@ impl<'a> FunctionBuilder<'a> {
 
     pub fn start_block(&mut self, block: BlockId) {
         self.ensure_block(block);
+        self.current_block = Some(block);
         let snapshots = self.region_snapshots.remove(&block).unwrap_or_default();
 
         if let Some(first) = snapshots.first() {
             self.regions = first.1.clone();
             self.wrap_region_slots_in_refs(&snapshots);
         }
-
-        self.current_block = Some(block);
         trace_ctx!("block", format!("{block:?}"));
         trace!({"type": "block_start", "block": format!("{block:?}")});
     }
@@ -271,8 +270,16 @@ impl<'a> FunctionBuilder<'a> {
 
                 let width = self.vreg_width(slot);
                 let source = self.merge_slot(snapshots, region_idx, slot_idx);
+                let is_phi = matches!(source, VRegRefSource::Phi(_));
                 let ref_vreg = self.alloc_ref(width, source);
                 self.regions[region_idx].slots[slot_idx] = ref_vreg;
+
+                // Phi refs need converge_into to materialize them, which
+                // requires them to be params. Record usage so they appear
+                // in uses \ defs even if no instruction explicitly touches them.
+                if is_phi {
+                    self.record_use(ref_vreg);
+                }
             }
         }
     }
@@ -450,7 +457,7 @@ impl<'a> FunctionBuilder<'a> {
             });
         }
 
-        let block_order = self.block_order;
+        let block_order = rpo(&self.block_order[0], &self.blocks);
         let mut blocks = self.blocks;
         let vreg_defs = self.vreg_defs;
         let vreg_refs = self.vreg_refs;
@@ -605,4 +612,37 @@ impl<'a> FunctionBuilder<'a> {
             .or_default()
             .push((source_block, self.regions.clone()));
     }
+}
+
+/// Compute reverse postorder of the block graph.
+///
+/// For br_if blocks (two successors), visits block_else first so that
+/// block_if (the fall-through target) is placed immediately after the
+/// branch block in the final order.
+fn rpo(entry: &BlockId, blocks: &HashMap<BlockId, IrBlock>) -> Vec<BlockId> {
+    let mut visited = HashSet::new();
+    let mut postorder = Vec::new();
+
+    fn dfs(
+        id: BlockId,
+        blocks: &HashMap<BlockId, IrBlock>,
+        visited: &mut HashSet<BlockId>,
+        postorder: &mut Vec<BlockId>,
+    ) {
+        if !visited.insert(id) {
+            return;
+        }
+        let block = &blocks[&id];
+        // Visit successors in reverse so the first successor (block_if
+        // for br_if, or the branch target) ends up right after this
+        // block in RPO.
+        for &succ in block.successors.iter().rev() {
+            dfs(succ, blocks, visited, postorder);
+        }
+        postorder.push(id);
+    }
+
+    dfs(*entry, blocks, &mut visited, &mut postorder);
+    postorder.reverse();
+    postorder
 }
