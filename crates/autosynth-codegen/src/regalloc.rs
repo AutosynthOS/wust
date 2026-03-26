@@ -430,12 +430,14 @@ impl RegAlloc {
         backend: &mut impl BackendEmitter,
     ) -> Result<(), LowerError> {
         for &param in into_params {
+            trace_do! { autosynth_lower::push_subgroup(); }
             match param {
                 VReg::Ref(ref_id) => {
                     let source = self.vreg_refs[ref_id as usize].source.clone();
                     match &source {
                         VRegRefSource::Phi(sources) => {
                             let Some((_, src)) = sources.iter().find(|(pred, _)| *pred == from) else {
+                                trace_do! { autosynth_lower::pop_subgroup(); }
                                 continue;
                             };
                             let src_def = self.resolve_to_def(*src);
@@ -444,7 +446,6 @@ impl RegAlloc {
 
                             trace!({
                                 "type": "converge",
-                                "parent": autosynth_lower::current_group(),
                                 "phi": format!("{param}"),
                                 "src": format!("{src_def}")
                             });
@@ -457,14 +458,25 @@ impl RegAlloc {
                         }
                         VRegRefSource::Direct(src) => {
                             let def = self.resolve_to_def(*src);
+                            trace!({
+                                "type": "converge",
+                                "phi": format!("{param}"),
+                                "src": format!("{def}")
+                            });
                             self.reconcile_def(def, into_state, backend)?;
                         }
                     }
                 }
                 VReg::Def(_) => {
+                    trace!({
+                        "type": "converge",
+                        "phi": format!("{param}"),
+                        "src": format!("{param}")
+                    });
                     self.reconcile_def(param, into_state, backend)?;
                 }
             }
+            trace_do! { autosynth_lower::pop_subgroup(); }
         }
         Ok(())
     }

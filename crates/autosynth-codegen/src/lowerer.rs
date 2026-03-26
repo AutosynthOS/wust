@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 
 use autosynth_ir::{BlockId, IrInst, LowerInst};
-use autosynth_lower::{trace, trace_ctx};
+use autosynth_lower::{trace, trace_ctx, trace_do};
 
 use crate::ir_function::IRFunction;
 use crate::regalloc::{MachineState, RegAlloc};
@@ -36,7 +36,7 @@ pub fn compile(
         });
 
         for inst in &block.instructions {
-            autosynth_lower::set_group(ir_index);
+            trace_do! { autosynth_lower::set_group(ir_index); }
 
             trace!({
                 "type": "lower_inst",
@@ -56,6 +56,10 @@ pub fn compile(
             }
             ir_index += 1;
         }
+
+        // Ensure a valid group exists for convergence (empty blocks
+        // may not have called set_group in the instruction loop).
+        trace_do! { autosynth_lower::set_group(ir_index); }
 
         for &succ in &block.successors {
             let into_params = &func.blocks[&succ].params;

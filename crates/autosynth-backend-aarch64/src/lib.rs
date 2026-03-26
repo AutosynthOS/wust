@@ -13,7 +13,7 @@ use autosynth_isa_aarch64::{
     SubReg, SubsImm, SubsReg, UImm16,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
-use autosynth_lower::{trace, LowerCtx, LowerCtxExt};
+use autosynth_lower::{trace, trace_do, LowerCtx, LowerCtxExt};
 use autosynth_lower::{BackendEmitter, LowerError, MachineConfig};
 
 /// A saved patch point — the byte offset of an instruction that needs
@@ -53,7 +53,8 @@ pub struct Aarch64Backend {
 struct Operation {
     /// The instruction group this operation belongs to — restored
     /// before emitting so ASM events carry the right parent.
-    group: usize,
+    #[cfg(feature = "trace")]
+    group: String,
     op: CompoundOperation,
 }
 
@@ -90,12 +91,11 @@ impl BackendEmitter for Aarch64Backend {
         inst: IrInst,
         emit: autosynth_lower::Emit,
     ) -> Result<(), LowerError> {
-        let group = autosynth_lower::current_group();
-
         if emit == autosynth_lower::Emit::Immediate {
             self.flush(ctx)?;
             let op = Operation {
-                group,
+                #[cfg(feature = "trace")]
+                group: autosynth_lower::current_group(),
                 op: CompoundOperation::Base(inst),
             };
             return self.emit(ctx, op);
@@ -105,14 +105,15 @@ impl BackendEmitter for Aarch64Backend {
             None => {
                 trace!({"type": "defer", "inst": format!("{inst}")});
                 self.pending = Some(Operation {
-                    group,
+                    #[cfg(feature = "trace")]
+                    group: autosynth_lower::current_group(),
                     op: CompoundOperation::Base(inst),
                 });
                 Ok(())
             }
             Some(pending) => {
                 trace!({"type": "fuse_attempt", "inst": format!("{inst}")});
-                self.fuse(ctx, pending, inst, group)
+                self.fuse(ctx, pending, inst)
             }
         }
     }
@@ -226,7 +227,6 @@ impl Aarch64Backend {
         ctx: &mut impl LowerCtx,
         pending: Operation,
         inst: IrInst,
-        group: usize,
     ) -> Result<(), LowerError> {
         match (&pending.op, &inst) {
             // Comp + BrIf → subs + b.cond (fused compare-and-branch)
@@ -240,13 +240,13 @@ impl Aarch64Backend {
                 IrInst::BrIf { cond: cond_vreg, .. },
             ) => {
                 // subs goes under the Comp's group.
-                autosynth_lower::set_group(pending.group);
+                trace_do! { autosynth_lower::restore_group(&pending.group); }
                 lower_cmp(ctx, *c, *dst, *lhs, *rhs, self)?;
                 // Consume the cond vreg's remaining use — only the flags
                 // matter, but the register needs to be freed.
                 let _ = ctx.resolve_vreg(*cond_vreg, self)?;
                 // b.cond goes under the BrIf's group.
-                autosynth_lower::set_group(group);
+                trace_do! { autosynth_lower::restore_group(&autosynth_lower::current_group()); }
                 let cond = comp_op_to_cond(*c).invert();
                 let offset = emit_inst_at(self, BCond { cond, offset: SImm19::try_from(0).unwrap() })?;
                 self.patches.push(Patch {
@@ -261,7 +261,8 @@ impl Aarch64Backend {
             _ => {
                 self.emit(ctx, pending)?;
                 self.pending = Some(Operation {
-                    group,
+                    #[cfg(feature = "trace")]
+                    group: autosynth_lower::current_group(),
                     op: CompoundOperation::Base(inst),
                 });
                 Ok(())
@@ -317,7 +318,7 @@ impl Aarch64Backend {
     }
 
     fn emit(&mut self, ctx: &mut impl LowerCtx, pending: Operation) -> Result<(), LowerError> {
-        autosynth_lower::set_group(pending.group);
+        trace_do! { autosynth_lower::restore_group(&pending.group); }
         match pending.op {
             CompoundOperation::Base(inst) => self.emit_base(ctx, inst),
         }

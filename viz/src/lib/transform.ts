@@ -304,10 +304,12 @@ export function transformTrace(raw: any[]): FunctionView[] {
 		}
 	}
 
-	// Pre-pass 2: collect regalloc snapshots, ASM, and converge ops, keyed by ir_index/parent
+	// Pre-pass 2: collect regalloc snapshots, ASM, and converge ops.
+	// ASM and converge events use dot-separated group strings as parents
+	// (e.g. "7" for the instruction, "7.0" for a convergence sub-op).
 	const regAllocByIrIndex = new Map<number, RegAllocSnapshotView>();
-	const asmByParent = new Map<number, AsmView[]>();
-	const convergeByParent = new Map<number, { phi: string; src: string }[]>();
+	const asmByParent = new Map<string, AsmView[]>();
+	const convergeOps: { phi: string; src: string; irIndex: number }[] = [];
 	let lastIrIndex = -1;
 
 	for (const e of raw) {
@@ -316,15 +318,12 @@ export function transformTrace(raw: any[]): FunctionView[] {
 		} else if (e.type === 'regalloc_state') {
 			regAllocByIrIndex.set(lastIrIndex, convertRegAllocState(e.state));
 		} else if (e.type === 'asm' && e.parent !== undefined) {
-			const parent = e.parent as number;
+			const parent = String(e.parent);
 			const list = asmByParent.get(parent) ?? [];
 			list.push({ addr: e.addr, text: e.text, origin: e.origin ?? 'lower' });
 			asmByParent.set(parent, list);
-		} else if (e.type === 'converge' && e.parent !== undefined) {
-			const parent = e.parent as number;
-			const list = convergeByParent.get(parent) ?? [];
-			list.push({ phi: e.phi, src: e.src });
-			convergeByParent.set(parent, list);
+		} else if (e.type === 'converge') {
+			convergeOps.push({ phi: e.phi, src: e.src, irIndex: lastIrIndex });
 		}
 	}
 
@@ -399,26 +398,27 @@ export function transformTrace(raw: any[]): FunctionView[] {
 				}
 				if (!currentGroup) { buildIrIndex++; break; }
 				const irIdx = buildIrIndex++;
-				const allAsm = asmByParent.get(irIdx) ?? [];
-				const converges = convergeByParent.get(irIdx) ?? [];
+				const irKey = String(irIdx);
 
-				// Split asm: first N entries are convergence materializations,
-				// rest belong to the actual instruction (e.g. branch).
-				const convergeAsm = allAsm.slice(0, converges.length);
-				const instrAsm = allAsm.slice(converges.length);
-
+				// Collect convergence ops for this ir_index.
+				// Each gets asm from its subgroup (e.g. "7.0", "7.1").
+				const converges = convergeOps.filter(c => c.irIndex === irIdx);
 				for (let i = 0; i < converges.length; i++) {
+					const subKey = `${irKey}.${i}`;
+					const subAsm = asmByParent.get(subKey) ?? [];
 					currentGroup.ops.push({
 						seq: e.seq,
 						kind: 'ir',
 						inst: null,
 						text: `materialize ${converges[i].src} \u2192 ${converges[i].phi}`,
-						asm: convergeAsm[i] ? [convergeAsm[i]] : [],
+						asm: subAsm,
 						region_snapshot: null,
 						regalloc_snapshot: null,
 					});
 				}
 
+				// Instruction's own asm (parent = plain ir_index, no dot).
+				const instrAsm = asmByParent.get(irKey) ?? [];
 				currentGroup.ops.push({
 					seq: e.seq,
 					kind: 'ir',

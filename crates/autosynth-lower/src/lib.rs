@@ -18,34 +18,86 @@ pub mod trace;
 #[doc(hidden)]
 pub use serde_json as __serde_json;
 
+#[cfg(feature = "trace")]
+use std::cell::RefCell;
+
 use autosynth_ir::VReg;
 use autosynth_isa::{IsaReg, PReg, PRegOr, Width};
 
-// --- Instruction group tracking ---
+// --- Instruction group tracking (trace-only) ---
 //
-// The lowerer sets the current group index before processing each
-// instruction. The backend saves/restores it on deferred Operations
-// so that ASM events carry the identity of the instruction that
-// produced them. This is the only mechanism needed for correct
-// ASM parent attribution through deferred/fused instruction paths.
+// Groups form a dot-separated hierarchy: "7" is the base group for
+// IR instruction 7, "7.0" and "7.1" are sub-groups (e.g. individual
+// convergence operations within that instruction).
+//
+// The lowerer calls `set_group(ir_index)` before each instruction.
+// Convergence and other multi-step operations use `push_subgroup()`
+// / `pop_subgroup()` to create child groups. The backend saves and
+// restores the group string on deferred Operations so ASM events
+// carry the correct parent through fused instruction paths.
+//
+// All group tracking compiles to nothing without the `trace` feature.
 
+#[cfg(feature = "trace")]
+struct GroupLevel {
+    name: String,
+    next_child: usize,
+}
+
+#[cfg(feature = "trace")]
 thread_local! {
-    static CURRENT_GROUP: Cell<usize> = const { Cell::new(0) };
+    static GROUP_STACK: RefCell<Vec<GroupLevel>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Set the current instruction group index.
-///
-/// Called by the lowerer before processing each instruction.
+/// Set the base group for the current IR instruction.
+#[cfg(feature = "trace")]
 pub fn set_group(index: usize) {
-    CURRENT_GROUP.with(|g| g.set(index));
+    GROUP_STACK.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.push(GroupLevel { name: index.to_string(), next_child: 0 });
+    });
 }
 
-/// Get the current instruction group index.
-///
-/// Called by the backend when deferring instructions (save) and
-/// before emitting ASM (read parent for trace events).
-pub fn current_group() -> usize {
-    CURRENT_GROUP.with(|g| g.get())
+/// Get the current group string (e.g. "7" or "7.1").
+#[cfg(feature = "trace")]
+pub fn current_group() -> String {
+    GROUP_STACK.with(|s| {
+        s.borrow().last().map(|l| l.name.clone()).unwrap_or_else(|| "0".to_string())
+    })
+}
+
+/// Push a new child sub-group under the current group.
+#[cfg(feature = "trace")]
+pub fn push_subgroup() {
+    GROUP_STACK.with(|s| {
+        let mut s = s.borrow_mut();
+        if s.is_empty() {
+            s.push(GroupLevel { name: "0".to_string(), next_child: 0 });
+        }
+        let parent = &s.last().unwrap().name;
+        let child = s.last().unwrap().next_child;
+        let name = format!("{parent}.{child}");
+        s.last_mut().unwrap().next_child += 1;
+        s.push(GroupLevel { name, next_child: 0 });
+    });
+}
+
+/// Pop back to the parent group.
+#[cfg(feature = "trace")]
+pub fn pop_subgroup() {
+    GROUP_STACK.with(|s| s.borrow_mut().pop());
+}
+
+/// Restore a previously saved group string (used by the backend
+/// when replaying deferred instructions).
+#[cfg(feature = "trace")]
+pub fn restore_group(group: &str) {
+    GROUP_STACK.with(|s| {
+        let mut s = s.borrow_mut();
+        s.clear();
+        s.push(GroupLevel { name: group.to_string(), next_child: 0 });
+    });
 }
 
 /// The context a backend uses to resolve operands and emit machine code.
