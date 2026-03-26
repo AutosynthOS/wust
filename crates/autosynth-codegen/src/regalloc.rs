@@ -318,7 +318,6 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::Clobber { vreg } => {
-                self.consume(*vreg);
                 backend.flush(self)?;
                 trace_ctx!("origin", "regalloc");
                 let loc = self.state.entry(*vreg)?.loc;

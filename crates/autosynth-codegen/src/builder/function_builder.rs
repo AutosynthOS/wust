@@ -527,9 +527,10 @@ impl<'a> FunctionBuilder<'a> {
                     LowerInst::Reg(reg) => match reg {
                         RegInst::SetSlot { vreg, .. }
                         | RegInst::ClearSlot { vreg, .. }
-                        | RegInst::Clobber { vreg }
                         | RegInst::Resolve { vreg } => { mark(*vreg); }
-                        RegInst::Define { .. } => {}
+                        // Clobber checks if a value needs saving but doesn't
+                        // consume it — exclude from liveness counting.
+                        RegInst::Clobber { .. } | RegInst::Define { .. } => {}
                     },
                 }
             }
