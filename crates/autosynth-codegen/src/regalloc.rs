@@ -292,6 +292,7 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::SetSlot { vreg, slot } => {
+                self.consume(*vreg);
                 self.state.entry_mut(*vreg)?.slots.push(SlotState {
                     slot: *slot,
                     dirty: true,
@@ -299,6 +300,7 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::ClearSlot { vreg, slot } => {
+                self.consume(*vreg);
                 let loc = self.state.entry(*vreg)?.loc;
                 let is_clean = self
                     .state
@@ -316,6 +318,7 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::Clobber { vreg } => {
+                self.consume(*vreg);
                 backend.flush(self)?;
                 trace_ctx!("origin", "regalloc");
                 let loc = self.state.entry(*vreg)?.loc;
@@ -332,6 +335,7 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::Resolve { vreg } => {
+                self.consume(*vreg);
                 self.define_vreg(*vreg, backend)?;
                 Ok(())
             }
