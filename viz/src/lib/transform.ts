@@ -305,16 +305,22 @@ export function transformTrace(raw: any[]): FunctionView[] {
 	}
 
 	// Pre-pass 2: collect regalloc snapshots, ASM, and converge ops.
-	// ASM and converge events use dot-separated group strings as parents
-	// (e.g. "7" for the instruction, "7.0" for a convergence sub-op).
+	// ASM parents use structured keys like "ir:18" or "block:User(5):conv:3".
+	// Converge events are collected per block for rendering.
 	const regAllocByIrIndex = new Map<number, RegAllocSnapshotView>();
 	const asmByParent = new Map<string, AsmView[]>();
-	const convergeOps: { phi: string; src: string; irIndex: number }[] = [];
+	type ConvergeOp = { phi: string; src: string; block: string; index: number };
+	const convergeByBlock = new Map<string, ConvergeOp[]>();
 	let lastIrIndex = -1;
+	let lastBlock = '';
+	let convergeCounter = 0;
 
 	for (const e of raw) {
 		if (e.type === 'lower_inst') {
 			lastIrIndex = e.ir_index;
+		} else if (e.type === 'lower_block_start') {
+			lastBlock = e.block;
+			convergeCounter = 0;
 		} else if (e.type === 'regalloc_state') {
 			regAllocByIrIndex.set(lastIrIndex, convertRegAllocState(e.state));
 		} else if (e.type === 'asm' && e.parent !== undefined) {
@@ -323,7 +329,11 @@ export function transformTrace(raw: any[]): FunctionView[] {
 			list.push({ addr: e.addr, text: e.text, origin: e.origin ?? 'lower' });
 			asmByParent.set(parent, list);
 		} else if (e.type === 'converge') {
-			convergeOps.push({ phi: e.phi, src: e.src, irIndex: lastIrIndex });
+			const block = e.block ?? lastBlock;
+			const list = convergeByBlock.get(block) ?? [];
+			const index = convergeCounter++;
+			list.push({ phi: e.phi, src: e.src, block, index });
+			convergeByBlock.set(block, list);
 		}
 	}
 
@@ -398,26 +408,7 @@ export function transformTrace(raw: any[]): FunctionView[] {
 				}
 				if (!currentGroup) { buildIrIndex++; break; }
 				const irIdx = buildIrIndex++;
-				const irKey = String(irIdx);
-
-				// Collect convergence ops for this ir_index.
-				// Each gets asm from its subgroup (e.g. "7.0", "7.1").
-				const converges = convergeOps.filter(c => c.irIndex === irIdx);
-				for (let i = 0; i < converges.length; i++) {
-					const subKey = `${irKey}.${i}`;
-					const subAsm = asmByParent.get(subKey) ?? [];
-					currentGroup.ops.push({
-						seq: e.seq,
-						kind: 'ir',
-						inst: null,
-						text: `materialize ${converges[i].src} \u2192 ${converges[i].phi}`,
-						asm: subAsm,
-						region_snapshot: null,
-						regalloc_snapshot: null,
-					});
-				}
-
-				// Instruction's own asm (parent = plain ir_index, no dot).
+				const irKey = `ir:${irIdx}`;
 				const instrAsm = asmByParent.get(irKey) ?? [];
 				currentGroup.ops.push({
 					seq: e.seq,

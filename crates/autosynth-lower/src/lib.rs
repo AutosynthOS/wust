@@ -49,13 +49,14 @@ thread_local! {
     static GROUP_STACK: RefCell<Vec<GroupLevel>> = const { RefCell::new(Vec::new()) };
 }
 
-/// Set the base group for the current IR instruction.
+/// Set the base group path for the current IR instruction.
+/// Path format: `"func:0:block:U3:ir:18"`
 #[cfg(feature = "trace")]
-pub fn set_group(index: usize) {
+pub fn set_group(path: &str) {
     GROUP_STACK.with(|s| {
         let mut s = s.borrow_mut();
         s.clear();
-        s.push(GroupLevel { name: index.to_string(), next_child: 0 });
+        s.push(GroupLevel { name: path.to_string(), next_child: 0 });
     });
 }
 
@@ -68,16 +69,17 @@ pub fn current_group() -> String {
 }
 
 /// Push a new child sub-group under the current group.
+/// Creates paths like `"ir:18:conv:0"`, `"ir:18:conv:1"`.
 #[cfg(feature = "trace")]
-pub fn push_subgroup() {
+pub fn push_subgroup(label: &str) {
     GROUP_STACK.with(|s| {
         let mut s = s.borrow_mut();
         if s.is_empty() {
-            s.push(GroupLevel { name: "0".to_string(), next_child: 0 });
+            s.push(GroupLevel { name: "ir:0".to_string(), next_child: 0 });
         }
         let parent = &s.last().unwrap().name;
         let child = s.last().unwrap().next_child;
-        let name = format!("{parent}.{child}");
+        let name = format!("{parent}:{label}:{child}");
         s.last_mut().unwrap().next_child += 1;
         s.push(GroupLevel { name, next_child: 0 });
     });

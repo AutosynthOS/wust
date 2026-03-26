@@ -92,7 +92,10 @@ impl BackendEmitter for Aarch64Backend {
         emit: autosynth_lower::Emit,
     ) -> Result<(), LowerError> {
         if emit == autosynth_lower::Emit::Immediate {
+            // Save caller's group — flush may restore a pending op's group.
+            trace_do! { let saved = autosynth_lower::current_group(); }
             self.flush(ctx)?;
+            trace_do! { autosynth_lower::restore_group(&saved); }
             let op = Operation {
                 #[cfg(feature = "trace")]
                 group: autosynth_lower::current_group(),

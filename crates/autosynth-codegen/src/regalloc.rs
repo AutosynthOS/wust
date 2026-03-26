@@ -430,7 +430,7 @@ impl RegAlloc {
         backend: &mut impl BackendEmitter,
     ) -> Result<(), LowerError> {
         for &param in into_params {
-            trace_do! { autosynth_lower::push_subgroup(); }
+            trace_do! { autosynth_lower::push_subgroup("conv"); }
             match param {
                 VReg::Ref(ref_id) => {
                     let source = self.vreg_refs[ref_id as usize].source.clone();
