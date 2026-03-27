@@ -78,6 +78,7 @@ export const mockTrace: ModuleTrace = {
 				bindings: [
 					{ preg: 'x0', vreg: 'v0' },
 					{ preg: 'x30', vreg: 'v5' },
+					{ preg: 'sp', vreg: 'v3' },
 				],
 				vreg_locs: [
 					{ vreg: 'v0', loc: 'reg', preg: 'x0', dirty: true },

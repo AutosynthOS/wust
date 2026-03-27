@@ -276,19 +276,20 @@ impl RegAlloc {
                 if self.state.def_entries[idx].is_some() {
                     return Err(LowerError::DuplicateDefine(*vreg));
                 }
-                let loc = match value {
-                    VInit::Const(val) => VRegLoc::Const(*val),
+                let (loc, slots) = match value {
+                    VInit::Const(val) => (VRegLoc::Const(*val), Vec::new()),
                     VInit::PReg(preg) => {
                         self.acquire(*preg, backend)?;
                         self.state.bindings[preg.0 as usize] = Some(*vreg);
-                        VRegLoc::Reg(*preg)
+                        (VRegLoc::Reg(*preg), Vec::new())
                     }
-                    VInit::InstDst => VRegLoc::Pending,
+                    VInit::InstDst => (VRegLoc::Pending, Vec::new()),
+                    VInit::Mem(slot) => (VRegLoc::Mem, vec![SlotState {
+                        slot: *slot,
+                        dirty: false,
+                    }]),
                 };
-                self.state.def_entries[idx] = Some(VRegEntry {
-                    loc,
-                    slots: Vec::new(),
-                });
+                self.state.def_entries[idx] = Some(VRegEntry { loc, slots });
                 Ok(())
             }
             RegInst::SetSlot { vreg, slot } => {
@@ -334,6 +335,7 @@ impl RegAlloc {
                 Ok(())
             }
             RegInst::Resolve { vreg } => {
+                backend.flush(self)?;
                 self.consume(*vreg);
                 self.define_vreg(*vreg, backend)?;
                 Ok(())
@@ -354,8 +356,20 @@ impl RegAlloc {
         };
 
         let loc = self.state.entry(victim)?.loc;
-        if !self.is_live(victim) || matches!(loc, VRegLoc::Const(_)) {
+        if matches!(loc, VRegLoc::Const(_)) {
             self.state.bindings[preg.0 as usize] = None;
+            return Ok(preg);
+        }
+        if !self.is_live(victim) {
+            // Dead in terms of future reads, but may have dirty slots
+            // that need flushing for the canonical stack.
+            let has_dirty = self.state.entry(victim)?.slots.iter().any(|s| s.dirty);
+            if has_dirty {
+                let width = self.vreg_width(victim);
+                self.flush_vreg(victim, preg, width, backend)?;
+            } else {
+                self.state.bindings[preg.0 as usize] = None;
+            }
             return Ok(preg);
         }
 

@@ -10,7 +10,6 @@ use autosynth_lower::{trace, trace_ctx, trace_do};
 use super::code_builder::CodeBuilder;
 use crate::ir_function::{IRFunction, IrBlock};
 
-
 /// Incrementally builds an [`IRFunction`] by emitting instructions
 /// into blocks and managing VReg allocation.
 pub struct FunctionBuilder<'a> {
@@ -144,8 +143,25 @@ impl<'a> FunctionBuilder<'a> {
     /// Emit Clobber for every vreg in a region. Used before calls to
     /// ensure all values are stored to memory.
     pub fn clobber_region(&mut self, region: VRegionId) {
-        for vreg in self.regions[region.0 as usize].slots.clone() {
+        let slots: Vec<(usize, VReg)> = self.regions[region.0 as usize]
+            .slots
+            .iter()
+            .copied()
+            .enumerate()
+            .collect();
+
+        for &(_, vreg) in &slots {
             self.emit_reg(RegInst::Clobber { vreg });
+        }
+
+        // Replace each slot with a fresh vreg that starts in memory.
+        // This ends the old vreg's lifetime — subsequent get_field
+        // returns the new vreg, which the regalloc will reload on use.
+        for &(i, old) in &slots {
+            let slot = self.slot_offset(region, i as u32);
+            let width = self.vreg_width(old);
+            let fresh = self.alloc_vreg(width, VInit::Mem(slot));
+            self.regions[region.0 as usize].slots[i] = fresh;
         }
     }
 
@@ -184,7 +200,10 @@ impl<'a> FunctionBuilder<'a> {
             target: None,
         });
         self.record_def(id);
-        self.emit_reg(RegInst::Define { vreg: id, value: origin });
+        self.emit_reg(RegInst::Define {
+            vreg: id,
+            value: origin,
+        });
         id
     }
 
@@ -192,11 +211,7 @@ impl<'a> FunctionBuilder<'a> {
     fn alloc_ref(&mut self, width: Width, source: VRegRefSource) -> VReg {
         let id = VReg::Ref(self.next_ref);
         self.next_ref += 1;
-        self.vreg_refs.push(VRegRef {
-            id,
-            width,
-            source,
-        });
+        self.vreg_refs.push(VRegRef { id, width, source });
         id
     }
 
@@ -257,10 +272,7 @@ impl<'a> FunctionBuilder<'a> {
     /// For slots that already hold a Ref, keep as-is.
     /// For Defs, wrap in a Direct ref (single predecessor) or
     /// diff across all predecessors to decide Direct vs Phi.
-    fn wrap_region_slots_in_refs(
-        &mut self,
-        snapshots: &[(BlockId, Vec<VRegion>)],
-    ) {
+    fn wrap_region_slots_in_refs(&mut self, snapshots: &[(BlockId, Vec<VRegion>)]) {
         for region_idx in 0..self.regions.len() {
             for slot_idx in 0..self.regions[region_idx].slots.len() {
                 let slot = self.regions[region_idx].slots[slot_idx];
@@ -308,7 +320,10 @@ impl<'a> FunctionBuilder<'a> {
             let sources = snapshots
                 .iter()
                 .map(|(pred_block, regions)| {
-                    (*pred_block, resolve_ref(regions[region_idx].slots[slot_idx], refs))
+                    (
+                        *pred_block,
+                        resolve_ref(regions[region_idx].slots[slot_idx], refs),
+                    )
                 })
                 .collect();
             VRegRefSource::Phi(sources)
@@ -520,14 +535,21 @@ impl<'a> FunctionBuilder<'a> {
                 };
                 match inst {
                     LowerInst::Ir(ir) => match ir {
-                        IrInst::Alu { lhs, rhs, .. } => { mark(*lhs); mark(*rhs); }
-                        IrInst::BrIf { cond, .. } => { mark(*cond); }
+                        IrInst::Alu { lhs, rhs, .. } => {
+                            mark(*lhs);
+                            mark(*rhs);
+                        }
+                        IrInst::BrIf { cond, .. } => {
+                            mark(*cond);
+                        }
                         _ => {}
                     },
                     LowerInst::Reg(reg) => match reg {
                         RegInst::SetSlot { vreg, .. }
                         | RegInst::ClearSlot { vreg, .. }
-                        | RegInst::Resolve { vreg } => { mark(*vreg); }
+                        | RegInst::Resolve { vreg } => {
+                            mark(*vreg);
+                        }
                         // Clobber checks if a value needs saving but doesn't
                         // consume it — exclude from liveness counting.
                         RegInst::Clobber { .. } | RegInst::Define { .. } => {}

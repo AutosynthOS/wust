@@ -54,7 +54,15 @@ pub fn compile(
                 LowerInst::Ir(IrInst::Branch { target }) if Some(*target) == next_block => {}
                 LowerInst::Ir(ir) => {
                     trace_ctx!("origin", "lower");
-                    backend.lower(&mut regalloc, ir.clone(), autosynth_lower::Emit::Fuse)?
+                    backend.lower(&mut regalloc, ir.clone(), autosynth_lower::Emit::Fuse)?;
+                    trace_do! {
+                        let state_json = autosynth_lower::__serde_json::to_value(&regalloc.state).unwrap();
+                        trace!({
+                            "type": "regalloc_state",
+                            "inst": autosynth_lower::__serde_json::to_value(ir).ok(),
+                            "state": state_json
+                        });
+                    }
                 }
                 LowerInst::Reg(reg) => regalloc.process(reg, backend)?,
             }

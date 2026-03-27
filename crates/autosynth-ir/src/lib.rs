@@ -40,7 +40,6 @@ impl fmt::Display for VReg {
     }
 }
 
-
 /// Identifies a basic block within a function.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
@@ -328,8 +327,9 @@ pub enum RegInst {
     /// Used before calls — the register is about to be destroyed.
     Clobber { vreg: VReg },
     /// Force-resolve a vreg — ensure its value is in a register.
-    /// Emits load from memory if needed. Used with set_target to
-    /// ensure a vreg ends up in a specific physical register.
+    /// Emits load from memory or materializes a const if needed.
+    /// Used with set_target to ensure a vreg ends up in a specific
+    /// physical register.
     Resolve { vreg: VReg },
 }
 
@@ -378,6 +378,10 @@ pub enum VInit {
     PReg(PReg),
     /// Produced as the destination of an instruction (ALU, load, etc.).
     InstDst,
+    /// Value lives in memory at [slot.base + slot.offset]. Created after
+    /// clobber to start a fresh vreg lifetime — the regalloc reloads on
+    /// first use.
+    Mem(SlotRef),
 }
 
 /// Metadata for a virtual register definition.

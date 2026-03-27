@@ -16,7 +16,7 @@ use crate::trampoline::{call_trampoline, emit_entry_trampoline};
 
 /// Toggle fuel checks in generated code. Set to `false` to emit
 /// straight-line code without fuel subtraction or suspend branches.
-const EMIT_FUEL_CHECKS: bool = false;
+const EMIT_FUEL_CHECKS: bool = true;
 
 /// A JIT-compiled WASM module, generic over the backend.
 ///
@@ -316,22 +316,15 @@ impl<B: BackendEmitter> JitModule<B> {
                     let callee_sig = func_signature(callee);
 
                     // Pop args and constrain each to its CC register.
-                    let mut args = Vec::new();
                     for i in (0..callee_sig.params.len()).rev() {
                         let vreg = f.pop(operands, callee_sig.params[i].width());
                         f.set_target(vreg, PReg(i as u8));
-                        args.push(vreg);
+                        f.emit_reg(RegInst::Resolve { vreg });
                     }
 
-                    // Clobber all live vregs — call will destroy registers.
                     f.clobber_region(locals);
                     f.clobber_region(operands);
                     f.clobber_region(fibre);
-
-                    // Resolve args AFTER clobbers so they don't get evicted.
-                    for vreg in args {
-                        f.emit_reg(RegInst::Resolve { vreg });
-                    }
 
                     // Frame advance: the caller's top-of-stack operands
                     // become the callee's params (same stack slots). We

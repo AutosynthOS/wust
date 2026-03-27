@@ -148,6 +148,8 @@
 			>
 				{#if row.groupPc !== null}
 					<span class="pc-text">{row.groupPc}</span>
+				{:else}
+					<span class="pc-text">--</span>
 				{/if}
 			</div>
 		{/if}

@@ -125,7 +125,7 @@ impl InlineOp {
             OpCode::Br | OpCode::BrIf => {
                 format!("{} {}", op.wasm_name(), self.immediate_u32())
             }
-            OpCode::Block | OpCode::Loop | OpCode::Else | OpCode::End => String::new(),
+            OpCode::Block | OpCode::Loop | OpCode::Else | OpCode::End => op.wasm_name().into(),
             OpCode::If => op.wasm_name().into(),
             _ => op.wasm_name().into(),
         }
