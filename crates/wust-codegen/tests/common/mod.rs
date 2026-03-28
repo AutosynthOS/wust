@@ -82,7 +82,7 @@ pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
             emitter.emit(inst, &mut ops, &mut page).unwrap();
         }
     }
-    page.finish().unwrap();
+    page.flash().unwrap();
 
     JitFunction { _page: page }
 }

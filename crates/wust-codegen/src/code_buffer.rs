@@ -40,22 +40,11 @@ impl CodeBuffer {
         })
     }
 
-    /// Write compiled code bytes into the buffer, growing if needed, then
-    /// finalize the region as executable.
-    ///
-    /// If the buffer was previously finalized, it is reopened for writing
-    /// first. After writing, the region is set to execute-only and the
-    /// instruction cache is invalidated.
-    pub fn flash(&mut self, code: &[u8]) -> anyhow::Result<()> {
-        if self.finalized {
-            self.reopen()?;
-        }
-        self.ensure_committed(code.len());
-        unsafe {
-            std::ptr::copy_nonoverlapping(code.as_ptr(), self.region.base(), code.len());
-        }
-        self.len = code.len();
-        self.finalize_inner(code.len())
+    /// Finalize the buffer as executable — set RX permissions and
+    /// invalidate the instruction cache. Call after all code has
+    /// been written via [`CodeContext::emit_bytes`].
+    pub fn flash(&mut self) -> anyhow::Result<()> {
+        self.finalize_inner(self.len)
     }
 
     /// Pointer to the start of executable code. Only valid after `finalize()`.
@@ -64,7 +53,7 @@ impl CodeBuffer {
         self.region.base() as *const u8
     }
 
-    fn ensure_committed(&mut self, needed: usize) {
+    fn ensure_space(&mut self, needed: usize) {
         if needed <= self.committed {
             return;
         }
@@ -94,11 +83,6 @@ impl CodeBuffer {
         self.committed = new_committed;
     }
 
-    /// Finalize the buffer as executable. Call after all code has been emitted.
-    pub fn finish(&mut self) -> anyhow::Result<()> {
-        self.finalize_inner(self.len)
-    }
-
     /// Current write position (bytes emitted so far).
     pub fn len(&self) -> usize {
         self.len
@@ -111,7 +95,6 @@ impl CodeBuffer {
         self.finalized = true;
         Ok(())
     }
-
 }
 
 impl CodeContext for CodeBuffer {
@@ -121,7 +104,7 @@ impl CodeContext for CodeBuffer {
         if self.finalized {
             self.reopen()?;
         }
-        self.ensure_committed(self.len + bytes.len());
+        self.ensure_space(self.len + bytes.len());
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
