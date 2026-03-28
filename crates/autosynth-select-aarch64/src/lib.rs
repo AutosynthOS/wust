@@ -23,61 +23,62 @@ impl Selector for Aarch64Selector {
         input: &mut CodeCtx,
         output: &mut CodeCtx,
     ) -> Result<(), SelectorError> {
-        // Pass 1: fold immediates
-        let mut mid = CodeCtx::new();
-        fold_immediates(regalloc, input, &mut mid)?;
-
-        // Pass 2: resolve VRegs → PRegs
-        resolve_pregs(regalloc, &mut mid, output)?;
-
+        let mid = pass_1_fold_imms(regalloc, input)?;
+        let result = pass_2_resolve_pregs(regalloc, mid)?;
+        *output = result;
         Ok(())
     }
 }
 
-/// Pass 1: fold Const VRegs into immediates where the instruction supports it.
-fn fold_immediates(
+fn pass_1_fold_imms(
     regalloc: &RegAlloc,
     input: &mut CodeCtx,
-    output: &mut CodeCtx,
-) -> Result<(), SelectorError> {
+) -> Result<CodeCtx, SelectorError> {
+    let mut output = CodeCtx::new();
     let mut ops = input.operands.drain(..);
 
     for inst in input.instructions.drain(..) {
-        match &inst {
-            VCode::Alu { .. } => {
-                let lhs = ops.next().ok_or(SelectorError::OperandUnderflow)?;
-                let rhs = ops.next().ok_or(SelectorError::OperandUnderflow)?;
-                let dst = ops.next().ok_or(SelectorError::OperandUnderflow)?;
+        fold_imms_inst(regalloc, &inst, &mut ops, &mut output)?;
+    }
 
-                let rhs = match regalloc.try_fold_imm::<UImm12>(&rhs) {
-                    Some(imm) => Operand::UImm12(imm),
-                    None => rhs,
-                };
+    Ok(output)
+}
 
-                output.push_operand(lhs);
-                output.push_operand(rhs);
-                output.push_operand(dst);
-                output.push_inst(inst);
-            }
-            _ => {
-                output.push_inst(inst);
-            }
+fn fold_imms_inst(
+    regalloc: &RegAlloc,
+    inst: &VCode,
+    ops: &mut impl Iterator<Item = Operand>,
+    output: &mut CodeCtx,
+) -> Result<(), SelectorError> {
+    match inst {
+        VCode::Alu { .. } => {
+            let lhs = ops.next().ok_or(SelectorError::OperandUnderflow)?;
+            let rhs = ops.next().ok_or(SelectorError::OperandUnderflow)?;
+            let dst = ops.next().ok_or(SelectorError::OperandUnderflow)?;
+
+            let rhs = match regalloc.try_fold_imm::<UImm12>(&rhs) {
+                Some(imm) => Operand::UImm12(imm),
+                None => rhs,
+            };
+
+            output.push_operand(lhs);
+            output.push_operand(rhs);
+            output.push_operand(dst);
+            output.push_inst(inst.clone());
+        }
+        _ => {
+            output.push_inst(inst.clone());
         }
     }
 
     Ok(())
 }
 
-/// Pass 2: resolve remaining VReg operands to PRegs.
-///
-/// - VInit::PReg(p) → Operand::PReg(p)
-/// - VInit::InstDst → same PReg as the first input operand
-/// - Already resolved (UImm12 etc.) → pass through
-fn resolve_pregs(
+fn pass_2_resolve_pregs(
     regalloc: &RegAlloc,
-    input: &mut CodeCtx,
-    output: &mut CodeCtx,
-) -> Result<(), SelectorError> {
+    mut input: CodeCtx,
+) -> Result<CodeCtx, SelectorError> {
+    let mut output = CodeCtx::new();
     let mut ops = input.operands.drain(..);
 
     for inst in input.instructions.drain(..) {
@@ -96,7 +97,7 @@ fn resolve_pregs(
         }
     }
 
-    Ok(())
+    Ok(output)
 }
 
 fn resolve_operand(

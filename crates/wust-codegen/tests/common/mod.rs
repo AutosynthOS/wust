@@ -5,9 +5,9 @@ use autosynth_emitter::Emitter;
 use autosynth_ir::{AluOp, BlockId};
 use autosynth_isa::Width;
 use autosynth_select_aarch64::Aarch64Selector;
-use wust_codegen::wasm_builder::WasmFunctionBuilder;
 use wust_codegen::CodeBuffer;
-use wust_core::{FuncMeta, FRAME_HEADER_SIZE, OpCode, ParsedModule, slot_size};
+use wust_codegen::wasm_builder::WasmFunctionBuilder;
+use wust_core::{FRAME_HEADER_SIZE, FuncMeta, OpCode, ParsedModule, slot_size};
 
 pub fn parse_wat(wat: &str) -> ParsedModule {
     let bytes = wat::parse_str(wat).expect("parse WAT");
@@ -67,14 +67,16 @@ pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
     page.flash().unwrap();
 
     // Compute frame layout for the trampoline.
-    let locals_size: u32 = func_meta.params.iter()
+    let locals_size: u32 = func_meta
+        .params
+        .iter()
         .chain(func_meta.locals.iter())
         .map(|t| slot_size(*t) as u32)
         .sum();
     let locals_header_size = locals_size + FRAME_HEADER_SIZE as u32;
 
     JitFunction {
-        _page: page,
+        page,
         locals_size,
         locals_header_size,
         num_params: func_meta.params.len(),
@@ -87,7 +89,7 @@ pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
 /// Includes frame layout metadata for the trampoline to set up
 /// the managed stack correctly.
 pub struct JitFunction {
-    _page: CodeBuffer,
+    page: CodeBuffer,
     locals_size: u32,
     locals_header_size: u32,
     num_params: usize,
@@ -112,7 +114,7 @@ impl JitFunction {
             *(frame_base as *mut i32) = arg;
         }
 
-        let func_ptr = self._page.entry();
+        let func_ptr = self.page.entry();
         let result: i64;
         unsafe {
             std::arch::asm!(
@@ -157,4 +159,3 @@ unsafe extern "custom" fn trampoline_call_i32() {
         "ret",
     );
 }
-
