@@ -1,21 +1,16 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use autosynth_ir::{BlockId, Operand, VCode};
 use autosynth_regalloc::RegAlloc;
 
-use super::Block;
+use super::block::{BlockBuilder, IrBlock};
 
 /// Builds a function's VCode representation.
 ///
 /// Owns the [`RegAlloc`] — all VReg definitions go through it.
-/// Tracks block structure and the VCode + operand streams per block.
+/// Emits into the currently active [`BlockBuilder`].
 pub struct FunctionBuilder {
-    /// The register allocator — authority on all VRegs.
     pub regalloc: RegAlloc,
-    /// All blocks, keyed by BlockId.
-    blocks: BTreeMap<BlockId, Block>,
-    /// Block layout order.
-    block_order: Vec<BlockId>,
-    /// Currently active block.
+    blocks: BTreeMap<BlockId, BlockBuilder>,
     current_block: Option<BlockId>,
 }
 
@@ -24,7 +19,6 @@ impl FunctionBuilder {
         Self {
             regalloc: RegAlloc::new(),
             blocks: BTreeMap::new(),
-            block_order: Vec::new(),
             current_block: None,
         }
     }
@@ -41,33 +35,104 @@ impl FunctionBuilder {
         block.operands.push(op);
     }
 
-    /// Start a new block.
+    /// Start or switch to a block.
     pub fn start_block(&mut self, id: BlockId) {
-        if !self.blocks.contains_key(&id) {
-            self.block_order.push(id);
-            self.blocks.insert(id, Block::new(id));
-        }
+        self.blocks.entry(id).or_insert_with(|| BlockBuilder::new(id));
         self.current_block = Some(id);
     }
 
-    /// Finalize and return the built function.
+    /// Finalize — compute successors/predecessors from branch
+    /// instructions, order blocks by RPO, and return the IrFunction.
     pub fn build(self) -> IrFunction {
+        // Extract successors from branch instructions.
+        let mut successors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+        for (id, block) in &self.blocks {
+            let mut succs = Vec::new();
+            for inst in &block.instructions {
+                match inst {
+                    VCode::Branch { target } => succs.push(*target),
+                    VCode::BrIf { block_if, block_else } => {
+                        succs.push(*block_if);
+                        succs.push(*block_else);
+                    }
+                    _ => {}
+                }
+            }
+            successors.insert(*id, succs);
+        }
+
+        // Compute predecessors from successors.
+        let mut predecessors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+        for (&id, succs) in &successors {
+            for succ in succs {
+                predecessors.entry(*succ).or_default().push(id);
+            }
+        }
+
+        // RPO: DFS visiting else before then so fall-throughs work.
+        let block_order = rpo(&self.blocks, &successors);
+
+        // Build IrBlocks.
+        let mut ir_blocks = BTreeMap::new();
+        for (id, builder) in self.blocks {
+            ir_blocks.insert(id, IrBlock {
+                id,
+                instructions: builder.instructions,
+                operands: builder.operands,
+                successors: successors.remove(&id).unwrap_or_default(),
+                predecessors: predecessors.remove(&id).unwrap_or_default(),
+            });
+        }
+
         IrFunction {
             regalloc: self.regalloc,
-            blocks: self.blocks,
-            block_order: self.block_order,
+            blocks: ir_blocks,
+            block_order,
         }
     }
 
-    fn current_block_mut(&mut self) -> &mut Block {
+    fn current_block_mut(&mut self) -> &mut BlockBuilder {
         let id = self.current_block.expect("no active block");
         self.blocks.get_mut(&id).unwrap()
     }
 }
 
-/// A completed function — blocks + regalloc state.
+/// A completed function — finalized blocks in RPO + regalloc state.
 pub struct IrFunction {
     pub regalloc: RegAlloc,
-    pub blocks: BTreeMap<BlockId, Block>,
+    pub blocks: BTreeMap<BlockId, IrBlock>,
     pub block_order: Vec<BlockId>,
+}
+
+/// Compute reverse postorder of the block graph.
+fn rpo(
+    blocks: &BTreeMap<BlockId, BlockBuilder>,
+    successors: &BTreeMap<BlockId, Vec<BlockId>>,
+) -> Vec<BlockId> {
+    let mut visited = HashSet::new();
+    let mut postorder = Vec::new();
+
+    if let Some(&entry) = blocks.keys().next() {
+        dfs(entry, successors, &mut visited, &mut postorder);
+    }
+
+    postorder.reverse();
+    postorder
+}
+
+fn dfs(
+    id: BlockId,
+    successors: &BTreeMap<BlockId, Vec<BlockId>>,
+    visited: &mut HashSet<BlockId>,
+    postorder: &mut Vec<BlockId>,
+) {
+    if !visited.insert(id) {
+        return;
+    }
+    if let Some(succs) = successors.get(&id) {
+        for &succ in succs.iter().rev() {
+            dfs(succ, successors, visited, postorder);
+        }
+    }
+    postorder.push(id);
 }
