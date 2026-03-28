@@ -38,6 +38,19 @@ fn lower_inst(
             output.operands.push_back(dst);
             output.vcode.push_back(inst.clone());
         }
+        VCode::BrIf { .. } => {
+            let lhs = input.next_operand()?;
+            let rhs = input.next_operand()?;
+
+            let rhs = match regalloc.imm_or_materialize::<UImm12>(rhs, output)? {
+                VRegOr::Imm(imm) => Operand::UImm12(imm),
+                VRegOr::VReg(id) => Operand::VReg(id),
+            };
+
+            output.operands.push_back(lhs);
+            output.operands.push_back(rhs);
+            output.vcode.push_back(inst.clone());
+        }
         _ => {
             output.vcode.push_back(inst.clone());
         }

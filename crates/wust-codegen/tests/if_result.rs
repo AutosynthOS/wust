@@ -20,9 +20,10 @@ fn if_result() {
     assert_eq!(result.block_order.len(), 4);
 
     // Entry: compare 0 == 0 and branch.
+    // No params → v1=Const(0) gets x0 (first free scratch).
     common::assert_block_eq(&result.blocks[&BlockId::Entry], &[
         (VCode::BrIf { op: CompOp::Eq, block_if: BlockId::User(4), block_else: BlockId::User(6) }, &[
-            Operand::PReg(PReg(1)),     // v1=Const(0) materialized/resolved
+            Operand::PReg(PReg(0)),     // v1=Const(0) materialized
             Operand::UImm12(UImm12::try_from(0).unwrap()),  // v2=Const(0) folded
         ]),
     ]);
@@ -38,11 +39,13 @@ fn if_result() {
     ]);
 
     // Merge: add(5, phi) + return.
-    // v0=Const(5) is the lhs, phi is the rhs, result targets x0.
+    // v0=Const(5) got x1 (x0 was taken in Entry by v1).
+    // phi got x2 (first free after x0, x1).
+    // result targets x0 (return CC register).
     common::assert_block_eq(&result.blocks[&BlockId::User(7)], &[
         (VCode::Alu { op: AluOp::Add }, &[
-            Operand::PReg(PReg(0)),     // v0=Const(5) materialized
-            Operand::PReg(PReg(2)),     // phi resolved to some PReg
+            Operand::PReg(PReg(1)),     // v0=Const(5)
+            Operand::PReg(PReg(2)),     // phi
             Operand::PReg(PReg(0)),     // result targets x0
         ]),
         (VCode::Return, &[]),
