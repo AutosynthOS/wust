@@ -23,7 +23,6 @@ impl WasmFunctionBuilder {
     /// and zero-initialized locals. Starts in the Entry block.
     pub fn new(func: &FuncMeta) -> Self {
         let mut inner = FunctionBuilder::new();
-        inner.start_block(BlockId::Entry);
 
         let mut locals = Vec::new();
 

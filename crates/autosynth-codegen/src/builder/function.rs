@@ -11,15 +11,18 @@ use super::block::{BlockBuilder, IrBlock};
 pub struct FunctionBuilder {
     pub regalloc: RegAlloc,
     blocks: BTreeMap<BlockId, BlockBuilder>,
-    current_block: Option<BlockId>,
+    current_block: BlockId,
 }
 
 impl FunctionBuilder {
     pub fn new() -> Self {
+        let entry = BlockId::Entry;
+        let mut blocks = BTreeMap::new();
+        blocks.insert(entry, BlockBuilder::new(entry));
         Self {
             regalloc: RegAlloc::new(),
-            blocks: BTreeMap::new(),
-            current_block: None,
+            blocks,
+            current_block: entry,
         }
     }
 
@@ -38,7 +41,7 @@ impl FunctionBuilder {
     /// Start or switch to a block.
     pub fn start_block(&mut self, id: BlockId) {
         self.blocks.entry(id).or_insert_with(|| BlockBuilder::new(id));
-        self.current_block = Some(id);
+        self.current_block = id;
     }
 
     /// Finalize — compute successors/predecessors from branch
@@ -92,8 +95,7 @@ impl FunctionBuilder {
     }
 
     fn current_block_mut(&mut self) -> &mut BlockBuilder {
-        let id = self.current_block.expect("no active block");
-        self.blocks.get_mut(&id).unwrap()
+        self.blocks.get_mut(&self.current_block).unwrap()
     }
 }
 
