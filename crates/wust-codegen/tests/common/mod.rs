@@ -1,4 +1,4 @@
-use autosynth_codegen::builder::IrFunction;
+use autosynth_codegen::ir::IrFunction;
 use autosynth_codegen::pipeline::{compile, trivial_regalloc};
 use autosynth_emit_aarch64::Aarch64Emitter;
 use autosynth_emitter::Emitter;

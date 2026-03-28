@@ -1,5 +1,5 @@
 mod block;
 mod function;
 
-pub use block::{BlockBuilder, IrBlock};
-pub use function::{FunctionBuilder, IrFunction};
+pub use block::BlockBuilder;
+pub use function::FunctionBuilder;

@@ -5,7 +5,7 @@ use autosynth_isa::PReg;
 use autosynth_regalloc::{RegAlloc, VInit};
 use autosynth_selector::{CodeCtx, Selector, SelectorError};
 
-use crate::builder::IrFunction;
+use crate::ir::IrFunction;
 
 /// A compiled function — lowered VCode blocks + regalloc state.
 pub struct VCodeFunction {

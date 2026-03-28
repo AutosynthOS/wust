@@ -93,7 +93,7 @@ impl WasmFunctionBuilder {
     }
 
     /// Build and return the completed IR function.
-    pub fn build(self) -> autosynth_codegen::builder::IrFunction {
+    pub fn build(self) -> autosynth_codegen::ir::IrFunction {
         self.inner.build()
     }
 }

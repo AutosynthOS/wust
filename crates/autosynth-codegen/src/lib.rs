@@ -8,6 +8,8 @@
 
 /// New VCode pipeline builder.
 pub mod builder;
+/// IR types (IrFunction, IrBlock).
+pub mod ir;
 /// New VCode pipeline — compile IrFunction through a Selector.
 pub mod pipeline;
 /// Old builder (preserved for reference / old tests).

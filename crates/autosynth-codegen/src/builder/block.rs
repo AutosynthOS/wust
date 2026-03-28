@@ -17,13 +17,13 @@ impl BlockBuilder {
             finalized: false,
         }
     }
-}
 
-/// A finalized block in the IR function.
-pub struct IrBlock {
-    pub id: BlockId,
-    pub instructions: Vec<VCode>,
-    pub operands: Vec<Operand>,
-    pub successors: Vec<BlockId>,
-    pub predecessors: Vec<BlockId>,
+    /// Extract successor BlockIds from branch instructions.
+    pub fn successors(&self) -> Vec<BlockId> {
+        self.instructions.iter().flat_map(|inst| match inst {
+            VCode::Branch { target } => vec![*target],
+            VCode::BrIf { block_if, block_else } => vec![*block_if, *block_else],
+            _ => vec![],
+        }).collect()
+    }
 }
