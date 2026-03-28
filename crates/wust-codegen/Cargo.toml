@@ -18,8 +18,10 @@ autosynth-backend-aarch64 = { path = "../autosynth-backend-aarch64" }
 autosynth-ir = { path = "../autosynth-ir" }
 autosynth-isa = { path = "../autosynth-isa" }
 autosynth-regalloc = { path = "../autosynth-regalloc" }
+autosynth-emitter = { path = "../autosynth-emitter" }
 
 [dev-dependencies]
 wat = "1.245.1"
 autosynth-select-aarch64 = { path = "../autosynth-select-aarch64" }
 autosynth-selector = { path = "../autosynth-selector" }
+autosynth-emit-aarch64 = { path = "../autosynth-emit-aarch64" }

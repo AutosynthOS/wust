@@ -3055,6 +3055,8 @@ dependencies = [
  "anyhow",
  "autosynth-backend-aarch64",
  "autosynth-codegen",
+ "autosynth-emit-aarch64",
+ "autosynth-emitter",
  "autosynth-ir",
  "autosynth-isa",
  "autosynth-lower",

@@ -1,3 +1,4 @@
+use autosynth_emitter::CodeContext;
 use wust_core::mmap::{MmapRegion, Protection, align_up, page_size};
 
 /// Default reservation: 128MB virtual address space.
@@ -14,6 +15,8 @@ pub struct CodeBuffer {
     region: MmapRegion,
     /// Bytes currently committed (RW). Always page-aligned.
     committed: usize,
+    /// Bytes written so far.
+    len: usize,
     finalized: bool,
 }
 
@@ -32,6 +35,7 @@ impl CodeBuffer {
         Ok(CodeBuffer {
             region,
             committed: initial_commit,
+            len: 0,
             finalized: false,
         })
     }
@@ -50,7 +54,8 @@ impl CodeBuffer {
         unsafe {
             std::ptr::copy_nonoverlapping(code.as_ptr(), self.region.base(), code.len());
         }
-        self.finalize(code.len())
+        self.len = code.len();
+        self.finalize_inner(code.len())
     }
 
     /// Pointer to the start of executable code. Only valid after `finalize()`.
@@ -89,8 +94,17 @@ impl CodeBuffer {
         self.committed = new_committed;
     }
 
-    fn finalize(&mut self, code_len: usize) -> anyhow::Result<()> {
-        debug_assert!(!self.finalized, "already finalized");
+    /// Finalize the buffer as executable. Call after all code has been emitted.
+    pub fn finish(&mut self) -> anyhow::Result<()> {
+        self.finalize_inner(self.len)
+    }
+
+    /// Current write position (bytes emitted so far).
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    fn finalize_inner(&mut self, code_len: usize) -> anyhow::Result<()> {
         self.region
             .set_protection_range(0, self.committed, Protection::EXEC)?;
         unsafe { sys_icache_invalidate(self.region.base(), code_len) };
@@ -98,6 +112,29 @@ impl CodeBuffer {
         Ok(())
     }
 
+}
+
+impl CodeContext for CodeBuffer {
+    type Error = anyhow::Error;
+
+    fn emit_bytes(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        if self.finalized {
+            self.reopen()?;
+        }
+        self.ensure_committed(self.len + bytes.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.region.base().add(self.len),
+                bytes.len(),
+            );
+        }
+        self.len += bytes.len();
+        Ok(())
+    }
+}
+
+impl CodeBuffer {
     fn reopen(&mut self) -> anyhow::Result<()> {
         debug_assert!(self.finalized, "buffer is not finalized");
         self.region

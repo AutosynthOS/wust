@@ -2,40 +2,45 @@
 ///
 /// All operands must be concrete (PRegs, immediates). If the emitter
 /// encounters a VReg or Mem operand, that's a pipeline bug.
-///
-/// The emitter is stateful — it tracks labels for branch targets and
-/// patches them after all code has been emitted.
-use autosynth_ir::{BlockId, Operand, VCode};
+use autosynth_ir::{Operand, VCode};
+
+/// Code output — implemented by the caller to receive emitted bytes.
+pub trait CodeContext {
+    type Error;
+
+    /// Write machine code bytes to the output.
+    fn emit_bytes(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+}
 
 /// Machine code emitter — implemented per backend.
+///
+/// The emitter consumes operands from the iterator as needed per
+/// instruction. It knows the arity of each VCode instruction.
 pub trait Emitter {
-    /// Emit one VCode instruction with its operands.
-    ///
-    /// All operands must be fully resolved (PRegs, immediates).
-    /// Returns an error if any VReg or Mem operands remain.
     fn emit(
         &mut self,
         inst: &VCode,
-        operands: &[Operand],
+        operands: &mut impl Iterator<Item = Operand>,
+        ctx: &mut impl CodeContext,
     ) -> Result<(), EmitError>;
+}
 
-    /// Bind a label at the current code offset.
-    /// Called before emitting a block's instructions.
-    fn bind_label(&mut self, block: BlockId);
-
-    /// Patch all branch/call offsets after all code has been emitted.
-    fn patch_labels(&mut self) -> Result<(), EmitError>;
-
-    /// The emitted machine code bytes.
-    fn code(&self) -> &[u8];
+impl CodeContext for Vec<u8> {
+    type Error = core::convert::Infallible;
+    fn emit_bytes(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 pub enum EmitError {
     /// An operand was not fully resolved (VReg or Mem still present).
-    UnresolvedOperand(Operand),
-    /// A branch target label was never bound.
-    UnboundLabel(BlockId),
+    UnresolvedOperand,
+    /// Ran out of operands.
+    OperandUnderflow,
     /// An immediate value is out of encodable range.
     ImmediateOutOfRange,
+    /// Unhandled VCode instruction.
+    Unhandled,
 }
