@@ -520,19 +520,24 @@ impl fmt::Display for IrInst {
 /// A simple index — metadata (width, origin) lives in a side table.
 /// Every value flowing through the pipeline has a unique VRegId.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VRegId(pub u32);
+pub struct VRegDefId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VRegRefId(pub u32);
+
+/// A virtual register — either a concrete definition or an
+/// indirection (ref) that resolves to a Def or Phi.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VReg {
+    Def(VRegDefId),
+    Ref(VRegRefId),
+}
 
 /// An operand on the VCode operand stack.
-///
-/// Operands are separate from instructions — each VCode instruction
-/// implicitly consumes and produces operands based on its arity.
-/// The instruction selector transforms operands to make them
-/// concrete for the target architecture (e.g. folding a Const as
-/// an immediate, emitting a load for a Mem operand).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
     Const(i64),
-    VReg(VRegId),
+    VReg(VReg),
     PReg(PReg),
     Mem(SlotRef),
     UImm12(autosynth_isa::UImm12),

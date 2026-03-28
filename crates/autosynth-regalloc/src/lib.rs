@@ -12,7 +12,7 @@ use alloc::vec::Vec;
 use autosynth_ir::{CodeCtx, CompileError, Operand, VCode};
 use autosynth_isa::{PReg, Width};
 
-pub use autosynth_ir::{SlotRef, VInit, VRegId};
+pub use autosynth_ir::{SlotRef, VInit, VReg, VRegDefId, VRegRefId};
 
 /// Result of trying to fold a VReg as an immediate.
 pub enum VRegOr<Imm> {
@@ -20,10 +20,19 @@ pub enum VRegOr<Imm> {
     VReg(VRegId),
 }
 
+/// A VReg reference — indirection for inherited block operands.
+#[derive(Debug, Clone)]
+pub enum VRegRefDef {
+    /// Single predecessor — just an alias for the source VReg.
+    Direct(VReg),
+    /// Merge point — multiple predecessors provide different VRegs.
+    Phi(Vec<VReg>),
+}
+
 /// Metadata for a defined virtual register.
 #[derive(Debug, Clone)]
 pub struct VRegDef {
-    pub id: VRegId,
+    pub id: VRegDefId,
     pub width: Width,
     pub init: VInit,
     /// Target PReg constraint. If set, the regalloc must place this
@@ -35,23 +44,22 @@ pub struct VRegDef {
 /// Register allocator state.
 #[derive(Clone)]
 pub struct RegAlloc {
-    /// VReg definitions, indexed by VRegId.
     defs: Vec<VRegDef>,
-    /// PReg → VRegId binding. None = free.
-    bindings: Vec<Option<VRegId>>,
-    /// VRegId → PReg mapping. None = not in a register.
+    refs: Vec<VRegRefDef>,
+    /// PReg → VReg binding. None = free.
+    bindings: Vec<Option<VReg>>,
+    /// VRegDefId → PReg mapping. None = not in a register.
     locations: Vec<Option<PReg>>,
-    /// Scratch register pool (available for allocation).
     scratch_pool: Vec<PReg>,
 }
 
 impl RegAlloc {
     pub fn new() -> Self {
-        // Default: x0-x15 as scratch (skip x16-x18 platform, x29 fp, x30 lr, x31 sp)
         let scratch_pool: Vec<PReg> = (0..16).map(PReg).collect();
         let num_regs = 32;
         Self {
             defs: Vec::new(),
+            refs: Vec::new(),
             bindings: vec![None; num_regs],
             locations: Vec::new(),
             scratch_pool,
