@@ -1,3 +1,6 @@
+mod assert;
+pub use assert::assert_block_eq;
+
 use autosynth_codegen::ir::IrFunction;
 use autosynth_codegen::pipeline::compile;
 use autosynth_emit_aarch64::Aarch64Emitter;

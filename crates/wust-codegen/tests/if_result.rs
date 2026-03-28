@@ -1,7 +1,8 @@
 #![feature(abi_custom)]
 
 use autosynth_codegen::pipeline::compile;
-use autosynth_ir::BlockId;
+use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode};
+use autosynth_isa::{PReg, UImm12};
 use autosynth_select_aarch64::Aarch64Selector;
 
 mod common;
@@ -15,11 +16,35 @@ fn if_result() {
     let mut selector = Aarch64Selector::new();
     let result = compile(func, &mut selector).unwrap();
 
-    // Should have multiple blocks
-    assert!(result.block_order.len() >= 3);
+    // 4 blocks: Entry, then(User(4)), else(User(6)), merge(User(7))
+    assert_eq!(result.block_order.len(), 4);
 
-    // Execute
-    let module = common::parse_wat(include_str!("if_result.wat"));
-    let jit = common::jit_compile(&module, 0);
-    assert_eq!(jit.call_i32(0), 15);
+    // Entry: compare 0 == 0 and branch.
+    common::assert_block_eq(&result.blocks[&BlockId::Entry], &[
+        (VCode::BrIf { op: CompOp::Eq, block_if: BlockId::User(4), block_else: BlockId::User(6) }, &[
+            Operand::PReg(PReg(1)),     // v1=Const(0) materialized/resolved
+            Operand::UImm12(UImm12::try_from(0).unwrap()),  // v2=Const(0) folded
+        ]),
+    ]);
+
+    // Then: just branch to merge.
+    common::assert_block_eq(&result.blocks[&BlockId::User(4)], &[
+        (VCode::Branch { target: BlockId::User(7) }, &[]),
+    ]);
+
+    // Else: just branch to merge.
+    common::assert_block_eq(&result.blocks[&BlockId::User(6)], &[
+        (VCode::Branch { target: BlockId::User(7) }, &[]),
+    ]);
+
+    // Merge: add(5, phi) + return.
+    // v0=Const(5) is the lhs, phi is the rhs, result targets x0.
+    common::assert_block_eq(&result.blocks[&BlockId::User(7)], &[
+        (VCode::Alu { op: AluOp::Add }, &[
+            Operand::PReg(PReg(0)),     // v0=Const(5) materialized
+            Operand::PReg(PReg(2)),     // phi resolved to some PReg
+            Operand::PReg(PReg(0)),     // result targets x0
+        ]),
+        (VCode::Return, &[]),
+    ]);
 }

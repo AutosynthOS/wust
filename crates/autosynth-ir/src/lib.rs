@@ -551,7 +551,7 @@ pub enum Operand {
 /// High-level VCode (emitted by the frontend) and low-level VCode
 /// (after selection) share this enum. The selector reduces high-level
 /// operations into sequences of lower-level ones when needed.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VCode {
     /// Arithmetic / logic / comparison: consumes 2 operands (lhs, rhs),
     /// pushes 1 result (dst). The selector resolves operand forms
