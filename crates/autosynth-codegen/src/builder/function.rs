@@ -44,52 +44,17 @@ impl FunctionBuilder {
         self.current_block = id;
     }
 
-    /// Finalize — compute successors/predecessors from branch
-    /// instructions, order blocks by RPO, and return the IrFunction.
+    /// Finalize — compute control flow edges, order blocks by RPO,
+    /// and return the IrFunction.
     pub fn build(self) -> IrFunction {
-        // Extract successors from branch instructions.
-        let mut successors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
-        for (id, block) in &self.blocks {
-            let mut succs = Vec::new();
-            for inst in &block.instructions {
-                match inst {
-                    VCode::Branch { target } => succs.push(*target),
-                    VCode::BrIf { block_if, block_else } => {
-                        succs.push(*block_if);
-                        succs.push(*block_else);
-                    }
-                    _ => {}
-                }
-            }
-            successors.insert(*id, succs);
-        }
-
-        // Compute predecessors from successors.
-        let mut predecessors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
-        for (&id, succs) in &successors {
-            for succ in succs {
-                predecessors.entry(*succ).or_default().push(id);
-            }
-        }
-
-        // RPO: DFS visiting else before then so fall-throughs work.
+        let successors = extract_successors(&self.blocks);
+        let predecessors = compute_predecessors(&successors);
         let block_order = rpo(&self.blocks, &successors);
-
-        // Build IrBlocks.
-        let mut ir_blocks = BTreeMap::new();
-        for (id, builder) in self.blocks {
-            ir_blocks.insert(id, IrBlock {
-                id,
-                instructions: builder.instructions,
-                operands: builder.operands,
-                successors: successors.remove(&id).unwrap_or_default(),
-                predecessors: predecessors.remove(&id).unwrap_or_default(),
-            });
-        }
+        let blocks = finalize_blocks(self.blocks, successors, predecessors);
 
         IrFunction {
             regalloc: self.regalloc,
-            blocks: ir_blocks,
+            blocks,
             block_order,
         }
     }
@@ -104,6 +69,43 @@ pub struct IrFunction {
     pub regalloc: RegAlloc,
     pub blocks: BTreeMap<BlockId, IrBlock>,
     pub block_order: Vec<BlockId>,
+}
+
+fn extract_successors(blocks: &BTreeMap<BlockId, BlockBuilder>) -> BTreeMap<BlockId, Vec<BlockId>> {
+    blocks.iter().map(|(&id, block)| {
+        let succs = block.instructions.iter().flat_map(|inst| match inst {
+            VCode::Branch { target } => vec![*target],
+            VCode::BrIf { block_if, block_else } => vec![*block_if, *block_else],
+            _ => vec![],
+        }).collect();
+        (id, succs)
+    }).collect()
+}
+
+fn compute_predecessors(successors: &BTreeMap<BlockId, Vec<BlockId>>) -> BTreeMap<BlockId, Vec<BlockId>> {
+    let mut predecessors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
+    for (&id, succs) in successors {
+        for &succ in succs {
+            predecessors.entry(succ).or_default().push(id);
+        }
+    }
+    predecessors
+}
+
+fn finalize_blocks(
+    builders: BTreeMap<BlockId, BlockBuilder>,
+    mut successors: BTreeMap<BlockId, Vec<BlockId>>,
+    mut predecessors: BTreeMap<BlockId, Vec<BlockId>>,
+) -> BTreeMap<BlockId, IrBlock> {
+    builders.into_iter().map(|(id, b)| {
+        (id, IrBlock {
+            id,
+            instructions: b.instructions,
+            operands: b.operands,
+            successors: successors.remove(&id).unwrap_or_default(),
+            predecessors: predecessors.remove(&id).unwrap_or_default(),
+        })
+    }).collect()
 }
 
 /// Compute reverse postorder of the block graph.
