@@ -50,8 +50,24 @@ impl FunctionBuilder {
         self.current_block = Some(id);
     }
 
+    /// Finalize and return the built function.
+    pub fn build(self) -> IrFunction {
+        IrFunction {
+            regalloc: self.regalloc,
+            blocks: self.blocks,
+            block_order: self.block_order,
+        }
+    }
+
     fn current_block_mut(&mut self) -> &mut Block {
         let id = self.current_block.expect("no active block");
         self.blocks.get_mut(&id).unwrap()
     }
+}
+
+/// A completed function — blocks + regalloc state.
+pub struct IrFunction {
+    pub regalloc: RegAlloc,
+    pub blocks: BTreeMap<BlockId, Block>,
+    pub block_order: Vec<BlockId>,
 }

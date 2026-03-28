@@ -139,6 +139,7 @@ dependencies = [
  "autosynth-isa-x86_64",
  "autosynth-lower",
  "autosynth-regalloc",
+ "autosynth-selector",
  "serde",
 ]
 
@@ -192,6 +193,7 @@ dependencies = [
 name = "autosynth-regalloc"
 version = "0.1.0"
 dependencies = [
+ "autosynth-ir",
  "autosynth-isa",
 ]
 
@@ -199,9 +201,12 @@ dependencies = [
 name = "autosynth-select-aarch64"
 version = "0.1.0"
 dependencies = [
+ "autosynth-codegen",
  "autosynth-ir",
  "autosynth-isa",
  "autosynth-isa-aarch64",
+ "autosynth-regalloc",
+ "autosynth-selector",
 ]
 
 [[package]]

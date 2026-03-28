@@ -32,6 +32,14 @@ impl CodeCtx {
     pub fn from(instructions: Vec<VCode>, operands: Vec<Operand>) -> Self {
         Self { instructions, operands }
     }
+
+    pub fn push_inst(&mut self, inst: VCode) {
+        self.instructions.push(inst);
+    }
+
+    pub fn push_operand(&mut self, op: Operand) {
+        self.operands.push(op);
+    }
 }
 
 /// Instruction selector — implemented per backend.

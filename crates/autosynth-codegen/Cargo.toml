@@ -15,3 +15,4 @@ autosynth-isa-aarch64 = { path = "../autosynth-isa-aarch64" }
 autosynth-isa-riscv64 = { path = "../autosynth-isa-riscv64" }
 autosynth-isa-x86_64 = { path = "../autosynth-isa-x86_64" }
 autosynth-regalloc = { path = "../autosynth-regalloc" }
+autosynth-selector = { path = "../autosynth-selector" }

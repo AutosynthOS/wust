@@ -2,4 +2,4 @@ mod block;
 mod function;
 
 pub use block::Block;
-pub use function::FunctionBuilder;
+pub use function::{FunctionBuilder, IrFunction};

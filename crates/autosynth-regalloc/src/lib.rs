@@ -8,36 +8,12 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use autosynth_isa::{PReg, Width};
+use autosynth_isa::Width;
 
-/// Virtual register ID — a simple index into the regalloc's def table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VRegId(pub u32);
-
-/// How a VReg's value was produced.
-#[derive(Debug, Clone, Copy)]
-pub enum VInit {
-    /// Compile-time constant. Rematerializable — the regalloc can
-    /// recreate the value instead of spilling.
-    Const(i64),
-    /// Arrived in a physical register (function params, call results).
-    PReg(PReg),
-    /// Produced as the destination of an instruction (ALU, load, etc.).
-    InstDst,
-    /// Value lives in memory at a known slot. Created after clobber
-    /// to start a fresh vreg lifetime.
-    Mem(SlotRef),
-}
-
-/// A resolved memory location — base register + byte offset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SlotRef {
-    pub base: PReg,
-    pub offset: u32,
-}
+pub use autosynth_ir::{SlotRef, VInit, VRegId};
 
 /// Metadata for a defined virtual register.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct VRegDef {
     pub id: VRegId,
     pub width: Width,
@@ -48,6 +24,7 @@ pub struct VRegDef {
 ///
 /// Every VReg is born through [`define`](Self::define) with an
 /// explicit [`VInit`] origin.
+#[derive(Clone)]
 pub struct RegAlloc {
     defs: Vec<VRegDef>,
 }
