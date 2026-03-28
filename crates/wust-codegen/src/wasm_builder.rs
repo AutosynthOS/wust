@@ -88,7 +88,14 @@ impl WasmFunctionBuilder {
     }
 
     /// Emit a return instruction.
-    pub fn emit_return(&mut self) {
+    ///
+    /// Sets target constraints on result VRegs (x0, x1, ...) per
+    /// the calling convention, then emits Return.
+    pub fn emit_return(&mut self, func: &FuncMeta) {
+        for (i, _) in func.results.iter().enumerate().rev() {
+            let result = self.pop();
+            self.inner.regalloc.set_target(result, PReg(i as u8));
+        }
         self.inner.emit(VCode::Return);
     }
 

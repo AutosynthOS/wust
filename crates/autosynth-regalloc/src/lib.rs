@@ -26,6 +26,10 @@ pub struct VRegDef {
     pub id: VRegId,
     pub width: Width,
     pub init: VInit,
+    /// Target PReg constraint. If set, the regalloc must place this
+    /// VReg in this specific register (e.g. CC registers for
+    /// params/returns).
+    pub target: Option<PReg>,
 }
 
 /// Register allocator state.
@@ -58,15 +62,23 @@ impl RegAlloc {
 
     pub fn define(&mut self, init: VInit, width: Width) -> VRegId {
         let id = VRegId(self.defs.len() as u32);
-        self.defs.push(VRegDef { id, width, init });
+        let target = match init {
+            VInit::PReg(preg) => Some(preg),
+            _ => None,
+        };
+        self.defs.push(VRegDef { id, width, init, target });
         self.locations.push(None);
 
-        // If the VReg starts in a PReg, bind it immediately.
         if let VInit::PReg(preg) = init {
             self.bind(id, preg);
         }
 
         id
+    }
+
+    /// Set a target PReg constraint on a VReg.
+    pub fn set_target(&mut self, id: VRegId, preg: PReg) {
+        self.defs[id.0 as usize].target = Some(preg);
     }
 
     pub fn def(&self, id: VRegId) -> &VRegDef {
@@ -129,7 +141,7 @@ impl RegAlloc {
         }
 
         // Has a target constraint?
-        if let VInit::PReg(target) = self.def(vreg).init {
+        if let Some(target) = self.def(vreg).target {
             // TODO: evict if occupied
             self.bind(vreg, target);
             return Ok(target);

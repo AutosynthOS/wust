@@ -34,7 +34,7 @@ pub fn compile_func(module: &ParsedModule, func_idx: usize) -> IrFunction {
             OpCode::I32Sub => f.binop(AluOp::Sub, Width::W32),
             OpCode::End => {
                 if inline_op.immediate_u32() == 0 {
-                    f.emit_return();
+                    f.emit_return(func);
                     break;
                 }
             }
