@@ -7,7 +7,7 @@ use autosynth_isa::Width;
 use autosynth_select_aarch64::Aarch64Selector;
 use wust_codegen::wasm_builder::WasmFunctionBuilder;
 use wust_codegen::CodeBuffer;
-use wust_core::{OpCode, ParsedModule};
+use wust_core::{FuncMeta, FRAME_HEADER_SIZE, OpCode, ParsedModule, slot_size};
 
 pub fn parse_wat(wat: &str) -> ParsedModule {
     let bytes = wat::parse_str(wat).expect("parse WAT");
@@ -47,11 +47,13 @@ pub fn compile_func(module: &ParsedModule, func_idx: usize) -> IrFunction {
     f.build()
 }
 
+/// Full pipeline: IR → select → emit → executable.
 pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
-    let func = compile_func(module, func_idx);
+    let func_meta = &module.funcs[func_idx];
+    let ir_func = compile_func(module, func_idx);
 
     let mut selector = Aarch64Selector::new();
-    let vcode = compile(func, &mut selector).unwrap();
+    let vcode = compile(ir_func, &mut selector).unwrap();
 
     let mut page = CodeBuffer::new().unwrap();
     let mut emitter = Aarch64Emitter::new();
@@ -64,25 +66,86 @@ pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
     }
     page.flash().unwrap();
 
-    JitFunction { _page: page }
+    // Compute frame layout for the trampoline.
+    let locals_size: u32 = func_meta.params.iter()
+        .chain(func_meta.locals.iter())
+        .map(|t| slot_size(*t) as u32)
+        .sum();
+    let locals_header_size = locals_size + FRAME_HEADER_SIZE as u32;
+
+    JitFunction {
+        _page: page,
+        locals_size,
+        locals_header_size,
+        num_params: func_meta.params.len(),
+        num_results: func_meta.results.len(),
+    }
 }
 
+/// A JIT-compiled function backed by executable memory.
+///
+/// Includes frame layout metadata for the trampoline to set up
+/// the managed stack correctly.
 pub struct JitFunction {
     _page: CodeBuffer,
+    locals_size: u32,
+    locals_header_size: u32,
+    num_params: usize,
+    num_results: usize,
 }
 
 impl JitFunction {
+    /// Call with one i32 argument, return i32 result.
+    ///
+    /// Sets up a managed stack frame per the wust ABI:
+    /// - x29 (g.lb) points to the frame base
+    /// - Param written to [x29 + 0]
+    /// - Param also in x0 (CC register)
+    /// - After return, result read from x0
     pub fn call_i32(&self, arg: i32) -> i32 {
-        let result: i64;
+        // Allocate managed stack space.
+        let mut managed_stack = [0u8; 4096];
+        let frame_base = managed_stack.as_mut_ptr();
+
+        // Write param to the managed stack (canonical ABI).
         unsafe {
-            std::arch::asm!(
-                "blr {func}",
-                func = in(reg) self._page.entry(),
-                in("x0") arg as i64,
-                lateout("x0") result,
-                clobber_abi("C"),
-            );
+            *(frame_base as *mut i32) = arg;
         }
-        result as i32
+
+        let func_ptr = self._page.entry();
+        unsafe { trampoline_call_i32(func_ptr, frame_base, arg as i64) as i32 }
     }
 }
+
+/// Naked trampoline — sets up x29 (g.lb) and calls the JIT function.
+///
+/// C calling convention args:
+///   x0 = JIT function pointer
+///   x1 = managed stack frame base (becomes x29)
+///   x2 = i32 param (placed in x0 for CC)
+///
+/// Returns result in x0.
+#[unsafe(naked)]
+unsafe extern "C" fn trampoline_call_i32(
+    _func: *const u8,
+    _frame: *mut u8,
+    _arg: i64,
+) -> i64 {
+    std::arch::naked_asm!(
+        // Save caller's frame pointer and link register.
+        "stp x29, x30, [sp, #-16]!",
+        // Save func pointer to a temp register before we clobber x0.
+        "mov x3, x0",
+        // Set up g.lb (x29) = managed stack frame base.
+        "mov x29, x1",
+        // Move param to x0 (CC register for the JIT function).
+        "mov x0, x2",
+        // Call JIT function.
+        "blr x3",
+        // Result is in x0 — return it.
+        // Restore caller's frame pointer and link register.
+        "ldp x29, x30, [sp], #16",
+        "ret",
+    );
+}
+
