@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use autosynth_ir::BlockId;
 use autosynth_regalloc::RegAlloc;
-use autosynth_selector::{CodeCtx, Selector, SelectorError};
+use autosynth_selector::{CodeCtx, SelectorError};
 
 use crate::builder::IrFunction;
 
@@ -13,32 +13,30 @@ pub struct VCodeFunction {
     pub block_order: Vec<BlockId>,
 }
 
-/// Compile an IR function through the selector.
+/// Compile an IR function through a selector function.
 ///
-/// Walks blocks in layout order, runs the selector on each block's
-/// instructions + operands, and collects the lowered output.
+/// Takes ownership of the IrFunction. The selector closure receives
+/// `&mut RegAlloc` (to update VReg metadata during folding) plus
+/// the input/output contexts per block.
 pub fn compile(
-    func: &IrFunction,
-    selector: &mut impl Selector,
+    func: IrFunction,
+    mut select: impl FnMut(&mut RegAlloc, &mut CodeCtx, &mut CodeCtx) -> Result<(), SelectorError>,
 ) -> Result<VCodeFunction, SelectorError> {
+    let IrFunction { mut regalloc, blocks: ir_blocks, block_order } = func;
     let mut blocks = BTreeMap::new();
 
-    for &block_id in &func.block_order {
-        let block = &func.blocks[&block_id];
+    for &block_id in &block_order {
+        let block = &ir_blocks[&block_id];
         let mut input = CodeCtx::from(
             block.instructions.clone(),
             block.operands.clone(),
         );
         let mut output = CodeCtx::new();
 
-        selector.select(&mut input, &mut output)?;
+        select(&mut regalloc, &mut input, &mut output)?;
 
         blocks.insert(block_id, output);
     }
 
-    Ok(VCodeFunction {
-        regalloc: func.regalloc.clone(),
-        blocks,
-        block_order: func.block_order.clone(),
-    })
+    Ok(VCodeFunction { regalloc, blocks, block_order })
 }

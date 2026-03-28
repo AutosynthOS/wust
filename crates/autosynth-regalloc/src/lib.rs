@@ -56,6 +56,11 @@ impl RegAlloc {
         self.defs[id.0 as usize].width
     }
 
+    /// Update a VReg's init origin (e.g. after const folding).
+    pub fn set_init(&mut self, id: VRegId, init: VInit) {
+        self.defs[id.0 as usize].init = init;
+    }
+
     /// Number of defined VRegs.
     pub fn len(&self) -> usize {
         self.defs.len()
