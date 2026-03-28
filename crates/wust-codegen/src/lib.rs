@@ -13,8 +13,9 @@
 
 mod code_buffer;
 mod conversion;
-mod jit_module;
+// mod jit_module;      // new API sketch — not compilable yet
+// mod jit_module_old;  // old implementation
 mod trampoline;
+pub mod wasm_builder;
 
 pub use code_buffer::CodeBuffer;
-pub use jit_module::JitModule;

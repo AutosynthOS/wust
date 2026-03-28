@@ -24,7 +24,7 @@ impl Aarch64Selector {
 
         for inst in input.instructions.drain(..) {
             match &inst {
-                VCode::Alu { op } => {
+                VCode::Alu { .. } => {
                     let lhs = ops.next().ok_or(SelectorError::OperandUnderflow)?;
                     let rhs = ops.next().ok_or(SelectorError::OperandUnderflow)?;
                     let dst = ops.next().ok_or(SelectorError::OperandUnderflow)?;
