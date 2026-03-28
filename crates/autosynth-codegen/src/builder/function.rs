@@ -32,6 +32,10 @@ impl FunctionBuilder {
         self.current_block_mut().operands.push(op);
     }
 
+    pub fn current_block_id(&self) -> BlockId {
+        self.current_block
+    }
+
     pub fn current_block(&self) -> &BlockBuilder {
         self.blocks.get(&self.current_block).unwrap()
     }
