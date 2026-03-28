@@ -1,5 +1,5 @@
 use autosynth_codegen::ir::IrFunction;
-use autosynth_codegen::pipeline::{compile, trivial_regalloc};
+use autosynth_codegen::pipeline::compile;
 use autosynth_emit_aarch64::Aarch64Emitter;
 use autosynth_emitter::Emitter;
 use autosynth_ir::{AluOp, BlockId};
@@ -51,8 +51,7 @@ pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
     let func = compile_func(module, func_idx);
 
     let mut selector = Aarch64Selector::new();
-    let mut vcode = compile(func, &mut selector).unwrap();
-    trivial_regalloc(&mut vcode);
+    let vcode = compile(func, &mut selector).unwrap();
 
     let mut page = CodeBuffer::new().unwrap();
     let mut emitter = Aarch64Emitter::new();

@@ -1,8 +1,7 @@
 use std::collections::BTreeMap;
 
-use autosynth_ir::{BlockId, Operand};
-use autosynth_isa::PReg;
-use autosynth_regalloc::{RegAlloc, VInit};
+use autosynth_ir::BlockId;
+use autosynth_regalloc::RegAlloc;
 use autosynth_selector::{CodeCtx, Selector, SelectorError};
 
 use crate::ir::IrFunction;
@@ -39,43 +38,4 @@ pub fn compile(
     }
 
     Ok(VCodeFunction { regalloc, blocks, block_order })
-}
-
-/// Trivial register allocation — resolves VRegs to PRegs in-place.
-///
-/// - PReg(p) → Operand::PReg(p)
-/// - InstDst → same PReg as the first input operand
-/// - Already-resolved operands (UImm12 etc.) → unchanged
-///
-/// Placeholder — a real regalloc would do liveness, spilling, etc.
-pub fn trivial_regalloc(func: &mut VCodeFunction) {
-    let regalloc = &func.regalloc;
-    for block in func.blocks.values_mut() {
-        let mut last_preg: Option<PReg> = None;
-        for op in &mut block.operands {
-            *op = resolve_operand(regalloc, *op, &mut last_preg);
-        }
-    }
-}
-
-fn resolve_operand(regalloc: &RegAlloc, op: Operand, last_preg: &mut Option<PReg>) -> Operand {
-    match op {
-        Operand::VReg(id) => match regalloc.init(id) {
-            VInit::PReg(preg) => {
-                *last_preg = Some(*preg);
-                Operand::PReg(*preg)
-            }
-            VInit::InstDst => {
-                let preg = last_preg.expect("InstDst with no prior PReg");
-                Operand::PReg(preg)
-            }
-            _ => op,
-        },
-        other => {
-            if let Operand::PReg(preg) = &other {
-                *last_preg = Some(*preg);
-            }
-            other
-        }
-    }
 }
