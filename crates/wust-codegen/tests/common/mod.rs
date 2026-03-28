@@ -30,13 +30,36 @@ pub fn compile_func(module: &ParsedModule, func_idx: usize) -> IrFunction {
                 let val = f.pop();
                 f.local_set(inline_op.local_index() as usize, val);
             }
+            OpCode::I32Eqz => f.eqz(),
             OpCode::I32Add => f.binop(AluOp::Add, Width::W32),
             OpCode::I32Sub => f.binop(AluOp::Sub, Width::W32),
+            OpCode::If => {
+                let block_idx = inline_op.immediate_u32();
+                let block = &func.body.blocks[block_idx as usize];
+                let cond = f.pop();
+                let then_block = BlockId::User(pc as u32 + 1);
+                let false_target = if block.else_pc != 0 {
+                    BlockId::User(block.else_pc + 1)
+                } else {
+                    BlockId::User(block.end_pc)
+                };
+                f.br_if(cond, then_block, false_target);
+                f.start_block(then_block);
+            }
+            OpCode::Else => {
+                let block_idx = inline_op.immediate_u32();
+                let end_pc = func.body.blocks[block_idx as usize].end_pc;
+                f.br(BlockId::User(end_pc));
+                f.start_block(BlockId::User(pc as u32 + 1));
+            }
             OpCode::End => {
-                if inline_op.immediate_u32() == 0 {
+                let block_idx = inline_op.immediate_u32();
+                if block_idx == 0 {
                     f.emit_return(func);
                     break;
                 }
+                f.br(BlockId::User(pc as u32));
+                f.start_block(BlockId::User(pc as u32));
             }
             _ => todo!("unhandled opcode: {:?}", op),
         }
