@@ -16,9 +16,9 @@ fn add_const_folds_to_uimm12() {
     let v1 = f.regalloc.define(VInit::Const(5), Width::W32);
     let v2 = f.regalloc.define(VInit::InstDst, Width::W32);
 
-    f.push_operand(Operand::VReg { id: v0, width: Width::W32 });
-    f.push_operand(Operand::VReg { id: v1, width: Width::W32 });
-    f.push_operand(Operand::VReg { id: v2, width: Width::W32 });
+    f.push_operand(Operand::VReg(v0));
+    f.push_operand(Operand::VReg(v1));
+    f.push_operand(Operand::VReg(v2));
     f.emit(VCode::Alu { op: AluOp::Add });
 
     let func = f.build();
@@ -27,9 +27,9 @@ fn add_const_folds_to_uimm12() {
 
     let block = &result.blocks[&BlockId::Entry];
     assert_eq!(block.instructions.len(), 1);
-    assert_eq!(block.operands[0], Operand::VReg { id: v0, width: Width::W32 });
+    assert_eq!(block.operands[0], Operand::VReg(v0));
     assert_eq!(block.operands[1], Operand::UImm12(UImm12::try_from(5).unwrap()));
-    assert_eq!(block.operands[2], Operand::VReg { id: v2, width: Width::W32 });
+    assert_eq!(block.operands[2], Operand::VReg(v2));
 }
 
 /// v2 = v0 + const(5000)
@@ -43,9 +43,9 @@ fn add_large_const_stays_vreg() {
     let v1 = f.regalloc.define(VInit::Const(5000), Width::W32);
     let v2 = f.regalloc.define(VInit::InstDst, Width::W32);
 
-    f.push_operand(Operand::VReg { id: v0, width: Width::W32 });
-    f.push_operand(Operand::VReg { id: v1, width: Width::W32 });
-    f.push_operand(Operand::VReg { id: v2, width: Width::W32 });
+    f.push_operand(Operand::VReg(v0));
+    f.push_operand(Operand::VReg(v1));
+    f.push_operand(Operand::VReg(v2));
     f.emit(VCode::Alu { op: AluOp::Add });
 
     let func = f.build();
@@ -53,6 +53,6 @@ fn add_large_const_stays_vreg() {
     let result = compile(func, &mut selector).unwrap();
 
     let block = &result.blocks[&BlockId::Entry];
-    assert_eq!(block.operands[1], Operand::VReg { id: v1, width: Width::W32 });
+    assert_eq!(block.operands[1], Operand::VReg(v1));
 }
 

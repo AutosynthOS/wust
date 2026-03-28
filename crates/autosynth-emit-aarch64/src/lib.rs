@@ -50,17 +50,19 @@ fn emit_alu(
         AluOp::Add => {
             let dst_preg = expect_preg(&dst)?;
             let lhs_preg = expect_preg(&lhs)?;
-            let lhs_width = lhs.width().ok_or(EmitError::UnresolvedOperand)?;
+            // Default to W32 — the emitter operates on fully-resolved
+            // operands where width comes from instruction context.
+            let width = Width::W32;
 
             match rhs {
                 Operand::UImm12(imm) => {
-                    let rd = to_gpr_or_sp(dst_preg, lhs_width);
-                    let rn = to_gpr_or_sp(lhs_preg, lhs_width);
+                    let rd = to_gpr_or_sp(dst_preg, width);
+                    let rn = to_gpr_or_sp(lhs_preg, width);
                     encode(AddImm { rd, rn, imm }, ctx)
                 }
-                Operand::PReg { preg, width } => {
+                Operand::PReg(preg) => {
                     let rd = to_gpr_or_zr(dst_preg, width);
-                    let rn = to_gpr_or_zr(lhs_preg, lhs_width);
+                    let rn = to_gpr_or_zr(lhs_preg, width);
                     let rm = to_gpr_or_zr(preg, width);
                     encode(AddReg { rd, rn, rm }, ctx)
                 }
@@ -73,7 +75,7 @@ fn emit_alu(
 
 fn expect_preg(op: &Operand) -> Result<PReg, EmitError> {
     match op {
-        Operand::PReg { preg, .. } => Ok(*preg),
+        Operand::PReg(preg) => Ok(*preg),
         _ => Err(EmitError::UnresolvedOperand),
     }
 }

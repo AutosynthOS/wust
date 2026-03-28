@@ -1,5 +1,5 @@
 use autosynth_codegen::builder::FunctionBuilder;
-use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode};
+use autosynth_ir::{AluOp, BlockId, Operand, VCode};
 use autosynth_isa::{PReg, Width};
 use autosynth_regalloc::{VInit, VRegId};
 
@@ -66,12 +66,9 @@ impl WasmFunctionBuilder {
         let lhs = self.pop();
         let dst = self.inner.regalloc.define(VInit::InstDst, width);
 
-        let lhs_width = self.inner.regalloc.width(lhs);
-        let rhs_width = self.inner.regalloc.width(rhs);
-
-        self.inner.push_operand(Operand::VReg { id: lhs, width: lhs_width });
-        self.inner.push_operand(Operand::VReg { id: rhs, width: rhs_width });
-        self.inner.push_operand(Operand::VReg { id: dst, width });
+        self.inner.push_operand(Operand::VReg(lhs));
+        self.inner.push_operand(Operand::VReg(rhs));
+        self.inner.push_operand(Operand::VReg(dst));
         self.inner.emit(VCode::Alu { op });
 
         self.operands.push(dst);

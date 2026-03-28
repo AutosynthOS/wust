@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use autosynth_ir::{BlockId, Operand, VCode};
+use autosynth_ir::{BlockId, Operand};
 use autosynth_isa::PReg;
 use autosynth_regalloc::{RegAlloc, VInit};
 use autosynth_selector::{CodeCtx, Selector, SelectorError};
@@ -60,19 +60,19 @@ pub fn trivial_regalloc(func: &mut VCodeFunction) {
 
 fn resolve_operand(regalloc: &RegAlloc, op: Operand, last_preg: &mut Option<PReg>) -> Operand {
     match op {
-        Operand::VReg { id, width } => match regalloc.init(id) {
+        Operand::VReg(id) => match regalloc.init(id) {
             VInit::PReg(preg) => {
                 *last_preg = Some(*preg);
-                Operand::PReg { preg: *preg, width }
+                Operand::PReg(*preg)
             }
             VInit::InstDst => {
                 let preg = last_preg.expect("InstDst with no prior PReg");
-                Operand::PReg { preg, width }
+                Operand::PReg(preg)
             }
             _ => op,
         },
         other => {
-            if let Operand::PReg { preg, .. } = &other {
+            if let Operand::PReg(preg) = &other {
                 *last_preg = Some(*preg);
             }
             other

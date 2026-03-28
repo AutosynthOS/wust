@@ -74,7 +74,7 @@ impl RegAlloc {
     where
         Imm: TryFrom<i64>,
     {
-        let Operand::VReg { id, .. } = op else { return None };
+        let Operand::VReg(id) = op else { return None };
         let VInit::Const(val) = self.init(*id) else { return None };
         Imm::try_from(*val).ok()
     }
@@ -82,7 +82,7 @@ impl RegAlloc {
     /// Try to evaluate a const-const ALU op at compile time.
     /// Returns the result if both operands are const.
     pub fn try_const_val(&self, op: &Operand) -> Option<i64> {
-        let Operand::VReg { id, .. } = op else { return None };
+        let Operand::VReg(id) = op else { return None };
         let VInit::Const(val) = self.init(*id) else { return None };
         Some(*val)
     }

@@ -530,36 +530,13 @@ pub struct VRegId(pub u32);
 /// an immediate, emitting a load for a Mem operand).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
-    /// Virtual register — the default at the highest IR level.
-    /// The selector resolves to a more concrete form by looking
-    /// up VReg metadata.
-    VReg { id: VRegId, width: Width },
-
-    /// Physical register (function params, call results, reserved regs).
-    PReg { preg: PReg, width: Width },
-
-    /// Value in memory at a known slot.
-    Mem { slot: SlotRef, width: Width },
-
-    // --- Immediates (populated by selector) ---
-
+    Const(i64),
+    VReg(VRegId),
+    PReg(PReg),
+    Mem(SlotRef),
     UImm12(autosynth_isa::UImm12),
-    UImm16(autosynth_isa::UImm16),
-    SImm9(autosynth_isa::SImm9),
-    SImm19(autosynth_isa::SImm19),
-    SImm26(autosynth_isa::SImm26),
 }
 
-impl Operand {
-    pub fn width(&self) -> Option<Width> {
-        match self {
-            Operand::VReg { width, .. }
-            | Operand::PReg { width, .. }
-            | Operand::Mem { width, .. } => Some(*width),
-            _ => None,
-        }
-    }
-}
 
 // ---- VCode: new pipeline instruction set ----
 
