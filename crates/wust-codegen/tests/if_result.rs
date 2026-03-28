@@ -50,4 +50,9 @@ fn if_result() {
         ]),
         (VCode::Return, &[]),
     ]);
+
+    // Execute.
+    let module = common::parse_wat(include_str!("if_result.wat"));
+    let jit = common::jit_compile(&module, 0);
+    assert_eq!(jit.call_i32(0), 15);
 }

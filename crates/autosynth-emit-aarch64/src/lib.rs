@@ -3,10 +3,10 @@
 /// Encodes fully-resolved VCode instructions to ARM64 machine code.
 /// All operands must be concrete — PRegs and immediates only.
 use autosynth_emitter::{CodeContext, EmitError, Emitter};
-use autosynth_ir::{AluOp, Operand, VCode};
-use autosynth_isa::{PReg, Width};
+use autosynth_ir::{AluOp, CompOp, Operand, VCode};
+use autosynth_isa::{PReg, SImm19, SImm26, Width};
 use autosynth_isa_aarch64::{
-    Aarch64Inst, AddImm, AddReg, Ret,
+    Aarch64Inst, AddImm, AddReg, B, BCond, Cond, Ret, SubsImm, SubsReg,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
 
@@ -27,6 +27,8 @@ impl Emitter for Aarch64Emitter {
     ) -> Result<(), EmitError> {
         match inst {
             VCode::Alu { op } => emit_alu(op, operands, ctx),
+            VCode::BrIf { op, .. } => emit_brif(op, operands, ctx),
+            VCode::Branch { .. } => encode(B { offset: SImm26::try_from(0x1FFFFFF).unwrap() }, ctx),
             VCode::Return => encode(Ret { rn: XGpr(GprId::LINK_REGISTER) }, ctx),
             _ => Err(EmitError::Unhandled),
         }
@@ -70,6 +72,54 @@ fn emit_alu(
             }
         }
         _ => todo!("emit_alu: {op:?}"),
+    }
+}
+
+fn emit_brif(
+    op: &CompOp,
+    operands: &mut impl Iterator<Item = Operand>,
+    ctx: &mut impl CodeContext,
+) -> Result<(), EmitError> {
+    let lhs = next_op(operands)?;
+    let rhs = next_op(operands)?;
+
+    let lhs_preg = expect_preg(&lhs)?;
+    let width = Width::W32;
+
+    // Emit subs (flag-setting compare).
+    match rhs {
+        Operand::UImm12(imm) => {
+            let rd = to_gpr_or_zr(lhs_preg, width);
+            let rn = to_gpr_or_sp(lhs_preg, width);
+            encode(SubsImm { rd, rn, imm }, ctx)?;
+        }
+        Operand::PReg(preg) => {
+            let rd = to_gpr_or_zr(lhs_preg, width);
+            let rn = to_gpr_or_zr(lhs_preg, width);
+            let rm = to_gpr_or_zr(preg, width);
+            encode(SubsReg { rd, rn, rm }, ctx)?;
+        }
+        _ => return Err(EmitError::UnresolvedOperand),
+    }
+
+    // Emit b.cond with placeholder max offset.
+    // Inverted condition: BrIf branches to block_else when condition is FALSE.
+    let cond = comp_op_to_cond(op).invert();
+    encode(BCond { cond, offset: SImm19::try_from(0x3FFFF).unwrap() }, ctx)
+}
+
+fn comp_op_to_cond(op: &CompOp) -> Cond {
+    match op {
+        CompOp::Eq => Cond::EQ,
+        CompOp::Ne => Cond::NE,
+        CompOp::LtS => Cond::LT,
+        CompOp::LtU => Cond::CC,
+        CompOp::GtS => Cond::GT,
+        CompOp::GtU => Cond::HI,
+        CompOp::LeS => Cond::LE,
+        CompOp::LeU => Cond::LS,
+        CompOp::GeS => Cond::GE,
+        CompOp::GeU => Cond::CS,
     }
 }
 
