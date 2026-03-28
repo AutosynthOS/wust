@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use autosynth_codegen::builder::FunctionBuilder;
 use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode, VReg};
@@ -8,13 +8,8 @@ use wust_core::FuncMeta;
 
 use crate::conversion::valtype_to_width;
 
-/// Per-block wasm region state.
-#[derive(Clone)]
-struct WasmBlockState {
-    locals: Vec<VReg>,
-    operands: Vec<VReg>,
-    fibre: Vec<VReg>,
-}
+/// Per-block wasm region state — named stacks of VRegs.
+type WasmBlockState = BTreeMap<&'static str, Vec<VReg>>;
 
 /// Wasm-aware function builder.
 pub struct WasmFunctionBuilder {
@@ -43,11 +38,11 @@ impl WasmFunctionBuilder {
 
         Self {
             inner,
-            state: WasmBlockState {
-                locals,
-                operands: Vec::new(),
-                fibre: Vec::new(),
-            },
+            state: BTreeMap::from([
+                ("locals", locals),
+                ("operands", Vec::new()),
+                ("fibre", Vec::new()),
+            ]),
             snapshots: HashMap::new(),
         }
     }
@@ -56,23 +51,28 @@ impl WasmFunctionBuilder {
 
     pub fn push_const(&mut self, val: i64, width: Width) {
         let id = self.inner.regalloc.define(VInit::Const(val), width);
-        self.state.operands.push(VReg::Def(id));
+        self.region("operands").push(VReg::Def(id));
     }
 
     pub fn push_local(&mut self, idx: usize) {
-        self.state.operands.push(self.state.locals[idx]);
+        let vreg = self.region("locals")[idx];
+        self.region("operands").push(vreg);
     }
 
     pub fn pop(&mut self) -> VReg {
-        self.state.operands.pop().expect("operand stack underflow")
+        self.region("operands").pop().expect("operand stack underflow")
     }
 
     pub fn push(&mut self, vreg: VReg) {
-        self.state.operands.push(vreg);
+        self.region("operands").push(vreg);
     }
 
     pub fn local_set(&mut self, idx: usize, val: VReg) {
-        self.state.locals[idx] = val;
+        self.region("locals")[idx] = val;
+    }
+
+    fn region(&mut self, name: &str) -> &mut Vec<VReg> {
+        self.state.get_mut(name).expect(name)
     }
 
     // --- VCode emission ---
@@ -87,7 +87,7 @@ impl WasmFunctionBuilder {
         self.inner.push_operand(Operand::VReg(VReg::Def(dst)));
         self.inner.emit(VCode::Alu { op });
 
-        self.state.operands.push(VReg::Def(dst));
+        self.region("operands").push(VReg::Def(dst));
     }
 
     pub fn eqz(&mut self) {
@@ -102,7 +102,7 @@ impl WasmFunctionBuilder {
             op: AluOp::Comp(CompOp::Eq),
         });
 
-        self.state.operands.push(VReg::Def(dst));
+        self.region("operands").push(VReg::Def(dst));
     }
 
     // --- Control flow ---
@@ -192,37 +192,19 @@ impl WasmFunctionBuilder {
     }
 
     fn wrap_in_refs(&mut self, snaps: &[WasmBlockState]) {
-        wrap_slots(
-            &mut self.state.operands,
-            snaps.iter().map(|s| &s.operands),
-            &mut self.inner.regalloc,
-        );
-        wrap_slots(
-            &mut self.state.locals,
-            snaps.iter().map(|s| &s.locals),
-            &mut self.inner.regalloc,
-        );
-        wrap_slots(
-            &mut self.state.fibre,
-            snaps.iter().map(|s| &s.fibre),
-            &mut self.inner.regalloc,
-        );
-    }
-}
-
-fn wrap_slots<'a>(
-    slots: &mut [VReg],
-    snap_regions: impl Iterator<Item = &'a Vec<VReg>> + Clone,
-    regalloc: &mut autosynth_regalloc::RegAlloc,
-) {
-    for i in 0..slots.len() {
-        let first = slots[i];
-        let all_same = snap_regions.clone().all(|r| r.get(i) == Some(&first));
-        let ref_def = if all_same {
-            VRegRefDef::Direct(first)
-        } else {
-            VRegRefDef::Phi(snap_regions.clone().map(|r| r[i]).collect())
-        };
-        slots[i] = VReg::Ref(regalloc.alloc_ref(ref_def));
+        let regalloc = &mut self.inner.regalloc;
+        for (name, slots) in self.state.iter_mut() {
+            for i in 0..slots.len() {
+                let first = slots[i];
+                let snap_vals = snaps.iter().map(|s| s[name][i]);
+                let all_same = snap_vals.clone().all(|v| v == first);
+                let ref_def = if all_same {
+                    VRegRefDef::Direct(first)
+                } else {
+                    VRegRefDef::Phi(snap_vals.collect())
+                };
+                slots[i] = VReg::Ref(regalloc.alloc_ref(ref_def));
+            }
+        }
     }
 }
