@@ -13,7 +13,7 @@ members = [
     "crates/autosynth-lower",
     "crates/autosynth-backend-aarch64",
     "crates/plasma",
-    "crates/plasma_hello",
+    "crates/plasma_hello", "crates/autosynth-select-aarch64", "crates/autosynth-selector", "crates/autosynth-regalloc",
 ]
 
 [profile.release]

@@ -1,5 +1,4 @@
-use alloc::vec::Vec;
-use autosynth_ir::{BlockId, Operand, VCode, VRegId};
+use autosynth_ir::{BlockId, Operand, VCode};
 
 /// A basic block in the VCode pipeline.
 ///

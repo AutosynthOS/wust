@@ -14,3 +14,4 @@ serde = { version = "1", features = ["derive"], optional = true }
 autosynth-isa-aarch64 = { path = "../autosynth-isa-aarch64" }
 autosynth-isa-riscv64 = { path = "../autosynth-isa-riscv64" }
 autosynth-isa-x86_64 = { path = "../autosynth-isa-x86_64" }
+autosynth-regalloc = { path = "../autosynth-regalloc" }

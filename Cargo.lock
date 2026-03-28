@@ -138,6 +138,7 @@ dependencies = [
  "autosynth-isa-riscv64",
  "autosynth-isa-x86_64",
  "autosynth-lower",
+ "autosynth-regalloc",
  "serde",
 ]
 
@@ -185,6 +186,30 @@ dependencies = [
  "autosynth-isa",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "autosynth-regalloc"
+version = "0.1.0"
+dependencies = [
+ "autosynth-isa",
+]
+
+[[package]]
+name = "autosynth-select-aarch64"
+version = "0.1.0"
+dependencies = [
+ "autosynth-ir",
+ "autosynth-isa",
+ "autosynth-isa-aarch64",
+]
+
+[[package]]
+name = "autosynth-selector"
+version = "0.1.0"
+dependencies = [
+ "autosynth-ir",
+ "autosynth-isa",
 ]
 
 [[package]]

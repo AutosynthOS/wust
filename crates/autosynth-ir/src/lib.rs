@@ -41,7 +41,7 @@ impl fmt::Display for VReg {
 }
 
 /// Identifies a basic block within a function.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum BlockId {
     /// Function entry / prologue block.

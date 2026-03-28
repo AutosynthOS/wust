@@ -6,17 +6,23 @@
 //! specific language or runtime — the caller decides call conventions, frame
 //! layouts, and register roles.
 
-mod builder;
-/// IR function and block types.
+/// New VCode pipeline builder.
+pub mod builder;
+/// Old builder (preserved for reference / old tests).
+mod builder_old;
+/// IR function and block types (old pipeline).
 mod ir_function;
-/// Lowerer — drives the backend with register allocation decisions.
+/// Lowerer (old pipeline).
 mod lowerer;
-/// Register allocator — vreg location tracking and physical register pool.
+/// Register allocator (old pipeline).
 mod regalloc;
+
+pub use autosynth_regalloc;
 pub use autosynth_ir::{
     AluOp, BlockId, CompOp, FunctionIdx, IrInst, LowerInst, RegInst, SlotRef, VReg, VInit,
     VRegion, VRegionId,
 };
 pub use autosynth_isa::Width;
-pub use builder::{CodeBuilder, FunctionBuilder};
+pub use builder_old::{CodeBuilder, FunctionBuilder as OldFunctionBuilder};
+pub use builder::FunctionBuilder;
 pub use lowerer::compile;

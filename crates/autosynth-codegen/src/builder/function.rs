@@ -1,18 +1,16 @@
-use alloc::collections::BTreeMap;
-use alloc::vec::Vec;
-use autosynth_ir::{BlockId, Operand, VCode, VRegId};
-use autosynth_isa::Width;
+use std::collections::BTreeMap;
+use autosynth_ir::{BlockId, Operand, VCode};
+use autosynth_regalloc::RegAlloc;
 
 use super::Block;
 
 /// Builds a function's VCode representation.
 ///
-/// Tracks VReg allocation, block structure, and the VCode + operand
-/// streams. The caller (wust-codegen) manages wasm-specific regions
-/// (locals, operands, fibre) and pushes VReg operands here.
+/// Owns the [`RegAlloc`] — all VReg definitions go through it.
+/// Tracks block structure and the VCode + operand streams per block.
 pub struct FunctionBuilder {
-    /// Next VRegId to allocate.
-    next_vreg: u32,
+    /// The register allocator — authority on all VRegs.
+    pub regalloc: RegAlloc,
     /// All blocks, keyed by BlockId.
     blocks: BTreeMap<BlockId, Block>,
     /// Block layout order.
@@ -24,18 +22,11 @@ pub struct FunctionBuilder {
 impl FunctionBuilder {
     pub fn new() -> Self {
         Self {
-            next_vreg: 0,
+            regalloc: RegAlloc::new(),
             blocks: BTreeMap::new(),
             block_order: Vec::new(),
             current_block: None,
         }
-    }
-
-    /// Allocate a new VRegId.
-    pub fn alloc_vreg(&mut self) -> VRegId {
-        let id = VRegId(self.next_vreg);
-        self.next_vreg += 1;
-        id
     }
 
     /// Emit a VCode instruction into the current block.
