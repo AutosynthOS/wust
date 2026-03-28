@@ -1,3 +1,5 @@
+#![feature(abi_custom)]
+
 use autosynth_codegen::pipeline::compile;
 use autosynth_ir::{AluOp, BlockId, Operand, VCode};
 use autosynth_isa::{UImm12, Width};

@@ -113,24 +113,33 @@ impl JitFunction {
         }
 
         let func_ptr = self._page.entry();
-        unsafe { trampoline_call_i32(func_ptr, frame_base, arg as i64) as i32 }
+        let result: i64;
+        unsafe {
+            std::arch::asm!(
+                "blr {trampoline}",
+                trampoline = in(reg) trampoline_call_i32 as *const (),
+                in("x0") func_ptr as u64,
+                in("x1") frame_base as u64,
+                in("x2") arg as i64,
+                lateout("x0") result,
+                clobber_abi("C"),
+            );
+        }
+        result as i32
     }
 }
 
 /// Naked trampoline — sets up x29 (g.lb) and calls the JIT function.
 ///
-/// C calling convention args:
+/// `extern "custom"` — no params, no return type. Everything through
+/// registers. The caller sets up:
 ///   x0 = JIT function pointer
 ///   x1 = managed stack frame base (becomes x29)
 ///   x2 = i32 param (placed in x0 for CC)
 ///
 /// Returns result in x0.
 #[unsafe(naked)]
-unsafe extern "C" fn trampoline_call_i32(
-    _func: *const u8,
-    _frame: *mut u8,
-    _arg: i64,
-) -> i64 {
+unsafe extern "custom" fn trampoline_call_i32() {
     std::arch::naked_asm!(
         // Save caller's frame pointer and link register.
         "stp x29, x30, [sp, #-16]!",
