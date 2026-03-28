@@ -1,473 +1,272 @@
-use std::marker::PhantomData;
-
-use autosynth_codegen::{
-    AluOp, BlockId, CodeBuilder, CompOp, FunctionBuilder, FunctionIdx, IrInst, RegInst, VInit,
-    VReg, VRegion, VRegionId, Width,
-};
-use autosynth_isa::{IsaReg, PReg};
-use autosynth_lower::{BackendEmitter, MachineConfig, trace, trace_ctx};
-
-use wust_core::exec::ModuleExecutor;
-use wust_core::{FRAME_HEADER_SIZE, FuncMeta, OpCode, Outcome, ParsedModule, Task, slot_size};
-
-use crate::CodeBuffer;
-use crate::conversion::{build_signatures, func_signature, valtype_to_width};
-use crate::trampoline::{call_trampoline, emit_entry_trampoline};
-
-/// Toggle fuel checks in generated code. Set to `false` to emit
-/// straight-line code without fuel subtraction or suspend branches.
-const EMIT_FUEL_CHECKS: bool = true;
-
-/// A JIT-compiled WASM module, generic over the backend.
+/// Dream jit_module.rs — the API we WANT.
 ///
-/// Owns the parsed module, the autosynth IR compiler state, and an
-/// executable code page. Constructs the orchestrator internally from
-/// the backend's machine config.
-pub struct JitModule<B: BackendEmitter> {
-    _module: ParsedModule,
-    compiler: CodeBuilder,
-    page: CodeBuffer,
-    /// Byte offset of each function's entry trampoline within the code page.
-    trampoline_offsets: Vec<usize>,
-    _backend: PhantomData<B>,
-}
+/// This sketches the ideal compile_func using the new VCode pipeline.
+/// Types/methods that don't exist yet are used freely — we'll build
+/// backwards from this to create the traits and types we need.
+use autosynth_ir::{AluOp, BlockId, CompOp, VCode};
+use autosynth_isa::Width;
+use wust_core::{FRAME_HEADER_SIZE, FuncMeta, OpCode, slot_size};
 
-impl<B: BackendEmitter> JitModule<B> {
-    /// Compile all functions in the parsed WASM module to native code.
-    pub fn new(module: ParsedModule) -> Result<Self, anyhow::Error> {
-        let mut backend = B::new();
-        let mut compiler = CodeBuilder::new();
+use crate::conversion::valtype_to_width;
 
-        let signatures = build_signatures(&module);
-        for (idx, sig) in signatures {
-            compiler.add_signature(idx, sig);
-        }
+/// Compile a single WASM function into VCode.
+///
+/// `f` is the wust-specific function builder that wraps the autosynth
+/// builder. It manages wasm regions (locals, operands, fibre) and
+/// emits VCode + operands to the underlying builder.
+fn compile_func(f: &mut WasmFunctionBuilder, func: &FuncMeta, all_funcs: &[FuncMeta]) {
+    // --- Prologue ---
 
-        let mut page = CodeBuffer::new()?;
-        let mut all_code: Vec<u8> = Vec::new();
-        let mut trampoline_offsets: Vec<usize> = Vec::new();
-
-        for (func_idx, func) in module.funcs.iter().enumerate() {
-            Self::compile_func(
-                &mut compiler,
-                B::machine_config(),
-                func_idx as i32,
-                &module.funcs,
-            )?;
-
-            let ir_func = &compiler.functions()[compiler.functions().len() - 1];
-            let body_bytes = autosynth_codegen::compile(ir_func, &mut backend)
-                .map_err(|e| anyhow::anyhow!(e))?;
-
-            let trampoline_bytes = emit_entry_trampoline(func);
-
-            let trampoline_offset = all_code.len();
-            trampoline_offsets.push(trampoline_offset);
-            all_code.extend_from_slice(&trampoline_bytes);
-            all_code.extend_from_slice(&body_bytes);
-        }
-
-        page.flash(&all_code)?;
-
-        Ok(JitModule {
-            _module: module,
-            compiler,
-            page,
-            trampoline_offsets,
-            _backend: PhantomData,
-        })
+    // Declare parameters — each arrives in a CC register.
+    for (i, param) in func.params.iter().enumerate() {
+        let w = valtype_to_width(param);
+        f.declare_param(i, w);
     }
 
-    /// Access the compiled IR (for debugging/inspection).
-    pub fn ir(&self) -> &CodeBuilder {
-        &self.compiler
+    // Declare zero-initialized locals.
+    for local in func.locals.iter() {
+        let w = valtype_to_width(local);
+        f.declare_local(w);
     }
 
-    /// Compile a single WASM function into autosynth IR.
-    pub fn compile_func(
-        cb: &mut CodeBuilder,
-        mut config: MachineConfig,
-        func_idx: i32,
-        all_funcs: &[FuncMeta],
-    ) -> anyhow::Result<()> {
-        let func = &all_funcs[func_idx as usize];
-        let sig = func_signature(func);
+    // Save link register onto the fibre stack.
+    f.save_lr();
 
-        trace_ctx!("phase", "build");
-        trace_ctx!("function", func_idx);
-        trace!({
-            "type": "function_start",
-            "index": func_idx,
-            "params": func.params.len(),
-            "results": func.results.len(),
-            "locals": func.locals.len(),
-            "body_len": func.body.ops.len()
-        });
+    // Branch to first user block.
+    f.br(BlockId::User(0));
+    f.start_block(BlockId::User(0));
 
-        let lbp_preg = config.reserve(IsaReg::FramePointer);
-        let lr_preg = config.reserve(IsaReg::ReturnAddress);
-        let fuel_preg = config.reserve(IsaReg::FromEnd);
-        let _ctx_preg = config.reserve(IsaReg::FromEnd);
-        let fsp_preg = config.reserve(IsaReg::StackPointer);
-        let stack_alignment = config.stack_alignment();
+    // --- Main compilation loop ---
+    let mut pc = 0;
+    loop {
+        let inline_op = &func.body.ops[pc];
+        let op = inline_op.opcode();
 
-        let mut f = FunctionBuilder::new(cb, config, sig);
-
-        // Entry block must be active before defining vstacks,
-        // since vstack state lives on the block.
-        f.entry_block(BlockId::Entry);
-
-        // g.lb (locals-base) points to the start of the frame. All stack
-        // access uses positive unsigned offsets from g.lb, which gives
-        // 0–16KB range via ARM64's ldr/str [Xn, #imm12] encoding.
-        // See abi.md "JIT locals-base register" for the full rationale.
-        //
-        // [params][locals][FrameHeader 12B][operands...]
-        // ^g.lb           ^+locals_size    ^+locals_header_size
-        let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
-
-        let locals = f.define_region(VRegion {
-            label: "local",
-            base: lbp_preg,
-            base_offset: 0,
-            slots: Vec::new(),
-        });
-        let operands = f.define_region(VRegion {
-            label: "ops",
-            base: lbp_preg,
-            base_offset: locals_header_size,
-            slots: Vec::new(),
-        });
-        let fibre = f.define_region(VRegion {
-            label: "fibre",
-            base: fsp_preg,
-            base_offset: 0,
-            slots: Vec::new(),
-        });
-
-        trace!({
-            "type": "regions",
-            "locals": { "base": format!("x{}", lbp_preg.0), "offset": 0 },
-            "operands": { "base": format!("x{}", lbp_preg.0), "offset": locals_header_size },
-            "fibre": { "base": format!("x{}", fsp_preg.0), "offset": 0 }
-        });
-
-        trace!({"type": "group", "label": "(prologue)"});
-
-        // Declare parameters — each starts in its CC register (PReg(i)).
-        for (i, param) in func.params.iter().enumerate() {
-            let w = valtype_to_width(param);
-            let preg = PReg(i as u8);
-            let v = f.alloc_vreg(w, VInit::PReg(preg));
-            f.push_vreg(locals, v);
-        }
-
-        // Declare zero-initialized locals
-        for (i, local) in func.locals.iter().enumerate() {
-            let w = valtype_to_width(&local);
-            let v = f.alloc_vreg(w, VInit::Const(0));
-            f.push_vreg(locals, v);
-        }
-
-        // Allocate native stack space for the fibre (lr save slot).
-        let sp = f.alloc_vreg(Width::W64, VInit::PReg(fsp_preg));
-        let frame_size = f.alloc_vreg(Width::W64, VInit::Const(stack_alignment as i64));
-        f.emit(IrInst::Alu {
-            op: AluOp::Sub,
-            dst: sp,
-            lhs: sp,
-            rhs: frame_size,
-        });
-
-        // Save link register onto fibre.
-        let lr = f.alloc_vreg(Width::W64, VInit::PReg(lr_preg));
-        f.push_vreg(fibre, lr);
-
-        // Finalize entry block, branch to first user block.
-        f.br(BlockId::User(0));
-        f.start_block(BlockId::User(0));
-
-        // Fuel tracking: accumulate cost per opcode, flush before calls.
-        let mut pending_fuel: u32 = 0;
-
-        // Main compilation loop
-        let mut pc = 0;
-        loop {
-            debug_assert!(
-                pc < func.body.ops.len(),
-                "pc {pc} out of bounds (len={})",
-                func.body.ops.len()
-            );
-            let inline_op = unsafe { func.body.ops.get_unchecked(pc) };
-            let op = inline_op.opcode();
-
-            trace_ctx!("pc", pc as u32);
-            trace!({
-                "type": "wasm_op",
-                "pc": pc,
-                "opcode": format!("{op:?}"),
-                "label": inline_op.display_label()
-            });
-
-            // Accrue fuel cost for this opcode.
-            pending_fuel += op.fuel_cost();
-
-            match op {
-                OpCode::I32Const => {
-                    let value = inline_op.immediate_i32() as i64;
-                    let v = f.alloc_vreg(Width::W32, VInit::Const(value));
-                    f.push_vreg(operands, v);
-                }
-                OpCode::LocalGetI32 => {
-                    let idx = inline_op.local_index() as usize;
-                    let src = f.get_field(locals, idx);
-                    f.push_vreg(operands, src);
-                }
-                OpCode::LocalSetI32 => {
-                    let idx = inline_op.local_index() as usize;
-                    let val = f.pop(operands, Width::W32);
-                    f.set_field(locals, idx, val);
-                }
-                OpCode::I32Eqz => {
-                    let val = f.pop(operands, Width::W32);
-                    let zero = f.alloc_vreg(Width::W32, VInit::Const(0));
-                    let dst = f.alloc_vreg(Width::W32, VInit::InstDst);
-                    f.emit(IrInst::Alu {
-                        op: AluOp::Comp(CompOp::Eq),
-                        dst,
-                        lhs: val,
-                        rhs: zero,
-                    });
-                    f.push_vreg(operands, dst);
-                }
-                OpCode::I32Add => f.binop(AluOp::Add, operands, Width::W32),
-                OpCode::I32Sub => f.binop(AluOp::Sub, operands, Width::W32),
-                OpCode::I32LeS => f.binop(AluOp::Comp(CompOp::LeS), operands, Width::W32),
-                OpCode::If => {
-                    let block_idx = inline_op.immediate_u32();
-                    let block = &func.body.blocks[block_idx as usize];
-                    let cond = f.pop(operands, Width::W32);
-                    let then_block = BlockId::User(pc as u32 + 1);
-                    // If there's an else branch, false goes to else_pc+1;
-                    // otherwise false skips to end_pc.
-                    let false_target = if block.else_pc != 0 {
-                        BlockId::User(block.else_pc + 1)
-                    } else {
-                        BlockId::User(block.end_pc)
-                    };
-                    f.br_if(cond, then_block, false_target);
-                    f.start_block(then_block);
-                }
-                OpCode::Else => {
-                    let block_idx = inline_op.immediate_u32();
-                    let end_pc = func.body.blocks[block_idx as usize].end_pc;
-                    // End of then-branch — jump over the else body.
-                    if !f.is_finalized() {
-                        f.br(BlockId::User(end_pc));
-                    }
-                    f.start_block(BlockId::User(pc as u32 + 1));
-                }
-                OpCode::BrIf => {
-                    let block_idx = inline_op.immediate_u32();
-                    let target_block = &func.body.blocks[block_idx as usize];
-                    let target = BlockId::User(target_block.end_pc);
-                    let cont = BlockId::User(pc as u32 + 1);
-                    let cond = f.pop(operands, Width::W32);
-                    f.br_if(cond, target, cont);
-                    f.start_block(cont);
-                }
-                OpCode::End => {
-                    let block_idx = inline_op.immediate_u32();
-                    if block_idx == 0 {
-                        Self::emit_epilogue(
-                            &mut f,
-                            operands,
-                            fibre,
-                            lr_preg,
-                            fsp_preg,
-                            stack_alignment,
-                            func,
-                        );
-                        break;
-                    }
-                    // Wasm block end — finalize current block if not already done.
-                    if !f.is_finalized() {
-                        f.br(BlockId::User(pc as u32));
-                    }
-                    f.start_block(BlockId::User(pc as u32));
-                }
-                OpCode::Return => Self::emit_epilogue(
-                    &mut f,
-                    operands,
-                    fibre,
-                    lr_preg,
-                    fsp_preg,
-                    stack_alignment,
-                    func,
-                ),
-                OpCode::Call => {
-                    let callee_idx = inline_op.immediate_i32();
-                    if callee_idx.is_negative() {
-                        todo!("call to negative index function");
-                    }
-
-                    let func_idx = FunctionIdx::User(callee_idx as u32);
-                    let callee = &all_funcs[callee_idx as usize];
-                    let callee_sig = func_signature(callee);
-
-                    // Pop args and constrain each to its CC register.
-                    for i in (0..callee_sig.params.len()).rev() {
-                        let vreg = f.pop(operands, callee_sig.params[i].width());
-                        f.set_target(vreg, PReg(i as u8));
-                        f.emit_reg(RegInst::Resolve { vreg });
-                    }
-
-                    f.clobber_region(locals);
-                    f.clobber_region(operands);
-                    f.clobber_region(fibre);
-
-                    // Frame advance: the caller's top-of-stack operands
-                    // become the callee's params (same stack slots). We
-                    // advance g.lb past the caller's frame up to (but not
-                    // including) those args, so the callee sees them as
-                    // locals[0..N]. See abi.md "Frame advance on calls".
-                    //
-                    // advance = locals_header_size
-                    //         + (operand_depth[pc] - callee_param_slots) * 4
-                    let callee_param_slots: u32 =
-                        callee.params.iter().map(|t| slot_size(*t) as u32).sum();
-                    let caller_operand_depth = func.body.operand_depth[pc] as u32;
-                    let advance =
-                        locals_header_size + (caller_operand_depth - callee_param_slots) * 4;
-
-                    // TODO: when callee has more params than CC registers,
-                    // overflow params stay on the stack instead of moving
-                    // to registers.
-                    let lb = f.alloc_vreg(Width::W64, VInit::PReg(lbp_preg));
-                    let advance_vreg = f.alloc_vreg(Width::W64, VInit::Const(advance as i64));
-                    f.emit(IrInst::Alu {
-                        op: AluOp::Add,
-                        dst: lb,
-                        lhs: lb,
-                        rhs: advance_vreg,
-                    });
-
-                    f.emit(IrInst::Call { func_idx });
-
-                    // Restore g.lb after call returns.
-                    let lb = f.alloc_vreg(Width::W64, VInit::PReg(lbp_preg));
-                    let advance_vreg = f.alloc_vreg(Width::W64, VInit::Const(advance as i64));
-                    f.emit(IrInst::Alu {
-                        op: AluOp::Sub,
-                        dst: lb,
-                        lhs: lb,
-                        rhs: advance_vreg,
-                    });
-
-                    // Push result vregs — initialized from CC registers.
-                    for (i, ty) in callee_sig.results.iter().enumerate() {
-                        let v = f.alloc_vreg(ty.width(), VInit::PReg(PReg(i as u8)));
-                        f.push_vreg(operands, v);
-                    }
-
-                    if EMIT_FUEL_CHECKS {
-                        trace!({"type": "group", "label": "(fuel check)"});
-                        let fuel = f.alloc_vreg(Width::W64, VInit::PReg(fuel_preg));
-                        Self::emit_fuel_check(&mut f, fuel, &mut pending_fuel, pc);
-                    }
-                }
-                _ => todo!("unhandled opcode: {:?}", op),
+        match op {
+            // --- Constants and locals ---
+            OpCode::I32Const => {
+                let value = inline_op.immediate_i32();
+                f.push_const(value as i64);
+            }
+            OpCode::LocalGetI32 => {
+                let idx = inline_op.local_index() as usize;
+                f.push_local(idx);
+            }
+            OpCode::LocalSetI32 => {
+                let idx = inline_op.local_index() as usize;
+                let val = f.pop();
+                f.local_set(idx, val);
             }
 
-            pc += 1;
+            // --- Arithmetic ---
+            OpCode::I32Add => f.binop(AluOp::Add),
+            OpCode::I32Sub => f.binop(AluOp::Sub),
+            OpCode::I32LeS => f.binop(AluOp::Comp(CompOp::LeS)),
+            OpCode::I32Eqz => {
+                let val = f.pop();
+                let zero = f.const_vreg(0);
+                f.push_cmp(CompOp::Eq, val, zero);
+            }
+
+            // --- Control flow ---
+            OpCode::If => {
+                let block_idx = inline_op.immediate_u32();
+                let block = &func.body.blocks[block_idx as usize];
+                let cond = f.pop();
+                let then_block = BlockId::User(pc as u32 + 1);
+                let false_target = if block.else_pc != 0 {
+                    BlockId::User(block.else_pc + 1)
+                } else {
+                    BlockId::User(block.end_pc)
+                };
+                f.br_if(cond, then_block, false_target);
+                f.start_block(then_block);
+            }
+            OpCode::Else => {
+                let block_idx = inline_op.immediate_u32();
+                let end_pc = func.body.blocks[block_idx as usize].end_pc;
+                if !f.is_block_finalized() {
+                    f.br(BlockId::User(end_pc));
+                }
+                f.start_block(BlockId::User(pc as u32 + 1));
+            }
+            OpCode::BrIf => {
+                let block_idx = inline_op.immediate_u32();
+                let target_block = &func.body.blocks[block_idx as usize];
+                let target = BlockId::User(target_block.end_pc);
+                let cont = BlockId::User(pc as u32 + 1);
+                let cond = f.pop();
+                f.br_if(cond, target, cont);
+                f.start_block(cont);
+            }
+            OpCode::End => {
+                let block_idx = inline_op.immediate_u32();
+                if block_idx == 0 {
+                    // Function end — emit epilogue and return.
+                    f.emit_return(func);
+                    break;
+                }
+                if !f.is_block_finalized() {
+                    f.br(BlockId::User(pc as u32));
+                }
+                f.start_block(BlockId::User(pc as u32));
+            }
+            OpCode::Return => {
+                f.emit_return(func);
+            }
+
+            // --- Calls ---
+            OpCode::Call => {
+                let callee_idx = inline_op.immediate_i32();
+                let callee = &all_funcs[callee_idx as usize];
+
+                // Pop args from the wasm operand stack.
+                let args: Vec<VReg> = (0..callee.params.len()).rev().map(|i| f.pop()).collect();
+
+                // call() handles everything:
+                // 1. Save dirty locals/fibre to memory
+                // 2. Set args into CC registers
+                // 3. Frame advance
+                // 4. Emit bl
+                // 5. Frame restore
+                // 6. Fuel check (if enabled)
+                let result = f.call(callee_idx as u32, &args, callee, pc);
+
+                // Push result onto wasm operand stack.
+                if !callee.results.is_empty() {
+                    f.push(result);
+                }
+            }
+
+            _ => todo!("unhandled opcode: {:?}", op),
         }
 
-        f.build();
-        trace!({ "type": "function_end" });
-        Ok(())
-    }
-
-    fn emit_epilogue(
-        f: &mut FunctionBuilder,
-        operands: VRegionId,
-        fibre: VRegionId,
-        lr_preg: PReg,
-        fsp_preg: PReg,
-        stack_alignment: u32,
-        func: &FuncMeta,
-    ) {
-        // Pop results into CC registers.
-        for i in (0..func.results.len()).rev() {
-            let width = valtype_to_width(&func.results[i]);
-            let vreg = f.pop(operands, width);
-            f.set_target(vreg, PReg(i as u8));
-        }
-        Self::emit_native_ret(f, fibre, lr_preg, fsp_preg, stack_alignment);
-    }
-
-    /// Restore lr, sp, and emit ret. Shared by normal return and
-    /// suspend paths — neither needs to handle wasm-level results.
-    fn emit_native_ret(
-        f: &mut FunctionBuilder,
-        fibre: VRegionId,
-        lr_preg: PReg,
-        fsp_preg: PReg,
-        stack_alignment: u32,
-    ) {
-        // Restore lr into x30.
-        let lr = f.pop(fibre, Width::W64);
-        f.set_target(lr, lr_preg);
-        f.emit_reg(RegInst::Resolve { vreg: lr });
-        // Restore native stack pointer.
-        let sp = f.alloc_vreg(Width::W64, VInit::PReg(fsp_preg));
-        let frame_size = f.alloc_vreg(Width::W64, VInit::Const(stack_alignment as i64));
-        f.emit(IrInst::Alu {
-            op: AluOp::Add,
-            dst: sp,
-            lhs: sp,
-            rhs: frame_size,
-        });
-        f.ret();
-    }
-
-    fn emit_fuel_check(f: &mut FunctionBuilder, fuel: VReg, pending_fuel: &mut u32, pc: usize) {
-        // Fused subtract-and-compare: subs fuel, fuel, #N
-        // LeS makes the backend emit `subs` (flag-setting subtract).
-        // Using `fuel` (physical register) as dst writes the result
-        // back to fuel while setting flags for the LE condition.
-
-        let op = IrInst::Alu {
-            op: AluOp::Comp(CompOp::LeS),
-            dst: fuel,
-            lhs: fuel,
-            rhs: f.alloc_vreg(Width::W32, VInit::Const(*pending_fuel as i64)),
-        };
-        f.emit(op);
-        *pending_fuel = 0;
-
-        let fuel_cond = f.alloc_vreg(Width::W64, VInit::Const(0));
-        let suspend_block = f.gen_block();
-        let cont_block = BlockId::User(pc as u32);
-        f.br_if(fuel_cond, suspend_block, cont_block);
-
-        f.start_block(suspend_block);
-        f.ret();
-
-        f.start_block(cont_block);
+        pc += 1;
     }
 }
 
-impl<B: BackendEmitter> ModuleExecutor for JitModule<B> {
-    /// Execute JIT-compiled code for the current task.
-    ///
-    /// Sets up registers for the JIT calling convention, calls
-    /// the entry trampoline via inline asm, and stores results
-    /// back to the task context.
-    fn poll(&self, task: &mut Task) -> Outcome {
-        let func_idx = *task.context.wasm_fp.frame().func_idx as usize;
-        let trampoline_offset = self.trampoline_offsets[func_idx];
-        let trampoline_ptr = unsafe { self.page.entry().add(trampoline_offset) };
+// --- Placeholder types (to be implemented) ---
 
-        call_trampoline(trampoline_ptr, &mut task.context)
+struct WasmFunctionBuilder {
+    // Wasm-level state:
+    // - locals region (VRegion tracking local VRegs + their slots)
+    // - operands region (wasm operand stack)
+    // - fibre region (lr save slot)
+    //
+    // Wraps an autosynth-codegen builder that receives VCode + operands.
+}
+
+// VReg will come from autosynth-ir once we define the new VReg type
+// for the VCode pipeline. For now, placeholder.
+#[derive(Clone, Copy)]
+struct VReg;
+
+impl WasmFunctionBuilder {
+    /// Push a constant onto the wasm operand stack.
+    /// Allocates a VReg with Const origin.
+    fn push_const(&mut self, val: i64) {
+        todo!()
+    }
+
+    /// Push a local's VReg onto the wasm operand stack.
+    /// The local retains its reference — this is a read, not a move.
+    fn push_local(&mut self, idx: usize) {
+        todo!()
+    }
+
+    /// Pop the top value from the wasm operand stack.
+    fn pop(&mut self) -> VReg {
+        todo!()
+    }
+
+    /// Push a VReg onto the wasm operand stack.
+    fn push(&mut self, vreg: VReg) {
+        todo!()
+    }
+
+    /// Write a value into a local slot.
+    fn local_set(&mut self, idx: usize, val: VReg) {
+        todo!()
+    }
+
+    /// Emit an ALU binary op: pop two, push result.
+    /// Emits VCode::Alu + pushes operands to the vcode operand stack.
+    fn binop(&mut self, op: AluOp) {
+        let rhs = self.pop();
+        let lhs = self.pop();
+        let dst = todo!("allocate result vreg");
+        // Push operands to vcode stack, emit instruction
+        // self.builder.push_operand(lhs);
+        // self.builder.push_operand(rhs);
+        // self.builder.push_operand(dst);
+        // self.builder.emit(VCode::Alu { op });
+        self.push(dst);
+    }
+
+    /// Compare two values, push the condition result.
+    fn push_cmp(&mut self, op: CompOp, lhs: VReg, rhs: VReg) {
+        todo!()
+    }
+
+    /// Allocate a VReg for a constant value.
+    fn const_vreg(&mut self, val: i64) -> VReg {
+        todo!()
+    }
+
+    /// Declare a function parameter.
+    fn declare_param(&mut self, idx: usize, width: Width) {
+        todo!()
+    }
+
+    /// Declare a zero-initialized local.
+    fn declare_local(&mut self, width: Width) {
+        todo!()
+    }
+
+    /// Save the link register to the fibre stack.
+    fn save_lr(&mut self) {
+        todo!()
+    }
+
+    /// Unconditional branch.
+    fn br(&mut self, target: BlockId) {
+        todo!()
+    }
+
+    /// Conditional branch.
+    fn br_if(&mut self, cond: VReg, then_block: BlockId, else_block: BlockId) {
+        todo!()
+    }
+
+    /// Start a new block.
+    fn start_block(&mut self, block: BlockId) {
+        todo!()
+    }
+
+    /// Is the current block finalized (already has a terminator)?
+    fn is_block_finalized(&self) -> bool {
+        todo!()
+    }
+
+    /// Emit a function call.
+    ///
+    /// Handles the full call sequence:
+    /// 1. Save dirty locals/operands/fibre to canonical stack slots
+    /// 2. Place args in CC registers (x0, x1, ...)
+    /// 3. Advance g.lb (frame pointer) past caller's frame
+    /// 4. Emit bl instruction
+    /// 5. Restore g.lb
+    /// 6. Emit fuel check (if enabled)
+    ///
+    /// Returns the result VReg (from x0 after call returns).
+    fn call(&mut self, callee_idx: u32, args: &[VReg], callee: &FuncMeta, pc: usize) -> VReg {
+        todo!()
+    }
+
+    /// Emit function return.
+    ///
+    /// Pops the result value, places it in x0, restores lr and sp, ret.
+    fn emit_return(&mut self, func: &FuncMeta) {
+        todo!()
     }
 }

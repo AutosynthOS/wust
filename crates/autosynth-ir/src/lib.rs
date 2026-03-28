@@ -511,3 +511,101 @@ impl fmt::Display for IrInst {
         }
     }
 }
+
+// ---- VCode pipeline types ----
+
+/// Virtual register ID for the VCode pipeline.
+///
+/// A simple index — metadata (width, origin) lives in a side table.
+/// Every value flowing through the pipeline has a unique VRegId.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VRegId(pub u32);
+
+/// An operand on the VCode operand stack.
+///
+/// Operands are separate from instructions — each VCode instruction
+/// implicitly consumes and produces operands based on its arity.
+/// The instruction selector transforms operands to make them
+/// concrete for the target architecture (e.g. folding a Const as
+/// an immediate, emitting a load for a Mem operand).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operand {
+    /// Virtual register — the default at the highest IR level.
+    /// The selector resolves to a more concrete form by looking
+    /// up VReg metadata.
+    VReg { id: VRegId, width: Width },
+
+    /// Physical register (function params, call results, reserved regs).
+    PReg { preg: PReg, width: Width },
+
+    /// Value in memory at a known slot.
+    Mem { slot: SlotRef, width: Width },
+
+    // --- Immediates (populated by selector) ---
+
+    UImm12(autosynth_isa::UImm12),
+    UImm16(autosynth_isa::UImm16),
+    SImm9(autosynth_isa::SImm9),
+    SImm19(autosynth_isa::SImm19),
+    SImm26(autosynth_isa::SImm26),
+}
+
+impl Operand {
+    pub fn width(&self) -> Option<Width> {
+        match self {
+            Operand::VReg { width, .. }
+            | Operand::PReg { width, .. }
+            | Operand::Mem { width, .. } => Some(*width),
+            _ => None,
+        }
+    }
+}
+
+// ---- VCode: new pipeline instruction set ----
+
+/// Virtual-code instruction — the shared instruction type for the
+/// select → regalloc → emit pipeline.
+///
+/// Instructions are pure operation tags. Operands live on a separate
+/// stack and are consumed implicitly based on the instruction's arity.
+/// The instruction selector transforms operands (e.g. folding constants
+/// as immediates) without changing the instruction itself.
+///
+/// High-level VCode (emitted by the frontend) and low-level VCode
+/// (after selection) share this enum. The selector reduces high-level
+/// operations into sequences of lower-level ones when needed.
+#[derive(Debug, Clone)]
+pub enum VCode {
+    /// Arithmetic / logic / comparison: consumes 2 operands (lhs, rhs),
+    /// pushes 1 result (dst). The selector resolves operand forms
+    /// (register vs immediate) based on the target architecture.
+    Alu { op: AluOp },
+
+    /// Conditional branch: consumes 1 operand (condition from a prior
+    /// Comp). The selector may fuse Alu(Comp) + BrIf into a single
+    /// compare-and-branch instruction.
+    BrIf {
+        block_if: BlockId,
+        block_else: BlockId,
+    },
+
+    /// Unconditional branch.
+    Branch { target: BlockId },
+
+    /// Function call: consumes N operands (args). The frontend is
+    /// responsible for emitting saves/restores around this.
+    Call { func_idx: FunctionIdx },
+
+    /// Load from memory: consumes 1 operand (base), pushes 1 result.
+    Load { offset: u32, width: Width },
+
+    /// Store to memory: consumes 2 operands (value, base).
+    Store { offset: u32, width: Width },
+
+    /// Move / copy: consumes 1 operand (src), pushes 1 result (dst).
+    /// Used for register-to-register moves, CC setup, etc.
+    Move,
+
+    /// Return from function. Consumes 0..N operands (results).
+    Return,
+}
