@@ -17,7 +17,7 @@ pub use autosynth_ir::{SlotRef, VInit, VReg, VRegDefId, VRegRefId};
 /// Result of trying to fold a VReg as an immediate.
 pub enum VRegOr<Imm> {
     Imm(Imm),
-    VReg(VRegId),
+    VReg(VReg),
 }
 
 /// A VReg reference — indirection for inherited block operands.
@@ -68,13 +68,18 @@ impl RegAlloc {
 
     // --- VReg definitions ---
 
-    pub fn define(&mut self, init: VInit, width: Width) -> VRegId {
-        let id = VRegId(self.defs.len() as u32);
+    pub fn define(&mut self, init: VInit, width: Width) -> VRegDefId {
+        let id = VRegDefId(self.defs.len() as u32);
         let target = match init {
             VInit::PReg(preg) => Some(preg),
             _ => None,
         };
-        self.defs.push(VRegDef { id, width, init, target });
+        self.defs.push(VRegDef {
+            id,
+            width,
+            init,
+            target,
+        });
         self.locations.push(None);
 
         if let VInit::PReg(preg) = init {
@@ -84,20 +89,32 @@ impl RegAlloc {
         id
     }
 
-    /// Set a target PReg constraint on a VReg.
-    pub fn set_target(&mut self, id: VRegId, preg: PReg) {
+    /// Allocate a new VRegRef. Returns the RefId.
+    pub fn alloc_ref(&mut self, def: VRegRefDef) -> VRegRefId {
+        let id = VRegRefId(self.refs.len() as u32);
+        self.refs.push(def);
+        id
+    }
+
+    /// Look up a ref's definition.
+    pub fn ref_def(&self, id: VRegRefId) -> &VRegRefDef {
+        &self.refs[id.0 as usize]
+    }
+
+    /// Set a target PReg constraint on a VReg definition.
+    pub fn set_target(&mut self, id: VRegDefId, preg: PReg) {
         self.defs[id.0 as usize].target = Some(preg);
     }
 
-    pub fn def(&self, id: VRegId) -> &VRegDef {
+    pub fn def(&self, id: VRegDefId) -> &VRegDef {
         &self.defs[id.0 as usize]
     }
 
-    pub fn init(&self, id: VRegId) -> &VInit {
+    pub fn init(&self, id: VRegDefId) -> &VInit {
         &self.defs[id.0 as usize].init
     }
 
-    pub fn width(&self, id: VRegId) -> Width {
+    pub fn width(&self, id: VRegDefId) -> Width {
         self.defs[id.0 as usize].width
     }
 
@@ -107,27 +124,27 @@ impl RegAlloc {
 
     // --- Bindings ---
 
-    /// Bind a VReg to a PReg.
-    fn bind(&mut self, vreg: VRegId, preg: PReg) {
-        self.bindings[preg.0 as usize] = Some(vreg);
+    /// Bind a VRegDefId to a PReg.
+    fn bind(&mut self, vreg: VRegDefId, preg: PReg) {
+        self.bindings[preg.0 as usize] = Some(VReg::Def(vreg));
         self.locations[vreg.0 as usize] = Some(preg);
     }
 
-    /// Unbind a VReg from its PReg.
-    fn unbind(&mut self, vreg: VRegId) {
+    /// Unbind a VRegDefId from its PReg.
+    fn unbind(&mut self, vreg: VRegDefId) {
         if let Some(preg) = self.locations[vreg.0 as usize] {
             self.bindings[preg.0 as usize] = None;
         }
         self.locations[vreg.0 as usize] = None;
     }
 
-    /// Which PReg is this VReg in, if any?
-    pub fn location(&self, vreg: VRegId) -> Option<PReg> {
+    /// Which PReg is this VRegDefId in, if any?
+    pub fn location(&self, vreg: VRegDefId) -> Option<PReg> {
         self.locations[vreg.0 as usize]
     }
 
     /// Which VReg occupies this PReg, if any?
-    pub fn occupant(&self, preg: PReg) -> Option<VRegId> {
+    pub fn occupant(&self, preg: PReg) -> Option<VReg> {
         self.bindings[preg.0 as usize]
     }
 
@@ -139,10 +156,10 @@ impl RegAlloc {
             .copied()
     }
 
-    /// Allocate a physical register for a VReg. If the VReg has a
+    /// Allocate a physical register for a VRegDefId. If the VReg has a
     /// target PReg (from VInit::PReg), use that. Otherwise pick a
     /// free scratch register.
-    pub fn alloc_preg(&mut self, vreg: VRegId) -> Result<PReg, CompileError> {
+    pub fn alloc_preg(&mut self, vreg: VRegDefId) -> Result<PReg, CompileError> {
         // Already in a register?
         if let Some(preg) = self.location(vreg) {
             return Ok(preg);
@@ -161,17 +178,28 @@ impl RegAlloc {
         Ok(preg)
     }
 
-    /// Resolve a VReg to its physical register.
+    /// Resolve a VRegDefId to its physical register.
     /// Allocates one if the VReg doesn't have one yet.
-    pub fn resolve_vreg(&mut self, vreg: VRegId) -> Result<PReg, CompileError> {
+    pub fn resolve_vreg(&mut self, vreg: VRegDefId) -> Result<PReg, CompileError> {
         self.alloc_preg(vreg)
+    }
+
+    /// Extract a VRegDefId from a VReg enum, panicking on Ref.
+    fn expect_def(vreg: VReg) -> VRegDefId {
+        match vreg {
+            VReg::Def(id) => id,
+            VReg::Ref(_) => panic!("expected VReg::Def, got VReg::Ref"),
+        }
     }
 
     /// Resolve any operand to its final form (PReg or immediate).
     /// VRegs get allocated to PRegs. Other operands pass through.
     pub fn resolve_operand(&mut self, op: Operand) -> Result<Operand, CompileError> {
         match op {
-            Operand::VReg(id) => Ok(Operand::PReg(self.resolve_vreg(id)?)),
+            Operand::VReg(vreg) => {
+                let id = Self::expect_def(vreg);
+                Ok(Operand::PReg(self.resolve_vreg(id)?))
+            }
             other => Ok(other),
         }
     }
@@ -180,7 +208,7 @@ impl RegAlloc {
 
     pub fn imm_or_materialize_vreg<Imm>(
         &mut self,
-        vreg: VRegId,
+        vreg: VRegDefId,
         output: &mut CodeCtx,
     ) -> Result<VRegOr<Imm>, CompileError>
     where
@@ -193,10 +221,14 @@ impl RegAlloc {
         }
 
         self.materialize(vreg, output)?;
-        Ok(VRegOr::VReg(vreg))
+        Ok(VRegOr::VReg(VReg::Def(vreg)))
     }
 
-    pub fn materialize(&mut self, vreg: VRegId, output: &mut CodeCtx) -> Result<(), CompileError> {
+    pub fn materialize(
+        &mut self,
+        vreg: VRegDefId,
+        output: &mut CodeCtx,
+    ) -> Result<(), CompileError> {
         match self.def(vreg).init {
             VInit::Const(val) => {
                 self.defs[vreg.0 as usize].init = VInit::InstDst;
@@ -224,23 +256,26 @@ impl RegAlloc {
             Operand::Const(val) => {
                 let vreg = self.define(VInit::InstDst, Width::W64);
                 self.materialize_const(vreg, val, output)?;
-                Ok(VRegOr::VReg(vreg))
+                Ok(VRegOr::VReg(VReg::Def(vreg)))
             }
-            Operand::VReg(vreg) => self.imm_or_materialize_vreg(vreg, output),
+            Operand::VReg(vreg) => {
+                let id = Self::expect_def(vreg);
+                self.imm_or_materialize_vreg(id, output)
+            }
             _ => unimplemented!(),
         }
     }
 
     fn materialize_const(
         &mut self,
-        vreg: VRegId,
+        vreg: VRegDefId,
         val: i64,
         output: &mut CodeCtx,
     ) -> Result<(), CompileError> {
         self.defs[vreg.0 as usize].init = VInit::InstDst;
 
         output.operands.push_back(Operand::Const(val));
-        output.operands.push_back(Operand::VReg(vreg));
+        output.operands.push_back(Operand::VReg(VReg::Def(vreg)));
         output.vcode.push_back(VCode::Materialize);
 
         Ok(())

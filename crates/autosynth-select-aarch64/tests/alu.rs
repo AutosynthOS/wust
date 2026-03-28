@@ -1,6 +1,6 @@
 use autosynth_codegen::builder::FunctionBuilder;
 use autosynth_codegen::pipeline::compile;
-use autosynth_ir::{AluOp, BlockId, Operand, VCode};
+use autosynth_ir::{AluOp, BlockId, Operand, VCode, VReg};
 use autosynth_isa::{PReg, UImm12, Width};
 use autosynth_regalloc::VInit;
 use autosynth_select_aarch64::Aarch64Selector;
@@ -15,9 +15,9 @@ fn add_const_folds_to_uimm12() {
     let v1 = f.regalloc.define(VInit::Const(5), Width::W32);
     let v2 = f.regalloc.define(VInit::InstDst, Width::W32);
 
-    f.push_operand(Operand::VReg(v0));
-    f.push_operand(Operand::VReg(v1));
-    f.push_operand(Operand::VReg(v2));
+    f.push_operand(Operand::VReg(VReg::Def(v0)));
+    f.push_operand(Operand::VReg(VReg::Def(v1)));
+    f.push_operand(Operand::VReg(VReg::Def(v2)));
     f.emit(VCode::Alu { op: AluOp::Add });
 
     let func = f.build();
@@ -42,9 +42,9 @@ fn add_large_const_materializes() {
     let v1 = f.regalloc.define(VInit::Const(5000), Width::W32);
     let v2 = f.regalloc.define(VInit::InstDst, Width::W32);
 
-    f.push_operand(Operand::VReg(v0));
-    f.push_operand(Operand::VReg(v1));
-    f.push_operand(Operand::VReg(v2));
+    f.push_operand(Operand::VReg(VReg::Def(v0)));
+    f.push_operand(Operand::VReg(VReg::Def(v1)));
+    f.push_operand(Operand::VReg(VReg::Def(v2)));
     f.emit(VCode::Alu { op: AluOp::Add });
 
     let func = f.build();

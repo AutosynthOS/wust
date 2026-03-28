@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use autosynth_codegen::builder::FunctionBuilder;
-use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode};
+use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode, VReg};
 use autosynth_isa::{PReg, Width};
-use autosynth_regalloc::{VInit, VRegId};
+use autosynth_regalloc::{VInit, VRegDefId, VRegRefDef};
 use wust_core::FuncMeta;
 
 use crate::conversion::valtype_to_width;
@@ -11,18 +11,15 @@ use crate::conversion::valtype_to_width;
 /// Per-block wasm region state.
 #[derive(Clone)]
 struct WasmBlockState {
-    locals: Vec<VRegId>,
-    operands: Vec<VRegId>,
-    fibre: Vec<VRegId>,
+    locals: Vec<VReg>,
+    operands: Vec<VReg>,
+    fibre: Vec<VReg>,
 }
 
 /// Wasm-aware function builder.
 pub struct WasmFunctionBuilder {
     pub inner: FunctionBuilder,
-    /// Current block's region state.
     state: WasmBlockState,
-    /// Snapshots from predecessors, keyed by target block.
-    /// Each target accumulates one snapshot per predecessor.
     snapshots: HashMap<BlockId, Vec<WasmBlockState>>,
 }
 
@@ -34,14 +31,14 @@ impl WasmFunctionBuilder {
 
         for (i, param) in func.params.iter().enumerate() {
             let w = valtype_to_width(param);
-            let vreg = inner.regalloc.define(VInit::PReg(PReg(i as u8)), w);
-            locals.push(vreg);
+            let id = inner.regalloc.define(VInit::PReg(PReg(i as u8)), w);
+            locals.push(VReg::Def(id));
         }
 
         for local in func.locals.iter() {
             let w = valtype_to_width(local);
-            let vreg = inner.regalloc.define(VInit::Const(0), w);
-            locals.push(vreg);
+            let id = inner.regalloc.define(VInit::Const(0), w);
+            locals.push(VReg::Def(id));
         }
 
         Self {
@@ -58,23 +55,23 @@ impl WasmFunctionBuilder {
     // --- Region operations ---
 
     pub fn push_const(&mut self, val: i64, width: Width) {
-        let vreg = self.inner.regalloc.define(VInit::Const(val), width);
-        self.state.operands.push(vreg);
+        let id = self.inner.regalloc.define(VInit::Const(val), width);
+        self.state.operands.push(VReg::Def(id));
     }
 
     pub fn push_local(&mut self, idx: usize) {
         self.state.operands.push(self.state.locals[idx]);
     }
 
-    pub fn pop(&mut self) -> VRegId {
+    pub fn pop(&mut self) -> VReg {
         self.state.operands.pop().expect("operand stack underflow")
     }
 
-    pub fn push(&mut self, vreg: VRegId) {
+    pub fn push(&mut self, vreg: VReg) {
         self.state.operands.push(vreg);
     }
 
-    pub fn local_set(&mut self, idx: usize, val: VRegId) {
+    pub fn local_set(&mut self, idx: usize, val: VReg) {
         self.state.locals[idx] = val;
     }
 
@@ -87,10 +84,10 @@ impl WasmFunctionBuilder {
 
         self.inner.push_operand(Operand::VReg(lhs));
         self.inner.push_operand(Operand::VReg(rhs));
-        self.inner.push_operand(Operand::VReg(dst));
+        self.inner.push_operand(Operand::VReg(VReg::Def(dst)));
         self.inner.emit(VCode::Alu { op });
 
-        self.state.operands.push(dst);
+        self.state.operands.push(VReg::Def(dst));
     }
 
     pub fn eqz(&mut self) {
@@ -99,21 +96,22 @@ impl WasmFunctionBuilder {
         let dst = self.inner.regalloc.define(VInit::InstDst, Width::W32);
 
         self.inner.push_operand(Operand::VReg(val));
-        self.inner.push_operand(Operand::VReg(zero));
-        self.inner.push_operand(Operand::VReg(dst));
-        self.inner.emit(VCode::Alu { op: AluOp::Comp(CompOp::Eq) });
+        self.inner.push_operand(Operand::VReg(VReg::Def(zero)));
+        self.inner.push_operand(Operand::VReg(VReg::Def(dst)));
+        self.inner.emit(VCode::Alu {
+            op: AluOp::Comp(CompOp::Eq),
+        });
 
-        self.state.operands.push(dst);
+        self.state.operands.push(VReg::Def(dst));
     }
 
     // --- Control flow ---
 
-    /// Emit conditional branch. If the condition was produced by a
-    /// comparison, fuses the Comp + BrIf into a single CmpBranch.
-    pub fn br_if(&mut self, cond: VRegId, then_block: BlockId, else_block: BlockId) {
-        // Try fuse: peek at last instruction.
+    pub fn br_if(&mut self, cond: VReg, then_block: BlockId, else_block: BlockId) {
         let fused = match self.inner.current_block().vcode.back() {
-            Some(VCode::Alu { op: AluOp::Comp(comp_op) }) => Some(*comp_op),
+            Some(VCode::Alu {
+                op: AluOp::Comp(comp_op),
+            }) => Some(*comp_op),
             _ => None,
         };
 
@@ -133,10 +131,9 @@ impl WasmFunctionBuilder {
                 block_else: else_block,
             });
         } else {
-            // No fusion — compare cond != 0.
             let zero = self.inner.regalloc.define(VInit::Const(0), Width::W32);
             self.inner.push_operand(Operand::VReg(cond));
-            self.inner.push_operand(Operand::VReg(zero));
+            self.inner.push_operand(Operand::VReg(VReg::Def(zero)));
             self.inner.emit(VCode::BrIf {
                 op: CompOp::Ne,
                 block_if: then_block,
@@ -148,26 +145,21 @@ impl WasmFunctionBuilder {
         self.snapshot_onto(else_block);
     }
 
-    /// Emit unconditional branch. Snapshots current state for the target.
     pub fn br(&mut self, target: BlockId) {
         self.inner.emit(VCode::Branch { target });
         self.snapshot_onto(target);
     }
 
-    /// Switch to a new block. Restores region state from predecessor
-    /// snapshots. At merge points, creates phi VRegs where predecessors
-    /// disagree.
     pub fn start_block(&mut self, id: BlockId) {
         self.inner.start_block(id);
 
         if let Some(snaps) = self.snapshots.remove(&id) {
             if let Some(first) = snaps.first() {
+                // Start with first predecessor's state.
                 self.state = first.clone();
 
-                // Merge: create phi VRegs where predecessors differ.
-                if snaps.len() > 1 {
-                    self.merge_snapshots(&snaps);
-                }
+                // Wrap all inherited slots in refs.
+                self.wrap_in_refs(&snaps);
             }
         }
     }
@@ -175,7 +167,13 @@ impl WasmFunctionBuilder {
     pub fn emit_return(&mut self, func: &FuncMeta) {
         for (i, _) in func.results.iter().enumerate() {
             let result = self.pop();
-            self.inner.regalloc.set_target(result, PReg(i as u8));
+            match result {
+                VReg::Def(id) => self.inner.regalloc.set_target(id, PReg(i as u8)),
+                VReg::Ref(_) => {
+                    // TODO: resolve ref to def and set target
+                    todo!("set_target on ref")
+                }
+            }
         }
         self.inner.emit(VCode::Return);
     }
@@ -186,7 +184,6 @@ impl WasmFunctionBuilder {
 
     // --- Internal ---
 
-    /// Save current region state as a snapshot for the target block.
     fn snapshot_onto(&mut self, target: BlockId) {
         self.snapshots
             .entry(target)
@@ -194,31 +191,38 @@ impl WasmFunctionBuilder {
             .push(self.state.clone());
     }
 
-    /// At a merge point, compare snapshots and create phi VRegs
-    /// for slots where predecessors disagree.
-    fn merge_snapshots(&mut self, snaps: &[WasmBlockState]) {
-        // Merge operand stacks.
-        for i in 0..self.state.operands.len() {
-            let first = self.state.operands[i];
-            let all_same = snaps.iter().all(|s| s.operands.get(i) == Some(&first));
-            if !all_same {
-                // Create a phi VReg — for now just use the first predecessor's value.
-                // TODO: proper phi with Move instructions from each predecessor.
-                let width = self.inner.regalloc.width(first);
-                let phi = self.inner.regalloc.define(VInit::InstDst, width);
-                self.state.operands[i] = phi;
-            }
-        }
+    fn wrap_in_refs(&mut self, snaps: &[WasmBlockState]) {
+        wrap_slots(
+            &mut self.state.operands,
+            snaps.iter().map(|s| &s.operands),
+            &mut self.inner.regalloc,
+        );
+        wrap_slots(
+            &mut self.state.locals,
+            snaps.iter().map(|s| &s.locals),
+            &mut self.inner.regalloc,
+        );
+        wrap_slots(
+            &mut self.state.fibre,
+            snaps.iter().map(|s| &s.fibre),
+            &mut self.inner.regalloc,
+        );
+    }
+}
 
-        // Merge locals.
-        for i in 0..self.state.locals.len() {
-            let first = self.state.locals[i];
-            let all_same = snaps.iter().all(|s| s.locals.get(i) == Some(&first));
-            if !all_same {
-                let width = self.inner.regalloc.width(first);
-                let phi = self.inner.regalloc.define(VInit::InstDst, width);
-                self.state.locals[i] = phi;
-            }
-        }
+fn wrap_slots<'a>(
+    slots: &mut [VReg],
+    snap_regions: impl Iterator<Item = &'a Vec<VReg>> + Clone,
+    regalloc: &mut autosynth_regalloc::RegAlloc,
+) {
+    for i in 0..slots.len() {
+        let first = slots[i];
+        let all_same = snap_regions.clone().all(|r| r.get(i) == Some(&first));
+        let ref_def = if all_same {
+            VRegRefDef::Direct(first)
+        } else {
+            VRegRefDef::Phi(snap_regions.clone().map(|r| r[i]).collect())
+        };
+        slots[i] = VReg::Ref(regalloc.alloc_ref(ref_def));
     }
 }

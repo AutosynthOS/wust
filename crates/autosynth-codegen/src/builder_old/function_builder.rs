@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use autosynth_ir::{
     Abi, AluOp, BlockId, FunctionSignature, IrInst, LowerInst, RegInst, SlotRef, VInit, VReg,
-    VRegDef, VRegRef, VRegRefSource, VRegion, VRegionId, resolve_ref,
+    VRegDef, VRegDefId, VRegRef, VRegRefId, VRegRefSource, VRegion, VRegionId, resolve_ref,
 };
 use autosynth_isa::{PReg, Width};
 use autosynth_lower::{trace, trace_ctx, trace_do};
@@ -192,7 +192,7 @@ impl<'a> FunctionBuilder<'a> {
     /// Emits a `RegInst::Define` so the lowerer knows about the vreg
     /// and its initial value origin.
     pub fn alloc_vreg(&mut self, width: Width, origin: VInit) -> VReg {
-        let id = VReg::Def(self.next_vreg);
+        let id = VReg::Def(VRegDefId(self.next_vreg));
         self.next_vreg += 1;
         self.vreg_defs.push(VRegDef {
             id,
@@ -209,7 +209,7 @@ impl<'a> FunctionBuilder<'a> {
 
     /// Allocate a new ref vreg with the given width and source.
     fn alloc_ref(&mut self, width: Width, source: VRegRefSource) -> VReg {
-        let id = VReg::Ref(self.next_ref);
+        let id = VReg::Ref(VRegRefId(self.next_ref));
         self.next_ref += 1;
         self.vreg_refs.push(VRegRef { id, width, source });
         id
@@ -218,8 +218,8 @@ impl<'a> FunctionBuilder<'a> {
     /// Get the width of a vreg (any kind).
     pub fn vreg_width(&self, vreg: VReg) -> Width {
         match vreg {
-            VReg::Def(id) => self.vreg_defs[id as usize].width,
-            VReg::Ref(id) => self.vreg_refs[id as usize].width,
+            VReg::Def(VRegDefId(id)) => self.vreg_defs[id as usize].width,
+            VReg::Ref(VRegRefId(id)) => self.vreg_refs[id as usize].width,
         }
     }
 
@@ -229,8 +229,8 @@ impl<'a> FunctionBuilder<'a> {
     pub fn set_target(&mut self, vreg: VReg, preg: PReg) {
         self.record_use(vreg);
         match vreg {
-            VReg::Def(id) => self.vreg_defs[id as usize].target = Some(preg),
-            VReg::Ref(id) => {
+            VReg::Def(VRegDefId(id)) => self.vreg_defs[id as usize].target = Some(preg),
+            VReg::Ref(VRegRefId(id)) => {
                 let source = &self.vreg_refs[id as usize].source;
                 match source {
                     VRegRefSource::Direct(src) => self.set_target(*src, preg),
@@ -498,7 +498,7 @@ impl<'a> FunctionBuilder<'a> {
                     for &param in &succ.params {
                         let needed = match param {
                             VReg::Def(_) => param,
-                            VReg::Ref(ref_id) => {
+                            VReg::Ref(VRegRefId(ref_id)) => {
                                 match &vreg_refs[ref_id as usize].source {
                                     VRegRefSource::Direct(src) => *src,
                                     VRegRefSource::Phi(sources) => {

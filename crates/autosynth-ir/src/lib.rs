@@ -13,30 +13,43 @@ use core::fmt;
 
 use autosynth_isa::{PReg, Width};
 
+/// Virtual register ID for definitions.
+///
+/// A simple index — metadata (width, origin) lives in a side table.
+/// Every value flowing through the pipeline has a unique VRegDefId.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
+pub struct VRegDefId(pub u32);
+
+/// Virtual register ID for references (indirections at block entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
+pub struct VRegRefId(pub u32);
+
 /// Virtual register identifier.
 ///
 /// Tagged by kind: [`Def`](VReg::Def) is a real value produced by an
 /// instruction, [`Ref`](VReg::Ref) is an indirection created at block
 /// entry when cloning region state from a predecessor.
 ///
-/// Each variant's `u32` indexes into a separate metadata table
+/// Each variant indexes into a separate metadata table
 /// (`vreg_defs`, `vreg_refs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum VReg {
     /// A real definition — produced by an instruction, constant, or physical register.
-    Def(u32),
+    Def(VRegDefId),
     /// Indirection — created at block entry when cloning region state.
     /// Metadata in [`VRegRef`] determines whether this is a direct
     /// alias or a phi (merge of multiple predecessors).
-    Ref(u32),
+    Ref(VRegRefId),
 }
 
 impl fmt::Display for VReg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            VReg::Def(id) => write!(f, "v{id}"),
-            VReg::Ref(id) => write!(f, "r{id}"),
+            VReg::Def(VRegDefId(id)) => write!(f, "v{id}"),
+            VReg::Ref(VRegRefId(id)) => write!(f, "r{id}"),
         }
     }
 }
@@ -452,7 +465,7 @@ impl fmt::Display for VRegRef {
 pub fn resolve_ref(vreg: VReg, refs: &[VRegRef]) -> VReg {
     match vreg {
         VReg::Def(_) => vreg,
-        VReg::Ref(id) => match &refs[id as usize].source {
+        VReg::Ref(VRegRefId(id)) => match &refs[id as usize].source {
             VRegRefSource::Direct(src) => resolve_ref(*src, refs),
             VRegRefSource::Phi(_) => vreg,
         },
@@ -515,24 +528,6 @@ impl fmt::Display for IrInst {
 
 // ---- VCode pipeline types ----
 
-/// Virtual register ID for the VCode pipeline.
-///
-/// A simple index — metadata (width, origin) lives in a side table.
-/// Every value flowing through the pipeline has a unique VRegId.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VRegDefId(pub u32);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VRegRefId(pub u32);
-
-/// A virtual register — either a concrete definition or an
-/// indirection (ref) that resolves to a Def or Phi.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum VReg {
-    Def(VRegDefId),
-    Ref(VRegRefId),
-}
-
 /// An operand on the VCode operand stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
@@ -556,7 +551,7 @@ pub enum Operand {
 /// High-level VCode (emitted by the frontend) and low-level VCode
 /// (after selection) share this enum. The selector reduces high-level
 /// operations into sequences of lower-level ones when needed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VCode {
     /// Arithmetic / logic / comparison: consumes 2 operands (lhs, rhs),
     /// pushes 1 result (dst). The selector resolves operand forms

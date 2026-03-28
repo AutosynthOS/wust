@@ -8,25 +8,24 @@
 
 /// New VCode pipeline builder.
 pub mod builder;
+/// Old builder (preserved for reference / old tests).
+// mod builder_old;
 /// IR types (IrFunction, IrBlock).
 pub mod ir;
-/// New VCode pipeline — compile IrFunction through a Selector.
-pub mod pipeline;
-/// Old builder (preserved for reference / old tests).
-mod builder_old;
 /// IR function and block types (old pipeline).
 mod ir_function;
 /// Lowerer (old pipeline).
-mod lowerer;
-/// Register allocator (old pipeline).
-mod regalloc;
-
-pub use autosynth_regalloc;
+// mod lowerer;
+/// New VCode pipeline — compile IrFunction through a Selector.
+pub mod pipeline;
 pub use autosynth_ir::{
-    AluOp, BlockId, CompOp, FunctionIdx, IrInst, LowerInst, RegInst, SlotRef, VReg, VInit,
-    VRegion, VRegionId,
+    AluOp, BlockId, CompOp, FunctionIdx, IrInst, LowerInst, RegInst, SlotRef, VInit, VReg, VRegion,
+    VRegionId,
 };
 pub use autosynth_isa::Width;
-pub use builder_old::{CodeBuilder, FunctionBuilder as OldFunctionBuilder};
+/// Register allocator (old pipeline).
+// mod regalloc;
+pub use autosynth_regalloc;
 pub use builder::FunctionBuilder;
-pub use lowerer::compile;
+// pub use builder_old::{CodeBuilder, FunctionBuilder as OldFunctionBuilder};
+// pub use lowerer::compile;

@@ -30,7 +30,7 @@ fn lower_inst(
 
             let rhs = match regalloc.imm_or_materialize::<UImm12>(rhs, output)? {
                 VRegOr::Imm(imm) => Operand::UImm12(imm),
-                VRegOr::VReg(id) => Operand::VReg(id),
+                VRegOr::VReg(vreg) => Operand::VReg(vreg),
             };
 
             output.operands.push_back(lhs);
@@ -44,7 +44,7 @@ fn lower_inst(
 
             let rhs = match regalloc.imm_or_materialize::<UImm12>(rhs, output)? {
                 VRegOr::Imm(imm) => Operand::UImm12(imm),
-                VRegOr::VReg(id) => Operand::VReg(id),
+                VRegOr::VReg(vreg) => Operand::VReg(vreg),
             };
 
             output.operands.push_back(lhs);
