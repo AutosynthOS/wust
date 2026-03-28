@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use autosynth_codegen::builder::FunctionBuilder;
+use autosynth_codegen::builder::{FunctionBuilder, VRefSource, VRegOrRef};
 use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode, VReg};
 use autosynth_isa::{PReg, Width};
-use autosynth_regalloc::{VInit, VRegDefId};
+use autosynth_regalloc::VInit;
 use wust_core::FuncMeta;
 
 use crate::conversion::valtype_to_width;
@@ -22,11 +22,11 @@ impl WasmFunctionBuilder {
         let mut locals = Vec::new();
         for (i, param) in func.params.iter().enumerate() {
             let id = inner.regalloc.define(VInit::PReg(PReg(i as u8)), valtype_to_width(param));
-            locals.push(VReg::Def(id));
+            locals.push(VRegOrRef::VReg(id));
         }
         for local in func.locals.iter() {
             let id = inner.regalloc.define(VInit::Const(0), valtype_to_width(local));
-            locals.push(VReg::Def(id));
+            locals.push(VRegOrRef::VReg(id));
         }
 
         let entry_block = WasmBlock {
@@ -56,57 +56,80 @@ impl WasmFunctionBuilder {
 
     pub fn push_const(&mut self, val: i64, width: Width) {
         let id = self.inner.regalloc.define(VInit::Const(val), width);
-        self.current().region("operands").push(VReg::Def(id));
+        self.current().region("operands").push(VRegOrRef::VReg(id));
     }
 
     pub fn push_local(&mut self, idx: usize) {
-        let vreg = self.current().region_ref("locals")[idx];
-        self.current().region("operands").push(vreg);
+        let val = self.current().region_ref("locals")[idx];
+        self.current().region("operands").push(val);
     }
 
-    pub fn pop(&mut self) -> VReg {
+    pub fn pop(&mut self) -> VRegOrRef {
         self.current().region("operands").pop().expect("operand stack underflow")
     }
 
-    pub fn push(&mut self, vreg: VReg) {
-        self.current().region("operands").push(vreg);
+    pub fn push(&mut self, val: VRegOrRef) {
+        self.current().region("operands").push(val);
     }
 
-    pub fn local_set(&mut self, idx: usize, val: VReg) {
+    pub fn local_set(&mut self, idx: usize, val: VRegOrRef) {
         self.current().region("locals")[idx] = val;
     }
 
     // --- VCode emission ---
 
+    /// Resolve a VRegOrRef to a VReg for operand emission.
+    /// Direct refs chase to source. Phi refs create a new VRegDef.
+    fn resolve_to_vreg(&mut self, val: VRegOrRef) -> VReg {
+        match val {
+            VRegOrRef::VReg(vreg) => vreg,
+            VRegOrRef::Ref(ref_id) => {
+                match self.inner.ref_source(ref_id).clone() {
+                    VRefSource::Direct(inner) => self.resolve_to_vreg(inner),
+                    VRefSource::Phi(sources) => {
+                        let resolved: Vec<VReg> = sources.into_iter()
+                            .map(|s| self.resolve_to_vreg(s))
+                            .collect();
+                        let width = self.inner.regalloc.width(resolved[0]);
+                        self.inner.regalloc.define(VInit::Phi(resolved), width)
+                    }
+                }
+            }
+        }
+    }
+
     pub fn binop(&mut self, op: AluOp, width: Width) {
         let rhs = self.pop();
         let lhs = self.pop();
+        let rhs = self.resolve_to_vreg(rhs);
+        let lhs = self.resolve_to_vreg(lhs);
         let dst = self.inner.regalloc.define(VInit::InstDst, width);
 
-        self.inner.push_operand(Operand::VReg(lhs));
-        self.inner.push_operand(Operand::VReg(rhs));
-        self.inner.push_operand(Operand::VReg(VReg::Def(dst)));
+        self.inner.push_operand(lhs);
+        self.inner.push_operand(rhs);
+        self.inner.push_operand(dst);
         self.inner.emit(VCode::Alu { op });
 
-        self.current().region("operands").push(VReg::Def(dst));
+        self.current().region("operands").push(VRegOrRef::VReg(dst));
     }
 
     pub fn eqz(&mut self) {
         let val = self.pop();
+        let val = self.resolve_to_vreg(val);
         let zero = self.inner.regalloc.define(VInit::Const(0), Width::W32);
         let dst = self.inner.regalloc.define(VInit::InstDst, Width::W32);
 
-        self.inner.push_operand(Operand::VReg(val));
-        self.inner.push_operand(Operand::VReg(VReg::Def(zero)));
-        self.inner.push_operand(Operand::VReg(VReg::Def(dst)));
+        self.inner.push_operand(VRegOrRef::VReg(val));
+        self.inner.push_operand(VRegOrRef::VReg(zero));
+        self.inner.push_operand(VRegOrRef::VReg(dst));
         self.inner.emit(VCode::Alu { op: AluOp::Comp(CompOp::Eq) });
 
-        self.current().region("operands").push(VReg::Def(dst));
+        self.current().region("operands").push(VRegOrRef::VReg(dst));
     }
 
     // --- Control flow ---
 
-    pub fn br_if(&mut self, cond: VReg, then_block: BlockId, else_block: BlockId) {
+    pub fn br_if(&mut self, cond: VRegOrRef, then_block: BlockId, else_block: BlockId) {
         let fused = match self.inner.current_block().vcode.back() {
             Some(VCode::Alu { op: AluOp::Comp(comp_op) }) => Some(*comp_op),
             _ => None,
@@ -116,9 +139,7 @@ impl WasmFunctionBuilder {
             let block = self.inner.current_block_mut();
             block.vcode.pop_back();
             block.operands.pop(); // dst
-            let rhs = block.operands.pop();
-            let lhs = block.operands.pop();
-            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+            if let (Some(rhs), Some(lhs)) = (block.operands.pop(), block.operands.pop()) {
                 self.inner.push_operand(lhs);
                 self.inner.push_operand(rhs);
             }
@@ -128,9 +149,10 @@ impl WasmFunctionBuilder {
                 block_else: else_block,
             });
         } else {
+            let cond = self.resolve_to_vreg(cond);
             let zero = self.inner.regalloc.define(VInit::Const(0), Width::W32);
-            self.inner.push_operand(Operand::VReg(cond));
-            self.inner.push_operand(Operand::VReg(VReg::Def(zero)));
+            self.inner.push_operand(cond);
+            self.inner.push_operand(zero);
             self.inner.emit(VCode::BrIf {
                 op: CompOp::Ne,
                 block_if: then_block,
@@ -159,10 +181,8 @@ impl WasmFunctionBuilder {
     pub fn emit_return(&mut self, func: &FuncMeta) {
         for (i, _) in func.results.iter().enumerate() {
             let result = self.pop();
-            match result {
-                VReg::Def(id) => self.inner.regalloc.set_target(id, PReg(i as u8)),
-                VReg::Ref(_) => todo!("set_target on ref"),
-            }
+            let vreg = self.resolve_to_vreg(result);
+            self.inner.regalloc.set_target(vreg, PReg(i as u8));
         }
         self.inner.emit(VCode::Return);
     }
@@ -177,7 +197,7 @@ impl WasmFunctionBuilder {
     /// If it already exists (another predecessor got there first), merge.
     fn ensure_or_merge(&mut self, target: BlockId, fork: &WasmBlock) {
         if let Some(existing) = self.blocks.get_mut(&target) {
-            existing.merge(fork, &mut self.inner.regalloc);
+            existing.merge(fork, &mut self.inner);
         } else {
             self.blocks.insert(target, fork.clone());
         }

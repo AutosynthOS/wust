@@ -12,7 +12,12 @@ use alloc::vec::Vec;
 use autosynth_ir::{CodeCtx, CompileError, Operand, VCode};
 use autosynth_isa::{PReg, Width};
 
-pub use autosynth_ir::{SlotRef, VInit, VReg, VRegDefId, VRegRefId};
+pub use autosynth_ir::{SlotRef, VInit, VReg};
+
+/// Index into the regalloc's ref table. Builder-local — not part of
+/// the portable IR.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VRegRefId(pub u32);
 
 /// Result of trying to fold a VReg as an immediate.
 pub enum VRegOr<Imm> {
@@ -22,7 +27,7 @@ pub enum VRegOr<Imm> {
 
 /// Result of resolving a VReg through Direct ref chains.
 pub enum DefOrPhi {
-    Def(VRegDefId),
+    Def(VReg),
     Phi(Vec<VReg>),
 }
 
@@ -38,7 +43,7 @@ pub enum VRegRefDef {
 /// Metadata for a defined virtual register.
 #[derive(Debug, Clone)]
 pub struct VRegDef {
-    pub id: VRegDefId,
+    pub id: VReg,
     pub width: Width,
     pub init: VInit,
     /// Target PReg constraint. If set, the regalloc must place this
@@ -54,7 +59,7 @@ pub struct RegAlloc {
     refs: Vec<VRegRefDef>,
     /// PReg → VReg binding. None = free.
     bindings: Vec<Option<VReg>>,
-    /// VRegDefId → PReg mapping. None = not in a register.
+    /// VReg → PReg mapping. None = not in a register.
     locations: Vec<Option<PReg>>,
     scratch_pool: Vec<PReg>,
 }
@@ -74,8 +79,8 @@ impl RegAlloc {
 
     // --- VReg definitions ---
 
-    pub fn define(&mut self, init: VInit, width: Width) -> VRegDefId {
-        let id = VRegDefId(self.defs.len() as u32);
+    pub fn define(&mut self, init: VInit, width: Width) -> VReg {
+        let id = VReg(self.defs.len() as u32);
         let target = match &init {
             VInit::PReg(preg) => Some(*preg),
             _ => None,
@@ -108,32 +113,26 @@ impl RegAlloc {
         &self.refs[id.0 as usize]
     }
 
-    /// Resolve a VReg through all Direct ref indirections.
-    /// Returns either the underlying Def or an unresolved Phi.
+    /// Resolve a VReg. In the new pipeline, VRegs are always defs —
+    /// the Def/Ref distinction is handled at the builder layer.
     pub fn resolve(&self, vreg: VReg) -> DefOrPhi {
-        match vreg {
-            VReg::Def(id) => DefOrPhi::Def(id),
-            VReg::Ref(id) => match &self.refs[id.0 as usize] {
-                VRegRefDef::Direct(src) => self.resolve(*src),
-                VRegRefDef::Phi(sources) => DefOrPhi::Phi(sources.clone()),
-            },
-        }
+        DefOrPhi::Def(vreg)
     }
 
     /// Set a target PReg constraint on a VReg definition.
-    pub fn set_target(&mut self, id: VRegDefId, preg: PReg) {
+    pub fn set_target(&mut self, id: VReg, preg: PReg) {
         self.defs[id.0 as usize].target = Some(preg);
     }
 
-    pub fn def(&self, id: VRegDefId) -> &VRegDef {
+    pub fn def(&self, id: VReg) -> &VRegDef {
         &self.defs[id.0 as usize]
     }
 
-    pub fn init(&self, id: VRegDefId) -> &VInit {
+    pub fn init(&self, id: VReg) -> &VInit {
         &self.defs[id.0 as usize].init
     }
 
-    pub fn width(&self, id: VRegDefId) -> Width {
+    pub fn width(&self, id: VReg) -> Width {
         self.defs[id.0 as usize].width
     }
 
@@ -143,22 +142,22 @@ impl RegAlloc {
 
     // --- Bindings ---
 
-    /// Bind a VRegDefId to a PReg.
-    fn bind(&mut self, vreg: VRegDefId, preg: PReg) {
-        self.bindings[preg.0 as usize] = Some(VReg::Def(vreg));
+    /// Bind a VReg to a PReg.
+    fn bind(&mut self, vreg: VReg, preg: PReg) {
+        self.bindings[preg.0 as usize] = Some(vreg);
         self.locations[vreg.0 as usize] = Some(preg);
     }
 
-    /// Unbind a VRegDefId from its PReg.
-    fn unbind(&mut self, vreg: VRegDefId) {
+    /// Unbind a VReg from its PReg.
+    fn unbind(&mut self, vreg: VReg) {
         if let Some(preg) = self.locations[vreg.0 as usize] {
             self.bindings[preg.0 as usize] = None;
         }
         self.locations[vreg.0 as usize] = None;
     }
 
-    /// Which PReg is this VRegDefId in, if any?
-    pub fn location(&self, vreg: VRegDefId) -> Option<PReg> {
+    /// Which PReg is this VReg in, if any?
+    pub fn location(&self, vreg: VReg) -> Option<PReg> {
         self.locations[vreg.0 as usize]
     }
 
@@ -175,10 +174,10 @@ impl RegAlloc {
             .copied()
     }
 
-    /// Allocate a physical register for a VRegDefId. If the VReg has a
+    /// Allocate a physical register for a VReg. If the VReg has a
     /// target PReg (from VInit::PReg), use that. Otherwise pick a
     /// free scratch register.
-    pub fn alloc_preg(&mut self, vreg: VRegDefId) -> Result<PReg, CompileError> {
+    pub fn alloc_preg(&mut self, vreg: VReg) -> Result<PReg, CompileError> {
         // Already in a register?
         if let Some(preg) = self.location(vreg) {
             return Ok(preg);
@@ -221,12 +220,9 @@ impl RegAlloc {
         }
     }
 
-    /// Extract a VRegDefId from a VReg enum, panicking on Ref.
-    fn expect_def(vreg: VReg) -> VRegDefId {
-        match vreg {
-            VReg::Def(id) => id,
-            VReg::Ref(_) => panic!("expected VReg::Def, got VReg::Ref"),
-        }
+    /// Identity — VReg is now a plain struct, no Def/Ref distinction.
+    fn expect_def(vreg: VReg) -> VReg {
+        vreg
     }
 
     /// Resolve any operand to its final form (PReg or immediate).
@@ -242,7 +238,7 @@ impl RegAlloc {
 
     pub fn imm_or_materialize_vreg<Imm>(
         &mut self,
-        vreg: VRegDefId,
+        vreg: VReg,
         output: &mut CodeCtx,
     ) -> Result<VRegOr<Imm>, CompileError>
     where
@@ -255,12 +251,12 @@ impl RegAlloc {
         }
 
         self.materialize(vreg, output)?;
-        Ok(VRegOr::VReg(VReg::Def(vreg)))
+        Ok(VRegOr::VReg(vreg))
     }
 
     pub fn materialize(
         &mut self,
-        vreg: VRegDefId,
+        vreg: VReg,
         output: &mut CodeCtx,
     ) -> Result<(), CompileError> {
         match &self.def(vreg).init {
@@ -292,7 +288,7 @@ impl RegAlloc {
             Operand::Const(val) => {
                 let vreg = self.define(VInit::InstDst, Width::W64);
                 self.materialize_const(vreg, val, output)?;
-                Ok(VRegOr::VReg(VReg::Def(vreg)))
+                Ok(VRegOr::VReg(vreg))
             }
             Operand::VReg(vreg) => match self.resolve(vreg) {
                 DefOrPhi::Def(id) => self.imm_or_materialize_vreg(id, output),
@@ -304,14 +300,14 @@ impl RegAlloc {
 
     fn materialize_const(
         &mut self,
-        vreg: VRegDefId,
+        vreg: VReg,
         val: i64,
         output: &mut CodeCtx,
     ) -> Result<(), CompileError> {
         self.defs[vreg.0 as usize].init = VInit::InstDst;
 
         output.operands.push_back(Operand::Const(val));
-        output.operands.push_back(Operand::VReg(VReg::Def(vreg)));
+        output.operands.push_back(Operand::VReg(vreg));
         output.vcode.push_back(VCode::Materialize);
 
         Ok(())

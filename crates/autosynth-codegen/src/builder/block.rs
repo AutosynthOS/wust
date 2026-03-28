@@ -1,11 +1,13 @@
 use std::collections::VecDeque;
-use autosynth_ir::{BlockId, Operand, VCode};
+use autosynth_ir::{BlockId, VCode};
+
+use super::VRegOrRef;
 
 /// Mutable block under construction.
 pub struct BlockBuilder {
     pub id: BlockId,
     pub vcode: VecDeque<VCode>,
-    pub operands: Vec<Operand>,
+    pub operands: Vec<VRegOrRef>,
     pub finalized: bool,
 }
 
@@ -19,7 +21,6 @@ impl BlockBuilder {
         }
     }
 
-    /// Extract successor BlockIds from branch instructions.
     pub fn successors(&self) -> Vec<BlockId> {
         self.vcode.iter().flat_map(|inst| match inst {
             VCode::Branch { target } => vec![*target],

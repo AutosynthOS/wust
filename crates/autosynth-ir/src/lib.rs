@@ -13,44 +13,14 @@ use core::fmt;
 
 use autosynth_isa::{PReg, Width};
 
-/// Virtual register ID for definitions.
-///
-/// A simple index — metadata (width, origin) lives in a side table.
-/// Every value flowing through the pipeline has a unique VRegDefId.
+/// Virtual register — a simple index into the regalloc's def table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
-pub struct VRegDefId(pub u32);
-
-/// Virtual register ID for references (indirections at block entry).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "trace", derive(serde::Serialize))]
-pub struct VRegRefId(pub u32);
-
-/// Virtual register identifier.
-///
-/// Tagged by kind: [`Def`](VReg::Def) is a real value produced by an
-/// instruction, [`Ref`](VReg::Ref) is an indirection created at block
-/// entry when cloning region state from a predecessor.
-///
-/// Each variant indexes into a separate metadata table
-/// (`vreg_defs`, `vreg_refs`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(feature = "trace", derive(serde::Serialize))]
-pub enum VReg {
-    /// A real definition — produced by an instruction, constant, or physical register.
-    Def(VRegDefId),
-    /// Indirection — created at block entry when cloning region state.
-    /// Metadata in [`VRegRef`] determines whether this is a direct
-    /// alias or a phi (merge of multiple predecessors).
-    Ref(VRegRefId),
-}
+pub struct VReg(pub u32);
 
 impl fmt::Display for VReg {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            VReg::Def(VRegDefId(id)) => write!(f, "v{id}"),
-            VReg::Ref(VRegRefId(id)) => write!(f, "r{id}"),
-        }
+        write!(f, "v{}", self.0)
     }
 }
 
@@ -463,17 +433,13 @@ impl fmt::Display for VRegRef {
     }
 }
 
-/// Chase through Direct refs to find the root VReg.
-/// Phi refs are first-class and returned as-is.
-pub fn resolve_ref(vreg: VReg, refs: &[VRegRef]) -> VReg {
-    match vreg {
-        VReg::Def(_) => vreg,
-        VReg::Ref(VRegRefId(id)) => match &refs[id as usize].source {
-            VRegRefSource::Direct(src) => resolve_ref(*src, refs),
-            VRegRefSource::Phi(_) => vreg,
-        },
-    }
-}
+/// Region slot entries can hold either a VReg (a real definition) or
+/// a VRegionSlot (which may be a ref/phi for block merging). This is
+/// used by the old builder's region snapshots and merge logic.
+///
+/// The VRegRef / VRegRefSource types above are retained for the old
+/// builder pipeline; new code should use the VCode pipeline's builder
+/// which handles refs locally.
 
 /// A named region of memory anchored to a register + offset.
 ///
