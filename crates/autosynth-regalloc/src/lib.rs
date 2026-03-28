@@ -8,6 +8,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use autosynth_ir::Operand;
 use autosynth_isa::Width;
 
 pub use autosynth_ir::{SlotRef, VInit, VRegId};
@@ -64,5 +65,25 @@ impl RegAlloc {
     /// Number of defined VRegs.
     pub fn len(&self) -> usize {
         self.defs.len()
+    }
+
+    /// Try to fold a VReg operand as an immediate of type `Imm`.
+    /// If the operand is a VReg with Const origin and the value fits
+    /// `Imm`, returns `Some(imm)`. Otherwise returns `None`.
+    pub fn try_fold_imm<Imm>(&self, op: &Operand) -> Option<Imm>
+    where
+        Imm: TryFrom<i64>,
+    {
+        let Operand::VReg { id, .. } = op else { return None };
+        let VInit::Const(val) = self.init(*id) else { return None };
+        Imm::try_from(*val).ok()
+    }
+
+    /// Try to evaluate a const-const ALU op at compile time.
+    /// Returns the result if both operands are const.
+    pub fn try_const_val(&self, op: &Operand) -> Option<i64> {
+        let Operand::VReg { id, .. } = op else { return None };
+        let VInit::Const(val) = self.init(*id) else { return None };
+        Some(*val)
     }
 }

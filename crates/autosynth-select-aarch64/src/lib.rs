@@ -7,7 +7,6 @@ use autosynth_isa::UImm12;
 use autosynth_regalloc::{RegAlloc, VInit};
 use autosynth_selector::{CodeCtx, SelectorError};
 
-/// AArch64 instruction selector.
 pub struct Aarch64Selector;
 
 impl Aarch64Selector {
@@ -15,7 +14,6 @@ impl Aarch64Selector {
         Self
     }
 
-    /// Run selection on a block.
     pub fn select(
         &mut self,
         regalloc: &mut RegAlloc,
@@ -32,7 +30,7 @@ impl Aarch64Selector {
                     let dst = ops.next().ok_or(SelectorError::OperandUnderflow)?;
 
                     // Both const → fold entirely at compile time.
-                    if let (Some(l), Some(r)) = (try_const(regalloc, &lhs), try_const(regalloc, &rhs)) {
+                    if let (Some(l), Some(r)) = (regalloc.try_const_val(&lhs), regalloc.try_const_val(&rhs)) {
                         if let Some(result) = eval_const_alu(op, l, r) {
                             let Operand::VReg { id: dst_id, .. } = dst else {
                                 unreachable!("Alu dst must be VReg");
@@ -43,8 +41,13 @@ impl Aarch64Selector {
                     }
 
                     // Rhs const fits UImm12 → fold immediate.
+                    let rhs = match regalloc.try_fold_imm::<UImm12>(&rhs) {
+                        Some(imm) => Operand::UImm12(imm),
+                        None => rhs,
+                    };
+
                     output.push_operand(lhs);
-                    output.push_operand(try_fold_uimm12(regalloc, rhs));
+                    output.push_operand(rhs);
                     output.push_operand(dst);
                     output.push_inst(inst);
                 }
@@ -58,23 +61,6 @@ impl Aarch64Selector {
     }
 }
 
-/// If the operand is a VReg with Const origin, return the value.
-fn try_const(regalloc: &RegAlloc, op: &Operand) -> Option<i64> {
-    let Operand::VReg { id, .. } = op else { return None };
-    let VInit::Const(val) = regalloc.init(*id) else { return None };
-    Some(*val)
-}
-
-/// Try to fold a VReg operand as a UImm12 if it's a small constant.
-fn try_fold_uimm12(regalloc: &RegAlloc, op: Operand) -> Operand {
-    let Some(val) = try_const(regalloc, &op) else { return op };
-    match UImm12::try_from(val) {
-        Ok(imm) => Operand::UImm12(imm),
-        Err(_) => op,
-    }
-}
-
-/// Evaluate an ALU op on two constant values.
 fn eval_const_alu(op: &AluOp, lhs: i64, rhs: i64) -> Option<i64> {
     match op {
         AluOp::Add => Some(lhs.wrapping_add(rhs)),
