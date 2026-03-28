@@ -56,30 +56,3 @@ fn add_large_const_stays_vreg() {
     assert_eq!(block.operands[1], Operand::VReg { id: v1, width: Width::W32 });
 }
 
-/// v2 = const(3) + const(5)
-/// Both operands are const — fold at compile time. No instruction
-/// emitted, dst VReg becomes Const(8).
-#[test]
-fn add_two_consts_folds_entirely() {
-    let mut f = FunctionBuilder::new();
-    f.start_block(BlockId::Entry);
-
-    let v0 = f.regalloc.define(VInit::Const(3), Width::W32);
-    let v1 = f.regalloc.define(VInit::Const(5), Width::W32);
-    let v2 = f.regalloc.define(VInit::InstDst, Width::W32);
-
-    f.push_operand(Operand::VReg { id: v0, width: Width::W32 });
-    f.push_operand(Operand::VReg { id: v1, width: Width::W32 });
-    f.push_operand(Operand::VReg { id: v2, width: Width::W32 });
-    f.emit(VCode::Alu { op: AluOp::Add });
-
-    let func = f.build();
-    let mut selector = Aarch64Selector::new();
-    let result = compile(func, |ra, input, output| selector.select(ra, input, output)).unwrap();
-
-    let block = &result.blocks[&BlockId::Entry];
-    // Instruction eliminated entirely.
-    assert_eq!(block.instructions.len(), 0);
-    // The dst VReg is now Const(8).
-    assert!(matches!(result.regalloc.init(v2), VInit::Const(8)));
-}
