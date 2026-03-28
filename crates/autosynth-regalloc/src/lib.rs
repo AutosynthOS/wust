@@ -119,9 +119,10 @@ impl RegAlloc {
             .copied()
     }
 
-    /// Allocate a register for a VReg. If the VReg has a target PReg
-    /// (from VInit::PReg), use that. Otherwise pick a free scratch.
-    pub fn alloc(&mut self, vreg: VRegId) -> Result<PReg, CompileError> {
+    /// Allocate a physical register for a VReg. If the VReg has a
+    /// target PReg (from VInit::PReg), use that. Otherwise pick a
+    /// free scratch register.
+    pub fn alloc_preg(&mut self, vreg: VRegId) -> Result<PReg, CompileError> {
         // Already in a register?
         if let Some(preg) = self.location(vreg) {
             return Ok(preg);
@@ -135,15 +136,15 @@ impl RegAlloc {
         }
 
         // Pick a free scratch register.
-        let preg = self.alloc_scratch().ok_or(CompileError::OperandUnderflow)?; // TODO: proper error
+        let preg = self.alloc_scratch().ok_or(CompileError::RegPoolExhausted)?;
         self.bind(vreg, preg);
         Ok(preg)
     }
 
-    /// Resolve a VReg operand to a PReg operand.
-    /// Allocates a register if the VReg doesn't have one yet.
+    /// Resolve a VReg to its physical register.
+    /// Allocates one if the VReg doesn't have one yet.
     pub fn resolve_vreg(&mut self, vreg: VRegId) -> Result<PReg, CompileError> {
-        self.alloc(vreg)
+        self.alloc_preg(vreg)
     }
 
     /// Resolve any operand to its final form (PReg or immediate).

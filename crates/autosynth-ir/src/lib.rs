@@ -601,6 +601,7 @@ pub enum VCode {
 #[derive(Debug)]
 pub enum CompileError {
     OperandUnderflow,
+    RegPoolExhausted,
 }
 
 pub struct CodeCtx {
