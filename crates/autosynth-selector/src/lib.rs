@@ -54,8 +54,7 @@ pub trait Selector {
         &mut self,
         regalloc: &mut RegAlloc,
         input: &mut CodeCtx,
-        output: &mut CodeCtx,
-    ) -> Result<(), SelectorError>;
+    ) -> Result<CodeCtx, SelectorError>;
 }
 
 /// Errors during instruction selection.

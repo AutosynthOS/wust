@@ -21,12 +21,9 @@ impl Selector for Aarch64Selector {
         &mut self,
         regalloc: &mut RegAlloc,
         input: &mut CodeCtx,
-        output: &mut CodeCtx,
-    ) -> Result<(), SelectorError> {
+    ) -> Result<CodeCtx, SelectorError> {
         let mid = pass_1_fold_imms(regalloc, input)?;
-        let result = pass_2_resolve_pregs(regalloc, mid)?;
-        *output = result;
-        Ok(())
+        pass_2_resolve_pregs(regalloc, mid)
     }
 }
 

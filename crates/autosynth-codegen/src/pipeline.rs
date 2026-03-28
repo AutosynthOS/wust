@@ -30,10 +30,8 @@ pub fn compile(
             block.instructions.clone(),
             block.operands.clone(),
         );
-        let mut output = CodeCtx::new();
 
-        selector.select(&mut regalloc, &mut input, &mut output)?;
-
+        let output = selector.select(&mut regalloc, &mut input)?;
         blocks.insert(block_id, output);
     }
 
