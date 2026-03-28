@@ -144,6 +144,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "autosynth-emit-aarch64"
+version = "0.1.0"
+dependencies = [
+ "autosynth-emitter",
+ "autosynth-ir",
+ "autosynth-isa",
+ "autosynth-isa-aarch64",
+]
+
+[[package]]
+name = "autosynth-emitter"
+version = "0.1.0"
+dependencies = [
+ "autosynth-ir",
+ "autosynth-isa",
+]
+
+[[package]]
 name = "autosynth-ir"
 version = "0.1.0"
 dependencies = [
