@@ -383,7 +383,7 @@ pub struct SlotRef {
 /// SSA: a VReg's value never changes after definition. The origin
 /// tells the lowerer how to obtain the value (rematerialize a const,
 /// look up a register binding, resolve via the register allocator).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum VInit {
     /// A compile-time constant (sign-extended to 64 bits). Rematerializable.
@@ -396,6 +396,9 @@ pub enum VInit {
     /// clobber to start a fresh vreg lifetime — the regalloc reloads on
     /// first use.
     Mem(SlotRef),
+    /// Merge point — value comes from one of several predecessors.
+    /// The regalloc ensures all sources converge into the same PReg.
+    Phi(Vec<VReg>),
 }
 
 /// Metadata for a virtual register definition.

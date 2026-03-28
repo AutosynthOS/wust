@@ -76,10 +76,11 @@ impl RegAlloc {
 
     pub fn define(&mut self, init: VInit, width: Width) -> VRegDefId {
         let id = VRegDefId(self.defs.len() as u32);
-        let target = match init {
-            VInit::PReg(preg) => Some(preg),
+        let target = match &init {
+            VInit::PReg(preg) => Some(*preg),
             _ => None,
         };
+        let bind_preg = target;
         self.defs.push(VRegDef {
             id,
             width,
@@ -88,7 +89,7 @@ impl RegAlloc {
         });
         self.locations.push(None);
 
-        if let VInit::PReg(preg) = init {
+        if let Some(preg) = bind_preg {
             self.bind(id, preg);
         }
 
@@ -202,7 +203,21 @@ impl RegAlloc {
     pub fn resolve_vreg(&mut self, vreg: VReg) -> Result<PReg, CompileError> {
         match self.resolve(vreg) {
             DefOrPhi::Def(id) => self.alloc_preg(id),
-            DefOrPhi::Phi(_) => todo!("phi resolution in regalloc"),
+            DefOrPhi::Phi(sources) => {
+                // TODO: proper phi resolution — ensure all sources
+                // converge into the same register. For now, just
+                // allocate a fresh Def with VInit::Phi.
+                let width = self.resolve_phi_width(&sources);
+                let phi_def = self.define(VInit::Phi(sources), width);
+                self.alloc_preg(phi_def)
+            }
+        }
+    }
+
+    fn resolve_phi_width(&self, sources: &[VReg]) -> Width {
+        match self.resolve(sources[0]) {
+            DefOrPhi::Def(id) => self.width(id),
+            DefOrPhi::Phi(nested) => self.resolve_phi_width(&nested),
         }
     }
 
@@ -233,8 +248,8 @@ impl RegAlloc {
     where
         Imm: TryFrom<i64>,
     {
-        if let VInit::Const(val) = self.def(vreg).init {
-            if let Ok(imm) = Imm::try_from(val) {
+        if let VInit::Const(val) = &self.def(vreg).init {
+            if let Ok(imm) = Imm::try_from(*val) {
                 return Ok(VRegOr::Imm(imm));
             }
         }
@@ -248,8 +263,9 @@ impl RegAlloc {
         vreg: VRegDefId,
         output: &mut CodeCtx,
     ) -> Result<(), CompileError> {
-        match self.def(vreg).init {
+        match &self.def(vreg).init {
             VInit::Const(val) => {
+                let val = *val;
                 self.defs[vreg.0 as usize].init = VInit::InstDst;
                 self.materialize_const(vreg, val, output)?;
             }
@@ -259,6 +275,7 @@ impl RegAlloc {
                 // Already in a register, nothing to materialize.
             }
             VInit::InstDst => {}
+            VInit::Phi(_) => {} // phi resolution handled elsewhere
         }
         Ok(())
     }
