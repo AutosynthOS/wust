@@ -5,7 +5,7 @@
 use autosynth_ir::{Operand, VCode};
 use autosynth_isa::UImm12;
 use autosynth_regalloc::RegAlloc;
-use autosynth_selector::{CodeCtx, SelectorError};
+use autosynth_selector::{CodeCtx, Selector, SelectorError};
 
 pub struct Aarch64Selector;
 
@@ -13,8 +13,10 @@ impl Aarch64Selector {
     pub fn new() -> Self {
         Self
     }
+}
 
-    pub fn select(
+impl Selector for Aarch64Selector {
+    fn select(
         &mut self,
         regalloc: &mut RegAlloc,
         input: &mut CodeCtx,

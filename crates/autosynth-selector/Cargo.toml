@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 autosynth-ir = { path = "../autosynth-ir" }
 autosynth-isa = { path = "../autosynth-isa" }
+autosynth-regalloc = { path = "../autosynth-regalloc" }

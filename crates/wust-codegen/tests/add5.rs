@@ -16,10 +16,7 @@ fn add5_vcode() {
     let func = common::compile_func(&module, 0);
 
     let mut selector = Aarch64Selector::new();
-    let result = compile(func, |ra, input, output| {
-        selector.select(ra, input, output)
-    })
-    .unwrap();
+    let result = compile(func, &mut selector).unwrap();
 
     let block = &result.blocks[&BlockId::Entry];
 

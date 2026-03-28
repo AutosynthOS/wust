@@ -23,7 +23,7 @@ fn add_const_folds_to_uimm12() {
 
     let func = f.build();
     let mut selector = Aarch64Selector::new();
-    let result = compile(func, |ra, input, output| selector.select(ra, input, output)).unwrap();
+    let result = compile(func, &mut selector).unwrap();
 
     let block = &result.blocks[&BlockId::Entry];
     assert_eq!(block.instructions.len(), 1);
@@ -50,7 +50,7 @@ fn add_large_const_stays_vreg() {
 
     let func = f.build();
     let mut selector = Aarch64Selector::new();
-    let result = compile(func, |ra, input, output| selector.select(ra, input, output)).unwrap();
+    let result = compile(func, &mut selector).unwrap();
 
     let block = &result.blocks[&BlockId::Entry];
     assert_eq!(block.operands[1], Operand::VReg { id: v1, width: Width::W32 });

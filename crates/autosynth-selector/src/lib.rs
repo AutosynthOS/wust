@@ -8,6 +8,7 @@
 /// making passes composable — one pass's output becomes the next
 /// pass's input.
 use autosynth_ir::{Operand, VCode};
+use autosynth_regalloc::RegAlloc;
 
 /// A bag of VCode instructions and operands.
 ///
@@ -45,14 +46,13 @@ impl CodeCtx {
 /// Instruction selector — implemented per backend.
 ///
 /// Consumes VCode + operands from `input`, emits lowered VCode +
-/// operands into `output`. The selector drives the loop — it can
-/// consume one or more input instructions per output (fusion) or
-/// emit multiple outputs per input (decomposition).
-///
-/// Passes are composable: output becomes the next pass's input.
+/// operands into `output`. Has mutable access to the [`RegAlloc`]
+/// for looking up VReg metadata and updating inits (e.g. after
+/// const folding).
 pub trait Selector {
     fn select(
         &mut self,
+        regalloc: &mut RegAlloc,
         input: &mut CodeCtx,
         output: &mut CodeCtx,
     ) -> Result<(), SelectorError>;

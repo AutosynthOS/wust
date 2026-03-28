@@ -215,6 +215,7 @@ version = "0.1.0"
 dependencies = [
  "autosynth-ir",
  "autosynth-isa",
+ "autosynth-regalloc",
 ]
 
 [[package]]
