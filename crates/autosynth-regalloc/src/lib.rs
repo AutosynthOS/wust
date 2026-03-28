@@ -20,6 +20,12 @@ pub enum VRegOr<Imm> {
     VReg(VReg),
 }
 
+/// Result of resolving a VReg through Direct ref chains.
+pub enum DefOrPhi {
+    Def(VRegDefId),
+    Phi(Vec<VReg>),
+}
+
 /// A VReg reference — indirection for inherited block operands.
 #[derive(Debug, Clone)]
 pub enum VRegRefDef {
@@ -101,6 +107,18 @@ impl RegAlloc {
         &self.refs[id.0 as usize]
     }
 
+    /// Resolve a VReg through all Direct ref indirections.
+    /// Returns either the underlying Def or an unresolved Phi.
+    pub fn resolve(&self, vreg: VReg) -> DefOrPhi {
+        match vreg {
+            VReg::Def(id) => DefOrPhi::Def(id),
+            VReg::Ref(id) => match &self.refs[id.0 as usize] {
+                VRegRefDef::Direct(src) => self.resolve(*src),
+                VRegRefDef::Phi(sources) => DefOrPhi::Phi(sources.clone()),
+            },
+        }
+    }
+
     /// Set a target PReg constraint on a VReg definition.
     pub fn set_target(&mut self, id: VRegDefId, preg: PReg) {
         self.defs[id.0 as usize].target = Some(preg);
@@ -178,10 +196,14 @@ impl RegAlloc {
         Ok(preg)
     }
 
-    /// Resolve a VRegDefId to its physical register.
-    /// Allocates one if the VReg doesn't have one yet.
-    pub fn resolve_vreg(&mut self, vreg: VRegDefId) -> Result<PReg, CompileError> {
-        self.alloc_preg(vreg)
+    /// Resolve a VReg to a physical register.
+    /// Chases through Direct refs, allocates a PReg for the underlying Def.
+    /// Panics on unresolved Phi — those need regalloc phi resolution first.
+    pub fn resolve_vreg(&mut self, vreg: VReg) -> Result<PReg, CompileError> {
+        match self.resolve(vreg) {
+            DefOrPhi::Def(id) => self.alloc_preg(id),
+            DefOrPhi::Phi(_) => todo!("phi resolution in regalloc"),
+        }
     }
 
     /// Extract a VRegDefId from a VReg enum, panicking on Ref.
@@ -196,10 +218,7 @@ impl RegAlloc {
     /// VRegs get allocated to PRegs. Other operands pass through.
     pub fn resolve_operand(&mut self, op: Operand) -> Result<Operand, CompileError> {
         match op {
-            Operand::VReg(vreg) => {
-                let id = Self::expect_def(vreg);
-                Ok(Operand::PReg(self.resolve_vreg(id)?))
-            }
+            Operand::VReg(vreg) => Ok(Operand::PReg(self.resolve_vreg(vreg)?)),
             other => Ok(other),
         }
     }
@@ -258,10 +277,10 @@ impl RegAlloc {
                 self.materialize_const(vreg, val, output)?;
                 Ok(VRegOr::VReg(VReg::Def(vreg)))
             }
-            Operand::VReg(vreg) => {
-                let id = Self::expect_def(vreg);
-                self.imm_or_materialize_vreg(id, output)
-            }
+            Operand::VReg(vreg) => match self.resolve(vreg) {
+                DefOrPhi::Def(id) => self.imm_or_materialize_vreg(id, output),
+                DefOrPhi::Phi(_) => Ok(VRegOr::VReg(vreg)), // phi stays for regalloc
+            },
             _ => unimplemented!(),
         }
     }
