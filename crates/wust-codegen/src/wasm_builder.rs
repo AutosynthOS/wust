@@ -2,40 +2,50 @@ use autosynth_codegen::builder::FunctionBuilder;
 use autosynth_ir::{AluOp, BlockId, Operand, VCode};
 use autosynth_isa::{PReg, Width};
 use autosynth_regalloc::{VInit, VRegId};
+use wust_core::FuncMeta;
+
+use crate::conversion::valtype_to_width;
 
 /// Wasm-aware function builder.
 ///
-/// Wraps [`FunctionBuilder`] and manages wasm-specific regions
-/// (locals, operands, fibre). Emits VCode + operands to the
-/// underlying builder.
+/// Wraps [`FunctionBuilder`] and manages wasm-specific state:
+/// locals (params + declared locals) and the operand stack.
 pub struct WasmFunctionBuilder {
     pub inner: FunctionBuilder,
-    /// Wasm local variables — each slot holds a VRegId.
     locals: Vec<VRegId>,
-    /// Wasm operand stack.
     operands: Vec<VRegId>,
 }
 
 impl WasmFunctionBuilder {
-    pub fn new() -> Self {
+    /// Create a new builder from a wasm function signature.
+    ///
+    /// Automatically sets up params (each in its CC register x0..xN)
+    /// and zero-initialized locals. Starts in the Entry block.
+    pub fn new(func: &FuncMeta) -> Self {
+        let mut inner = FunctionBuilder::new();
+        inner.start_block(BlockId::Entry);
+
+        let mut locals = Vec::new();
+
+        // Params — each arrives in a CC register.
+        for (i, param) in func.params.iter().enumerate() {
+            let w = valtype_to_width(param);
+            let vreg = inner.regalloc.define(VInit::PReg(PReg(i as u8)), w);
+            locals.push(vreg);
+        }
+
+        // Declared locals — zero-initialized.
+        for local in func.locals.iter() {
+            let w = valtype_to_width(local);
+            let vreg = inner.regalloc.define(VInit::Const(0), w);
+            locals.push(vreg);
+        }
+
         Self {
-            inner: FunctionBuilder::new(),
-            locals: Vec::new(),
+            inner,
+            locals,
             operands: Vec::new(),
         }
-    }
-
-    /// Declare a function parameter. Defines a VReg with PReg origin
-    /// (arrives in CC register) and pushes to locals.
-    pub fn declare_param(&mut self, idx: usize, width: Width) {
-        let vreg = self.inner.regalloc.define(VInit::PReg(PReg(idx as u8)), width);
-        self.locals.push(vreg);
-    }
-
-    /// Declare a zero-initialized local.
-    pub fn declare_local(&mut self, width: Width) {
-        let vreg = self.inner.regalloc.define(VInit::Const(0), width);
-        self.locals.push(vreg);
     }
 
     /// Push a constant onto the wasm operand stack.
@@ -46,8 +56,7 @@ impl WasmFunctionBuilder {
 
     /// Push a local's VReg onto the wasm operand stack.
     pub fn push_local(&mut self, idx: usize) {
-        let vreg = self.locals[idx];
-        self.operands.push(vreg);
+        self.operands.push(self.locals[idx]);
     }
 
     /// Pop from the wasm operand stack.
@@ -58,6 +67,11 @@ impl WasmFunctionBuilder {
     /// Push a VReg onto the wasm operand stack.
     pub fn push(&mut self, vreg: VRegId) {
         self.operands.push(vreg);
+    }
+
+    /// Set a local slot to a VReg.
+    pub fn local_set(&mut self, idx: usize, val: VRegId) {
+        self.locals[idx] = val;
     }
 
     /// Emit a binary ALU op: pop two, push result.
@@ -74,17 +88,9 @@ impl WasmFunctionBuilder {
         self.operands.push(dst);
     }
 
-    /// Emit a return. Pops the result from the operand stack and
-    /// emits a Return VCode instruction.
+    /// Emit a return instruction.
     pub fn emit_return(&mut self) {
-        // Result is on top of operand stack — the regalloc/emitter
-        // will ensure it ends up in x0.
         self.inner.emit(VCode::Return);
-    }
-
-    /// Start a new block.
-    pub fn start_block(&mut self, id: BlockId) {
-        self.inner.start_block(id);
     }
 
     /// Build and return the completed IR function.
