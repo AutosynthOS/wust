@@ -32,9 +32,10 @@ fn add_const_folds_to_uimm12() {
 }
 
 /// v2 = v0 + const(5000)
-/// 5000 doesn't fit UImm12 — stays as VReg (regalloc will materialize later).
+/// 5000 doesn't fit UImm12 — must be materialized into a PReg.
+/// No VReg operands should remain after selection.
 #[test]
-fn add_large_const_stays_vreg() {
+fn add_large_const_materializes() {
     let mut f = FunctionBuilder::new();
 
     let v0 = f.regalloc.define(VInit::PReg(PReg(0)), Width::W32);
@@ -51,5 +52,12 @@ fn add_large_const_stays_vreg() {
     let result = compile(func, &mut selector).unwrap();
 
     let block = &result.blocks[&BlockId::Entry];
-    assert_eq!(block.operands[1], Operand::VReg(v1));
+
+    // No VReg operands should remain.
+    for op in &block.operands {
+        assert!(!matches!(op, Operand::VReg(_)), "unresolved VReg: {op:?}");
+    }
+
+    // Should have materialization instruction(s) before the Alu.
+    assert!(block.instructions.len() > 1, "expected materialization + alu, got {:?}", block.instructions);
 }

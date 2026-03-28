@@ -583,6 +583,42 @@ pub enum VCode {
     /// Used for register-to-register moves, CC setup, etc.
     Move,
 
+    /// Materialize a constant into a register.
+    /// Operands: [Const(val), VReg(dst)] or [Const(val), PReg(dst)].
+    /// The emitter encodes this as movz/movk (ARM64), mov imm (x86), etc.
+    Materialize,
+
     /// Return from function. Consumes 0..N operands (results).
     Return,
+}
+
+// ---- CodeCtx ----
+
+/// A bag of VCode instructions and operands.
+///
+/// Used as both input and output for selector/regalloc passes.
+pub struct CodeCtx {
+    pub instructions: Vec<VCode>,
+    pub operands: Vec<Operand>,
+}
+
+impl CodeCtx {
+    pub fn new() -> Self {
+        Self {
+            instructions: Vec::new(),
+            operands: Vec::new(),
+        }
+    }
+
+    pub fn from(instructions: Vec<VCode>, operands: Vec<Operand>) -> Self {
+        Self { instructions, operands }
+    }
+
+    pub fn push_inst(&mut self, inst: VCode) {
+        self.instructions.push(inst);
+    }
+
+    pub fn push_operand(&mut self, op: Operand) {
+        self.operands.push(op);
+    }
 }

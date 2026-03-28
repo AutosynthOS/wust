@@ -8,10 +8,16 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use autosynth_ir::Operand;
+use autosynth_ir::{CodeCtx, Operand, VCode};
 use autosynth_isa::Width;
 
 pub use autosynth_ir::{SlotRef, VInit, VRegId};
+
+/// Result of trying to fold a VReg as an immediate.
+pub enum VRegOr<Imm> {
+    Imm(Imm),
+    VReg(VRegId),
+}
 
 /// Metadata for a defined virtual register.
 #[derive(Debug, Clone)]
@@ -22,9 +28,6 @@ pub struct VRegDef {
 }
 
 /// Register allocator state — the authority on all VRegs.
-///
-/// Every VReg is born through [`define`](Self::define) with an
-/// explicit [`VInit`] origin.
 #[derive(Clone)]
 pub struct RegAlloc {
     defs: Vec<VRegDef>,
@@ -35,55 +38,63 @@ impl RegAlloc {
         Self { defs: Vec::new() }
     }
 
-    /// Define a new VReg. Returns the allocated VRegId.
     pub fn define(&mut self, init: VInit, width: Width) -> VRegId {
         let id = VRegId(self.defs.len() as u32);
         self.defs.push(VRegDef { id, width, init });
         id
     }
 
-    /// Look up a VReg's definition.
     pub fn def(&self, id: VRegId) -> &VRegDef {
         &self.defs[id.0 as usize]
     }
 
-    /// Look up a VReg's init origin.
     pub fn init(&self, id: VRegId) -> &VInit {
         &self.defs[id.0 as usize].init
     }
 
-    /// Look up a VReg's width.
     pub fn width(&self, id: VRegId) -> Width {
         self.defs[id.0 as usize].width
     }
 
-    /// Update a VReg's init origin (e.g. after const folding).
     pub fn set_init(&mut self, id: VRegId, init: VInit) {
         self.defs[id.0 as usize].init = init;
     }
 
-    /// Number of defined VRegs.
     pub fn len(&self) -> usize {
         self.defs.len()
     }
 
     /// Try to fold a VReg operand as an immediate of type `Imm`.
-    /// If the operand is a VReg with Const origin and the value fits
-    /// `Imm`, returns `Some(imm)`. Otherwise returns `None`.
-    pub fn try_fold_imm<Imm>(&self, op: &Operand) -> Option<Imm>
+    ///
+    /// - Fits `Imm` → returns `VRegOr::Imm(imm)`.
+    /// - Doesn't fit → emits `VCode::Materialize` into `output`,
+    ///   updates the VReg to InstDst, returns `VRegOr::VReg(id)`.
+    /// - Not a const VReg → returns `VRegOr::VReg(id)`.
+    pub fn try_fold_imm<Imm>(
+        &mut self,
+        op: &Operand,
+        output: &mut CodeCtx,
+    ) -> VRegOr<Imm>
     where
         Imm: TryFrom<i64>,
     {
-        let Operand::VReg(id) = op else { return None };
-        let VInit::Const(val) = self.init(*id) else { return None };
-        Imm::try_from(*val).ok()
-    }
+        let Operand::VReg(id) = op else {
+            return VRegOr::VReg(VRegId(0));
+        };
+        let VInit::Const(val) = self.init(*id) else {
+            return VRegOr::VReg(*id);
+        };
+        let val = *val;
 
-    /// Try to evaluate a const-const ALU op at compile time.
-    /// Returns the result if both operands are const.
-    pub fn try_const_val(&self, op: &Operand) -> Option<i64> {
-        let Operand::VReg(id) = op else { return None };
-        let VInit::Const(val) = self.init(*id) else { return None };
-        Some(*val)
+        match Imm::try_from(val) {
+            Ok(imm) => VRegOr::Imm(imm),
+            Err(_) => {
+                output.push_operand(Operand::Const(val));
+                output.push_operand(*op);
+                output.push_inst(VCode::Materialize);
+                self.set_init(*id, VInit::InstDst);
+                VRegOr::VReg(*id)
+            }
+        }
     }
 }
