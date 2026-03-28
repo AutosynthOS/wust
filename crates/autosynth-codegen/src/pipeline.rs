@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use autosynth_ir::BlockId;
 use autosynth_regalloc::RegAlloc;
-use autosynth_selector::{CodeCtx, Selector, SelectorError};
+use autosynth_selector::{CodeCtx, CompileError, Selector};
 
 use crate::ir::IrFunction;
 
@@ -20,20 +20,25 @@ pub struct VCodeFunction {
 pub fn compile(
     func: IrFunction,
     selector: &mut impl Selector,
-) -> Result<VCodeFunction, SelectorError> {
-    let IrFunction { mut regalloc, blocks: ir_blocks, block_order } = func;
+) -> Result<VCodeFunction, CompileError> {
+    let IrFunction {
+        mut regalloc,
+        blocks: ir_blocks,
+        block_order,
+    } = func;
     let mut blocks = BTreeMap::new();
 
     for &block_id in &block_order {
         let block = &ir_blocks[&block_id];
-        let mut input = CodeCtx::from(
-            block.instructions.clone(),
-            block.operands.clone(),
-        );
+        let mut input = CodeCtx::from(block.vcode.clone(), block.operands.clone());
 
         let output = selector.select(&mut regalloc, &mut input)?;
         blocks.insert(block_id, output);
     }
 
-    Ok(VCodeFunction { regalloc, blocks, block_order })
+    Ok(VCodeFunction {
+        regalloc,
+        blocks,
+        block_order,
+    })
 }

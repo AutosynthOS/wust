@@ -1,10 +1,8 @@
 #![no_std]
 
-/// Instruction selector trait.
-use autosynth_ir::VCode;
 use autosynth_regalloc::RegAlloc;
 
-pub use autosynth_ir::CodeCtx;
+pub use autosynth_ir::{CodeCtx, CompileError};
 
 /// Instruction selector — implemented per backend.
 pub trait Selector {
@@ -12,13 +10,5 @@ pub trait Selector {
         &mut self,
         regalloc: &mut RegAlloc,
         input: &mut CodeCtx,
-    ) -> Result<CodeCtx, SelectorError>;
-}
-
-/// Errors during instruction selection.
-#[derive(Debug)]
-pub enum SelectorError {
-    UnexpectedEnd,
-    OperandUnderflow,
-    Unhandled(VCode),
+    ) -> Result<CodeCtx, CompileError>;
 }

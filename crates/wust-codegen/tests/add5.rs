@@ -16,9 +16,9 @@ fn add5() {
     let result = compile(func, &mut selector).unwrap();
 
     let block = &result.blocks[&BlockId::Entry];
-    assert_eq!(block.instructions.len(), 2);
-    assert!(matches!(block.instructions[0], VCode::Alu { op: AluOp::Add }));
-    assert!(matches!(block.instructions[1], VCode::Return));
+    assert_eq!(block.vcode.len(), 2);
+    assert!(matches!(block.vcode[0], VCode::Alu { op: AluOp::Add }));
+    assert!(matches!(block.vcode[1], VCode::Return));
     assert_eq!(block.operands[1], Operand::UImm12(UImm12::try_from(5).unwrap()));
 
     let module = common::parse_wat(include_str!("add5.wat"));

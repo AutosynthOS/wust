@@ -25,7 +25,7 @@ impl FunctionBuilder {
     }
 
     pub fn emit(&mut self, inst: VCode) {
-        self.current_block_mut().instructions.push(inst);
+        self.current_block_mut().vcode.push_back(inst);
     }
 
     pub fn push_operand(&mut self, op: Operand) {
@@ -54,7 +54,7 @@ impl FunctionBuilder {
         let blocks = self.blocks.into_iter().map(|(id, b)| {
             (id, IrBlock {
                 id,
-                instructions: b.instructions,
+                vcode: b.vcode,
                 operands: b.operands,
                 successors: successors.get(&id).cloned().unwrap_or_default(),
                 predecessors: predecessors.remove(&id).unwrap_or_default(),

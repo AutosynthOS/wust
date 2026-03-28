@@ -1,14 +1,16 @@
+use autosynth_ir::CompileError;
 use autosynth_ir::{CodeCtx, Operand, VCode};
 use autosynth_isa::UImm12;
 use autosynth_regalloc::{RegAlloc, VRegOr};
-use autosynth_selector::SelectorError;
 
-pub fn fold_immediates(regalloc: &mut RegAlloc, input: &mut CodeCtx) -> Result<CodeCtx, SelectorError> {
+pub fn fold_immediates(
+    regalloc: &mut RegAlloc,
+    input: &mut CodeCtx,
+) -> Result<CodeCtx, CompileError> {
     let mut output = CodeCtx::new();
-    let mut ops = input.operands.drain(..);
 
-    for inst in input.instructions.drain(..) {
-        lower_inst(regalloc, &inst, &mut ops, &mut output)?;
+    while let Some(inst) = input.vcode.pop_front() {
+        lower_inst(regalloc, &inst, input, &mut output)?;
     }
 
     Ok(output)
@@ -17,27 +19,27 @@ pub fn fold_immediates(regalloc: &mut RegAlloc, input: &mut CodeCtx) -> Result<C
 fn lower_inst(
     regalloc: &mut RegAlloc,
     inst: &VCode,
-    ops: &mut impl Iterator<Item = Operand>,
+    input: &mut CodeCtx,
     output: &mut CodeCtx,
-) -> Result<(), SelectorError> {
+) -> Result<(), CompileError> {
     match inst {
         VCode::Alu { .. } => {
-            let lhs = ops.next().ok_or(SelectorError::OperandUnderflow)?;
-            let rhs = ops.next().ok_or(SelectorError::OperandUnderflow)?;
-            let dst = ops.next().ok_or(SelectorError::OperandUnderflow)?;
+            let lhs = input.next_operand()?;
+            let rhs = input.next_operand()?;
+            let dst = input.next_operand()?;
 
-            let rhs = match regalloc.try_fold_imm::<UImm12>(&rhs, output) {
+            let rhs = match regalloc.imm_or_materialize::<UImm12>(rhs, output)? {
                 VRegOr::Imm(imm) => Operand::UImm12(imm),
                 VRegOr::VReg(id) => Operand::VReg(id),
             };
 
-            output.push_operand(lhs);
-            output.push_operand(rhs);
-            output.push_operand(dst);
-            output.push_inst(inst.clone());
+            output.operands.push_back(lhs);
+            output.operands.push_back(rhs);
+            output.operands.push_back(dst);
+            output.vcode.push_back(inst.clone());
         }
         _ => {
-            output.push_inst(inst.clone());
+            output.vcode.push_back(inst.clone());
         }
     }
 

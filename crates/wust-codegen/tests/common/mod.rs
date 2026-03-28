@@ -60,7 +60,7 @@ pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
     for &block_id in &vcode.block_order {
         let block = &vcode.blocks[&block_id];
         let mut ops = block.operands.iter().copied();
-        for inst in &block.instructions {
+        for inst in &block.vcode {
             emitter.emit(inst, &mut ops, &mut page).unwrap();
         }
     }

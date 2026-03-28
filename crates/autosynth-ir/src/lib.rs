@@ -7,6 +7,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -537,7 +538,6 @@ pub enum Operand {
     UImm12(autosynth_isa::UImm12),
 }
 
-
 // ---- VCode: new pipeline instruction set ----
 
 /// Virtual-code instruction — the shared instruction type for the
@@ -597,28 +597,35 @@ pub enum VCode {
 /// A bag of VCode instructions and operands.
 ///
 /// Used as both input and output for selector/regalloc passes.
+/// Error from CodeCtx operations.
+#[derive(Debug)]
+pub enum CompileError {
+    OperandUnderflow,
+}
+
 pub struct CodeCtx {
-    pub instructions: Vec<VCode>,
-    pub operands: Vec<Operand>,
+    pub vcode: VecDeque<VCode>,
+    pub operands: VecDeque<Operand>,
 }
 
 impl CodeCtx {
     pub fn new() -> Self {
         Self {
-            instructions: Vec::new(),
-            operands: Vec::new(),
+            vcode: VecDeque::new(),
+            operands: VecDeque::new(),
         }
     }
 
-    pub fn from(instructions: Vec<VCode>, operands: Vec<Operand>) -> Self {
-        Self { instructions, operands }
+    pub fn from(vcode: VecDeque<VCode>, operands: Vec<Operand>) -> Self {
+        Self {
+            vcode,
+            operands: VecDeque::from(operands),
+        }
     }
 
-    pub fn push_inst(&mut self, inst: VCode) {
-        self.instructions.push(inst);
-    }
-
-    pub fn push_operand(&mut self, op: Operand) {
-        self.operands.push(op);
+    pub fn next_operand(&mut self) -> Result<Operand, CompileError> {
+        self.operands
+            .pop_front()
+            .ok_or(CompileError::OperandUnderflow)
     }
 }

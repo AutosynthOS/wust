@@ -25,7 +25,7 @@ fn add_const_folds_to_uimm12() {
     let result = compile(func, &mut selector).unwrap();
 
     let block = &result.blocks[&BlockId::Entry];
-    assert_eq!(block.instructions.len(), 1);
+    assert_eq!(block.vcode.len(), 1);
     assert_eq!(block.operands[0], Operand::PReg(PReg(0)));
     assert_eq!(block.operands[1], Operand::UImm12(UImm12::try_from(5).unwrap()));
     assert_eq!(block.operands[2], Operand::PReg(PReg(0)));
@@ -59,5 +59,5 @@ fn add_large_const_materializes() {
     }
 
     // Should have materialization instruction(s) before the Alu.
-    assert!(block.instructions.len() > 1, "expected materialization + alu, got {:?}", block.instructions);
+    assert!(block.vcode.len() > 1, "expected materialization + alu, got {:?}", block.vcode);
 }
