@@ -108,13 +108,41 @@ impl WasmFunctionBuilder {
 
     // --- Control flow ---
 
-    /// Emit conditional branch. Snapshots current state for both targets.
+    /// Emit conditional branch. If the condition was produced by a
+    /// comparison, fuses the Comp + BrIf into a single CmpBranch.
     pub fn br_if(&mut self, cond: VRegId, then_block: BlockId, else_block: BlockId) {
-        self.inner.push_operand(Operand::VReg(cond));
-        self.inner.emit(VCode::BrIf {
-            block_if: then_block,
-            block_else: else_block,
-        });
+        // Try fuse: peek at last instruction.
+        let fused = match self.inner.current_block().vcode.back() {
+            Some(VCode::Alu { op: AluOp::Comp(comp_op) }) => Some(*comp_op),
+            _ => None,
+        };
+
+        if let Some(comp_op) = fused {
+            let block = self.inner.current_block_mut();
+            block.vcode.pop_back();
+            block.operands.pop(); // dst
+            let rhs = block.operands.pop();
+            let lhs = block.operands.pop();
+            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                self.inner.push_operand(lhs);
+                self.inner.push_operand(rhs);
+            }
+            self.inner.emit(VCode::BrIf {
+                op: comp_op,
+                block_if: then_block,
+                block_else: else_block,
+            });
+        } else {
+            // No fusion — compare cond != 0.
+            let zero = self.inner.regalloc.define(VInit::Const(0), Width::W32);
+            self.inner.push_operand(Operand::VReg(cond));
+            self.inner.push_operand(Operand::VReg(zero));
+            self.inner.emit(VCode::BrIf {
+                op: CompOp::Ne,
+                block_if: then_block,
+                block_else: else_block,
+            });
+        }
 
         self.snapshot_onto(then_block);
         self.snapshot_onto(else_block);

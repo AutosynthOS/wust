@@ -32,6 +32,10 @@ impl FunctionBuilder {
         self.current_block_mut().operands.push(op);
     }
 
+    pub fn current_block(&self) -> &BlockBuilder {
+        self.blocks.get(&self.current_block).unwrap()
+    }
+
     pub fn start_block(&mut self, id: BlockId) {
         self.blocks.entry(id).or_insert_with(|| BlockBuilder::new(id));
         self.current_block = id;
@@ -68,7 +72,7 @@ impl FunctionBuilder {
         }
     }
 
-    fn current_block_mut(&mut self) -> &mut BlockBuilder {
+    pub fn current_block_mut(&mut self) -> &mut BlockBuilder {
         self.blocks.get_mut(&self.current_block).unwrap()
     }
 }

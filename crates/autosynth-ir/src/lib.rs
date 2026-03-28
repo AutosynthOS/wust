@@ -558,10 +558,11 @@ pub enum VCode {
     /// (register vs immediate) based on the target architecture.
     Alu { op: AluOp },
 
-    /// Conditional branch: consumes 1 operand (condition from a prior
-    /// Comp). The selector may fuse Alu(Comp) + BrIf into a single
-    /// compare-and-branch instruction.
+    /// Compare-and-branch: consumes 2 operands (lhs, rhs), compares
+    /// with `op`, and branches. Fused from Alu(Comp) + BrIf at the
+    /// wasm builder level.
     BrIf {
+        op: CompOp,
         block_if: BlockId,
         block_else: BlockId,
     },

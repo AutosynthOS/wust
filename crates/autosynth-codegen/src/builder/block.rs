@@ -23,7 +23,7 @@ impl BlockBuilder {
     pub fn successors(&self) -> Vec<BlockId> {
         self.vcode.iter().flat_map(|inst| match inst {
             VCode::Branch { target } => vec![*target],
-            VCode::BrIf { block_if, block_else } => vec![*block_if, *block_else],
+            VCode::BrIf { block_if, block_else, .. } => vec![*block_if, *block_else],
             _ => vec![],
         }).collect()
     }
