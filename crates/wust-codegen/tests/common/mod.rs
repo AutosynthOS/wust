@@ -1,11 +1,11 @@
 mod assert;
-pub use assert::assert_block_eq;
+pub use assert::assert_stream_eq;
 
 use autosynth_codegen::ir::IrFunction;
 use autosynth_codegen::pipeline::compile;
 use autosynth_emit_aarch64::Aarch64Emitter;
-use autosynth_emitter::Emitter;
-use autosynth_ir::{AluOp, BlockId};
+use autosynth_emitter::{CodeContext, Emitter};
+use autosynth_ir::{AluOp, BlockId, FunctionIdx, Label};
 use autosynth_isa::Width;
 use autosynth_select_aarch64::Aarch64Selector;
 use wust_codegen::CodeBuffer;
@@ -76,20 +76,20 @@ pub fn compile_func(module: &ParsedModule, func_idx: usize) -> IrFunction {
 /// Full pipeline: IR → select → emit → executable.
 pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
     let func_meta = &module.funcs[func_idx];
-    let ir_func = compile_func(module, func_idx);
+    let mut ir_func = compile_func(module, func_idx);
 
-    let mut selector = Aarch64Selector::new();
-    let vcode = compile(ir_func, &mut selector).unwrap();
+    let mut selector = Aarch64Selector::new(ir_func.alloc.clone());
+    let vcode = compile(&ir_func, &mut selector).unwrap();
 
+    let func_idx = FunctionIdx::User(func_idx as u32);
     let mut page = CodeBuffer::new().unwrap();
-    let mut emitter = Aarch64Emitter::new();
+    let mut emitter = Aarch64Emitter::new(func_idx);
     for &block_id in &vcode.block_order {
-        let block = &vcode.blocks[&block_id];
-        let mut ops = block.operands.iter().copied();
-        for inst in &block.vcode {
-            emitter.emit(inst, &mut ops, &mut page).unwrap();
-        }
+        page.mark_label(Label::Block(func_idx, block_id));
+        let mut block_stream = vcode.blocks[&block_id].clone();
+        emitter.emit(&mut block_stream, &mut page).unwrap();
     }
+    emitter.finalize(&mut page).unwrap();
     page.flash().unwrap();
 
     // Compute frame layout for the trampoline.

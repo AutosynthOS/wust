@@ -2,7 +2,7 @@
 ///
 /// All operands must be concrete (PRegs, immediates). If the emitter
 /// encounters a VReg or Mem operand, that's a pipeline bug.
-use autosynth_ir::{Operand, VCode};
+use autosynth_ir::{CodeCtx, Label, Operand, VCode};
 
 /// Code output — implemented by the caller to receive emitted bytes.
 pub trait CodeContext {
@@ -10,27 +10,33 @@ pub trait CodeContext {
 
     /// Write machine code bytes to the output.
     fn emit_bytes(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+
+    /// Current write position (byte offset from the start).
+    fn offset(&self) -> usize;
+
+    /// Mark the current offset as the position of a label.
+    fn mark_label(&mut self, label: Label);
+
+    /// Look up the byte offset of a previously marked label.
+    /// Returns `None` if the label hasn't been marked yet.
+    fn label_offset(&self, label: Label) -> Option<usize>;
+
+    /// Overwrite bytes at a specific offset. Used for patch-ups
+    /// (e.g. resolving branch displacements after labels are known).
+    fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Self::Error>;
 }
 
 /// Machine code emitter — implemented per backend.
 ///
-/// The emitter consumes operands from the iterator as needed per
-/// instruction. It knows the arity of each VCode instruction.
+/// The emitter walks the unified VCode stream. Operands precede their
+/// instruction in the stream. The emitter collects operands, then
+/// encodes when it hits an instruction.
 pub trait Emitter {
     fn emit(
         &mut self,
-        inst: &VCode,
-        operands: &mut impl Iterator<Item = Operand>,
+        stream: &mut CodeCtx,
         ctx: &mut impl CodeContext,
     ) -> Result<(), EmitError>;
-}
-
-impl CodeContext for Vec<u8> {
-    type Error = core::convert::Infallible;
-    fn emit_bytes(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-        self.extend_from_slice(bytes);
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -43,4 +49,6 @@ pub enum EmitError {
     ImmediateOutOfRange,
     /// Unhandled VCode instruction.
     Unhandled,
+    /// A referenced label hasn't been marked yet.
+    UnresolvedLabel,
 }

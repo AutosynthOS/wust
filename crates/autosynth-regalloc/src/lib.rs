@@ -1,23 +1,23 @@
 #![no_std]
-//! Register allocator — the authority on all virtual registers.
+//! Virtual register allocator and per-block register state.
 //!
-//! Every VReg is born through [`RegAlloc::define`] with an explicit
-//! origin ([`VInit`]). The regalloc tracks definitions, physical
-//! register bindings, and liveness state.
+//! - `VRegAllocator`: global VReg factory — defines VRegs, stores metadata.
+//!   Shared via `Rc<RefCell<>>` across all blocks.
+//! - `VRegState`: per-VReg live state (preg, slot, dirty).
+//! - `RegState`: per-block mutable state — forked at branches, carries
+//!   a shared reference to the allocator.
 
 extern crate alloc;
 
+use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
-use autosynth_ir::{CodeCtx, CompileError, Operand, VCode};
+use core::cell::RefCell;
+use autosynth_ir::{CompileError, Operand, VCode};
 use autosynth_isa::{PReg, Width};
 
 pub use autosynth_ir::{SlotRef, VInit, VReg};
-
-/// Index into the regalloc's ref table. Builder-local — not part of
-/// the portable IR.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct VRegRefId(pub u32);
 
 /// Result of trying to fold a VReg as an immediate.
 pub enum VRegOr<Imm> {
@@ -25,59 +25,53 @@ pub enum VRegOr<Imm> {
     VReg(VReg),
 }
 
-/// Result of resolving a VReg through Direct ref chains.
-pub enum DefOrPhi {
-    Def(VReg),
-    Phi(Vec<VReg>),
-}
-
-/// A VReg reference — indirection for inherited block operands.
-#[derive(Debug, Clone)]
-pub enum VRegRefDef {
-    /// Single predecessor — just an alias for the source VReg.
-    Direct(VReg),
-    /// Merge point — multiple predecessors provide different VRegs.
-    Phi(Vec<VReg>),
-}
-
-/// Metadata for a defined virtual register.
+/// Immutable metadata for a defined virtual register.
 #[derive(Debug, Clone)]
 pub struct VRegDef {
     pub id: VReg,
     pub width: Width,
     pub init: VInit,
-    /// Target PReg constraint. If set, the regalloc must place this
-    /// VReg in this specific register (e.g. CC registers for
-    /// params/returns).
+    /// Target PReg constraint.
     pub target: Option<PReg>,
 }
 
-/// Register allocator state.
-#[derive(Clone)]
-pub struct RegAlloc {
-    defs: Vec<VRegDef>,
-    refs: Vec<VRegRefDef>,
-    /// PReg → VReg binding. None = free.
-    bindings: Vec<Option<VReg>>,
-    /// VReg → PReg mapping. None = not in a register.
-    locations: Vec<Option<PReg>>,
-    scratch_pool: Vec<PReg>,
+/// A canonical memory slot with dirty tracking.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotState {
+    pub slot: SlotRef,
+    pub dirty: bool,
 }
 
-impl RegAlloc {
+/// Per-block mutable live state for a VReg.
+#[derive(Debug, Clone)]
+pub struct VRegState {
+    /// Which PReg this VReg is currently in, if any.
+    pub preg: Option<PReg>,
+    /// Canonical memory slot on the managed stack.
+    pub slot: Option<SlotState>,
+}
+
+impl VRegState {
     pub fn new() -> Self {
-        let scratch_pool: Vec<PReg> = (0..16).map(PReg).collect();
-        let num_regs = 32;
         Self {
-            defs: Vec::new(),
-            refs: Vec::new(),
-            bindings: vec![None; num_regs],
-            locations: Vec::new(),
-            scratch_pool,
+            preg: None,
+            slot: None,
         }
     }
+}
 
-    // --- VReg definitions ---
+// --- VRegAllocator ---
+
+/// Global VReg factory — hands out VReg IDs and stores definitions.
+#[derive(Debug, Clone)]
+pub struct VRegAllocator {
+    defs: Vec<VRegDef>,
+}
+
+impl VRegAllocator {
+    pub fn new() -> Self {
+        Self { defs: Vec::new() }
+    }
 
     pub fn define(&mut self, init: VInit, width: Width) -> VReg {
         let id = VReg(self.defs.len() as u32);
@@ -85,47 +79,25 @@ impl RegAlloc {
             VInit::PReg(preg) => Some(*preg),
             _ => None,
         };
-        let bind_preg = target;
         self.defs.push(VRegDef {
             id,
             width,
             init,
             target,
         });
-        self.locations.push(None);
-
-        if let Some(preg) = bind_preg {
-            self.bind(id, preg);
-        }
-
         id
     }
 
-    /// Allocate a new VRegRef. Returns the RefId.
-    pub fn alloc_ref(&mut self, def: VRegRefDef) -> VRegRefId {
-        let id = VRegRefId(self.refs.len() as u32);
-        self.refs.push(def);
-        id
-    }
-
-    /// Look up a ref's definition.
-    pub fn ref_def(&self, id: VRegRefId) -> &VRegRefDef {
-        &self.refs[id.0 as usize]
-    }
-
-    /// Resolve a VReg. In the new pipeline, VRegs are always defs —
-    /// the Def/Ref distinction is handled at the builder layer.
-    pub fn resolve(&self, vreg: VReg) -> DefOrPhi {
-        DefOrPhi::Def(vreg)
-    }
-
-    /// Set a target PReg constraint on a VReg definition.
     pub fn set_target(&mut self, id: VReg, preg: PReg) {
         self.defs[id.0 as usize].target = Some(preg);
     }
 
     pub fn def(&self, id: VReg) -> &VRegDef {
         &self.defs[id.0 as usize]
+    }
+
+    pub fn def_mut(&mut self, id: VReg) -> &mut VRegDef {
+        &mut self.defs[id.0 as usize]
     }
 
     pub fn init(&self, id: VReg) -> &VInit {
@@ -139,26 +111,77 @@ impl RegAlloc {
     pub fn len(&self) -> usize {
         self.defs.len()
     }
+}
 
-    // --- Bindings ---
+pub type SharedVRegAllocator = Rc<RefCell<VRegAllocator>>;
+
+// --- RegState ---
+
+/// Per-block register state. Forked at branch points.
+/// Carries a shared reference to the VRegAllocator for def lookups.
+#[derive(Clone)]
+pub struct RegState {
+    pub alloc: SharedVRegAllocator,
+    /// Per-VReg live state — only populated for VRegs active in this block.
+    pub vregs: BTreeMap<VReg, VRegState>,
+    /// PReg → VReg reverse mapping. None = free.
+    pub bindings: Vec<Option<VReg>>,
+    pub scratch_pool: Vec<PReg>,
+}
+
+impl RegState {
+    pub fn new(alloc: SharedVRegAllocator) -> Self {
+        let scratch_pool: Vec<PReg> = (0..16).map(PReg).collect();
+        let num_regs = 32;
+        Self {
+            alloc,
+            vregs: BTreeMap::new(),
+            bindings: vec![None; num_regs],
+            scratch_pool,
+        }
+    }
+
+    /// Define a new VReg through the shared allocator and initialize
+    /// its live state in this block.
+    pub fn define(&mut self, init: VInit, width: Width) -> VReg {
+        let slot = match &init {
+            VInit::Mem(s) => Some(SlotState { slot: *s, dirty: false }),
+            _ => None,
+        };
+        let bind_preg = match &init {
+            VInit::PReg(preg) => Some(*preg),
+            _ => None,
+        };
+
+        let vreg = self.alloc.borrow_mut().define(init, width);
+        self.vregs.insert(vreg, VRegState { preg: None, slot });
+
+        if let Some(preg) = bind_preg {
+            self.bind(vreg, preg);
+        }
+
+        vreg
+    }
 
     /// Bind a VReg to a PReg.
-    fn bind(&mut self, vreg: VReg, preg: PReg) {
+    pub fn bind(&mut self, vreg: VReg, preg: PReg) {
         self.bindings[preg.0 as usize] = Some(vreg);
-        self.locations[vreg.0 as usize] = Some(preg);
+        self.vregs.entry(vreg).or_insert_with(VRegState::new).preg = Some(preg);
     }
 
     /// Unbind a VReg from its PReg.
-    fn unbind(&mut self, vreg: VReg) {
-        if let Some(preg) = self.locations[vreg.0 as usize] {
-            self.bindings[preg.0 as usize] = None;
+    pub fn unbind(&mut self, vreg: VReg) {
+        if let Some(state) = self.vregs.get_mut(&vreg) {
+            if let Some(preg) = state.preg {
+                self.bindings[preg.0 as usize] = None;
+            }
+            state.preg = None;
         }
-        self.locations[vreg.0 as usize] = None;
     }
 
     /// Which PReg is this VReg in, if any?
     pub fn location(&self, vreg: VReg) -> Option<PReg> {
-        self.locations[vreg.0 as usize]
+        self.vregs.get(&vreg).and_then(|s| s.preg)
     }
 
     /// Which VReg occupies this PReg, if any?
@@ -166,7 +189,7 @@ impl RegAlloc {
         self.bindings[preg.0 as usize]
     }
 
-    /// Allocate a free scratch register. Returns None if all are occupied.
+    /// Allocate a free scratch register.
     pub fn alloc_scratch(&self) -> Option<PReg> {
         self.scratch_pool
             .iter()
@@ -174,112 +197,36 @@ impl RegAlloc {
             .copied()
     }
 
-    /// Allocate a physical register for a VReg. If the VReg has a
-    /// target PReg (from VInit::PReg), use that. Otherwise pick a
-    /// free scratch register.
+    /// Allocate a physical register for a VReg.
     pub fn alloc_preg(&mut self, vreg: VReg) -> Result<PReg, CompileError> {
-        // Already in a register?
         if let Some(preg) = self.location(vreg) {
             return Ok(preg);
         }
 
-        // Has a target constraint?
-        if let Some(target) = self.def(vreg).target {
-            // TODO: evict if occupied
+        let target = self.alloc.borrow().def(vreg).target;
+        if let Some(target) = target {
             self.bind(vreg, target);
             return Ok(target);
         }
 
-        // Pick a free scratch register.
         let preg = self.alloc_scratch().ok_or(CompileError::RegPoolExhausted)?;
         self.bind(vreg, preg);
         Ok(preg)
     }
 
-    /// Resolve a VReg to a physical register.
-    /// Chases through Direct refs, allocates a PReg for the underlying Def.
-    /// Panics on unresolved Phi — those need regalloc phi resolution first.
-    pub fn resolve_vreg(&mut self, vreg: VReg) -> Result<PReg, CompileError> {
-        match self.resolve(vreg) {
-            DefOrPhi::Def(id) => self.alloc_preg(id),
-            DefOrPhi::Phi(sources) => {
-                // TODO: proper phi resolution — ensure all sources
-                // converge into the same register. For now, just
-                // allocate a fresh Def with VInit::Phi.
-                let width = self.resolve_phi_width(&sources);
-                let phi_def = self.define(VInit::Phi(sources), width);
-                self.alloc_preg(phi_def)
-            }
-        }
-    }
-
-    fn resolve_phi_width(&self, sources: &[VReg]) -> Width {
-        match self.resolve(sources[0]) {
-            DefOrPhi::Def(id) => self.width(id),
-            DefOrPhi::Phi(nested) => self.resolve_phi_width(&nested),
-        }
-    }
-
-    /// Identity — VReg is now a plain struct, no Def/Ref distinction.
-    fn expect_def(vreg: VReg) -> VReg {
-        vreg
-    }
-
-    /// Resolve any operand to its final form (PReg or immediate).
-    /// VRegs get allocated to PRegs. Other operands pass through.
+    /// Resolve a VReg operand to a PReg.
     pub fn resolve_operand(&mut self, op: Operand) -> Result<Operand, CompileError> {
         match op {
-            Operand::VReg(vreg) => Ok(Operand::PReg(self.resolve_vreg(vreg)?)),
+            Operand::VReg(vreg) => Ok(Operand::PReg(self.alloc_preg(vreg)?)),
             other => Ok(other),
         }
     }
 
-    // --- Immediate folding + materialization ---
-
-    pub fn imm_or_materialize_vreg<Imm>(
-        &mut self,
-        vreg: VReg,
-        output: &mut CodeCtx,
-    ) -> Result<VRegOr<Imm>, CompileError>
-    where
-        Imm: TryFrom<i64>,
-    {
-        if let VInit::Const(val) = &self.def(vreg).init {
-            if let Ok(imm) = Imm::try_from(*val) {
-                return Ok(VRegOr::Imm(imm));
-            }
-        }
-
-        self.materialize(vreg, output)?;
-        Ok(VRegOr::VReg(vreg))
-    }
-
-    pub fn materialize(
-        &mut self,
-        vreg: VReg,
-        output: &mut CodeCtx,
-    ) -> Result<(), CompileError> {
-        match &self.def(vreg).init {
-            VInit::Const(val) => {
-                let val = *val;
-                self.defs[vreg.0 as usize].init = VInit::InstDst;
-                self.materialize_const(vreg, val, output)?;
-            }
-            VInit::Mem(..) => todo!("mem materialization"),
-            VInit::PReg(..) => {
-                // TODO: emit move if target is different from current PReg
-                // Already in a register, nothing to materialize.
-            }
-            VInit::InstDst => {}
-            VInit::Phi(_) => {} // phi resolution handled elsewhere
-        }
-        Ok(())
-    }
-
+    /// Try to fold a VReg as an immediate, or materialize it.
     pub fn imm_or_materialize<Imm>(
         &mut self,
         operand: Operand,
-        output: &mut CodeCtx,
+        output: &mut autosynth_ir::CodeCtx,
     ) -> Result<VRegOr<Imm>, CompileError>
     where
         Imm: TryFrom<i64>,
@@ -290,26 +237,46 @@ impl RegAlloc {
                 self.materialize_const(vreg, val, output)?;
                 Ok(VRegOr::VReg(vreg))
             }
-            Operand::VReg(vreg) => match self.resolve(vreg) {
-                DefOrPhi::Def(id) => self.imm_or_materialize_vreg(id, output),
-                DefOrPhi::Phi(_) => Ok(VRegOr::VReg(vreg)), // phi stays for regalloc
-            },
+            Operand::VReg(vreg) => {
+                let init = self.alloc.borrow().init(vreg).clone();
+                if let VInit::Const(val) = init {
+                    if let Ok(imm) = Imm::try_from(val) {
+                        return Ok(VRegOr::Imm(imm));
+                    }
+                }
+                self.materialize(vreg, output)?;
+                Ok(VRegOr::VReg(vreg))
+            }
             _ => unimplemented!(),
         }
+    }
+
+    /// Materialize a VReg if it's a constant or in memory.
+    pub fn materialize(&mut self, vreg: VReg, output: &mut autosynth_ir::CodeCtx) -> Result<(), CompileError> {
+        let init = self.alloc.borrow().init(vreg).clone();
+        match init {
+            VInit::Const(val) => {
+                self.alloc.borrow_mut().def_mut(vreg).init = VInit::InstDst;
+                self.materialize_const(vreg, val, output)?;
+            }
+            VInit::Mem(..) => todo!("mem materialization"),
+            VInit::PReg(..) => {}
+            VInit::InstDst => {}
+            VInit::Phi(_) => {}
+        }
+        Ok(())
     }
 
     fn materialize_const(
         &mut self,
         vreg: VReg,
         val: i64,
-        output: &mut CodeCtx,
+        output: &mut autosynth_ir::CodeCtx,
     ) -> Result<(), CompileError> {
-        self.defs[vreg.0 as usize].init = VInit::InstDst;
-
-        output.operands.push_back(Operand::Const(val));
-        output.operands.push_back(Operand::VReg(vreg));
-        output.vcode.push_back(VCode::Materialize);
-
+        self.alloc.borrow_mut().def_mut(vreg).init = VInit::InstDst;
+        output.push(VCode::Materialize);
+        output.push_operand(Operand::Const(val));
+        output.push_operand(Operand::VReg(vreg));
         Ok(())
     }
 }

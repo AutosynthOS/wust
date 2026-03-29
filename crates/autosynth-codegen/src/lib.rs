@@ -8,12 +8,14 @@
 
 /// New VCode pipeline builder.
 pub mod builder;
+/// Convergence selector — phi materialization before branches.
+pub mod converge;
 /// Old builder (preserved for reference / old tests).
 // mod builder_old;
 /// IR types (IrFunction, IrBlock).
 pub mod ir;
 /// IR function and block types (old pipeline).
-mod ir_function;
+// mod ir_function;
 /// Lowerer (old pipeline).
 // mod lowerer;
 /// New VCode pipeline — compile IrFunction through a Selector.

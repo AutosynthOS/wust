@@ -14,7 +14,7 @@ use core::fmt;
 use autosynth_isa::{PReg, Width};
 
 /// Virtual register — a simple index into the regalloc's def table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub struct VReg(pub u32);
 
@@ -50,11 +50,19 @@ impl fmt::Display for BlockId {
 }
 
 /// Index identifying a function in the compilation unit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum FunctionIdx {
     /// A user-defined function, indexed by its position in the module.
     User(u32),
+}
+
+/// A label identifying a position in emitted code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
+pub enum Label {
+    /// A block within a function.
+    Block(FunctionIdx, BlockId),
 }
 
 /// WASM value type for the IR layer.
@@ -388,59 +396,6 @@ pub struct VRegDef {
     pub target: Option<PReg>,
 }
 
-/// How a [`VRegRef`] obtains its value.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "trace", derive(serde::Serialize))]
-pub enum VRegRefSource {
-    /// Direct alias — single predecessor, resolves straight through.
-    Direct(VReg),
-    /// Merge point — multiple predecessors provide different values.
-    /// Each entry is (predecessor_block, source_vreg).
-    Phi(Vec<(BlockId, VReg)>),
-}
-
-/// Metadata for a [`VReg::Ref`] — an indirection to another VReg.
-///
-/// Created at block entry when cloning predecessor region state.
-/// Starts as [`VRegRefSource::Direct`] and may be upgraded to
-/// [`VRegRefSource::Phi`] when additional predecessors merge in.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "trace", derive(serde::Serialize))]
-pub struct VRegRef {
-    /// The ref's own identifier (always [`VReg::Ref`]).
-    pub id: VReg,
-    /// Register width.
-    pub width: Width,
-    /// How this ref obtains its value.
-    pub source: VRegRefSource,
-}
-
-impl fmt::Display for VRegRef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.source {
-            VRegRefSource::Direct(src) => write!(f, "{}->{}", self.id, src),
-            VRegRefSource::Phi(sources) => {
-                write!(f, "{}\u{2192}", self.id)?;
-                for (i, (_, vreg)) in sources.iter().enumerate() {
-                    if i > 0 {
-                        write!(f, ",")?;
-                    }
-                    write!(f, "{vreg}")?;
-                }
-                Ok(())
-            }
-        }
-    }
-}
-
-/// Region slot entries can hold either a VReg (a real definition) or
-/// a VRegionSlot (which may be a ref/phi for block merging). This is
-/// used by the old builder's region snapshots and merge logic.
-///
-/// The VRegRef / VRegRefSource types above are retained for the old
-/// builder pipeline; new code should use the VCode pipeline's builder
-/// which handles refs locally.
-
 /// A named region of memory anchored to a register + offset.
 ///
 /// Used for both stack-like regions (push/pop) and struct-like regions
@@ -507,6 +462,22 @@ pub enum Operand {
     UImm12(autosynth_isa::UImm12),
 }
 
+impl From<VReg> for Operand {
+    fn from(v: VReg) -> Self { Operand::VReg(v) }
+}
+
+impl From<PReg> for Operand {
+    fn from(p: PReg) -> Self { Operand::PReg(p) }
+}
+
+impl From<autosynth_isa::UImm12> for Operand {
+    fn from(i: autosynth_isa::UImm12) -> Self { Operand::UImm12(i) }
+}
+
+impl From<SlotRef> for Operand {
+    fn from(s: SlotRef) -> Self { Operand::Mem(s) }
+}
+
 // ---- VCode: new pipeline instruction set ----
 
 /// Virtual-code instruction — the shared instruction type for the
@@ -522,14 +493,13 @@ pub enum Operand {
 /// operations into sequences of lower-level ones when needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VCode {
-    /// Arithmetic / logic / comparison: consumes 2 operands (lhs, rhs),
-    /// pushes 1 result (dst). The selector resolves operand forms
-    /// (register vs immediate) based on the target architecture.
+    /// An inline operand in the VCode stream.
+    Operand(Operand),
+
+    /// Arithmetic / logic / comparison.
     Alu { op: AluOp },
 
-    /// Compare-and-branch: consumes 2 operands (lhs, rhs), compares
-    /// with `op`, and branches. Fused from Alu(Comp) + BrIf at the
-    /// wasm builder level.
+    /// Compare-and-branch: fused from Alu(Comp) + BrIf.
     BrIf {
         op: CompOp,
         block_if: BlockId,
@@ -539,27 +509,29 @@ pub enum VCode {
     /// Unconditional branch.
     Branch { target: BlockId },
 
-    /// Function call: consumes N operands (args). The frontend is
-    /// responsible for emitting saves/restores around this.
+    /// Function call.
     Call { func_idx: FunctionIdx },
 
-    /// Load from memory: consumes 1 operand (base), pushes 1 result.
+    /// Load from memory.
     Load { offset: u32, width: Width },
 
-    /// Store to memory: consumes 2 operands (value, base).
+    /// Store to memory.
     Store { offset: u32, width: Width },
 
-    /// Move / copy: consumes 1 operand (src), pushes 1 result (dst).
-    /// Used for register-to-register moves, CC setup, etc.
+    /// Move / copy.
     Move,
 
     /// Materialize a constant into a register.
-    /// Operands: [Const(val), VReg(dst)] or [Const(val), PReg(dst)].
-    /// The emitter encodes this as movz/movk (ARM64), mov imm (x86), etc.
     Materialize,
 
-    /// Return from function. Consumes 0..N operands (results).
+    /// Return from function.
     Return,
+}
+
+impl From<Operand> for VCode {
+    fn from(op: Operand) -> Self {
+        VCode::Operand(op)
+    }
 }
 
 // ---- CodeCtx ----
@@ -574,29 +546,45 @@ pub enum CompileError {
     RegPoolExhausted,
 }
 
+#[derive(Clone)]
 pub struct CodeCtx {
-    pub vcode: VecDeque<VCode>,
-    pub operands: VecDeque<Operand>,
+    pub stream: VecDeque<VCode>,
 }
 
 impl CodeCtx {
     pub fn new() -> Self {
         Self {
-            vcode: VecDeque::new(),
-            operands: VecDeque::new(),
+            stream: VecDeque::new(),
         }
     }
 
-    pub fn from(vcode: VecDeque<VCode>, operands: Vec<Operand>) -> Self {
-        Self {
-            vcode,
-            operands: VecDeque::from(operands),
-        }
+    pub fn push(&mut self, item: VCode) {
+        self.stream.push_back(item);
     }
 
+    pub fn push_operand(&mut self, op: Operand) {
+        self.stream.push_back(VCode::Operand(op));
+    }
+
+    /// Pop the next non-operand item from the front.
     pub fn next_operand(&mut self) -> Result<Operand, CompileError> {
-        self.operands
-            .pop_front()
-            .ok_or(CompileError::OperandUnderflow)
+        match self.stream.pop_front() {
+            Some(VCode::Operand(op)) => Ok(op),
+            Some(other) => {
+                // Put it back — caller expected an operand but got an instruction.
+                self.stream.push_front(other);
+                Err(CompileError::OperandUnderflow)
+            }
+            None => Err(CompileError::OperandUnderflow),
+        }
+    }
+
+    /// Pop the next item from the front (operand or instruction).
+    pub fn next(&mut self) -> Option<VCode> {
+        self.stream.pop_front()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.stream.is_empty()
     }
 }

@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use autosynth_ir::BlockId;
-use autosynth_regalloc::RegAlloc;
+use autosynth_regalloc::SharedVRegAllocator;
 
 use super::IrBlock;
 
-/// A completed function — finalized blocks in RPO + regalloc state.
+/// A completed function — finalized blocks in RPO + shared VReg allocator.
 pub struct IrFunction {
-    pub regalloc: RegAlloc,
+    pub alloc: SharedVRegAllocator,
     pub blocks: BTreeMap<BlockId, IrBlock>,
     pub block_order: Vec<BlockId>,
 }

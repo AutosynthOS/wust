@@ -1,4 +1,4 @@
-use autosynth_ir::VReg;
+use autosynth_ir::{VCode, VReg};
 
 /// A value during building — either a concrete VReg or an indirection
 /// (ref) for block-inherited values. Resolved at build() time.
@@ -18,11 +18,10 @@ impl From<VReg> for VRegOrRef {
     }
 }
 
-/// How a ref obtains its value.
-#[derive(Debug, Clone)]
-pub enum VRefSource {
-    /// Single predecessor — just an alias.
-    Direct(VRegOrRef),
-    /// Merge point — multiple predecessors provide different values.
-    Phi(Vec<VRegOrRef>),
+/// An item in the builder's stream — either an operand (resolved
+/// later) or a VCode instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuilderItem {
+    Operand(VRegOrRef),
+    Inst(VCode),
 }

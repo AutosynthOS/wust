@@ -1,60 +1,70 @@
 use autosynth_ir::CompileError;
 use autosynth_ir::{CodeCtx, Operand, VCode};
 use autosynth_isa::UImm12;
-use autosynth_regalloc::{RegAlloc, VRegOr};
+use autosynth_regalloc::{SharedVRegAllocator, VInit};
 
 pub fn fold_immediates(
-    regalloc: &mut RegAlloc,
+    alloc: &SharedVRegAllocator,
     input: &mut CodeCtx,
 ) -> Result<CodeCtx, CompileError> {
     let mut output = CodeCtx::new();
 
-    while let Some(inst) = input.vcode.pop_front() {
-        lower_inst(regalloc, &inst, input, &mut output)?;
+    while let Some(item) = input.next() {
+        match item {
+            VCode::Alu { .. } => {
+                let lhs = input.next_operand()?;
+                let rhs = input.next_operand()?;
+                let dst = input.next_operand()?;
+
+                // lhs stays as VReg — must be a register operand.
+                // rhs: try to fold as immediate if it's a const VReg.
+                let rhs = try_fold_imm::<UImm12>(rhs, alloc);
+
+                output.push(item);
+                output.push_operand(lhs);
+                output.push_operand(rhs);
+                output.push_operand(dst);
+            }
+            VCode::BrIf { .. } => {
+                let lhs = input.next_operand()?;
+                let rhs = input.next_operand()?;
+
+                let rhs = try_fold_imm::<UImm12>(rhs, alloc);
+
+                output.push(item);
+                output.push_operand(lhs);
+                output.push_operand(rhs);
+            }
+            other => {
+                output.push(other);
+            }
+        }
     }
 
     Ok(output)
 }
 
-fn lower_inst(
-    regalloc: &mut RegAlloc,
-    inst: &VCode,
-    input: &mut CodeCtx,
-    output: &mut CodeCtx,
-) -> Result<(), CompileError> {
-    match inst {
-        VCode::Alu { .. } => {
-            let lhs = input.next_operand()?;
-            let rhs = input.next_operand()?;
-            let dst = input.next_operand()?;
-
-            let rhs = match regalloc.imm_or_materialize::<UImm12>(rhs, output)? {
-                VRegOr::Imm(imm) => Operand::UImm12(imm),
-                VRegOr::VReg(vreg) => Operand::VReg(vreg),
-            };
-
-            output.operands.push_back(lhs);
-            output.operands.push_back(rhs);
-            output.operands.push_back(dst);
-            output.vcode.push_back(inst.clone());
+/// Try to fold a VReg operand as an immediate. If the VReg is a
+/// Const that fits in `Imm`, returns the folded operand.
+/// Otherwise returns the original operand unchanged.
+fn try_fold_imm<Imm>(op: Operand, alloc: &SharedVRegAllocator) -> Operand
+where
+    Imm: TryFrom<i64> + Into<Operand>,
+{
+    let val = match op {
+        Operand::VReg(vreg) => {
+            let alloc = alloc.borrow();
+            match alloc.init(vreg) {
+                VInit::Const(val) => *val,
+                _ => return op,
+            }
         }
-        VCode::BrIf { .. } => {
-            let lhs = input.next_operand()?;
-            let rhs = input.next_operand()?;
+        Operand::Const(val) => val,
+        _ => return op,
+    };
 
-            let rhs = match regalloc.imm_or_materialize::<UImm12>(rhs, output)? {
-                VRegOr::Imm(imm) => Operand::UImm12(imm),
-                VRegOr::VReg(vreg) => Operand::VReg(vreg),
-            };
-
-            output.operands.push_back(lhs);
-            output.operands.push_back(rhs);
-            output.vcode.push_back(inst.clone());
-        }
-        _ => {
-            output.vcode.push_back(inst.clone());
-        }
+    match Imm::try_from(val) {
+        Ok(imm) => imm.into(),
+        _ => op,
     }
-
-    Ok(())
 }

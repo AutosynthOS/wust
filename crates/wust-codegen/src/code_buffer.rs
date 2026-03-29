@@ -1,4 +1,7 @@
+use std::collections::BTreeMap;
+
 use autosynth_emitter::CodeContext;
+use autosynth_ir::Label;
 use wust_core::mmap::{MmapRegion, Protection, align_up, page_size};
 
 /// Default reservation: 128MB virtual address space.
@@ -18,6 +21,8 @@ pub struct CodeBuffer {
     /// Bytes written so far.
     len: usize,
     finalized: bool,
+    /// Label → byte offset mapping. Persists across finalizations.
+    labels: BTreeMap<Label, usize>,
 }
 
 impl CodeBuffer {
@@ -37,6 +42,7 @@ impl CodeBuffer {
             committed: initial_commit,
             len: 0,
             finalized: false,
+            labels: BTreeMap::new(),
         })
     }
 
@@ -113,6 +119,33 @@ impl CodeContext for CodeBuffer {
             );
         }
         self.len += bytes.len();
+        Ok(())
+    }
+
+    fn offset(&self) -> usize {
+        self.len
+    }
+
+    fn mark_label(&mut self, label: Label) {
+        self.labels.insert(label, self.len);
+    }
+
+    fn label_offset(&self, label: Label) -> Option<usize> {
+        self.labels.get(&label).copied()
+    }
+
+    fn write_bytes(&mut self, offset: usize, bytes: &[u8]) -> Result<(), Self::Error> {
+        assert!(offset + bytes.len() <= self.len, "write_bytes out of bounds");
+        if self.finalized {
+            self.reopen()?;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.region.base().add(offset),
+                bytes.len(),
+            );
+        }
         Ok(())
     }
 }

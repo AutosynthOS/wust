@@ -1,38 +1,49 @@
 use std::collections::BTreeMap;
-use autosynth_ir::{BlockId, Operand, VCode, VInit, VReg};
-use autosynth_regalloc::RegAlloc;
+use std::cell::RefCell;
+use std::rc::Rc;
+use autosynth_ir::{BlockId, Operand, VCode, VReg};
+use autosynth_isa::{PReg, Width};
+use autosynth_regalloc::{SharedVRegAllocator, VInit, VRegAllocator};
 
-use super::{BlockBuilder, VRefId, VRefSource, VRegOrRef};
+use super::{BlockBuilder, BuilderItem, VRefId, VRegOrRef};
 use crate::ir::{IrBlock, IrFunction, block_order};
 
 /// Builds a function's VCode representation.
 pub struct FunctionBuilder {
-    pub regalloc: RegAlloc,
+    alloc: SharedVRegAllocator,
     blocks: BTreeMap<BlockId, BlockBuilder>,
     current_block: BlockId,
-    /// Ref table — builder-local indirections for block-inherited values.
-    refs: Vec<VRefSource>,
+    /// Ref table — each ref maps to a VReg.
+    refs: Vec<VReg>,
 }
 
 impl FunctionBuilder {
     pub fn new() -> Self {
+        let alloc: SharedVRegAllocator = Rc::new(RefCell::new(VRegAllocator::new()));
         let entry = BlockId::Entry;
         let mut blocks = BTreeMap::new();
         blocks.insert(entry, BlockBuilder::new(entry));
         Self {
-            regalloc: RegAlloc::new(),
+            alloc,
             blocks,
             current_block: entry,
             refs: Vec::new(),
         }
     }
 
+    /// Define a new VReg, recording it as a def on the current block.
+    pub fn define(&mut self, init: VInit, width: Width) -> VReg {
+        let vreg = self.alloc.borrow_mut().define(init, width);
+        self.current_block_mut().defs.push(vreg);
+        vreg
+    }
+
     pub fn emit(&mut self, inst: VCode) {
-        self.current_block_mut().vcode.push_back(inst);
+        self.current_block_mut().emit(inst);
     }
 
     pub fn push_operand(&mut self, val: impl Into<VRegOrRef>) {
-        self.current_block_mut().operands.push(val.into());
+        self.current_block_mut().push_operand(val);
     }
 
     pub fn current_block_id(&self) -> BlockId {
@@ -54,19 +65,63 @@ impl FunctionBuilder {
 
     // --- Ref table ---
 
-    pub fn alloc_ref(&mut self, source: VRefSource) -> VRefId {
+    pub fn alloc_ref(&mut self, vreg: VReg) -> VRefId {
         let id = VRefId(self.refs.len() as u32);
-        self.refs.push(source);
+        self.refs.push(vreg);
         id
     }
 
-    pub fn ref_source(&self, id: VRefId) -> &VRefSource {
-        &self.refs[id.0 as usize]
+    pub fn ref_vreg(&self, id: VRefId) -> VReg {
+        self.refs[id.0 as usize]
+    }
+
+    pub fn set_ref(&mut self, id: VRefId, vreg: VReg) {
+        self.refs[id.0 as usize] = vreg;
+    }
+
+    /// Merge a new source into a phi. If the existing VReg is already
+    /// a Phi, pushes the new source. Otherwise creates a new Phi VReg,
+    /// inheriting the target constraint, and returns it.
+    /// Returns `Some(new_phi)` if a new VReg was created, `None` if
+    /// the source was pushed onto an existing phi.
+    pub fn merge_phi(&mut self, existing: VReg, new_source: VReg) -> Option<VReg> {
+        let mut alloc = self.alloc.borrow_mut();
+        let def = alloc.def_mut(existing);
+        match &mut def.init {
+            VInit::Phi(sources) => {
+                sources.push(new_source);
+                None
+            }
+            _ => {
+                let width = def.width;
+                let target = def.target;
+                let phi = alloc.define(
+                    VInit::Phi(vec![existing, new_source]),
+                    width,
+                );
+                if let Some(preg) = target {
+                    alloc.set_target(phi, preg);
+                }
+                Some(phi)
+            }
+        }
+    }
+
+    pub fn set_target(&mut self, val: VRegOrRef, preg: PReg) {
+        let vreg = self.resolve(val);
+        self.alloc.borrow_mut().set_target(vreg, preg);
+    }
+
+    pub fn resolve(&self, val: VRegOrRef) -> VReg {
+        match val {
+            VRegOrRef::VReg(vreg) => vreg,
+            VRegOrRef::Ref(ref_id) => self.refs[ref_id.0 as usize],
+        }
     }
 
     // --- Build ---
 
-    pub fn build(mut self) -> IrFunction {
+    pub fn build(self) -> IrFunction {
         let successors: BTreeMap<BlockId, Vec<BlockId>> = self.blocks.iter()
             .map(|(&id, b)| (id, b.successors()))
             .collect();
@@ -80,50 +135,46 @@ impl FunctionBuilder {
 
         let order = block_order::rpo(BlockId::Entry, &successors);
 
-        // Resolve all VRegOrRef operands to concrete VRegs.
-        let mut resolved_blocks: Vec<(BlockId, BlockBuilder, Vec<Operand>)> = Vec::new();
-        for (id, mut b) in self.blocks {
-            let operands: Vec<Operand> = b.operands.drain(..)
-                .map(|val| Operand::VReg(resolve_vreg_or_ref(val, &self.refs, &mut self.regalloc)))
-                .collect();
-            resolved_blocks.push((id, b, operands));
-        }
+        let blocks = self.blocks.into_iter().map(|(id, b)| {
+            let mut stream = std::collections::VecDeque::new();
+            let mut params = Vec::new();
 
-        let blocks = resolved_blocks.into_iter().map(|(id, b, operands)| {
+            for item in b.stream {
+                match item {
+                    BuilderItem::Operand(val) => {
+                        let vreg = match val {
+                            VRegOrRef::VReg(vreg) => vreg,
+                            VRegOrRef::Ref(ref_id) => {
+                                let vreg = self.refs[ref_id.0 as usize];
+                                if !params.contains(&vreg) {
+                                    params.push(vreg);
+                                }
+                                vreg
+                            }
+                        };
+                        stream.push_back(VCode::Operand(Operand::VReg(vreg)));
+                    }
+                    BuilderItem::Inst(inst) => {
+                        stream.push_back(inst);
+                    }
+                }
+            }
+
             (id, IrBlock {
                 id,
-                vcode: b.vcode,
-                operands,
+                stream,
                 successors: successors.get(&id).cloned().unwrap_or_default(),
                 predecessors: predecessors.remove(&id).unwrap_or_default(),
-                params: Vec::new(),
+                defs: b.defs,
+                params,
                 results: Vec::new(),
             })
         }).collect();
 
         IrFunction {
-            regalloc: self.regalloc,
+            alloc: self.alloc,
             blocks,
             block_order: order,
-        }
-    }
-
-}
-
-fn resolve_vreg_or_ref(val: VRegOrRef, refs: &[VRefSource], regalloc: &mut RegAlloc) -> VReg {
-    match val {
-        VRegOrRef::VReg(vreg) => vreg,
-        VRegOrRef::Ref(ref_id) => {
-            match refs[ref_id.0 as usize].clone() {
-                VRefSource::Direct(inner) => resolve_vreg_or_ref(inner, refs, regalloc),
-                VRefSource::Phi(sources) => {
-                    let resolved: Vec<VReg> = sources.into_iter()
-                        .map(|s| resolve_vreg_or_ref(s, refs, regalloc))
-                        .collect();
-                    let width = regalloc.width(resolved[0]);
-                    regalloc.define(VInit::Phi(resolved), width)
-                }
-            }
         }
     }
 }
