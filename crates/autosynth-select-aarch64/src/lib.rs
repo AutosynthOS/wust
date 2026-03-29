@@ -1,8 +1,9 @@
 /// AArch64 instruction selector.
 ///
-/// Works purely with VRegs — no PReg allocation. Folds constants
-/// as immediates where possible, emits Materialize for the rest.
+/// Pass 1: commutative swap — move consts to rhs.
+/// Pass 2: fold immediates — fold rhs consts as UImm12.
 mod pass_1;
+mod pass_2;
 
 use autosynth_ir::{CodeCtx, CompileError};
 use autosynth_regalloc::SharedVRegAllocator;
@@ -23,6 +24,7 @@ impl Selector for Aarch64Selector {
         &mut self,
         input: &mut CodeCtx,
     ) -> Result<CodeCtx, CompileError> {
-        pass_1::fold_immediates(&self.alloc, input)
+        let mut swapped = pass_1::commutative_swap(&self.alloc, input)?;
+        pass_2::fold_immediates(&self.alloc, &mut swapped)
     }
 }

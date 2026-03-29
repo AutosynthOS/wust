@@ -25,3 +25,4 @@ wat = "1.245.1"
 autosynth-select-aarch64 = { path = "../autosynth-select-aarch64" }
 autosynth-selector = { path = "../autosynth-selector" }
 autosynth-emit-aarch64 = { path = "../autosynth-emit-aarch64" }
+autosynth-test-utils = { path = "../autosynth-test-utils" }

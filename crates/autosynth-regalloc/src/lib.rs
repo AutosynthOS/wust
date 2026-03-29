@@ -198,19 +198,60 @@ impl RegState {
     }
 
     /// Allocate a physical register for a VReg.
+    ///
+    /// For phi VRegs: reuses the PReg of the first source that already
+    /// has one, and sets target on all other sources so they converge
+    /// to the same register.
     pub fn alloc_preg(&mut self, vreg: VReg) -> Result<PReg, CompileError> {
         if let Some(preg) = self.location(vreg) {
             return Ok(preg);
         }
 
-        let target = self.alloc.borrow().def(vreg).target;
+        let alloc = self.alloc.borrow();
+        let target = alloc.def(vreg).target;
         if let Some(target) = target {
+            drop(alloc);
             self.bind(vreg, target);
             return Ok(target);
         }
 
+        // Phi: find an existing PReg from sources, propagate as target.
+        if let VInit::Phi(sources) = alloc.init(vreg).clone() {
+            drop(alloc);
+            let preg = self.alloc_phi_preg(vreg, &sources)?;
+            return Ok(preg);
+        }
+
+        drop(alloc);
         let preg = self.alloc_scratch().ok_or(CompileError::RegPoolExhausted)?;
         self.bind(vreg, preg);
+        Ok(preg)
+    }
+
+    /// Allocate a PReg for a phi VReg. Finds the first source that
+    /// already has a PReg, uses that, and sets target on all other
+    /// sources so predecessor blocks will place values there.
+    fn alloc_phi_preg(&mut self, phi: VReg, sources: &[VReg]) -> Result<PReg, CompileError> {
+        // Find a PReg from any source that's already allocated.
+        let preg = sources.iter()
+            .find_map(|&src| self.location(src))
+            .or_else(|| {
+                // No source has a PReg yet — pick a fresh scratch.
+                self.alloc_scratch()
+            })
+            .ok_or(CompileError::RegPoolExhausted)?;
+
+        // Bind the phi to this PReg.
+        self.bind(phi, preg);
+
+        // Set target on all sources so predecessors converge here.
+        let mut alloc = self.alloc.borrow_mut();
+        for &src in sources {
+            if alloc.def(src).target.is_none() {
+                alloc.set_target(src, preg);
+            }
+        }
+
         Ok(preg)
     }
 

@@ -4,7 +4,8 @@ use autosynth_ir::{BlockId, CodeCtx};
 use autosynth_regalloc::RegState;
 use autosynth_selector::{CompileError, Selector};
 
-use crate::converge::ConvergeSelector;
+use crate::selector::converge::ConvergeSelector;
+use crate::selector::preg_alloc::PRegAllocSelector;
 use crate::ir::IrFunction;
 
 /// A compiled function — lowered VCode blocks.
@@ -13,11 +14,12 @@ pub struct VCodeFunction {
     pub block_order: Vec<BlockId>,
 }
 
-/// Compile an IR function through a selector + convergence.
+/// Compile an IR function through select → converge → preg_alloc.
 ///
 /// For each block:
-/// 1. Run the main selector (instruction selection, immediate folding)
-/// 2. Run the convergence selector (phi materialization + PReg alloc before branches)
+/// 1. Instruction selection (pure VRegs, immediate folding)
+/// 2. Convergence (emit Materialize for const phi sources)
+/// 3. PReg allocation (resolve all VReg operands to PRegs)
 pub fn compile(
     func: &IrFunction,
     selector: &mut impl Selector,
@@ -26,29 +28,27 @@ pub fn compile(
     let mut snapshots: BTreeMap<BlockId, RegState> = BTreeMap::new();
 
     // Entry block starts with a fresh RegState.
-    let entry_state = RegState::new(func.alloc.clone());
-    snapshots.insert(func.block_order[0], entry_state);
+    snapshots.insert(func.block_order[0], RegState::new(func.alloc.clone()));
 
     for &block_id in &func.block_order {
         let block = &func.blocks[&block_id];
         let mut input = CodeCtx { stream: block.stream.clone() };
 
-        // 1. Instruction selection (pure VRegs, no PReg allocation).
-        let mut selected = selector.select(&mut input)?;
+        // 1. Instruction selection.
+        let mut stream = selector.select(&mut input)?;
 
-        // 2. Convergence — materialize phi sources before branches.
+        // 2. Convergence — emit Materialize for const phi sources.
+        {
+            let mut converge = ConvergeSelector::new(&func.alloc, block_id, &func.blocks);
+            stream = converge.select(&mut stream)?;
+        }
+
+        // 3. PReg allocation.
         let mut state = snapshots.remove(&block_id)
             .unwrap_or_else(|| RegState::new(func.alloc.clone()));
-
         {
-            let mut converge = ConvergeSelector::new(
-                func.alloc.clone(),
-                &mut state,
-                block_id,
-                &func.blocks,
-                &mut snapshots,
-            );
-            selected = converge.select(&mut selected)?;
+            let mut preg_alloc = PRegAllocSelector::new(&mut state);
+            stream = preg_alloc.select(&mut stream)?;
         }
 
         // Save state as snapshot for successors that don't have one yet.
@@ -58,7 +58,7 @@ pub fn compile(
             }
         }
 
-        blocks.insert(block_id, selected);
+        blocks.insert(block_id, stream);
     }
 
     Ok(VCodeFunction {

@@ -10,3 +10,6 @@ autosynth-isa-aarch64 = { path = "../autosynth-isa-aarch64" }
 autosynth-selector = { path = "../autosynth-selector" }
 autosynth-regalloc = { path = "../autosynth-regalloc" }
 autosynth-codegen = { path = "../autosynth-codegen" }
+
+[dev-dependencies]
+autosynth-test-utils = { path = "../autosynth-test-utils" }

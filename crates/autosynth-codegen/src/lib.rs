@@ -8,8 +8,8 @@
 
 /// New VCode pipeline builder.
 pub mod builder;
-/// Convergence selector — phi materialization before branches.
-pub mod converge;
+/// Backend-agnostic selector passes (convergence, PReg allocation).
+pub mod selector;
 /// Old builder (preserved for reference / old tests).
 // mod builder_old;
 /// IR types (IrFunction, IrBlock).

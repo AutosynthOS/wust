@@ -25,20 +25,16 @@ pub fn assert_stream_eq(block: &CodeCtx, expected: &[VCode]) {
         let e = exp_lines.get(i);
         match (g, e) {
             (Some(g), Some(e)) if g == e => {
-                // Match — dim
                 msg.push_str(&format!("  \x1b[2m{g}\x1b[0m\n"));
             }
             (Some(g), Some(e)) => {
-                // Mismatch — show both
                 msg.push_str(&format!("  \x1b[31m- {g}\x1b[0m\n"));
                 msg.push_str(&format!("  \x1b[32m+ {e}\x1b[0m\n"));
             }
             (Some(g), None) => {
-                // Extra in got
                 msg.push_str(&format!("  \x1b[31m- {g}\x1b[0m\n"));
             }
             (None, Some(e)) => {
-                // Missing from got
                 msg.push_str(&format!("  \x1b[32m+ {e}\x1b[0m\n"));
             }
             (None, None) => unreachable!(),

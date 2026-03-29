@@ -1,5 +1,4 @@
-mod assert;
-pub use assert::assert_stream_eq;
+pub use autosynth_test_utils::assert_stream_eq;
 
 use autosynth_codegen::ir::IrFunction;
 use autosynth_codegen::pipeline::compile;

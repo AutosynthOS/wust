@@ -1,0 +1,8 @@
+[package]
+name = "autosynth-test-utils"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+autosynth-ir = { path = "../autosynth-ir" }
+autosynth-isa = { path = "../autosynth-isa" }
