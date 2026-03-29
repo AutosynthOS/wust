@@ -54,32 +54,38 @@ impl WasmFunctionBuilder {
         self.blocks.get_mut(&id).expect("no current wasm block")
     }
 
+    fn region(&mut self, name: &str) -> &mut Vec<VRegOrRef> {
+        self.current().region(name)
+    }
+
+    fn region_ref(&self, name: &str) -> &[VRegOrRef] {
+        let id = self.inner.current_block_id();
+        self.blocks[&id].region_ref(name)
+    }
+
     // --- Region operations ---
 
     pub fn push_const(&mut self, val: i64, width: Width) {
         let id = self.inner.define(VInit::Const(val), width);
         self.inner.emit(VCode::Define(id));
-        self.current().region("operands").push(VRegOrRef::VReg(id));
+        self.region("operands").push(VRegOrRef::VReg(id));
     }
 
     pub fn push_local(&mut self, idx: usize) {
-        let val = self.current().region_ref("locals")[idx];
-        self.current().region("operands").push(val);
+        let val = self.region_ref("locals")[idx];
+        self.region("operands").push(val);
     }
 
     pub fn pop(&mut self) -> VRegOrRef {
-        self.current()
-            .region("operands")
-            .pop()
-            .expect("operand stack underflow")
+        self.region("operands").pop().expect("operand stack underflow")
     }
 
     pub fn push(&mut self, val: VRegOrRef) {
-        self.current().region("operands").push(val);
+        self.region("operands").push(val);
     }
 
     pub fn local_set(&mut self, idx: usize, val: VRegOrRef) {
-        self.current().region("locals")[idx] = val;
+        self.region("locals")[idx] = val;
     }
 
     // --- VCode emission ---
@@ -94,7 +100,7 @@ impl WasmFunctionBuilder {
         self.inner.emit(VCode::Alu { op });
         self.inner.emit(VCode::Define(dst));
 
-        self.current().region("operands").push(VRegOrRef::VReg(dst));
+        self.region("operands").push(VRegOrRef::VReg(dst));
     }
 
     pub fn eqz(&mut self) {
@@ -107,54 +113,23 @@ impl WasmFunctionBuilder {
         self.inner.emit(VCode::Alu { op: AluOp::Comp(CompOp::Eq) });
         self.inner.emit(VCode::Define(dst));
 
-        self.current().region("operands").push(VRegOrRef::VReg(dst));
+        self.region("operands").push(VRegOrRef::VReg(dst));
     }
 
     // --- Control flow ---
 
     pub fn br_if(&mut self, cond: VRegOrRef, then_block: BlockId, else_block: BlockId) {
-        // Try to fuse a preceding Alu(Comp) into BrIf.
-        let fused = {
-            let block = self.inner.current_block();
-            // Find the last instruction in the stream.
-            let last_inst = block.stream.iter().rev()
-                .find(|item| matches!(item, BuilderItem::Inst(_)));
-            match last_inst {
-                Some(BuilderItem::Inst(VCode::Alu { op: AluOp::Comp(comp_op) })) => {
-                    Some(*comp_op)
-                }
-                _ => None,
-            }
-        };
-
-        if let Some(comp_op) = fused {
-            // Stream is [..., lhs, rhs, Alu, dst]. Pop all 4,
-            // then push lhs + rhs + BrIf (inputs before instruction).
-            let block = self.inner.current_block_mut();
-            block.stream.pop(); // dst operand (output)
-            block.stream.pop(); // Alu inst
-            let rhs = block.stream.pop();
-            let lhs = block.stream.pop();
-
-            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
-                block.stream.push(lhs);
-                block.stream.push(rhs);
-            }
-            block.stream.push(BuilderItem::Inst(VCode::BrIf {
-                op: comp_op,
-                block_if: then_block,
-                block_else: else_block,
-            }));
-        } else {
-            let zero = self.inner.define(VInit::Const(0), Width::W32);
-            self.inner.push_operand(cond);
-            self.inner.push_operand(zero);
-            self.inner.emit(VCode::BrIf {
-                op: CompOp::Ne,
-                block_if: then_block,
-                block_else: else_block,
-            });
-        }
+        // No fusion — just emit BrIf(Ne, cond, 0).
+        // A fuser pass can optimize this later.
+        let zero = self.inner.define(VInit::Const(0), Width::W32);
+        self.inner.emit(VCode::Define(zero));
+        self.inner.push_operand(cond);
+        self.inner.push_operand(zero);
+        self.inner.emit(VCode::BrIf {
+            op: CompOp::Ne,
+            block_if: then_block,
+            block_else: else_block,
+        });
 
         // Fork current block state to each successor independently.
         let id = self.current_id();
@@ -195,13 +170,11 @@ impl WasmFunctionBuilder {
     fn ensure_or_merge(&mut self, target: BlockId, source: BlockId) {
         let src = &self.blocks[&source];
         if self.blocks.contains_key(&target) {
-            // Clone source regions so we can pass them to merge
-            // without holding an immutable borrow on self.blocks.
             let src_clone = src.clone();
             let existing = self.blocks.get_mut(&target).unwrap();
-            existing.merge(&src_clone, &mut self.inner);
+            existing.merge(&src_clone, source, &mut self.inner);
         } else {
-            let forked = src.fork(&mut self.inner);
+            let forked = src.fork(source, &mut self.inner);
             self.blocks.insert(target, forked);
         }
     }

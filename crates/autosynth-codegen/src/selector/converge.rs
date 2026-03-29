@@ -1,5 +1,8 @@
-//! Convergence selector — inserts Materialize instructions for
-//! unmaterialized const VRegs that feed into successor phi params.
+//! Convergence selector — ensures all successor block params
+//! survive to the branch point.
+//!
+//! For const values: emits Materialize + Define before the branch.
+//! For already-live values: emits KeepAlive to prevent unbinding.
 
 use std::collections::BTreeMap;
 
@@ -9,9 +12,13 @@ use autosynth_selector::Selector;
 
 use crate::ir::IrBlock;
 
+enum ConvergeOp {
+    Materialize { vreg: VReg, val: i64 },
+    KeepAlive(VReg),
+}
+
 pub struct ConvergeSelector {
-    /// source VReg → (const value) for consts that need materialization.
-    materializations: Vec<(VReg, i64)>,
+    ops: Vec<ConvergeOp>,
 }
 
 impl ConvergeSelector {
@@ -22,31 +29,36 @@ impl ConvergeSelector {
     ) -> Self {
         let alloc = alloc.borrow();
         let current = &ir_blocks[&block_id];
-        let mut materializations = Vec::new();
+        let mut ops = Vec::new();
 
         for &succ_id in &current.successors {
             let succ = &ir_blocks[&succ_id];
-            let pred_idx = succ.predecessors.iter()
-                .position(|&p| p == block_id);
-            let Some(pred_idx) = pred_idx else { continue };
 
-            for &phi_vreg in &succ.params {
-                let VInit::Phi(sources) = alloc.init(phi_vreg) else { continue };
-                let Some(&source) = sources.get(pred_idx) else { continue };
-
-                if let VInit::Const(val) = alloc.init(source) {
-                    materializations.push((source, *val));
+            for &param in &succ.params {
+                match alloc.init(param) {
+                    VInit::Phi(sources) => {
+                        let Some(source) = sources.iter().find(|s| s.block == block_id) else { continue };
+                        match alloc.init(source.vreg) {
+                            VInit::Const(val) => {
+                                ops.push(ConvergeOp::Materialize { vreg: source.vreg, val: *val });
+                            }
+                            _ => todo!("handle cases where phi source is not a const"),
+                        }
+                    }
+                    _ => {
+                        ops.push(ConvergeOp::KeepAlive(param));
+                    }
                 }
             }
         }
 
-        Self { materializations }
+        Self { ops }
     }
 }
 
 impl Selector for ConvergeSelector {
     fn select(&mut self, input: &mut CodeCtx) -> Result<CodeCtx, CompileError> {
-        if self.materializations.is_empty() {
+        if self.ops.is_empty() {
             let mut output = CodeCtx::new();
             while let Some(item) = input.next() {
                 output.push(item);
@@ -57,10 +69,18 @@ impl Selector for ConvergeSelector {
         let mut output = CodeCtx::new();
         while let Some(item) = input.next() {
             if matches!(item, VCode::Branch { .. } | VCode::BrIf { .. }) {
-                for (vreg, val) in self.materializations.drain(..) {
-                    output.push_operand(Operand::Const(val));
-                    output.push(VCode::Materialize);
-                    output.push(VCode::Define(vreg));
+                for op in self.ops.drain(..) {
+                    match op {
+                        ConvergeOp::Materialize { vreg, val } => {
+                            output.push_operand(Operand::Const(val));
+                            output.push(VCode::Materialize);
+                            output.push(VCode::Define(vreg));
+                        }
+                        ConvergeOp::KeepAlive(vreg) => {
+                            output.push(VCode::KeepAlive);
+                            output.push_operand(Operand::VReg(vreg));
+                        }
+                    }
                 }
             }
             output.push(item);

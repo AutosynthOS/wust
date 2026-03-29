@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::cell::RefCell;
 use std::rc::Rc;
-use autosynth_ir::{BlockId, Operand, VCode, VReg};
+use autosynth_ir::{BlockId, Operand, VCode, VReg, VRegSource};
 use autosynth_isa::{PReg, Width};
 use autosynth_regalloc::{SharedVRegAllocator, VInit, VRegAllocator};
 
@@ -13,8 +13,8 @@ pub struct FunctionBuilder {
     alloc: SharedVRegAllocator,
     blocks: BTreeMap<BlockId, BlockBuilder>,
     current_block: BlockId,
-    /// Ref table — each ref maps to a VReg.
-    refs: Vec<VReg>,
+    /// Ref table — each ref maps to a VRegSource (vreg + source block).
+    refs: Vec<VRegSource>,
 }
 
 impl FunctionBuilder {
@@ -65,28 +65,34 @@ impl FunctionBuilder {
 
     // --- Ref table ---
 
-    pub fn alloc_ref(&mut self, vreg: VReg) -> VRefId {
+    pub fn alloc_ref(&mut self, block: BlockId, vreg: VReg) -> VRefId {
         let id = VRefId(self.refs.len() as u32);
-        self.refs.push(vreg);
+        self.refs.push(VRegSource { block, vreg });
         id
     }
 
-    pub fn ref_vreg(&self, id: VRefId) -> VReg {
+    pub fn ref_source(&self, id: VRefId) -> VRegSource {
         self.refs[id.0 as usize]
     }
 
-    pub fn set_ref(&mut self, id: VRefId, vreg: VReg) {
-        self.refs[id.0 as usize] = vreg;
+    pub fn ref_vreg(&self, id: VRefId) -> VReg {
+        self.refs[id.0 as usize].vreg
+    }
+
+    pub fn set_ref(&mut self, id: VRefId, block: BlockId, vreg: VReg) {
+        self.refs[id.0 as usize] = VRegSource { block, vreg };
     }
 
     /// Merge a new source into a phi. If the existing VReg is already
     /// a Phi, pushes the new source. Otherwise creates a new Phi VReg,
     /// inheriting the target constraint, and returns it.
-    /// Returns `Some(new_phi)` if a new VReg was created, `None` if
-    /// the source was pushed onto an existing phi.
-    pub fn merge_phi(&mut self, existing: VReg, new_source: VReg) -> Option<VReg> {
+    pub fn merge_phi(
+        &mut self,
+        existing: VRegSource,
+        new_source: VRegSource,
+    ) -> Option<VReg> {
         let mut alloc = self.alloc.borrow_mut();
-        let def = alloc.def_mut(existing);
+        let def = alloc.def_mut(existing.vreg);
         match &mut def.init {
             VInit::Phi(sources) => {
                 sources.push(new_source);
@@ -115,7 +121,7 @@ impl FunctionBuilder {
     pub fn resolve(&self, val: VRegOrRef) -> VReg {
         match val {
             VRegOrRef::VReg(vreg) => vreg,
-            VRegOrRef::Ref(ref_id) => self.refs[ref_id.0 as usize],
+            VRegOrRef::Ref(ref_id) => self.refs[ref_id.0 as usize].vreg,
         }
     }
 
@@ -145,7 +151,7 @@ impl FunctionBuilder {
                         let vreg = match val {
                             VRegOrRef::VReg(vreg) => vreg,
                             VRegOrRef::Ref(ref_id) => {
-                                let vreg = self.refs[ref_id.0 as usize];
+                                let vreg = self.refs[ref_id.0 as usize].vreg;
                                 if !params.contains(&vreg) {
                                     params.push(vreg);
                                 }

@@ -375,8 +375,15 @@ pub enum VInit {
     /// first use.
     Mem(SlotRef),
     /// Merge point — value comes from one of several predecessors.
-    /// The regalloc ensures all sources converge into the same PReg.
-    Phi(Vec<VReg>),
+    Phi(Vec<VRegSource>),
+}
+
+/// A VReg with its source block.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "trace", derive(serde::Serialize))]
+pub struct VRegSource {
+    pub block: BlockId,
+    pub vreg: VReg,
 }
 
 /// Metadata for a virtual register definition.
@@ -503,6 +510,11 @@ pub enum VCode {
     /// Destination PReg for the preceding instruction's output.
     /// Emitted by preg_alloc to replace Define(VReg) for InstDst defs.
     DstPReg(PReg),
+
+    /// Keep a VReg alive through this point — no code emitted.
+    /// Inserted by convergence for phi sources that are already live
+    /// but need to survive until the branch. Consumed by preg_alloc.
+    KeepAlive,
 
     /// Arithmetic / logic / comparison.
     Alu { op: AluOp },

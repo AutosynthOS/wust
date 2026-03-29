@@ -55,6 +55,12 @@ impl Selector for PRegAllocSelector<'_> {
                     }
                     // Other defs (Const, PReg, Phi) are consumed silently.
                 }
+                VCode::KeepAlive => {
+                    // Strip — just a liveness marker. The operand
+                    // following it keeps the VReg visible in the
+                    // scan so it doesn't get unbound.
+                    let _ = input.next_operand();
+                }
                 inst => {
                     // Instruction boundary — unbind dead input VRegs.
                     let live_below = scan_live_vregs(input);

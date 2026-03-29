@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use autosynth_codegen::builder::{FunctionBuilder, VRegOrRef};
+use autosynth_ir::{BlockId, VRegSource};
 
 /// Per-block wasm region state — named stacks of VRegOrRef.
 #[derive(Clone)]
@@ -9,15 +10,13 @@ pub struct WasmBlock {
 
 impl WasmBlock {
     /// Create the successor block from the first predecessor.
-    /// Bare VRegs get wrapped in refs so that future predecessors
-    /// can mutate them to Phi. Values already wrapped are kept as-is.
-    pub fn fork(&self, builder: &mut FunctionBuilder) -> WasmBlock {
+    pub fn fork(&self, source: BlockId, builder: &mut FunctionBuilder) -> WasmBlock {
         let regions = self.regions.iter().map(|(&name, slots)| {
             let wrapped: Vec<VRegOrRef> = slots.iter().map(|&val| {
                 match val {
                     VRegOrRef::Ref(_) => val,
                     VRegOrRef::VReg(vreg) => {
-                        let ref_id = builder.alloc_ref(vreg);
+                        let ref_id = builder.alloc_ref(source, vreg);
                         VRegOrRef::Ref(ref_id)
                     }
                 }
@@ -28,11 +27,12 @@ impl WasmBlock {
     }
 
     /// Merge another predecessor's state into this block.
-    /// Each slot is a Ref (from fork). If the new value differs:
-    /// - If the ref's VReg is not yet a Phi, create a new Phi VReg
-    ///   with both values, update the ref.
-    /// - If already a Phi, push the new source onto it.
-    pub fn merge(&mut self, other: &WasmBlock, builder: &mut FunctionBuilder) {
+    pub fn merge(
+        &mut self,
+        other: &WasmBlock,
+        new_pred: BlockId,
+        builder: &mut FunctionBuilder,
+    ) {
         for (name, slots) in self.regions.iter_mut() {
             let other_slots = &other.regions[name];
             for i in 0..slots.len() {
@@ -41,14 +41,18 @@ impl WasmBlock {
                     _ => unreachable!("successor slots should all be refs from fork"),
                 };
                 let new_vreg = builder.resolve(other_slots[i]);
-                let existing_vreg = builder.ref_vreg(ref_id);
+                let existing = builder.ref_source(ref_id);
 
-                if existing_vreg == new_vreg {
+                if existing.vreg == new_vreg {
                     continue;
                 }
 
-                if let Some(phi) = builder.merge_phi(existing_vreg, new_vreg) {
-                    builder.set_ref(ref_id, phi);
+                let new_source = VRegSource { block: new_pred, vreg: new_vreg };
+                if let Some(phi) = builder.merge_phi(existing, new_source) {
+                    // Ref now points to the phi VReg. The block on
+                    // the ref doesn't matter — the phi's sources
+                    // carry the real block info.
+                    builder.set_ref(ref_id, existing.block, phi);
                 }
             }
         }

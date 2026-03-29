@@ -1,7 +1,8 @@
 (module
-  (func $test (export "test") (result i32)
+  ;; if (param == 0) then 10 else 20, add 5
+  (func $test (export "test") (param i32) (result i32)
     i32.const 5
-    i32.const 0
+    local.get 0
     i32.eqz
     if (result i32)
       i32.const 10

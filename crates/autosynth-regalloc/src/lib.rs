@@ -17,7 +17,7 @@ use core::cell::RefCell;
 use autosynth_ir::{CompileError, Operand, VCode};
 use autosynth_isa::{PReg, Width};
 
-pub use autosynth_ir::{SlotRef, VInit, VReg};
+pub use autosynth_ir::{SlotRef, VInit, VReg, VRegSource};
 
 /// Result of trying to fold a VReg as an immediate.
 pub enum VRegOr<Imm> {
@@ -231,24 +231,18 @@ impl RegState {
     /// Allocate a PReg for a phi VReg. Finds the first source that
     /// already has a PReg, uses that, and sets target on all other
     /// sources so predecessor blocks will place values there.
-    fn alloc_phi_preg(&mut self, phi: VReg, sources: &[VReg]) -> Result<PReg, CompileError> {
-        // Find a PReg from any source that's already allocated.
+    fn alloc_phi_preg(&mut self, phi: VReg, sources: &[VRegSource]) -> Result<PReg, CompileError> {
         let preg = sources.iter()
-            .find_map(|&src| self.location(src))
-            .or_else(|| {
-                // No source has a PReg yet — pick a fresh scratch.
-                self.alloc_scratch()
-            })
+            .find_map(|s| self.location(s.vreg))
+            .or_else(|| self.alloc_scratch())
             .ok_or(CompileError::RegPoolExhausted)?;
 
-        // Bind the phi to this PReg.
         self.bind(phi, preg);
 
-        // Set target on all sources so predecessors converge here.
         let mut alloc = self.alloc.borrow_mut();
-        for &src in sources {
-            if alloc.def(src).target.is_none() {
-                alloc.set_target(src, preg);
+        for s in sources {
+            if alloc.def(s.vreg).target.is_none() {
+                alloc.set_target(s.vreg, preg);
             }
         }
 
