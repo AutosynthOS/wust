@@ -159,14 +159,13 @@ fn emit_materialize(
 
     let rd = to_gpr_or_zr(dst, width);
     let uval = imm as u64;
-    let n = match width { Width::W32 => 2, Width::W64 => 4 };
-    let chunk = |hw: usize| UImm16::from(((uval >> (hw * 16)) & 0xFFFF) as u16);
+    let chunk = |hw: u8| UImm16::from(((uval >> (hw as u32 * 16)) & 0xFFFF) as u16);
 
     encode(Movz { rd, imm: chunk(0), hw: 0 }, ctx)?;
-    for hw in 1..n {
+    for hw in 1..(width.bytes() / 2) as u8 {
         let imm = chunk(hw);
         if imm.value() != 0 {
-            encode(Movk { rd, imm, hw: hw as u8 }, ctx)?;
+            encode(Movk { rd, imm, hw }, ctx)?;
         }
     }
     Ok(())
