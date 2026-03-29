@@ -18,7 +18,7 @@ pub fn to_ir_type(ty: &ValType) -> IrType {
 }
 
 /// Convert a wasm [`ValType`] to a register [`Width`].
-pub fn valtype_to_width(ty: &ValType) -> Width {
+pub fn val_width(ty: &ValType) -> Width {
     match ty {
         ValType::I32 => Width::W32,
         ValType::I64 => Width::W64,

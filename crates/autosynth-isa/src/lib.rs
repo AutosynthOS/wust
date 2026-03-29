@@ -60,7 +60,7 @@ pub struct PReg(pub u8);
 ///
 /// Lets the frontend declare named registers (frame pointer, fuel counter,
 /// etc.) without knowing the target platform's register numbering.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum IsaReg {
     /// The platform's frame pointer register (e.g. x29 on aarch64).
     FramePointer,

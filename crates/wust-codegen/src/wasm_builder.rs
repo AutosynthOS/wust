@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
-use autosynth_codegen::builder::{BuilderItem, FunctionBuilder, VRegOrRef};
-use autosynth_ir::{AluOp, BlockId, CompOp, FunctionIdx, Label, Operand, VCode, VReg, VRegState};
+use autosynth_codegen::builder::{FunctionBuilder, VRegOrRef};
+use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode, VRegState};
 use autosynth_isa::{PReg, Width};
 use autosynth_regalloc::MachineConfig;
-use wust_core::{FRAME_HEADER_SIZE, FuncMeta, slot_size};
+use wust_core::{FRAME_HEADER_SIZE, FuncMeta};
 
-use crate::conversion::valtype_to_width;
+use crate::conversion::val_width;
 use crate::region::StackRegion;
 use crate::wasm_block::WasmBlock;
 
@@ -17,25 +17,22 @@ pub struct WasmFunctionBuilder {
 }
 
 impl WasmFunctionBuilder {
-    pub fn new(func: &FuncMeta, config: MachineConfig) -> Self {
-        let g_lb = PReg(29);
-        let g_sp = PReg(31);
+    pub fn new(func: &FuncMeta, mut config: MachineConfig) -> Self {
+        let g_lb = config.isa_reg(autosynth_isa::IsaReg::FramePointer).expect("no frame pointer");
+        let g_sp = config.isa_reg(autosynth_isa::IsaReg::StackPointer).expect("no stack pointer");
 
         let mut inner = FunctionBuilder::new(config);
         let mut blocks = BTreeMap::new();
 
-        let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
-
         let alloc_rc = inner.alloc.clone();
 
-        // --- Entry(0): host trampoline ---
         // --- Entry(0): host trampoline ---
         // Params on managed stack (clean — host put them there).
         {
             inner.start_block(BlockId::Entry(0));
             let mut params = StackRegion::new(g_lb, 0, &alloc_rc);
             for param in func.params.iter() {
-                let vreg = params.push_define(VRegState::new(valtype_to_width(param)), false);
+                let vreg = params.push_define(VRegState::new(val_width(param)), false);
                 inner.emit(VCode::Define(vreg));
             }
 
@@ -62,7 +59,7 @@ impl WasmFunctionBuilder {
                 let vreg = locals.push_define(
                     VRegState {
                         preg: Some(PReg(i as u8)),
-                        ..VRegState::new(valtype_to_width(param))
+                        ..VRegState::new(val_width(param))
                     },
                     true,
                 );
@@ -72,13 +69,13 @@ impl WasmFunctionBuilder {
                 let vreg = locals.push_define(
                     VRegState {
                         r#const: Some(0),
-                        ..VRegState::new(valtype_to_width(local))
+                        ..VRegState::new(val_width(local))
                     },
                     true,
                 );
                 inner.emit(VCode::Define(vreg));
             }
-
+            let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
             let operands = StackRegion::new(g_lb, locals_header_size, &alloc_rc);
             let fibre = StackRegion::new(g_sp, 0, &alloc_rc);
             let entry1_block = inner.block(BlockId::Entry(1));

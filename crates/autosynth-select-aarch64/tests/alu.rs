@@ -7,10 +7,14 @@ use autosynth_test_utils::assert_stream_eq;
 
 /// Helper: build a single-block function with one Alu instruction.
 fn build_alu(op: AluOp, lhs_init: VRegState, rhs_init: VRegState) -> autosynth_codegen::ir::IrFunction {
-    let mut config = autosynth_regalloc::MachineConfig::new(32);
-    config.reserve(autosynth_isa::PReg(29));
-    config.reserve(autosynth_isa::PReg(30));
-    config.reserve(autosynth_isa::PReg(31));
+    use std::collections::BTreeMap;
+    use autosynth_isa::{IsaReg, PReg};
+    let config = autosynth_regalloc::MachineConfig::new(32, BTreeMap::from([
+        (IsaReg::FramePointer, PReg(29)),
+        (IsaReg::StackPointer, PReg(31)),
+        (IsaReg::ReturnAddress, PReg(30)),
+        (IsaReg::PlatformReserved, PReg(18)),
+    ]));
     let mut f = autosynth_codegen::builder::FunctionBuilder::new(config);
 
     let lhs = f.define(lhs_init);
@@ -34,10 +38,14 @@ fn build_alu_reuse_lhs(
     rhs1_init: VRegState,
     rhs2_init: VRegState,
 ) -> autosynth_codegen::ir::IrFunction {
-    let mut config = autosynth_regalloc::MachineConfig::new(32);
-    config.reserve(autosynth_isa::PReg(29));
-    config.reserve(autosynth_isa::PReg(30));
-    config.reserve(autosynth_isa::PReg(31));
+    use std::collections::BTreeMap;
+    use autosynth_isa::{IsaReg, PReg};
+    let config = autosynth_regalloc::MachineConfig::new(32, BTreeMap::from([
+        (IsaReg::FramePointer, PReg(29)),
+        (IsaReg::StackPointer, PReg(31)),
+        (IsaReg::ReturnAddress, PReg(30)),
+        (IsaReg::PlatformReserved, PReg(18)),
+    ]));
     let mut f = autosynth_codegen::builder::FunctionBuilder::new(config);
 
     let lhs = f.define(lhs_init);
