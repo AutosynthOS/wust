@@ -30,7 +30,7 @@ pub fn compile(
     let mut snapshots: BTreeMap<BlockId, RegState> = BTreeMap::new();
 
     // Entry block starts with a RegState initialized from PReg-bound defs.
-    let mut entry_state = RegState::new(func.alloc.clone());
+    let mut entry_state = RegState::new(func.alloc.clone(), &func.config);
     {
         let alloc = func.alloc.borrow();
         for i in 0..alloc.len() {
@@ -63,7 +63,7 @@ pub fn compile(
 
         // 4. PReg allocation.
         let mut state = snapshots.remove(&block_id)
-            .unwrap_or_else(|| RegState::new(func.alloc.clone()));
+            .unwrap_or_else(|| RegState::new(func.alloc.clone(), &func.config));
         {
             let mut preg_alloc = PRegAllocSelector::new(&mut state);
             stream = preg_alloc.select(&mut stream)?;

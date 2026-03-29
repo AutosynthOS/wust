@@ -16,9 +16,17 @@ pub fn parse_wat(wat: &str) -> ParsedModule {
     ParsedModule::new(&bytes).expect("parse module")
 }
 
+pub fn aarch64_config() -> autosynth_regalloc::MachineConfig {
+    let mut config = autosynth_regalloc::MachineConfig::new(32);
+    config.reserve(autosynth_isa::PReg(29)); // g.lb (frame pointer)
+    config.reserve(autosynth_isa::PReg(30)); // lr (link register)
+    config.reserve(autosynth_isa::PReg(31)); // sp/zr
+    config
+}
+
 pub fn compile_func(module: &ParsedModule, func_idx: usize) -> IrFunction {
     let func = &module.funcs[func_idx];
-    let mut f = WasmFunctionBuilder::new(func);
+    let mut f = WasmFunctionBuilder::new(func, aarch64_config());
 
     let mut pc = 0;
     loop {

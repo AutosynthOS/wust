@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use autosynth_codegen::builder::{BuilderItem, FunctionBuilder, VRegOrRef};
 use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode, VReg};
 use autosynth_isa::{PReg, Width};
-use autosynth_regalloc::VInit;
+use autosynth_regalloc::{MachineConfig, VInit};
 use wust_core::FuncMeta;
 
 use crate::conversion::valtype_to_width;
@@ -16,8 +16,8 @@ pub struct WasmFunctionBuilder {
 }
 
 impl WasmFunctionBuilder {
-    pub fn new(func: &FuncMeta) -> Self {
-        let mut inner = FunctionBuilder::new();
+    pub fn new(func: &FuncMeta, config: MachineConfig) -> Self {
+        let mut inner = FunctionBuilder::new(config);
 
         let mut locals = Vec::new();
         for (i, param) in func.params.iter().enumerate() {

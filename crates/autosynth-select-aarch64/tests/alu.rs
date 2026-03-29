@@ -7,7 +7,11 @@ use autosynth_test_utils::assert_stream_eq;
 
 /// Helper: build a single-block function with one Alu instruction.
 fn build_alu(op: AluOp, lhs_init: VInit, rhs_init: VInit) -> autosynth_codegen::ir::IrFunction {
-    let mut f = autosynth_codegen::builder::FunctionBuilder::new();
+    let mut config = autosynth_regalloc::MachineConfig::new(32);
+    config.reserve(autosynth_isa::PReg(29));
+    config.reserve(autosynth_isa::PReg(30));
+    config.reserve(autosynth_isa::PReg(31));
+    let mut f = autosynth_codegen::builder::FunctionBuilder::new(config);
 
     let lhs = f.define(lhs_init, Width::W32);
     let rhs = f.define(rhs_init, Width::W32);
@@ -30,7 +34,11 @@ fn build_alu_reuse_lhs(
     rhs1_init: VInit,
     rhs2_init: VInit,
 ) -> autosynth_codegen::ir::IrFunction {
-    let mut f = autosynth_codegen::builder::FunctionBuilder::new();
+    let mut config = autosynth_regalloc::MachineConfig::new(32);
+    config.reserve(autosynth_isa::PReg(29));
+    config.reserve(autosynth_isa::PReg(30));
+    config.reserve(autosynth_isa::PReg(31));
+    let mut f = autosynth_codegen::builder::FunctionBuilder::new(config);
 
     let lhs = f.define(lhs_init, Width::W32);
     let rhs1 = f.define(rhs1_init, Width::W32);

@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use autosynth_ir::{BlockId, Operand, VCode, VReg, VRegSource};
 use autosynth_isa::{PReg, Width};
-use autosynth_regalloc::{SharedVRegAllocator, VInit, VRegAllocator};
+use autosynth_regalloc::{MachineConfig, SharedVRegAllocator, VInit, VRegAllocator};
 
 use super::{BlockBuilder, BuilderItem, VRefId, VRegOrRef};
 use crate::ir::{IrBlock, IrFunction, block_order};
@@ -11,20 +11,21 @@ use crate::ir::{IrBlock, IrFunction, block_order};
 /// Builds a function's VCode representation.
 pub struct FunctionBuilder {
     alloc: SharedVRegAllocator,
+    config: MachineConfig,
     blocks: BTreeMap<BlockId, BlockBuilder>,
     current_block: BlockId,
-    /// Ref table — each ref maps to a VRegSource (vreg + source block).
     refs: Vec<VRegSource>,
 }
 
 impl FunctionBuilder {
-    pub fn new() -> Self {
+    pub fn new(config: MachineConfig) -> Self {
         let alloc: SharedVRegAllocator = Rc::new(RefCell::new(VRegAllocator::new()));
         let entry = BlockId::Entry;
         let mut blocks = BTreeMap::new();
         blocks.insert(entry, BlockBuilder::new(entry));
         Self {
             alloc,
+            config,
             blocks,
             current_block: entry,
             refs: Vec::new(),
@@ -183,6 +184,7 @@ impl FunctionBuilder {
 
         IrFunction {
             alloc: self.alloc,
+            config: self.config,
             blocks,
             block_order: order,
         }
