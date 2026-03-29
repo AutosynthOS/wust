@@ -49,10 +49,21 @@ impl Selector for PRegAllocSelector<'_> {
                     output.push_operand(op);
                 }
                 VCode::KeepAlive => {
-                    // Strip — just a liveness marker. The operand
-                    // following it is what keeps the VReg visible in
-                    // the liveness scans so it doesn't get unbound.
                     let _ = input.next_operand();
+                }
+                VCode::SetSlot { vreg, slot } => {
+                    if let Some(vs) = self.state.vregs.get_mut(&vreg) {
+                        vs.slot = Some(autosynth_regalloc::MemSlot {
+                            base: slot.base,
+                            offset: slot.offset,
+                            dirty: false,
+                        });
+                    }
+                }
+                VCode::ClearSlot(vreg) => {
+                    if let Some(vs) = self.state.vregs.get_mut(&vreg) {
+                        vs.slot = None;
+                    }
                 }
                 // Instruction boundary
                 inst => {

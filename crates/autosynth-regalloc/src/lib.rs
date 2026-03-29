@@ -35,27 +35,37 @@ pub struct VRegDef {
     pub target: Option<PReg>,
 }
 
-/// A canonical memory slot with dirty tracking.
+/// A memory slot on the managed stack.
 #[derive(Debug, Clone, Copy)]
-pub struct SlotState {
-    pub slot: SlotRef,
+pub struct MemSlot {
+    pub base: PReg,
+    pub offset: u32,
     pub dirty: bool,
 }
 
 /// Per-block mutable live state for a VReg.
+///
+/// Multiple fields can be active simultaneously — a value can be
+/// in a register AND in memory AND known as a constant.
 #[derive(Debug, Clone)]
 pub struct VRegState {
-    /// Which PReg this VReg is currently in, if any.
+    /// Currently live in this PReg.
     pub preg: Option<PReg>,
     /// Canonical memory slot on the managed stack.
-    pub slot: Option<SlotState>,
+    pub slot: Option<MemSlot>,
+    /// Known compile-time constant value (rematerializable).
+    pub known_const: Option<i64>,
+    /// Register width.
+    pub width: Width,
 }
 
 impl VRegState {
-    pub fn new() -> Self {
+    pub fn new(width: Width) -> Self {
         Self {
             preg: None,
             slot: None,
+            known_const: None,
+            width,
         }
     }
 }
@@ -144,20 +154,22 @@ impl RegState {
     /// Define a new VReg through the shared allocator and initialize
     /// its live state in this block.
     pub fn define(&mut self, init: VInit, width: Width) -> VReg {
-        let slot = match &init {
-            VInit::Mem(s) => Some(SlotState {
-                slot: *s,
+        let mut state = VRegState::new(width);
+
+        match &init {
+            VInit::PReg(preg) => state.preg = Some(*preg),
+            VInit::Const(val) => state.known_const = Some(*val),
+            VInit::Mem(slot) => state.slot = Some(MemSlot {
+                base: slot.base,
+                offset: slot.offset,
                 dirty: false,
             }),
-            _ => None,
-        };
-        let bind_preg = match &init {
-            VInit::PReg(preg) => Some(*preg),
-            _ => None,
-        };
+            _ => {}
+        }
 
+        let bind_preg = state.preg;
         let vreg = self.alloc.borrow_mut().define(init, width);
-        self.vregs.insert(vreg, VRegState { preg: None, slot });
+        self.vregs.insert(vreg, state);
 
         if let Some(preg) = bind_preg {
             self.bind(vreg, preg);
@@ -169,7 +181,8 @@ impl RegState {
     /// Bind a VReg to a PReg.
     pub fn bind(&mut self, vreg: VReg, preg: PReg) {
         self.bindings[preg.0 as usize] = Some(vreg);
-        self.vregs.entry(vreg).or_insert_with(VRegState::new).preg = Some(preg);
+        let width = self.alloc.borrow().width(vreg);
+        self.vregs.entry(vreg).or_insert_with(|| VRegState::new(width)).preg = Some(preg);
     }
 
     /// Unbind a VReg from its PReg.
@@ -241,7 +254,8 @@ impl RegState {
             // TODO: proper shared bindings so both VRegs track the PReg.
             VInit::Copy(source) => {
                 if let Some(preg) = self.location(source) {
-                    self.vregs.entry(vreg).or_insert_with(VRegState::new).preg = Some(preg);
+                    let width = self.alloc.borrow().width(vreg);
+                    self.vregs.entry(vreg).or_insert_with(|| VRegState::new(width)).preg = Some(preg);
                     return Ok(preg);
                 }
             }
