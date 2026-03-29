@@ -374,6 +374,8 @@ pub enum VInit {
     /// clobber to start a fresh vreg lifetime — the regalloc reloads on
     /// first use.
     Mem(SlotRef),
+    /// Copy of another VReg's value (e.g. local.get).
+    Copy(VReg),
     /// Merge point — value comes from one of several predecessors.
     Phi(Vec<VRegSource>),
 }
@@ -465,26 +467,36 @@ pub enum Operand {
     Const(i64),
     VReg(VReg),
     PReg(PReg),
-    /// Destination PReg — which register an instruction writes its result to.
+    /// Destination VReg — instruction output, before PReg allocation.
+    DstVReg(VReg),
+    /// Destination PReg — instruction output, after PReg allocation.
     DstPReg(PReg, Width),
     Mem(SlotRef),
     UImm12(autosynth_isa::UImm12),
 }
 
 impl From<VReg> for Operand {
-    fn from(v: VReg) -> Self { Operand::VReg(v) }
+    fn from(v: VReg) -> Self {
+        Operand::VReg(v)
+    }
 }
 
 impl From<PReg> for Operand {
-    fn from(p: PReg) -> Self { Operand::PReg(p) }
+    fn from(p: PReg) -> Self {
+        Operand::PReg(p)
+    }
 }
 
 impl From<autosynth_isa::UImm12> for Operand {
-    fn from(i: autosynth_isa::UImm12) -> Self { Operand::UImm12(i) }
+    fn from(i: autosynth_isa::UImm12) -> Self {
+        Operand::UImm12(i)
+    }
 }
 
 impl From<SlotRef> for Operand {
-    fn from(s: SlotRef) -> Self { Operand::Mem(s) }
+    fn from(s: SlotRef) -> Self {
+        Operand::Mem(s)
+    }
 }
 
 // ---- VCode: new pipeline instruction set ----
@@ -505,9 +517,12 @@ pub enum VCode {
     /// An inline operand (input) in the VCode stream.
     Operand(Operand),
 
-    /// A VReg definition (output). The VReg becomes live here.
-    /// Consumed by preg_alloc — InstDst defs become DstPReg.
-    Define(VReg),
+    /// Set a VReg's canonical stack slot. Consumed by preg_alloc
+    /// to update RegState — no machine code emitted.
+    SetSlot { vreg: VReg, slot: SlotRef },
+
+    /// Clear a VReg's canonical stack slot.
+    ClearSlot(VReg),
 
     /// Keep a VReg alive through this point — no code emitted.
     /// Inserted by convergence for phi sources that are already live
@@ -606,18 +621,13 @@ impl CodeCtx {
         self.stream.pop_front()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.stream.is_empty()
-    }
-
-    /// Pop the last item if it's an operand. Errors if the last
-    /// item is not an operand or the stream is empty.
+    /// Pop the last item if it's an operand.
     /// Scan the stream for all VRegs that appear as operands or defines.
     pub fn live_vregs(&self) -> alloc::collections::BTreeSet<VReg> {
         let mut live = alloc::collections::BTreeSet::new();
         for item in &self.stream {
             match item {
-                VCode::Operand(Operand::VReg(vreg)) | VCode::Define(vreg) => {
+                VCode::Operand(Operand::VReg(vreg)) => {
                     live.insert(*vreg);
                 }
                 _ => {}

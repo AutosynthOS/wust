@@ -38,6 +38,10 @@ impl FunctionBuilder {
         vreg
     }
 
+    pub fn width(&self, vreg: VReg) -> Width {
+        self.alloc.borrow().width(vreg)
+    }
+
     pub fn emit(&mut self, inst: VCode) {
         self.current_block_mut().emit(inst);
     }

@@ -13,12 +13,10 @@ fn build_alu(op: AluOp, lhs_init: VInit, rhs_init: VInit) -> autosynth_codegen::
     let rhs = f.define(rhs_init, Width::W32);
     let dst = f.define(VInit::InstDst, Width::W32);
 
-    f.emit(VCode::Define(lhs));  // lhs value exists
-    f.emit(VCode::Define(rhs));  // rhs value exists
-    f.push_operand(lhs);         // input
-    f.push_operand(rhs);         // input
+    f.push_operand(lhs);
+    f.push_operand(rhs);
     f.emit(VCode::Alu { op });
-    f.emit(VCode::Define(dst));  // result born after instruction
+    f.emit(VCode::Operand(Operand::DstVReg(dst)));
     f.emit(VCode::Return);
 
     f.build()
@@ -40,19 +38,15 @@ fn build_alu_reuse_lhs(
     let dst1 = f.define(VInit::InstDst, Width::W32);
     let dst2 = f.define(VInit::InstDst, Width::W32);
 
-    f.emit(VCode::Define(lhs));   // param exists
-    f.emit(VCode::Define(rhs1));  // const(3) exists
-    f.emit(VCode::Define(rhs2));  // const(7) exists
-
     f.push_operand(lhs);
     f.push_operand(rhs1);
     f.emit(VCode::Alu { op });
-    f.emit(VCode::Define(dst1));
+    f.emit(VCode::Operand(Operand::DstVReg(dst1)));
 
     f.push_operand(lhs);
     f.push_operand(rhs2);
     f.emit(VCode::Alu { op });
-    f.emit(VCode::Define(dst2));
+    f.emit(VCode::Operand(Operand::DstVReg(dst2)));
 
     f.emit(VCode::Return);
 

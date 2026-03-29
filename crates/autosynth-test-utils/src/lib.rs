@@ -57,8 +57,12 @@ fn format_operand(op: &Operand) -> String {
         Operand::Const(v) => format!("Const({v})"),
         Operand::VReg(v) => format!("{v}"),
         Operand::PReg(p) => format!("x{}", p.0),
+        Operand::DstVReg(v) => format!("→{v}"),
         Operand::DstPReg(p, w) => {
-            let prefix = match w { autosynth_isa::Width::W32 => "w", autosynth_isa::Width::W64 => "x" };
+            let prefix = match w {
+                autosynth_isa::Width::W32 => "w",
+                autosynth_isa::Width::W64 => "x",
+            };
             format!("→{prefix}{}", p.0)
         }
         Operand::Mem(s) => format!("Mem({s:?})"),

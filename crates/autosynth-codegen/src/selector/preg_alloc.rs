@@ -8,7 +8,6 @@
 //! - Define(VReg): allocate a PReg — dead input PRegs are now free
 //!   for reuse.
 
-use std::collections::BTreeSet;
 use autosynth_ir::{CodeCtx, CompileError, Operand, VCode, VReg};
 use autosynth_regalloc::{RegState, VInit};
 use autosynth_selector::Selector;
@@ -26,7 +25,6 @@ impl<'a> PRegAllocSelector<'a> {
 impl Selector for PRegAllocSelector<'_> {
     fn select(&mut self, input: &mut CodeCtx) -> Result<CodeCtx, CompileError> {
         let mut output = CodeCtx::new();
-        let mut after_producing_inst = false;
 
         while let Some(item) = input.next() {
             match item {
@@ -42,62 +40,32 @@ impl Selector for PRegAllocSelector<'_> {
                     let preg = self.state.alloc_preg(vreg)?;
                     output.push_operand(Operand::PReg(preg));
                 }
+                VCode::Operand(Operand::DstVReg(vreg)) => {
+                    let preg = self.state.alloc_preg(vreg)?;
+                    let width = self.state.alloc.borrow().width(vreg);
+                    output.push_operand(Operand::DstPReg(preg, width));
+                }
                 VCode::Operand(op) => {
                     output.push_operand(op);
                 }
-                VCode::Define(vreg) => {
-                    let preg = self.state.alloc_preg(vreg)?;
-                    if after_producing_inst {
-                        let width = self.state.alloc.borrow().width(vreg);
-                        output.push_operand(Operand::DstPReg(preg, width));
-                        after_producing_inst = false;
-                    }
-                }
                 VCode::KeepAlive => {
                     // Strip — just a liveness marker. The operand
-                    // following it keeps the VReg visible in the
-                    // scan so it doesn't get unbound.
+                    // following it is what keeps the VReg visible in
+                    // the liveness scans so it doesn't get unbound.
                     let _ = input.next_operand();
                 }
+                // Instruction boundary
                 inst => {
-                    // Instruction boundary — unbind dead input VRegs.
-                    let live_below = input.live_vregs();
-                    unbind_dead_inputs(&mut output, &live_below, self.state);
-                    after_producing_inst = matches!(inst,
-                        VCode::Alu { .. } | VCode::Materialize
-                    );
+                    // Kill any vregs that should are no longer
+                    // needed after this instruction...
+                    self.state.kill_unused_bindings(&input.live_vregs());
+
+                    // finally, emit the instruction
                     output.push(inst);
                 }
             }
         }
 
         Ok(output)
-    }
-}
-
-
-/// Walk backwards through the output's trailing operands and unbind
-/// any VRegs that aren't in the live set.
-fn unbind_dead_inputs(
-    output: &CodeCtx,
-    live_below: &BTreeSet<VReg>,
-    state: &mut RegState,
-) {
-    // The trailing items in output are the input operands for this
-    // instruction (already resolved to PRegs). We need to find the
-    // original VRegs. We can check which bound VRegs aren't live.
-    for (&vreg, vstate) in state.vregs.iter() {
-        if vstate.preg.is_some() && !live_below.contains(&vreg) {
-            // Will be unbound below — can't mutate during iteration.
-        }
-    }
-    // Collect then unbind.
-    let to_unbind: Vec<VReg> = state.vregs.iter()
-        .filter(|(_, vs)| vs.preg.is_some())
-        .map(|(&v, _)| v)
-        .filter(|v| !live_below.contains(v))
-        .collect();
-    for vreg in to_unbind {
-        state.unbind(vreg);
     }
 }

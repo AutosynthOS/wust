@@ -22,12 +22,10 @@ impl WasmFunctionBuilder {
         let mut locals = Vec::new();
         for (i, param) in func.params.iter().enumerate() {
             let id = inner.define(VInit::PReg(PReg(i as u8)), valtype_to_width(param));
-            inner.emit(VCode::Define(id));
             locals.push(VRegOrRef::VReg(id));
         }
         for local in func.locals.iter() {
             let id = inner.define(VInit::Const(0), valtype_to_width(local));
-            inner.emit(VCode::Define(id));
             locals.push(VRegOrRef::VReg(id));
         }
 
@@ -67,13 +65,15 @@ impl WasmFunctionBuilder {
 
     pub fn push_const(&mut self, val: i64, width: Width) {
         let id = self.inner.define(VInit::Const(val), width);
-        self.inner.emit(VCode::Define(id));
         self.region("operands").push(VRegOrRef::VReg(id));
     }
 
     pub fn push_local(&mut self, idx: usize) {
-        let val = self.region_ref("locals")[idx];
-        self.region("operands").push(val);
+        let local = self.region_ref("locals")[idx];
+        let source = self.inner.resolve(local);
+        let width = self.inner.width(source);
+        let copy = self.inner.define(VInit::Copy(source), width);
+        self.region("operands").push(VRegOrRef::VReg(copy));
     }
 
     pub fn pop(&mut self) -> VRegOrRef {
@@ -98,7 +98,7 @@ impl WasmFunctionBuilder {
         self.inner.push_operand(lhs);
         self.inner.push_operand(rhs);
         self.inner.emit(VCode::Alu { op });
-        self.inner.emit(VCode::Define(dst));
+        self.inner.emit(VCode::Operand(Operand::DstVReg(dst)));
 
         self.region("operands").push(VRegOrRef::VReg(dst));
     }
@@ -111,7 +111,7 @@ impl WasmFunctionBuilder {
         self.inner.push_operand(val);
         self.inner.push_operand(zero);
         self.inner.emit(VCode::Alu { op: AluOp::Comp(CompOp::Eq) });
-        self.inner.emit(VCode::Define(dst));
+        self.inner.emit(VCode::Operand(Operand::DstVReg(dst)));
 
         self.region("operands").push(VRegOrRef::VReg(dst));
     }
@@ -122,7 +122,6 @@ impl WasmFunctionBuilder {
         // No fusion — just emit BrIf(Ne, cond, 0).
         // A fuser pass can optimize this later.
         let zero = self.inner.define(VInit::Const(0), Width::W32);
-        self.inner.emit(VCode::Define(zero));
         self.inner.push_operand(cond);
         self.inner.push_operand(zero);
         self.inner.emit(VCode::BrIf {

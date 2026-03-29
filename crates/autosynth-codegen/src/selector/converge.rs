@@ -74,7 +74,7 @@ impl Selector for ConvergeSelector {
                         ConvergeOp::Materialize { vreg, val } => {
                             output.push_operand(Operand::Const(val));
                             output.push(VCode::Materialize);
-                            output.push(VCode::Define(vreg));
+                            output.push_operand(Operand::DstVReg(vreg));
                         }
                         ConvergeOp::KeepAlive(vreg) => {
                             output.push(VCode::KeepAlive);

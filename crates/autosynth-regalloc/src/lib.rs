@@ -9,13 +9,13 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, btree_set::BTreeSet};
 use alloc::rc::Rc;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cell::RefCell;
 use autosynth_ir::{CompileError, Operand, VCode};
 use autosynth_isa::{PReg, Width};
+use core::cell::RefCell;
 
 pub use autosynth_ir::{SlotRef, VInit, VReg, VRegSource};
 
@@ -145,7 +145,10 @@ impl RegState {
     /// its live state in this block.
     pub fn define(&mut self, init: VInit, width: Width) -> VReg {
         let slot = match &init {
-            VInit::Mem(s) => Some(SlotState { slot: *s, dirty: false }),
+            VInit::Mem(s) => Some(SlotState {
+                slot: *s,
+                dirty: false,
+            }),
             _ => None,
         };
         let bind_preg = match &init {
@@ -189,6 +192,22 @@ impl RegState {
         self.bindings[preg.0 as usize]
     }
 
+    /// Free any PRegs whose bound VReg is not in the live set.
+    pub fn kill_unused_bindings(&mut self, live: &BTreeSet<VReg>) {
+        for preg_idx in 0..self.bindings.len() {
+            let Some(vreg) = self.bindings[preg_idx] else {
+                continue;
+            };
+            if live.contains(&vreg) {
+                continue;
+            }
+
+            // TODO: if dirty, emit a store to the VReg's slot before unbinding.
+            // For now, just unbind.
+            self.unbind(vreg);
+        }
+    }
+
     /// Allocate a free scratch register.
     pub fn alloc_scratch(&self) -> Option<PReg> {
         self.scratch_pool
@@ -207,22 +226,32 @@ impl RegState {
             return Ok(preg);
         }
 
-        let alloc = self.alloc.borrow();
-        let target = alloc.def(vreg).target;
+        let (target, init) = {
+            let alloc = self.alloc.borrow();
+            (alloc.def(vreg).target, alloc.init(vreg).clone())
+        };
+
         if let Some(target) = target {
-            drop(alloc);
             self.bind(vreg, target);
             return Ok(target);
         }
 
-        // Phi: find an existing PReg from sources, propagate as target.
-        if let VInit::Phi(sources) = alloc.init(vreg).clone() {
-            drop(alloc);
-            let preg = self.alloc_phi_preg(vreg, &sources)?;
-            return Ok(preg);
+        match init {
+            // Copy: reuse the source's PReg if it has one.
+            // TODO: proper shared bindings so both VRegs track the PReg.
+            VInit::Copy(source) => {
+                if let Some(preg) = self.location(source) {
+                    self.vregs.entry(vreg).or_insert_with(VRegState::new).preg = Some(preg);
+                    return Ok(preg);
+                }
+            }
+            // Phi: find an existing PReg from sources, propagate as target.
+            VInit::Phi(sources) => {
+                return self.alloc_phi_preg(vreg, &sources);
+            }
+            _ => {}
         }
 
-        drop(alloc);
         let preg = self.alloc_scratch().ok_or(CompileError::RegPoolExhausted)?;
         self.bind(vreg, preg);
         Ok(preg)
@@ -232,7 +261,8 @@ impl RegState {
     /// already has a PReg, uses that, and sets target on all other
     /// sources so predecessor blocks will place values there.
     fn alloc_phi_preg(&mut self, phi: VReg, sources: &[VRegSource]) -> Result<PReg, CompileError> {
-        let preg = sources.iter()
+        let preg = sources
+            .iter()
             .find_map(|s| self.location(s.vreg))
             .or_else(|| self.alloc_scratch())
             .ok_or(CompileError::RegPoolExhausted)?;
@@ -256,62 +286,62 @@ impl RegState {
             other => Ok(other),
         }
     }
-
-    /// Try to fold a VReg as an immediate, or materialize it.
-    pub fn imm_or_materialize<Imm>(
-        &mut self,
-        operand: Operand,
-        output: &mut autosynth_ir::CodeCtx,
-    ) -> Result<VRegOr<Imm>, CompileError>
-    where
-        Imm: TryFrom<i64>,
-    {
-        match operand {
-            Operand::Const(val) => {
-                let vreg = self.define(VInit::InstDst, Width::W64);
-                self.materialize_const(vreg, val, output)?;
-                Ok(VRegOr::VReg(vreg))
-            }
-            Operand::VReg(vreg) => {
-                let init = self.alloc.borrow().init(vreg).clone();
-                if let VInit::Const(val) = init {
-                    if let Ok(imm) = Imm::try_from(val) {
-                        return Ok(VRegOr::Imm(imm));
-                    }
-                }
-                self.materialize(vreg, output)?;
-                Ok(VRegOr::VReg(vreg))
-            }
-            _ => unimplemented!(),
-        }
-    }
-
-    /// Materialize a VReg if it's a constant or in memory.
-    pub fn materialize(&mut self, vreg: VReg, output: &mut autosynth_ir::CodeCtx) -> Result<(), CompileError> {
-        let init = self.alloc.borrow().init(vreg).clone();
-        match init {
-            VInit::Const(val) => {
-                self.alloc.borrow_mut().def_mut(vreg).init = VInit::InstDst;
-                self.materialize_const(vreg, val, output)?;
-            }
-            VInit::Mem(..) => todo!("mem materialization"),
-            VInit::PReg(..) => {}
-            VInit::InstDst => {}
-            VInit::Phi(_) => {}
-        }
-        Ok(())
-    }
-
-    fn materialize_const(
-        &mut self,
-        vreg: VReg,
-        val: i64,
-        output: &mut autosynth_ir::CodeCtx,
-    ) -> Result<(), CompileError> {
-        self.alloc.borrow_mut().def_mut(vreg).init = VInit::InstDst;
-        output.push_operand(Operand::Const(val));
-        output.push(VCode::Materialize);
-        output.push(VCode::Define(vreg));
-        Ok(())
-    }
 }
+
+// /// Try to fold a VReg as an immediate, or materialize it.
+// pub fn imm_or_materialize<Imm>(
+//     &mut self,
+//     operand: Operand,
+//     output: &mut autosynth_ir::CodeCtx,
+// ) -> Result<VRegOr<Imm>, CompileError>
+// where
+//     Imm: TryFrom<i64>,
+// {
+//     match operand {
+//         Operand::Const(val) => {
+//             let vreg = self.define(VInit::InstDst, Width::W64);
+//             self.materialize_const(vreg, val, output)?;
+//             Ok(VRegOr::VReg(vreg))
+//         }
+//         Operand::VReg(vreg) => {
+//             let init = self.alloc.borrow().init(vreg).clone();
+//             if let VInit::Const(val) = init {
+//                 if let Ok(imm) = Imm::try_from(val) {
+//                     return Ok(VRegOr::Imm(imm));
+//                 }
+//             }
+//             self.materialize(vreg, output)?;
+//             Ok(VRegOr::VReg(vreg))
+//         }
+//         _ => unimplemented!(),
+//     }
+// }
+
+// /// Materialize a VReg if it's a constant or in memory.
+// pub fn materialize(&mut self, vreg: VReg, output: &mut autosynth_ir::CodeCtx) -> Result<(), CompileError> {
+//     let init = self.alloc.borrow().init(vreg).clone();
+//     match init {
+//         VInit::Const(val) => {
+//             self.alloc.borrow_mut().def_mut(vreg).init = VInit::InstDst;
+//             self.materialize_const(vreg, val, output)?;
+//         }
+//         VInit::Mem(..) => todo!("mem materialization"),
+//         VInit::PReg(..) => {}
+//         VInit::InstDst => {}
+//         VInit::Phi(_) => {}
+//     }
+//     Ok(())
+// }
+
+// fn materialize_const(
+//     &mut self,
+//     vreg: VReg,
+//     val: i64,
+//     output: &mut autosynth_ir::CodeCtx,
+// ) -> Result<(), CompileError> {
+//     self.alloc.borrow_mut().def_mut(vreg).init = VInit::InstDst;
+//     output.push_operand(Operand::Const(val));
+//     output.push(VCode::Materialize);
+//     output.push(VCode::Define(vreg));
+//     Ok(())
+// }
