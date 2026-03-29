@@ -10,8 +10,9 @@
 use autosynth_emitter::{CodeContext, EmitError, Emitter};
 use autosynth_ir::{AluOp, BlockId, CodeCtx, CodeCtxUnzipper, CompOp, Label, Operand, VCode};
 use autosynth_isa::{PReg, SImm19, SImm26, Width};
+use autosynth_isa::{UImm16};
 use autosynth_isa_aarch64::{
-    Aarch64Inst, AddImm, AddReg, B, BCond, Cond, Ret, SubsImm, SubsReg,
+    Aarch64Inst, AddImm, AddReg, B, BCond, Cond, Movk, Movz, Ret, SubsImm, SubsReg,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
 
@@ -194,15 +195,34 @@ fn emit_materialize(
     ctx: &mut impl CodeContext,
 ) -> Result<(), EmitError> {
     let val = next_op(uz)?;
-    let dst = next_dst(uz)?;
+    let dst_preg = next_dst(uz)?;
 
     let Operand::Const(imm) = val else {
         return Err(EmitError::UnresolvedOperand);
     };
 
-    // TODO: proper movz/movk sequence for large constants.
-    let word = 0x52800000 | ((imm as u32 & 0xFFFF) << 5) | (dst.0 as u32);
-    ctx.emit_bytes(&word.to_le_bytes()).map_err(|_| EmitError::ImmediateOutOfRange)
+    // TODO: width should come from the VRegDef, not hardcoded.
+    let width = Width::W32;
+    let rd = to_gpr_or_zr(dst_preg, width);
+    let uval = imm as u64;
+    let max_hw: u8 = match width {
+        Width::W32 => 1,
+        Width::W64 => 3,
+    };
+    let chunk = |hw: u8| ((uval >> (hw as u32 * 16)) & 0xFFFF) as u16;
+
+    // movz: load lowest 16 bits, zero the rest.
+    encode(Movz { rd, imm: UImm16::from(chunk(0)), hw: 0 }, ctx)?;
+
+    // movk: patch in each non-zero 16-bit chunk above.
+    for hw in 1..=max_hw {
+        let bits = chunk(hw);
+        if bits != 0 {
+            encode(Movk { rd, imm: UImm16::from(bits), hw }, ctx)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn comp_op_to_cond(op: &CompOp) -> Cond {
