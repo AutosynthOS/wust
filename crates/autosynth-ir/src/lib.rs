@@ -557,11 +557,15 @@ impl From<Operand> for VCode {
 /// A bag of VCode instructions and operands.
 ///
 /// Used as both input and output for selector/regalloc passes.
-/// Error from CodeCtx operations.
+/// Error from compilation — covers selection, regalloc, and emission.
 #[derive(Debug)]
 pub enum CompileError {
     OperandUnderflow,
     RegPoolExhausted,
+    UnresolvedOperand,
+    ImmediateOutOfRange,
+    UnhandledInstruction,
+    UnresolvedLabel,
 }
 
 #[derive(Clone)]
@@ -682,5 +686,21 @@ impl CodeCtxUnzipper {
             }
         }
         Err(CompileError::OperandUnderflow)
+    }
+
+    /// Get the next operand, expecting a PReg. Errors if not a PReg.
+    pub fn next_preg(&mut self) -> Result<PReg, CompileError> {
+        match self.next_operand()? {
+            Operand::PReg(preg) => Ok(preg),
+            _ => Err(CompileError::UnresolvedOperand),
+        }
+    }
+
+    /// Get the next operand, expecting a DstPReg. Errors if not a DstPReg.
+    pub fn next_dst(&mut self) -> Result<(PReg, Width), CompileError> {
+        match self.next_operand()? {
+            Operand::DstPReg(preg, width) => Ok((preg, width)),
+            _ => Err(CompileError::OperandUnderflow),
+        }
     }
 }

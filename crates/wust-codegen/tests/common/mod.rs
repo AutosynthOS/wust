@@ -85,8 +85,8 @@ pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
     let mut emitter = Aarch64Emitter::new(func_idx);
     for &block_id in &vcode.block_order {
         page.mark_label(Label::Block(func_idx, block_id));
-        let mut block_stream = vcode.blocks[&block_id].clone();
-        emitter.emit(&mut block_stream, &mut page).unwrap();
+        let block_stream = vcode.blocks[&block_id].clone();
+        emitter.emit(block_stream.unzip(), &mut page).unwrap();
     }
     emitter.finalize(&mut page).unwrap();
     page.flash().unwrap();
