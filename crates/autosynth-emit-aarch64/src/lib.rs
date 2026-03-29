@@ -51,12 +51,12 @@ impl Aarch64Emitter {
 
             let word = match patch.kind {
                 PatchKind::B => {
-                    let offset = SImm26::try_from(word_displacement as i32)
+                    let offset = SImm26::try_from(word_displacement)
                         .map_err(|_| EmitError::ImmediateOutOfRange)?;
                     B { offset }.encode_word()
                 }
                 PatchKind::BCond(cond) => {
-                    let offset = SImm19::try_from(word_displacement as i32)
+                    let offset = SImm19::try_from(word_displacement)
                         .map_err(|_| EmitError::ImmediateOutOfRange)?;
                     BCond { cond, offset }.encode_word()
                 }
