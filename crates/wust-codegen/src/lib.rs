@@ -16,6 +16,7 @@ mod conversion;
 // mod jit_module;      // new API sketch — not compilable yet
 // mod jit_module_old;  // old implementation
 mod trampoline;
+pub mod region;
 pub mod wasm_block;
 pub mod wasm_builder;
 

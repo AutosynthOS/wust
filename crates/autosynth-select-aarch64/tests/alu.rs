@@ -1,21 +1,21 @@
 use autosynth_codegen::pipeline::compile;
 use autosynth_ir::{AluOp, BlockId, CodeCtx, Operand, VCode};
 use autosynth_isa::{PReg, UImm12, Width};
-use autosynth_regalloc::VInit;
+use autosynth_regalloc::VRegState;
 use autosynth_select_aarch64::Aarch64Selector;
 use autosynth_test_utils::assert_stream_eq;
 
 /// Helper: build a single-block function with one Alu instruction.
-fn build_alu(op: AluOp, lhs_init: VInit, rhs_init: VInit) -> autosynth_codegen::ir::IrFunction {
+fn build_alu(op: AluOp, lhs_init: VRegState, rhs_init: VRegState) -> autosynth_codegen::ir::IrFunction {
     let mut config = autosynth_regalloc::MachineConfig::new(32);
     config.reserve(autosynth_isa::PReg(29));
     config.reserve(autosynth_isa::PReg(30));
     config.reserve(autosynth_isa::PReg(31));
     let mut f = autosynth_codegen::builder::FunctionBuilder::new(config);
 
-    let lhs = f.define(lhs_init, Width::W32);
-    let rhs = f.define(rhs_init, Width::W32);
-    let dst = f.define(VInit::InstDst, Width::W32);
+    let lhs = f.define(lhs_init);
+    let rhs = f.define(rhs_init);
+    let dst = f.define(VRegState { inst_dst: true, ..VRegState::new(Width::W32) });
 
     f.push_operand(lhs);
     f.push_operand(rhs);
@@ -30,9 +30,9 @@ fn build_alu(op: AluOp, lhs_init: VInit, rhs_init: VInit) -> autosynth_codegen::
 /// that both use the same lhs VReg.
 fn build_alu_reuse_lhs(
     op: AluOp,
-    lhs_init: VInit,
-    rhs1_init: VInit,
-    rhs2_init: VInit,
+    lhs_init: VRegState,
+    rhs1_init: VRegState,
+    rhs2_init: VRegState,
 ) -> autosynth_codegen::ir::IrFunction {
     let mut config = autosynth_regalloc::MachineConfig::new(32);
     config.reserve(autosynth_isa::PReg(29));
@@ -40,11 +40,11 @@ fn build_alu_reuse_lhs(
     config.reserve(autosynth_isa::PReg(31));
     let mut f = autosynth_codegen::builder::FunctionBuilder::new(config);
 
-    let lhs = f.define(lhs_init, Width::W32);
-    let rhs1 = f.define(rhs1_init, Width::W32);
-    let rhs2 = f.define(rhs2_init, Width::W32);
-    let dst1 = f.define(VInit::InstDst, Width::W32);
-    let dst2 = f.define(VInit::InstDst, Width::W32);
+    let lhs = f.define(lhs_init);
+    let rhs1 = f.define(rhs1_init);
+    let rhs2 = f.define(rhs2_init);
+    let dst1 = f.define(VRegState { inst_dst: true, ..VRegState::new(Width::W32) });
+    let dst2 = f.define(VRegState { inst_dst: true, ..VRegState::new(Width::W32) });
 
     f.push_operand(lhs);
     f.push_operand(rhs1);
@@ -75,7 +75,7 @@ fn compile_entry(func: &autosynth_codegen::ir::IrFunction) -> CodeCtx {
 /// dst reuses x0 — no register wasted.
 #[test]
 fn add_const_rhs_folds() {
-    let func = build_alu(AluOp::Add, VInit::PReg(PReg(0)), VInit::Const(5));
+    let func = build_alu(AluOp::Add, VRegState { preg: Some(PReg(0)), ..VRegState::new(Width::W32) }, VRegState { r#const: Some(5), ..VRegState::new(Width::W32) });
     let block = compile_entry(&func);
 
     assert_stream_eq(&block, &[
@@ -93,7 +93,7 @@ fn add_const_rhs_folds() {
 /// is not used again, so dst reuses x0.
 #[test]
 fn add_large_const_rhs_materializes() {
-    let func = build_alu(AluOp::Add, VInit::PReg(PReg(0)), VInit::Const(5000));
+    let func = build_alu(AluOp::Add, VRegState { preg: Some(PReg(0)), ..VRegState::new(Width::W32) }, VRegState { r#const: Some(5000), ..VRegState::new(Width::W32) });
     let block = compile_entry(&func);
 
     assert_stream_eq(&block, &[
@@ -117,7 +117,7 @@ fn add_large_const_rhs_materializes() {
 /// identical: a + b == b + a.
 #[test]
 fn add_const_lhs_swaps() {
-    let func = build_alu(AluOp::Add, VInit::Const(5), VInit::PReg(PReg(0)));
+    let func = build_alu(AluOp::Add, VRegState { r#const: Some(5), ..VRegState::new(Width::W32) }, VRegState { preg: Some(PReg(0)), ..VRegState::new(Width::W32) });
     let block = compile_entry(&func);
 
     // After swap: lhs=param(x0), rhs=#5, dst reuses x0.
@@ -139,7 +139,7 @@ fn add_const_lhs_swaps() {
 /// x0 holds the param, so the const materializes into x1.
 #[test]
 fn sub_const_lhs_materializes() {
-    let func = build_alu(AluOp::Sub, VInit::Const(5), VInit::PReg(PReg(0)));
+    let func = build_alu(AluOp::Sub, VRegState { r#const: Some(5), ..VRegState::new(Width::W32) }, VRegState { preg: Some(PReg(0)), ..VRegState::new(Width::W32) });
     let block = compile_entry(&func);
 
     // Both lhs (x1) and rhs (x0) are dead after the sub.
@@ -169,9 +169,9 @@ fn sub_const_lhs_materializes() {
 fn add_lhs_reused_needs_fresh_dst() {
     let func = build_alu_reuse_lhs(
         AluOp::Add,
-        VInit::PReg(PReg(0)),
-        VInit::Const(3),
-        VInit::Const(7),
+        VRegState { preg: Some(PReg(0)), ..VRegState::new(Width::W32) },
+        VRegState { r#const: Some(3), ..VRegState::new(Width::W32) },
+        VRegState { r#const: Some(7), ..VRegState::new(Width::W32) },
     );
     let block = compile_entry(&func);
 

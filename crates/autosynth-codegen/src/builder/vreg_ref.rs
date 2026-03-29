@@ -20,7 +20,7 @@ impl From<VReg> for VRegOrRef {
 
 /// An item in the builder's stream — either an operand (resolved
 /// later) or a VCode instruction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuilderItem {
     Operand(VRegOrRef),
     Inst(VCode),

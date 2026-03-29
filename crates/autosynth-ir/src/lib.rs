@@ -309,7 +309,7 @@ pub enum IrInst {
 pub enum RegInst {
     /// Define a new vreg with its initial value origin.
     /// Panics if the vreg has already been defined.
-    Define { vreg: VReg, value: VInit },
+    Define { vreg: VReg, value: VRegState },
     /// Assign a canonical memory slot to a vreg (push, set_field).
     /// The slot is always dirty — memory doesn't have the value yet.
     SetSlot { vreg: VReg, slot: SlotRef },
@@ -356,32 +356,47 @@ pub struct SlotRef {
     pub offset: u32,
 }
 
-/// Immutable origin of a VReg's value — how it was created.
-///
-/// SSA: a VReg's value never changes after definition. The origin
-/// tells the lowerer how to obtain the value (rematerialize a const,
-/// look up a register binding, resolve via the register allocator).
-#[derive(Debug, Clone, PartialEq)]
+/// A memory slot on the managed stack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
-pub enum VInit {
-    /// A compile-time constant (sign-extended to 64 bits). Rematerializable.
-    Const(i64),
-    /// Value arrived in a physical register (function params, call results).
-    PReg(PReg),
-    /// Produced as the destination of an instruction (ALU, load, etc.).
-    InstDst,
-    /// Value lives in memory at [slot.base + slot.offset]. Created after
-    /// clobber to start a fresh vreg lifetime — the regalloc reloads on
-    /// first use.
-    Mem(SlotRef),
-    /// Copy of another VReg's value (e.g. local.get).
-    Copy(VReg),
-    /// Merge point — value comes from one of several predecessors.
-    Phi(Vec<VRegSource>),
+pub struct MemSlot {
+    pub base: PReg,
+    pub offset: u32,
+    pub dirty: bool,
+}
+
+/// Per-VReg state. Tracks where a value currently lives.
+/// Multiple fields can be active simultaneously — a value can be
+/// in a register AND in memory AND known as a constant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VRegState {
+    pub width: Width,
+    pub preg: Option<PReg>,
+    pub target: Option<PReg>,
+    pub slot: Option<MemSlot>,
+    pub r#const: Option<i64>,
+    pub copy: Option<VReg>,
+    pub phi: Option<Vec<VRegSource>>,
+    pub inst_dst: bool,
+}
+
+impl VRegState {
+    pub fn new(width: Width) -> Self {
+        Self {
+            width,
+            preg: None,
+            target: None,
+            slot: None,
+            r#const: None,
+            copy: None,
+            phi: None,
+            inst_dst: false,
+        }
+    }
 }
 
 /// A VReg with its source block.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub struct VRegSource {
     pub block: BlockId,
@@ -473,6 +488,7 @@ pub enum Operand {
     DstPReg(PReg, Width),
     Mem(SlotRef),
     UImm12(autosynth_isa::UImm12),
+    SImm9(autosynth_isa::SImm9),
 }
 
 impl From<VReg> for Operand {
@@ -490,6 +506,12 @@ impl From<PReg> for Operand {
 impl From<autosynth_isa::UImm12> for Operand {
     fn from(i: autosynth_isa::UImm12) -> Self {
         Operand::UImm12(i)
+    }
+}
+
+impl From<autosynth_isa::SImm9> for Operand {
+    fn from(i: autosynth_isa::SImm9) -> Self {
+        Operand::SImm9(i)
     }
 }
 
@@ -512,10 +534,14 @@ impl From<SlotRef> for Operand {
 /// High-level VCode (emitted by the frontend) and low-level VCode
 /// (after selection) share this enum. The selector reduces high-level
 /// operations into sequences of lower-level ones when needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VCode {
     /// An inline operand (input) in the VCode stream.
     Operand(Operand),
+
+    /// Define — this VReg is live from here. preg_alloc looks up
+    /// the VRegState from the allocator to initialize RegState.
+    Define(VReg),
 
     /// Set a VReg's canonical stack slot. Consumed by preg_alloc
     /// to update RegState — no machine code emitted.
@@ -545,11 +571,19 @@ pub enum VCode {
     /// Branch-and-link (call). Saves return address, jumps to target label.
     Bl { target: Label },
 
-    /// Load from memory.
-    Load { offset: u32, width: Width },
+    /// Load from [base + offset]. Operands: [base, offset] → DstPReg.
+    Load { width: Width },
 
-    /// Store to memory.
-    Store { offset: u32, width: Width },
+    /// Store to [base + offset]. Operands: [value, base, offset].
+    Store { width: Width },
+
+    /// Store with pre-decrement: str Rt, [Rn, #imm]!
+    /// Operands: [value, base, offset]. Base is updated.
+    StrPre,
+
+    /// Load with post-increment: ldr Rt, [Rn], #imm
+    /// Operands: [base, offset] → DstPReg. Base is updated.
+    LdrPost,
 
     /// Move / copy.
     Move,

@@ -3,16 +3,17 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use autosynth_ir::{BlockId, Operand, VCode, VReg, VRegSource};
 use autosynth_isa::{PReg, Width};
-use autosynth_regalloc::{MachineConfig, SharedVRegAllocator, VInit, VRegAllocator};
+use autosynth_regalloc::{MachineConfig, SharedVRegAllocator, VRegAllocator, VRegState};
 
 use super::{BlockBuilder, BuilderItem, VRefId, VRegOrRef};
+use super::block::SharedBlockBuilder;
 use crate::ir::{IrBlock, IrFunction, block_order};
 
 /// Builds a function's VCode representation.
 pub struct FunctionBuilder {
-    alloc: SharedVRegAllocator,
+    pub alloc: SharedVRegAllocator,
     config: MachineConfig,
-    blocks: BTreeMap<BlockId, BlockBuilder>,
+    blocks: BTreeMap<BlockId, SharedBlockBuilder>,
     current_block: BlockId,
     refs: Vec<VRegSource>,
 }
@@ -22,7 +23,7 @@ impl FunctionBuilder {
         let alloc: SharedVRegAllocator = Rc::new(RefCell::new(VRegAllocator::new()));
         let entry = BlockId::Entry(1);
         let mut blocks = BTreeMap::new();
-        blocks.insert(entry, BlockBuilder::new(entry));
+        blocks.insert(entry, Rc::new(RefCell::new(BlockBuilder::new(entry))));
         Self {
             alloc,
             config,
@@ -32,10 +33,14 @@ impl FunctionBuilder {
         }
     }
 
-    /// Define a new VReg, recording it as a def on the current block.
-    pub fn define(&mut self, init: VInit, width: Width) -> VReg {
-        let vreg = self.alloc.borrow_mut().define(init, width);
-        self.current_block_mut().defs.push(vreg);
+    /// Get the shared block builder for a block.
+    pub fn block(&self, id: BlockId) -> SharedBlockBuilder {
+        self.blocks[&id].clone()
+    }
+
+    pub fn define(&mut self, state: VRegState) -> VReg {
+        let vreg = self.alloc.borrow_mut().define(state);
+        self.blocks[&self.current_block].borrow_mut().defs.push(vreg);
         vreg
     }
 
@@ -44,27 +49,19 @@ impl FunctionBuilder {
     }
 
     pub fn emit(&mut self, inst: VCode) {
-        self.current_block_mut().emit(inst);
+        self.blocks[&self.current_block].borrow_mut().emit(inst);
     }
 
     pub fn push_operand(&mut self, val: impl Into<VRegOrRef>) {
-        self.current_block_mut().push_operand(val);
+        self.blocks[&self.current_block].borrow_mut().push_operand(val);
     }
 
     pub fn current_block_id(&self) -> BlockId {
         self.current_block
     }
 
-    pub fn current_block(&self) -> &BlockBuilder {
-        self.blocks.get(&self.current_block).unwrap()
-    }
-
-    pub fn current_block_mut(&mut self) -> &mut BlockBuilder {
-        self.blocks.get_mut(&self.current_block).unwrap()
-    }
-
     pub fn start_block(&mut self, id: BlockId) {
-        self.blocks.entry(id).or_insert_with(|| BlockBuilder::new(id));
+        self.blocks.entry(id).or_insert_with(|| Rc::new(RefCell::new(BlockBuilder::new(id))));
         self.current_block = id;
     }
 
@@ -97,19 +94,19 @@ impl FunctionBuilder {
         new_source: VRegSource,
     ) -> Option<VReg> {
         let mut alloc = self.alloc.borrow_mut();
-        let def = alloc.def_mut(existing.vreg);
-        match &mut def.init {
-            VInit::Phi(sources) => {
+        let st = alloc.state_mut(existing.vreg);
+        match &mut st.phi {
+            Some(sources) => {
                 sources.push(new_source);
                 None
             }
-            _ => {
-                let width = def.width;
-                let target = def.target;
-                let phi = alloc.define(
-                    VInit::Phi(vec![existing, new_source]),
-                    width,
-                );
+            None => {
+                let width = st.width;
+                let target = st.target;
+                let phi = alloc.define(VRegState {
+                    phi: Some(vec![existing, new_source]),
+                    ..VRegState::new(width)
+                });
                 if let Some(preg) = target {
                     alloc.set_target(phi, preg);
                 }
@@ -134,7 +131,7 @@ impl FunctionBuilder {
 
     pub fn build(self) -> IrFunction {
         let successors: BTreeMap<BlockId, Vec<BlockId>> = self.blocks.iter()
-            .map(|(&id, b)| (id, b.successors()))
+            .map(|(&id, b)| (id, b.borrow().successors()))
             .collect();
 
         let mut predecessors: BTreeMap<BlockId, Vec<BlockId>> = BTreeMap::new();
@@ -146,7 +143,11 @@ impl FunctionBuilder {
 
         let order = block_order::rpo(BlockId::Entry(1), &successors);
 
-        let blocks = self.blocks.into_iter().map(|(id, b)| {
+        let blocks = self.blocks.into_iter().map(|(id, shared_b)| {
+            let b = Rc::try_unwrap(shared_b)
+                .unwrap_or_else(|_| panic!("block {id:?} still borrowed"))
+                .into_inner();
+
             let mut stream = std::collections::VecDeque::new();
             let mut params = Vec::new();
 

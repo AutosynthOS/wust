@@ -2,49 +2,43 @@
 
 use alloc::rc::Rc;
 use alloc::vec::Vec;
-use autosynth_ir::{VInit, VReg};
+use autosynth_ir::{VReg, VRegState};
 use autosynth_isa::{PReg, Width};
 use core::cell::RefCell;
 
-/// Immutable metadata for a defined virtual register.
-#[derive(Debug, Clone)]
-pub struct VRegDef {
-    pub id: VReg,
-    pub width: Width,
-    pub init: VInit,
-    pub target: Option<PReg>,
-}
+pub type SharedVRegAllocator = Rc<RefCell<VRegAllocator>>;
 
-/// Global VReg factory — hands out VReg IDs and stores definitions.
+/// Global VReg factory — hands out VReg IDs and stores state.
 #[derive(Debug, Clone)]
 pub struct VRegAllocator {
-    defs: Vec<VRegDef>,
+    states: Vec<VRegState>,
 }
 
 impl VRegAllocator {
     pub fn new() -> Self {
-        Self { defs: Vec::new() }
+        Self { states: Vec::new() }
     }
 
-    pub fn define(&mut self, init: VInit, width: Width) -> VReg {
-        let id = VReg(self.defs.len() as u32);
-        let target = match &init {
-            VInit::PReg(preg) => Some(*preg),
-            _ => None,
-        };
-        self.defs.push(VRegDef { id, width, init, target });
+    pub fn define(&mut self, state: VRegState) -> VReg {
+        let id = VReg(self.states.len() as u32);
+        self.states.push(state);
         id
     }
 
     pub fn set_target(&mut self, id: VReg, preg: PReg) {
-        self.defs[id.0 as usize].target = Some(preg);
+        self.states[id.0 as usize].target = Some(preg);
     }
 
-    pub fn def(&self, id: VReg) -> &VRegDef { &self.defs[id.0 as usize] }
-    pub fn def_mut(&mut self, id: VReg) -> &mut VRegDef { &mut self.defs[id.0 as usize] }
-    pub fn init(&self, id: VReg) -> &VInit { &self.defs[id.0 as usize].init }
-    pub fn width(&self, id: VReg) -> Width { self.defs[id.0 as usize].width }
-    pub fn len(&self) -> usize { self.defs.len() }
+    pub fn state(&self, id: VReg) -> &VRegState {
+        &self.states[id.0 as usize]
+    }
+    pub fn state_mut(&mut self, id: VReg) -> &mut VRegState {
+        &mut self.states[id.0 as usize]
+    }
+    pub fn width(&self, id: VReg) -> Width {
+        self.states[id.0 as usize].width
+    }
+    pub fn len(&self) -> usize {
+        self.states.len()
+    }
 }
-
-pub type SharedVRegAllocator = Rc<RefCell<VRegAllocator>>;

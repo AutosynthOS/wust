@@ -21,7 +21,7 @@ pub mod ir;
 /// New VCode pipeline — compile IrFunction through a Selector.
 pub mod pipeline;
 pub use autosynth_ir::{
-    AluOp, BlockId, CompOp, FunctionIdx, IrInst, LowerInst, RegInst, SlotRef, VInit, VReg, VRegion,
+    AluOp, BlockId, CompOp, FunctionIdx, IrInst, LowerInst, RegInst, SlotRef, VReg, VRegState, VRegion,
     VRegionId,
 };
 pub use autosynth_isa::Width;

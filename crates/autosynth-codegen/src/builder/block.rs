@@ -1,13 +1,15 @@
+use std::cell::RefCell;
+use std::rc::Rc;
 use autosynth_ir::{BlockId, VCode, VReg};
 
 use super::{BuilderItem, VRegOrRef};
 
+pub type SharedBlockBuilder = Rc<RefCell<BlockBuilder>>;
+
 /// Mutable block under construction.
 pub struct BlockBuilder {
     pub id: BlockId,
-    /// Unified builder stream — operands (as VRegOrRef) and instructions interleaved.
     pub stream: Vec<BuilderItem>,
-    /// VRegs defined while this block was current.
     pub defs: Vec<VReg>,
 }
 

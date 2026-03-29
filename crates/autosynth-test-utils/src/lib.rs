@@ -67,5 +67,6 @@ fn format_operand(op: &Operand) -> String {
         }
         Operand::Mem(s) => format!("Mem({s:?})"),
         Operand::UImm12(i) => format!("#{}", i.value()),
+        Operand::SImm9(i) => format!("#{}", i.value()),
     }
 }

@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use autosynth_ir::{BlockId, CodeCtx, CompileError, Operand, VCode, VReg};
-use autosynth_regalloc::{SharedVRegAllocator, VInit};
+use autosynth_regalloc::SharedVRegAllocator;
 use autosynth_selector::Selector;
 
 use crate::ir::IrBlock;
@@ -35,17 +35,19 @@ impl ConvergeSelector {
             let succ = &ir_blocks[&succ_id];
 
             for &param in &succ.params {
-                match alloc.init(param) {
-                    VInit::Phi(sources) => {
+                let param_state = alloc.state(param);
+                match &param_state.phi {
+                    Some(sources) => {
                         let Some(source) = sources.iter().find(|s| s.block == block_id) else { continue };
-                        match alloc.init(source.vreg) {
-                            VInit::Const(val) => {
-                                ops.push(ConvergeOp::Materialize { vreg: source.vreg, val: *val });
+                        let source_state = alloc.state(source.vreg);
+                        match source_state.r#const {
+                            Some(val) => {
+                                ops.push(ConvergeOp::Materialize { vreg: source.vreg, val });
                             }
-                            _ => todo!("handle cases where phi source is not a const"),
+                            None => todo!("handle cases where phi source is not a const"),
                         }
                     }
-                    _ => {
+                    None => {
                         ops.push(ConvergeOp::KeepAlive(param));
                     }
                 }

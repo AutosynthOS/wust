@@ -7,7 +7,7 @@
 use autosynth_ir::CompileError;
 use autosynth_ir::{CodeCtx, Operand, VCode};
 use autosynth_isa::UImm12;
-use autosynth_regalloc::{SharedVRegAllocator, VInit};
+use autosynth_regalloc::SharedVRegAllocator;
 
 pub fn fold_immediates(
     alloc: &SharedVRegAllocator,
@@ -48,9 +48,9 @@ where
     let val = match op {
         Operand::VReg(vreg) => {
             let alloc = alloc.borrow();
-            match alloc.init(vreg) {
-                VInit::Const(val) => *val,
-                _ => return op,
+            match alloc.state(vreg).r#const {
+                Some(val) => val,
+                None => return op,
             }
         }
         Operand::Const(val) => val,

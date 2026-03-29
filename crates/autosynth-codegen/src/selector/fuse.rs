@@ -43,7 +43,7 @@ impl Selector for FuseSelector {
 
                 // No match — pass through one item.
                 [item, ..] => {
-                    output.push(*item);
+                    output.push(item.clone());
                     i += 1;
                 }
 

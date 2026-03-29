@@ -9,7 +9,7 @@
 //!   for reuse.
 
 use autosynth_ir::{CodeCtx, CompileError, Operand, VCode, VReg};
-use autosynth_regalloc::{RegState, VInit};
+use autosynth_regalloc::RegState;
 use autosynth_selector::Selector;
 
 pub struct PRegAllocSelector<'a> {
@@ -30,12 +30,13 @@ impl Selector for PRegAllocSelector<'_> {
             match item {
                 VCode::Operand(Operand::VReg(vreg)) => {
                     // Materialize consts if needed.
-                    let init = self.state.alloc.borrow().init(vreg).clone();
-                    if let VInit::Const(val) = init {
-                        // Emit materialization: [Const(val), Materialize, Define(vreg)]
+                    let alloc = self.state.alloc.borrow();
+                    let konst = alloc.state(vreg).r#const;
+                    drop(alloc);
+                    if let Some(val) = konst {
                         output.push_operand(Operand::Const(val));
                         output.push(VCode::Materialize);
-                        self.state.alloc.borrow_mut().def_mut(vreg).init = VInit::InstDst;
+                        self.state.alloc.borrow_mut().state_mut(vreg).inst_dst = true;
                     }
                     let preg = self.state.alloc_preg(vreg)?;
                     output.push_operand(Operand::PReg(preg));
@@ -47,6 +48,14 @@ impl Selector for PRegAllocSelector<'_> {
                 }
                 VCode::Operand(op) => {
                     output.push_operand(op);
+                }
+                VCode::Define(vreg) => {
+                    let state = self.state.alloc.borrow().state(vreg).clone();
+                    let bind_preg = state.preg;
+                    self.state.vregs.insert(vreg, state);
+                    if let Some(preg) = bind_preg {
+                        self.state.bind(vreg, preg);
+                    }
                 }
                 VCode::KeepAlive => {
                     let _ = input.next_operand();

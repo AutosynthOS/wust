@@ -5,7 +5,7 @@
 //! rhs where it can be folded as an immediate in pass 2.
 
 use autosynth_ir::{AluOp, CodeCtx, CompileError, Operand, VCode};
-use autosynth_regalloc::{SharedVRegAllocator, VInit};
+use autosynth_regalloc::SharedVRegAllocator;
 
 pub fn commutative_swap(
     alloc: &SharedVRegAllocator,
@@ -52,7 +52,7 @@ fn is_commutative(op: &AluOp) -> bool {
 fn is_const_operand(op: &Operand, alloc: &SharedVRegAllocator) -> bool {
     match op {
         Operand::Const(_) => true,
-        Operand::VReg(vreg) => matches!(alloc.borrow().init(*vreg), VInit::Const(_)),
+        Operand::VReg(vreg) => alloc.borrow().state(*vreg).r#const.is_some(),
         _ => false,
     }
 }

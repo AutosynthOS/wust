@@ -35,8 +35,8 @@ pub fn compile(
         let alloc = func.alloc.borrow();
         for i in 0..alloc.len() {
             let vreg = autosynth_ir::VReg(i as u32);
-            if let autosynth_regalloc::VInit::PReg(preg) = alloc.init(vreg) {
-                entry_state.bind(vreg, *preg);
+            if let Some(preg) = alloc.state(vreg).preg {
+                entry_state.bind(vreg, preg);
             }
         }
     }
