@@ -45,20 +45,18 @@ impl Aarch64Emitter {
             let target_offset = ctx
                 .label_offset(patch.target)
                 .ok_or(EmitError::UnresolvedLabel)?;
-            let word_displacement = (target_offset as i64 - patch.offset as i64) / 4;
+            // Branch offsets are in words (4 bytes per ARM64 instruction).
+            let byte_displacement = target_offset as isize - patch.offset as isize;
+            let word_displacement = byte_displacement / 4;
 
             let word = match patch.kind {
                 PatchKind::B => {
-                    let disp: i32 = word_displacement.try_into()
-                        .map_err(|_| EmitError::ImmediateOutOfRange)?;
-                    let offset = SImm26::try_from(disp)
+                    let offset = SImm26::try_from(word_displacement as i32)
                         .map_err(|_| EmitError::ImmediateOutOfRange)?;
                     B { offset }.encode_word()
                 }
                 PatchKind::BCond(cond) => {
-                    let disp: i32 = word_displacement.try_into()
-                        .map_err(|_| EmitError::ImmediateOutOfRange)?;
-                    let offset = SImm19::try_from(disp)
+                    let offset = SImm19::try_from(word_displacement as i32)
                         .map_err(|_| EmitError::ImmediateOutOfRange)?;
                     BCond { cond, offset }.encode_word()
                 }
