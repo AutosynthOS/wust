@@ -38,7 +38,7 @@ impl WasmFunctionBuilder {
         };
 
         let mut blocks = BTreeMap::new();
-        blocks.insert(BlockId::Entry, entry_block);
+        blocks.insert(BlockId::Entry(1), entry_block);
 
         Self { inner, blocks }
     }

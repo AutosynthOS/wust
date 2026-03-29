@@ -64,7 +64,7 @@ fn build_alu_reuse_lhs(
 fn compile_entry(func: &autosynth_codegen::ir::IrFunction) -> CodeCtx {
     let mut selector = Aarch64Selector::new(func.alloc.clone());
     let result = compile(func, &mut selector).unwrap();
-    result.blocks[&BlockId::Entry].clone()
+    result.blocks[&BlockId::Entry(1)].clone()
 }
 
 // --- Const folding ---

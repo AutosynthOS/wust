@@ -28,8 +28,8 @@ impl fmt::Display for VReg {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[cfg_attr(feature = "trace", derive(serde::Serialize))]
 pub enum BlockId {
-    /// Function entry / prologue block.
-    Entry,
+    /// Function entry blocks. Entry(0) = host trampoline, Entry(1) = body.
+    Entry(u32),
     /// Caller-defined block, keyed by a source-level index (e.g. program counter).
     User(u32),
     /// Generated block (suspend stubs, cold paths, trampolines).
@@ -41,7 +41,7 @@ pub enum BlockId {
 impl fmt::Display for BlockId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            BlockId::Entry => write!(f, "E0"),
+            BlockId::Entry(n) => write!(f, "E{n}"),
             BlockId::User(n) => write!(f, "U{n}"),
             BlockId::Gen(n) => write!(f, "G{n}"),
             BlockId::Epilogue => write!(f, "Ep"),

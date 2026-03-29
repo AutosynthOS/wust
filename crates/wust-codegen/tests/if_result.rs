@@ -42,7 +42,7 @@ fn if_result() {
     // --- Entry ---
     // eqz fused into BrIf(Eq). param already in x0, zero folded to #0.
     // subs wzr, w0, #0 ; b.ne else
-    common::assert_stream_eq(&result.blocks[&BlockId::Entry], &[
+    common::assert_stream_eq(&result.blocks[&BlockId::Entry(1)], &[
         Operand::PReg(PReg(0)).into(),    // param
         Operand::UImm12(UImm12::try_from(0).unwrap()).into(),
         VCode::BrIf { op: CompOp::Eq, block_if: BlockId::User(4), block_else: BlockId::User(6) },

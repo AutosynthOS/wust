@@ -20,7 +20,7 @@ pub struct FunctionBuilder {
 impl FunctionBuilder {
     pub fn new(config: MachineConfig) -> Self {
         let alloc: SharedVRegAllocator = Rc::new(RefCell::new(VRegAllocator::new()));
-        let entry = BlockId::Entry;
+        let entry = BlockId::Entry(1);
         let mut blocks = BTreeMap::new();
         blocks.insert(entry, BlockBuilder::new(entry));
         Self {
@@ -144,7 +144,7 @@ impl FunctionBuilder {
             }
         }
 
-        let order = block_order::rpo(BlockId::Entry, &successors);
+        let order = block_order::rpo(BlockId::Entry(1), &successors);
 
         let blocks = self.blocks.into_iter().map(|(id, b)| {
             let mut stream = std::collections::VecDeque::new();
