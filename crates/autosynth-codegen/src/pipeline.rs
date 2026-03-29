@@ -5,6 +5,7 @@ use autosynth_regalloc::RegState;
 use autosynth_selector::{CompileError, Selector};
 
 use crate::selector::converge::ConvergeSelector;
+use crate::selector::fuse::FuseSelector;
 use crate::selector::preg_alloc::PRegAllocSelector;
 use crate::ir::IrFunction;
 
@@ -14,12 +15,13 @@ pub struct VCodeFunction {
     pub block_order: Vec<BlockId>,
 }
 
-/// Compile an IR function through select → converge → preg_alloc.
+/// Compile an IR function: converge → fuse → select → preg_alloc.
 ///
 /// For each block:
-/// 1. Instruction selection (pure VRegs, immediate folding)
-/// 2. Convergence (emit Materialize for const phi sources)
-/// 3. PReg allocation (resolve all VReg operands to PRegs)
+/// 1. Convergence (emit Materialize/KeepAlive for successor params)
+/// 2. Fusion (pattern-match Alu(Comp) + BrIf → fused BrIf)
+/// 3. Instruction selection (immediate folding, commutative swap)
+/// 4. PReg allocation (resolve VRegs to PRegs, materialize consts)
 pub fn compile(
     func: &IrFunction,
     selector: &mut impl Selector,
@@ -42,18 +44,24 @@ pub fn compile(
 
     for &block_id in &func.block_order {
         let block = &func.blocks[&block_id];
-        let mut input = CodeCtx { stream: block.stream.clone() };
+        let mut stream = CodeCtx { stream: block.stream.clone() };
 
-        // 1. Instruction selection.
-        let mut stream = selector.select(&mut input)?;
-
-        // 2. Convergence — emit Materialize for const phi sources.
+        // 1. Convergence.
         {
             let mut converge = ConvergeSelector::new(&func.alloc, block_id, &func.blocks);
             stream = converge.select(&mut stream)?;
         }
 
-        // 3. PReg allocation.
+        // 2. Fusion.
+        {
+            let mut fuse = FuseSelector::new();
+            stream = fuse.select(&mut stream)?;
+        }
+
+        // 3. Instruction selection.
+        stream = selector.select(&mut stream)?;
+
+        // 4. PReg allocation.
         let mut state = snapshots.remove(&block_id)
             .unwrap_or_else(|| RegState::new(func.alloc.clone()));
         {

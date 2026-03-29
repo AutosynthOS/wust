@@ -465,6 +465,8 @@ pub enum Operand {
     Const(i64),
     VReg(VReg),
     PReg(PReg),
+    /// Destination PReg — which register an instruction writes its result to.
+    DstPReg(PReg),
     Mem(SlotRef),
     UImm12(autosynth_isa::UImm12),
 }
@@ -506,10 +508,6 @@ pub enum VCode {
     /// A VReg definition (output). The VReg becomes live here.
     /// Consumed by preg_alloc — InstDst defs become DstPReg.
     Define(VReg),
-
-    /// Destination PReg for the preceding instruction's output.
-    /// Emitted by preg_alloc to replace Define(VReg) for InstDst defs.
-    DstPReg(PReg),
 
     /// Keep a VReg alive through this point — no code emitted.
     /// Inserted by convergence for phi sources that are already live
@@ -610,6 +608,20 @@ impl CodeCtx {
 
     /// Pop the last item if it's an operand. Errors if the last
     /// item is not an operand or the stream is empty.
+    /// Scan the stream for all VRegs that appear as operands or defines.
+    pub fn live_vregs(&self) -> alloc::collections::BTreeSet<VReg> {
+        let mut live = alloc::collections::BTreeSet::new();
+        for item in &self.stream {
+            match item {
+                VCode::Operand(Operand::VReg(vreg)) | VCode::Define(vreg) => {
+                    live.insert(*vreg);
+                }
+                _ => {}
+            }
+        }
+        live
+    }
+
     pub fn pop_operand_back(&mut self) -> Result<Operand, CompileError> {
         match self.stream.pop_back() {
             Some(VCode::Operand(op)) => Ok(op),

@@ -20,7 +20,7 @@ fn add5() {
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(5).unwrap()).into(),
         VCode::Alu { op: AluOp::Add },
-        VCode::DstPReg(PReg(0)),
+        Operand::DstPReg(PReg(0)).into(),
         VCode::Return,
     ]);
 

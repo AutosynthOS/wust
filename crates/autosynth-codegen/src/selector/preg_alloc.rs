@@ -9,7 +9,6 @@
 //!   for reuse.
 
 use std::collections::BTreeSet;
-
 use autosynth_ir::{CodeCtx, CompileError, Operand, VCode, VReg};
 use autosynth_regalloc::{RegState, VInit};
 use autosynth_selector::Selector;
@@ -27,6 +26,7 @@ impl<'a> PRegAllocSelector<'a> {
 impl Selector for PRegAllocSelector<'_> {
     fn select(&mut self, input: &mut CodeCtx) -> Result<CodeCtx, CompileError> {
         let mut output = CodeCtx::new();
+        let mut after_producing_inst = false;
 
         while let Some(item) = input.next() {
             match item {
@@ -46,14 +46,11 @@ impl Selector for PRegAllocSelector<'_> {
                     output.push_operand(op);
                 }
                 VCode::Define(vreg) => {
-                    // Define = VReg is born here. Allocate a PReg.
                     let preg = self.state.alloc_preg(vreg)?;
-                    let init = self.state.alloc.borrow().init(vreg).clone();
-                    if matches!(init, VInit::InstDst) {
-                        // Instruction output — emitter needs the dst PReg.
-                        output.push(VCode::DstPReg(preg));
+                    if after_producing_inst {
+                        output.push_operand(Operand::DstPReg(preg));
+                        after_producing_inst = false;
                     }
-                    // Other defs (Const, PReg, Phi) are consumed silently.
                 }
                 VCode::KeepAlive => {
                     // Strip — just a liveness marker. The operand
@@ -63,8 +60,11 @@ impl Selector for PRegAllocSelector<'_> {
                 }
                 inst => {
                     // Instruction boundary — unbind dead input VRegs.
-                    let live_below = scan_live_vregs(input);
+                    let live_below = input.live_vregs();
                     unbind_dead_inputs(&mut output, &live_below, self.state);
+                    after_producing_inst = matches!(inst,
+                        VCode::Alu { .. } | VCode::Materialize
+                    );
                     output.push(inst);
                 }
             }
@@ -74,18 +74,6 @@ impl Selector for PRegAllocSelector<'_> {
     }
 }
 
-/// Scan the remaining stream for all VRegs that are used.
-fn scan_live_vregs(remaining: &CodeCtx) -> BTreeSet<VReg> {
-    let mut live = BTreeSet::new();
-    for item in &remaining.stream {
-        match item {
-            VCode::Operand(Operand::VReg(vreg)) => { live.insert(*vreg); }
-            VCode::Define(vreg) => { live.insert(*vreg); }
-            _ => {}
-        }
-    }
-    live
-}
 
 /// Walk backwards through the output's trailing operands and unbind
 /// any VRegs that aren't in the live set.

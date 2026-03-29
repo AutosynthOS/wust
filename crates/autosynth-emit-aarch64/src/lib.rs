@@ -75,7 +75,6 @@ impl Emitter for Aarch64Emitter {
 
         while let Some(inst) = uz.next_inst() {
             match inst {
-                VCode::DstPReg(_) => {} // handled by instruction emitters
                 VCode::Alu { ref op } => emit_alu(op, &mut uz, ctx)?,
                 VCode::BrIf { ref op, block_if, block_else } => {
                     emit_brif(self, op, block_if, block_else, &mut uz, ctx)?;
@@ -95,8 +94,8 @@ fn next_op(uz: &mut CodeCtxUnzipper) -> Result<Operand, EmitError> {
 }
 
 fn next_dst(uz: &mut CodeCtxUnzipper) -> Result<PReg, EmitError> {
-    match uz.next_inst() {
-        Some(VCode::DstPReg(preg)) => Ok(preg),
+    match uz.next_operand() {
+        Ok(Operand::DstPReg(preg)) => Ok(preg),
         _ => Err(EmitError::OperandUnderflow),
     }
 }
@@ -195,25 +194,14 @@ fn emit_materialize(
     ctx: &mut impl CodeContext,
 ) -> Result<(), EmitError> {
     let val = next_op(uz)?;
+    let dst = next_dst(uz)?;
+
     let Operand::Const(imm) = val else {
         return Err(EmitError::UnresolvedOperand);
     };
 
-    // Materialize consumes no dst operand from the unzipper —
-    // the dst PReg was determined by preg_alloc and the Define
-    // was consumed. The next operand in the stream (after the
-    // Materialize instruction) should be the PReg that uses this
-    // value. But for encoding, we need to know which register
-    // to load into.
-    //
-    // TODO: the Materialize dst needs to come from somewhere.
-    // For now, peek at the next operand which should be the
-    // PReg this value was materialized into.
-    let dst = next_op(uz)?;
-    let dst_preg = expect_preg(&dst)?;
-
     // TODO: proper movz/movk sequence for large constants.
-    let word = 0x52800000 | ((imm as u32 & 0xFFFF) << 5) | (dst_preg.0 as u32);
+    let word = 0x52800000 | ((imm as u32 & 0xFFFF) << 5) | (dst.0 as u32);
     ctx.emit_bytes(&word.to_le_bytes()).map_err(|_| EmitError::ImmediateOutOfRange)
 }
 

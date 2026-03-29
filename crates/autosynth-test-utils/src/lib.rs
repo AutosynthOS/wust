@@ -57,6 +57,7 @@ fn format_operand(op: &Operand) -> String {
         Operand::Const(v) => format!("Const({v})"),
         Operand::VReg(v) => format!("{v}"),
         Operand::PReg(p) => format!("x{}", p.0),
+        Operand::DstPReg(p) => format!("→x{}", p.0),
         Operand::Mem(s) => format!("Mem({s:?})"),
         Operand::UImm12(i) => format!("#{}", i.value()),
     }
