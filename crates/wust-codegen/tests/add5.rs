@@ -17,10 +17,10 @@ fn add5() {
 
     assert_eq!(result.block_order.len(), 1);
     common::assert_stream_eq(&result.blocks[&BlockId::Entry], &[
-        VCode::Alu { op: AluOp::Add },
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(5).unwrap()).into(),
-        Operand::PReg(PReg(0)).into(),
+        VCode::Alu { op: AluOp::Add },
+        VCode::DstPReg(PReg(0)),
         VCode::Return,
     ]);
 

@@ -22,10 +22,12 @@ impl WasmFunctionBuilder {
         let mut locals = Vec::new();
         for (i, param) in func.params.iter().enumerate() {
             let id = inner.define(VInit::PReg(PReg(i as u8)), valtype_to_width(param));
+            inner.emit(VCode::Define(id));
             locals.push(VRegOrRef::VReg(id));
         }
         for local in func.locals.iter() {
             let id = inner.define(VInit::Const(0), valtype_to_width(local));
+            inner.emit(VCode::Define(id));
             locals.push(VRegOrRef::VReg(id));
         }
 
@@ -56,6 +58,7 @@ impl WasmFunctionBuilder {
 
     pub fn push_const(&mut self, val: i64, width: Width) {
         let id = self.inner.define(VInit::Const(val), width);
+        self.inner.emit(VCode::Define(id));
         self.current().region("operands").push(VRegOrRef::VReg(id));
     }
 
@@ -86,10 +89,10 @@ impl WasmFunctionBuilder {
         let lhs = self.pop();
         let dst = self.inner.define(VInit::InstDst, width);
 
-        self.inner.emit(VCode::Alu { op });
         self.inner.push_operand(lhs);
         self.inner.push_operand(rhs);
-        self.inner.push_operand(dst);
+        self.inner.emit(VCode::Alu { op });
+        self.inner.emit(VCode::Define(dst));
 
         self.current().region("operands").push(VRegOrRef::VReg(dst));
     }
@@ -99,10 +102,10 @@ impl WasmFunctionBuilder {
         let zero = self.inner.define(VInit::Const(0), Width::W32);
         let dst = self.inner.define(VInit::InstDst, Width::W32);
 
-        self.inner.emit(VCode::Alu { op: AluOp::Comp(CompOp::Eq) });
         self.inner.push_operand(val);
         self.inner.push_operand(zero);
-        self.inner.push_operand(dst);
+        self.inner.emit(VCode::Alu { op: AluOp::Comp(CompOp::Eq) });
+        self.inner.emit(VCode::Define(dst));
 
         self.current().region("operands").push(VRegOrRef::VReg(dst));
     }
@@ -125,32 +128,32 @@ impl WasmFunctionBuilder {
         };
 
         if let Some(comp_op) = fused {
-            // Stream is [..., Alu, lhs, rhs, dst]. Pop all 4,
-            // then push BrIf + lhs + rhs.
+            // Stream is [..., lhs, rhs, Alu, dst]. Pop all 4,
+            // then push lhs + rhs + BrIf (inputs before instruction).
             let block = self.inner.current_block_mut();
-            block.stream.pop(); // dst operand
+            block.stream.pop(); // dst operand (output)
+            block.stream.pop(); // Alu inst
             let rhs = block.stream.pop();
             let lhs = block.stream.pop();
-            block.stream.pop(); // Alu inst
 
+            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
+                block.stream.push(lhs);
+                block.stream.push(rhs);
+            }
             block.stream.push(BuilderItem::Inst(VCode::BrIf {
                 op: comp_op,
                 block_if: then_block,
                 block_else: else_block,
             }));
-            if let (Some(lhs), Some(rhs)) = (lhs, rhs) {
-                block.stream.push(lhs);
-                block.stream.push(rhs);
-            }
         } else {
             let zero = self.inner.define(VInit::Const(0), Width::W32);
+            self.inner.push_operand(cond);
+            self.inner.push_operand(zero);
             self.inner.emit(VCode::BrIf {
                 op: CompOp::Ne,
                 block_if: then_block,
                 block_else: else_block,
             });
-            self.inner.push_operand(cond);
-            self.inner.push_operand(zero);
         }
 
         // Fork current block state to each successor independently.

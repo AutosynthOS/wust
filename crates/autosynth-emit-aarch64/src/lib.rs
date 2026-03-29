@@ -8,28 +8,21 @@
 /// the CodeContext, re-encoding each instruction with the real
 /// displacement.
 use autosynth_emitter::{CodeContext, EmitError, Emitter};
-use autosynth_ir::{AluOp, BlockId, CodeCtx, CompOp, Label, Operand, VCode};
+use autosynth_ir::{AluOp, BlockId, CodeCtx, CodeCtxUnzipper, CompOp, Label, Operand, VCode};
 use autosynth_isa::{PReg, SImm19, SImm26, Width};
 use autosynth_isa_aarch64::{
     Aarch64Inst, AddImm, AddReg, B, BCond, Cond, Ret, SubsImm, SubsReg,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
 
-/// A recorded patch site — an instruction that needs its offset
-/// resolved after all labels are known.
 struct PatchSite {
-    /// Byte offset of the instruction in the code buffer.
     offset: usize,
-    /// The target label to resolve.
     target: Label,
-    /// What kind of instruction to re-encode.
     kind: PatchKind,
 }
 
 enum PatchKind {
-    /// B (unconditional branch) — SImm26 word offset.
     B,
-    /// B.cond (conditional branch) — SImm19 word offset.
     BCond(Cond),
 }
 
@@ -46,7 +39,6 @@ impl Aarch64Emitter {
         }
     }
 
-    /// Resolve all recorded patch sites.
     pub fn finalize(&mut self, ctx: &mut impl CodeContext) -> Result<(), EmitError> {
         for patch in self.patches.drain(..) {
             let target_offset = ctx.label_offset(patch.target)
@@ -78,18 +70,18 @@ impl Emitter for Aarch64Emitter {
         stream: &mut CodeCtx,
         ctx: &mut impl CodeContext,
     ) -> Result<(), EmitError> {
-        while let Some(item) = stream.next() {
-            match item {
-                VCode::Operand(_) => {
-                    // Stray operand — shouldn't happen in a well-formed stream.
-                    return Err(EmitError::UnresolvedOperand);
-                }
-                VCode::Alu { ref op } => emit_alu(op, stream, ctx)?,
+        let owned = CodeCtx { stream: core::mem::take(&mut stream.stream) };
+        let mut uz = owned.unzip();
+
+        while let Some(inst) = uz.next_inst() {
+            match inst {
+                VCode::DstPReg(_) => {} // handled by instruction emitters
+                VCode::Alu { ref op } => emit_alu(op, &mut uz, ctx)?,
                 VCode::BrIf { ref op, block_if, block_else } => {
-                    emit_brif(self, op, block_if, block_else, stream, ctx)?;
+                    emit_brif(self, op, block_if, block_else, &mut uz, ctx)?;
                 }
                 VCode::Branch { target } => emit_branch(self, target, ctx)?,
-                VCode::Materialize => emit_materialize(stream, ctx)?,
+                VCode::Materialize => emit_materialize(&mut uz, ctx)?,
                 VCode::Return => encode(Ret { rn: XGpr(GprId::LINK_REGISTER) }, ctx)?,
                 _ => return Err(EmitError::Unhandled),
             }
@@ -98,33 +90,39 @@ impl Emitter for Aarch64Emitter {
     }
 }
 
-fn next_op(stream: &mut CodeCtx) -> Result<Operand, EmitError> {
-    stream.next_operand().map_err(|_| EmitError::OperandUnderflow)
+fn next_op(uz: &mut CodeCtxUnzipper) -> Result<Operand, EmitError> {
+    uz.next_operand().map_err(|_| EmitError::OperandUnderflow)
+}
+
+fn next_dst(uz: &mut CodeCtxUnzipper) -> Result<PReg, EmitError> {
+    match uz.next_inst() {
+        Some(VCode::DstPReg(preg)) => Ok(preg),
+        _ => Err(EmitError::OperandUnderflow),
+    }
 }
 
 fn emit_alu(
     op: &AluOp,
-    stream: &mut CodeCtx,
+    uz: &mut CodeCtxUnzipper,
     ctx: &mut impl CodeContext,
 ) -> Result<(), EmitError> {
-    let lhs = next_op(stream)?;
-    let rhs = next_op(stream)?;
-    let dst = next_op(stream)?;
+    let lhs = next_op(uz)?;
+    let rhs = next_op(uz)?;
+    let dst = next_dst(uz)?;
 
     match op {
         AluOp::Add => {
-            let dst_preg = expect_preg(&dst)?;
             let lhs_preg = expect_preg(&lhs)?;
             let width = Width::W32;
 
             match rhs {
                 Operand::UImm12(imm) => {
-                    let rd = to_gpr_or_sp(dst_preg, width);
+                    let rd = to_gpr_or_sp(dst, width);
                     let rn = to_gpr_or_sp(lhs_preg, width);
                     encode(AddImm { rd, rn, imm }, ctx)
                 }
                 Operand::PReg(preg) => {
-                    let rd = to_gpr_or_zr(dst_preg, width);
+                    let rd = to_gpr_or_zr(dst, width);
                     let rn = to_gpr_or_zr(lhs_preg, width);
                     let rm = to_gpr_or_zr(preg, width);
                     encode(AddReg { rd, rn, rm }, ctx)
@@ -139,13 +137,13 @@ fn emit_alu(
 fn emit_brif(
     emitter: &mut Aarch64Emitter,
     op: &CompOp,
-    block_if: BlockId,
+    _block_if: BlockId,
     block_else: BlockId,
-    stream: &mut CodeCtx,
+    uz: &mut CodeCtxUnzipper,
     ctx: &mut impl CodeContext,
 ) -> Result<(), EmitError> {
-    let lhs = next_op(stream)?;
-    let rhs = next_op(stream)?;
+    let lhs = next_op(uz)?;
+    let rhs = next_op(uz)?;
 
     let lhs_preg = expect_preg(&lhs)?;
     let width = Width::W32;
@@ -193,19 +191,28 @@ fn emit_branch(
 }
 
 fn emit_materialize(
-    stream: &mut CodeCtx,
+    uz: &mut CodeCtxUnzipper,
     ctx: &mut impl CodeContext,
 ) -> Result<(), EmitError> {
-    let val = next_op(stream)?;
-    let dst = next_op(stream)?;
-
+    let val = next_op(uz)?;
     let Operand::Const(imm) = val else {
         return Err(EmitError::UnresolvedOperand);
     };
+
+    // Materialize consumes no dst operand from the unzipper —
+    // the dst PReg was determined by preg_alloc and the Define
+    // was consumed. The next operand in the stream (after the
+    // Materialize instruction) should be the PReg that uses this
+    // value. But for encoding, we need to know which register
+    // to load into.
+    //
+    // TODO: the Materialize dst needs to come from somewhere.
+    // For now, peek at the next operand which should be the
+    // PReg this value was materialized into.
+    let dst = next_op(uz)?;
     let dst_preg = expect_preg(&dst)?;
 
     // TODO: proper movz/movk sequence for large constants.
-    // For now, encode as movz (16-bit immediate, zero-extend).
     let word = 0x52800000 | ((imm as u32 & 0xFFFF) << 5) | (dst_preg.0 as u32);
     ctx.emit_bytes(&word.to_le_bytes()).map_err(|_| EmitError::ImmediateOutOfRange)
 }

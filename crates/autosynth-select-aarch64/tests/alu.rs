@@ -13,10 +13,12 @@ fn build_alu(op: AluOp, lhs_init: VInit, rhs_init: VInit) -> autosynth_codegen::
     let rhs = f.define(rhs_init, Width::W32);
     let dst = f.define(VInit::InstDst, Width::W32);
 
+    f.emit(VCode::Define(lhs));  // lhs value exists
+    f.emit(VCode::Define(rhs));  // rhs value exists
+    f.push_operand(lhs);         // input
+    f.push_operand(rhs);         // input
     f.emit(VCode::Alu { op });
-    f.push_operand(lhs);
-    f.push_operand(rhs);
-    f.push_operand(dst);
+    f.emit(VCode::Define(dst));  // result born after instruction
     f.emit(VCode::Return);
 
     f.build()
@@ -38,17 +40,19 @@ fn build_alu_reuse_lhs(
     let dst1 = f.define(VInit::InstDst, Width::W32);
     let dst2 = f.define(VInit::InstDst, Width::W32);
 
-    // First: dst1 = lhs op rhs1
-    f.emit(VCode::Alu { op });
+    f.emit(VCode::Define(lhs));   // param exists
+    f.emit(VCode::Define(rhs1));  // const(3) exists
+    f.emit(VCode::Define(rhs2));  // const(7) exists
+
     f.push_operand(lhs);
     f.push_operand(rhs1);
-    f.push_operand(dst1);
-
-    // Second: dst2 = lhs op rhs2  (lhs used again)
     f.emit(VCode::Alu { op });
+    f.emit(VCode::Define(dst1));
+
     f.push_operand(lhs);
     f.push_operand(rhs2);
-    f.push_operand(dst2);
+    f.emit(VCode::Alu { op });
+    f.emit(VCode::Define(dst2));
 
     f.emit(VCode::Return);
 
@@ -73,10 +77,10 @@ fn add_const_rhs_folds() {
     let block = compile_entry(&func);
 
     assert_stream_eq(&block, &[
+        Operand::PReg(PReg(0)).into(),                        // lhs = param
+        Operand::UImm12(UImm12::try_from(5).unwrap()).into(), // rhs folded
         VCode::Alu { op: AluOp::Add },
-        Operand::PReg(PReg(0)).into(),
-        Operand::UImm12(UImm12::try_from(5).unwrap()).into(),
-        Operand::PReg(PReg(0)).into(), // dst reuses lhs — lhs is dead after this
+        VCode::DstPReg(PReg(0)),                              // dst reuses x0 (lhs dead)
         VCode::Return,
     ]);
 }
@@ -91,13 +95,12 @@ fn add_large_const_rhs_materializes() {
     let block = compile_entry(&func);
 
     assert_stream_eq(&block, &[
-        VCode::Materialize,
-        Operand::Const(5000).into(),
-        Operand::PReg(PReg(1)).into(),    // materialized into x1
-        VCode::Alu { op: AluOp::Add },
         Operand::PReg(PReg(0)).into(),    // lhs = param
-        Operand::PReg(PReg(1)).into(),    // rhs = materialized const
-        Operand::PReg(PReg(0)).into(),    // dst reuses lhs
+        Operand::Const(5000).into(),      // rhs const, can't fold
+        VCode::Materialize,               // materialize 5000 → x1
+        Operand::PReg(PReg(1)).into(),    // rhs = materialized
+        VCode::Alu { op: AluOp::Add },
+        VCode::DstPReg(PReg(0)),          // dst reuses x0
         VCode::Return,
     ]);
 }
@@ -117,10 +120,10 @@ fn add_const_lhs_swaps() {
 
     // After swap: lhs=param(x0), rhs=#5, dst reuses x0.
     assert_stream_eq(&block, &[
-        VCode::Alu { op: AluOp::Add },
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(5).unwrap()).into(),
-        Operand::PReg(PReg(0)).into(),
+        VCode::Alu { op: AluOp::Add },
+        VCode::DstPReg(PReg(0)),
         VCode::Return,
     ]);
 }
@@ -132,21 +135,20 @@ fn add_const_lhs_swaps() {
 /// sub is not commutative (5 - x != x - 5), so we can't swap.
 /// The const must be materialized into a register for the lhs.
 /// x0 holds the param, so the const materializes into x1.
-/// dst reuses x1 (lhs is dead after this, and x0 holds rhs which
-/// is also dead — either could be reused, but lhs is conventional).
 #[test]
 fn sub_const_lhs_materializes() {
     let func = build_alu(AluOp::Sub, VInit::Const(5), VInit::PReg(PReg(0)));
     let block = compile_entry(&func);
 
+    // Both lhs (x1) and rhs (x0) are dead after the sub.
+    // Allocator picks first available — x0.
     assert_stream_eq(&block, &[
-        VCode::Materialize,
-        Operand::Const(5).into(),
-        Operand::PReg(PReg(1)).into(),    // const(5) → x1
-        VCode::Alu { op: AluOp::Sub },
+        Operand::Const(5).into(),         // const needs materialization
+        VCode::Materialize,               // materialize 5 → x1
         Operand::PReg(PReg(1)).into(),    // lhs = materialized const
         Operand::PReg(PReg(0)).into(),    // rhs = param
-        Operand::PReg(PReg(1)).into(),    // dst reuses lhs
+        VCode::Alu { op: AluOp::Sub },
+        VCode::DstPReg(PReg(0)),          // dst reuses x0 (first freed)
         VCode::Return,
     ]);
 }
@@ -173,15 +175,15 @@ fn add_lhs_reused_needs_fresh_dst() {
 
     assert_stream_eq(&block, &[
         // First: dst1 = param + 3 → x1 (can't reuse x0, param still live)
-        VCode::Alu { op: AluOp::Add },
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(3).unwrap()).into(),
-        Operand::PReg(PReg(1)).into(),    // fresh reg — lhs still needed
-        // Second: dst2 = param + 7 → x0 (param dead after this, reuse)
         VCode::Alu { op: AluOp::Add },
+        VCode::DstPReg(PReg(1)),
+        // Second: dst2 = param + 7 → x0 (param dead after this, reuse)
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(7).unwrap()).into(),
-        Operand::PReg(PReg(0)).into(),    // reuse — lhs is dead
+        VCode::Alu { op: AluOp::Add },
+        VCode::DstPReg(PReg(0)),
         VCode::Return,
     ]);
 }

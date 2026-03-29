@@ -493,8 +493,16 @@ impl From<SlotRef> for Operand {
 /// operations into sequences of lower-level ones when needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VCode {
-    /// An inline operand in the VCode stream.
+    /// An inline operand (input) in the VCode stream.
     Operand(Operand),
+
+    /// A VReg definition (output). The VReg becomes live here.
+    /// Consumed by preg_alloc — InstDst defs become DstPReg.
+    Define(VReg),
+
+    /// Destination PReg for the preceding instruction's output.
+    /// Emitted by preg_alloc to replace Define(VReg) for InstDst defs.
+    DstPReg(PReg),
 
     /// Arithmetic / logic / comparison.
     Alu { op: AluOp },
@@ -586,5 +594,69 @@ impl CodeCtx {
 
     pub fn is_empty(&self) -> bool {
         self.stream.is_empty()
+    }
+
+    /// Pop the last item if it's an operand. Errors if the last
+    /// item is not an operand or the stream is empty.
+    pub fn pop_operand_back(&mut self) -> Result<Operand, CompileError> {
+        match self.stream.pop_back() {
+            Some(VCode::Operand(op)) => Ok(op),
+            Some(other) => {
+                self.stream.push_back(other);
+                Err(CompileError::OperandUnderflow)
+            }
+            None => Err(CompileError::OperandUnderflow),
+        }
+    }
+
+    /// Split into an unzipper that separates instructions from operands.
+    pub fn unzip(self) -> CodeCtxUnzipper {
+        CodeCtxUnzipper {
+            stream: self.stream,
+            operands: VecDeque::new(),
+            instructions: VecDeque::new(),
+        }
+    }
+}
+
+/// Walks a CodeCtx stream, splitting instructions from operands.
+///
+/// Each side has a pending buffer. When you ask for an instruction,
+/// any operands encountered are buffered. When you ask for an
+/// operand, any instructions encountered are buffered. Both sides
+/// drain from the same underlying stream.
+pub struct CodeCtxUnzipper {
+    stream: VecDeque<VCode>,
+    operands: VecDeque<Operand>,
+    instructions: VecDeque<VCode>,
+}
+
+impl CodeCtxUnzipper {
+    /// Get the next instruction. Buffers any operands encountered.
+    pub fn next_inst(&mut self) -> Option<VCode> {
+        if let Some(inst) = self.instructions.pop_front() {
+            return Some(inst);
+        }
+        while let Some(item) = self.stream.pop_front() {
+            match item {
+                VCode::Operand(op) => self.operands.push_back(op),
+                inst => return Some(inst),
+            }
+        }
+        None
+    }
+
+    /// Get the next operand. Buffers any instructions encountered.
+    pub fn next_operand(&mut self) -> Result<Operand, CompileError> {
+        if let Some(op) = self.operands.pop_front() {
+            return Ok(op);
+        }
+        while let Some(item) = self.stream.pop_front() {
+            match item {
+                VCode::Operand(op) => return Ok(op),
+                inst => self.instructions.push_back(inst),
+            }
+        }
+        Err(CompileError::OperandUnderflow)
     }
 }

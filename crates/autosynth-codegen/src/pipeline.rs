@@ -27,8 +27,18 @@ pub fn compile(
     let mut blocks = BTreeMap::new();
     let mut snapshots: BTreeMap<BlockId, RegState> = BTreeMap::new();
 
-    // Entry block starts with a fresh RegState.
-    snapshots.insert(func.block_order[0], RegState::new(func.alloc.clone()));
+    // Entry block starts with a RegState initialized from PReg-bound defs.
+    let mut entry_state = RegState::new(func.alloc.clone());
+    {
+        let alloc = func.alloc.borrow();
+        for i in 0..alloc.len() {
+            let vreg = autosynth_ir::VReg(i as u32);
+            if let autosynth_regalloc::VInit::PReg(preg) = alloc.init(vreg) {
+                entry_state.bind(vreg, *preg);
+            }
+        }
+    }
+    snapshots.insert(func.block_order[0], entry_state);
 
     for &block_id in &func.block_order {
         let block = &func.blocks[&block_id];

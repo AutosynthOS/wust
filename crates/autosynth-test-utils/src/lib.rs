@@ -6,6 +6,7 @@ use autosynth_ir::{CodeCtx, Operand, VCode};
 ///   green (+) = expected but missing
 ///   red   (-) = got but unexpected
 ///   dim       = matching lines
+#[track_caller]
 pub fn assert_stream_eq(block: &CodeCtx, expected: &[VCode]) {
     let got: Vec<&VCode> = block.stream.iter().collect();
     let exp: Vec<&VCode> = expected.iter().collect();

@@ -315,9 +315,9 @@ impl RegState {
         output: &mut autosynth_ir::CodeCtx,
     ) -> Result<(), CompileError> {
         self.alloc.borrow_mut().def_mut(vreg).init = VInit::InstDst;
-        output.push(VCode::Materialize);
         output.push_operand(Operand::Const(val));
-        output.push_operand(Operand::VReg(vreg));
+        output.push(VCode::Materialize);
+        output.push(VCode::Define(vreg));
         Ok(())
     }
 }

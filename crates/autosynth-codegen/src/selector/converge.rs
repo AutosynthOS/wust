@@ -58,9 +58,9 @@ impl Selector for ConvergeSelector {
         while let Some(item) = input.next() {
             if matches!(item, VCode::Branch { .. } | VCode::BrIf { .. }) {
                 for (vreg, val) in self.materializations.drain(..) {
-                    output.push(VCode::Materialize);
                     output.push_operand(Operand::Const(val));
-                    output.push_operand(Operand::VReg(vreg));
+                    output.push(VCode::Materialize);
+                    output.push(VCode::Define(vreg));
                 }
             }
             output.push(item);

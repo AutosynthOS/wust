@@ -16,9 +16,8 @@ pub fn commutative_swap(
     while let Some(item) = input.next() {
         match item {
             VCode::Alu { op } if is_commutative(&op) => {
-                let lhs = input.next_operand()?;
-                let rhs = input.next_operand()?;
-                let dst = input.next_operand()?;
+                let rhs = output.pop_operand_back()?;
+                let lhs = output.pop_operand_back()?;
 
                 let (lhs, rhs) = if is_const_operand(&lhs, alloc) && !is_const_operand(&rhs, alloc) {
                     (rhs, lhs)
@@ -26,10 +25,9 @@ pub fn commutative_swap(
                     (lhs, rhs)
                 };
 
-                output.push(item);
                 output.push_operand(lhs);
                 output.push_operand(rhs);
-                output.push_operand(dst);
+                output.push(item);
             }
             other => output.push(other),
         }
@@ -39,11 +37,15 @@ pub fn commutative_swap(
 }
 
 fn is_commutative(op: &AluOp) -> bool {
-    matches!(op,
-        AluOp::Add | AluOp::Mul |
-        AluOp::And | AluOp::Or | AluOp::Xor |
-        AluOp::Comp(autosynth_ir::CompOp::Eq) |
-        AluOp::Comp(autosynth_ir::CompOp::Ne)
+    matches!(
+        op,
+        AluOp::Add
+            | AluOp::Mul
+            | AluOp::And
+            | AluOp::Or
+            | AluOp::Xor
+            | AluOp::Comp(autosynth_ir::CompOp::Eq)
+            | AluOp::Comp(autosynth_ir::CompOp::Ne)
     )
 }
 

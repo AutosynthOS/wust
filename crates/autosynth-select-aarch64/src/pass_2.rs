@@ -18,39 +18,29 @@ pub fn fold_immediates(
     while let Some(item) = input.next() {
         match item {
             VCode::Alu { .. } => {
-                let lhs = input.next_operand()?;
-                let rhs = input.next_operand()?;
-                let dst = input.next_operand()?;
+                let rhs = output.pop_operand_back()?;
+                let lhs = output.pop_operand_back()?;
 
-                let rhs = try_fold_imm::<UImm12>(rhs, alloc);
-
-                output.push(item);
                 output.push_operand(lhs);
-                output.push_operand(rhs);
-                output.push_operand(dst);
+                output.push_operand(try_fold_imm::<UImm12>(rhs, alloc));
+                output.push(item);
             }
             VCode::BrIf { .. } => {
-                let lhs = input.next_operand()?;
-                let rhs = input.next_operand()?;
+                let rhs = output.pop_operand_back()?;
+                let lhs = output.pop_operand_back()?;
 
-                let rhs = try_fold_imm::<UImm12>(rhs, alloc);
-
-                output.push(item);
                 output.push_operand(lhs);
-                output.push_operand(rhs);
+                output.push_operand(try_fold_imm::<UImm12>(rhs, alloc));
+                output.push(item);
             }
-            other => {
-                output.push(other);
-            }
+            other => output.push(other),
         }
     }
 
     Ok(output)
 }
 
-/// Try to fold a VReg operand as an immediate. If the VReg is a
-/// Const that fits in `Imm`, returns the folded operand.
-/// Otherwise returns the original operand unchanged.
+/// Try to fold a VReg operand as an immediate.
 fn try_fold_imm<Imm>(op: Operand, alloc: &SharedVRegAllocator) -> Operand
 where
     Imm: TryFrom<i64> + Into<Operand>,
