@@ -542,8 +542,8 @@ pub enum VCode {
     /// Unconditional branch.
     Branch { target: BlockId },
 
-    /// Function call.
-    Call { func_idx: FunctionIdx },
+    /// Branch-and-link (call). Saves return address, jumps to target label.
+    Bl { target: Label },
 
     /// Load from memory.
     Load { offset: u32, width: Width },

@@ -3,7 +3,7 @@ use autosynth_emitter::{CodeContext, Emitter};
 use autosynth_ir::{AluOp, BlockId, CodeCtxUnzipper, CompOp, CompileError, Label, Operand, VCode};
 use autosynth_isa::{PReg, SImm19, SImm26, UImm16, Width};
 use autosynth_isa_aarch64::{
-    Aarch64Inst, AddImm, AddReg, B, BCond, Cond, Movk, Movz, Ret, SubsImm, SubsReg,
+    Aarch64Inst, AddImm, AddReg, B, BCond, Bl as BlInst, Cond, Movk, Movz, Ret, SubsImm, SubsReg,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
 };
 
@@ -15,6 +15,7 @@ struct PatchSite {
 
 enum PatchKind {
     B,
+    Bl,
     BCond(Cond),
 }
 
@@ -40,6 +41,11 @@ impl Aarch64Emitter {
                     let offset = SImm26::try_from(word_disp)
                         .map_err(|_| CompileError::ImmediateOutOfRange)?;
                     B { offset }.encode_word()
+                }
+                PatchKind::Bl => {
+                    let offset = SImm26::try_from(word_disp)
+                        .map_err(|_| CompileError::ImmediateOutOfRange)?;
+                    BlInst { offset }.encode_word()
                 }
                 PatchKind::BCond(cond) => {
                     let offset = SImm19::try_from(word_disp)
@@ -67,6 +73,7 @@ impl Emitter for Aarch64Emitter {
                     emit_brif(self, op, block_else, &mut uz, ctx)?;
                 }
                 VCode::Branch { target } => emit_branch(self, target, ctx)?,
+                VCode::Bl { target } => emit_bl(self, target, ctx)?,
                 VCode::Materialize => emit_materialize(&mut uz, ctx)?,
                 VCode::Return => encode(Ret { rn: XGpr(GprId::LINK_REGISTER) }, ctx)?,
                 _ => return Err(CompileError::UnhandledInstruction),
@@ -142,6 +149,21 @@ fn emit_branch(
         offset: patch_offset,
         target: Label::Block(emitter.func_idx, target),
         kind: PatchKind::B,
+    });
+    Ok(())
+}
+
+fn emit_bl(
+    emitter: &mut Aarch64Emitter,
+    target: Label,
+    ctx: &mut impl CodeContext,
+) -> Result<(), CompileError> {
+    let patch_offset = ctx.offset();
+    encode(BlInst { offset: SImm26::try_from(0isize).unwrap() }, ctx)?;
+    emitter.patches.push(PatchSite {
+        offset: patch_offset,
+        target,
+        kind: PatchKind::Bl,
     });
     Ok(())
 }
