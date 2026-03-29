@@ -9,8 +9,8 @@
 /// displacement.
 use autosynth_emitter::{CodeContext, EmitError, Emitter};
 use autosynth_ir::{AluOp, BlockId, CodeCtx, CodeCtxUnzipper, CompOp, Label, Operand, VCode};
+use autosynth_isa::UImm16;
 use autosynth_isa::{PReg, SImm19, SImm26, Width};
-use autosynth_isa::{UImm16};
 use autosynth_isa_aarch64::{
     Aarch64Inst, AddImm, AddReg, B, BCond, Cond, Movk, Movz, Ret, SubsImm, SubsReg,
     reg::{Gpr, GprId, GprOrSp, GprOrZr, WGpr, XGpr},
@@ -42,18 +42,23 @@ impl Aarch64Emitter {
 
     pub fn finalize(&mut self, ctx: &mut impl CodeContext) -> Result<(), EmitError> {
         for patch in self.patches.drain(..) {
-            let target_offset = ctx.label_offset(patch.target)
+            let target_offset = ctx
+                .label_offset(patch.target)
                 .ok_or(EmitError::UnresolvedLabel)?;
             let word_displacement = (target_offset as i64 - patch.offset as i64) / 4;
 
             let word = match patch.kind {
                 PatchKind::B => {
-                    let offset = SImm26::try_from(word_displacement as i32)
+                    let disp: i32 = word_displacement.try_into()
+                        .map_err(|_| EmitError::ImmediateOutOfRange)?;
+                    let offset = SImm26::try_from(disp)
                         .map_err(|_| EmitError::ImmediateOutOfRange)?;
                     B { offset }.encode_word()
                 }
                 PatchKind::BCond(cond) => {
-                    let offset = SImm19::try_from(word_displacement as i32)
+                    let disp: i32 = word_displacement.try_into()
+                        .map_err(|_| EmitError::ImmediateOutOfRange)?;
+                    let offset = SImm19::try_from(disp)
                         .map_err(|_| EmitError::ImmediateOutOfRange)?;
                     BCond { cond, offset }.encode_word()
                 }
@@ -66,23 +71,30 @@ impl Aarch64Emitter {
 }
 
 impl Emitter for Aarch64Emitter {
-    fn emit(
-        &mut self,
-        stream: &mut CodeCtx,
-        ctx: &mut impl CodeContext,
-    ) -> Result<(), EmitError> {
-        let owned = CodeCtx { stream: core::mem::take(&mut stream.stream) };
+    fn emit(&mut self, stream: &mut CodeCtx, ctx: &mut impl CodeContext) -> Result<(), EmitError> {
+        let owned = CodeCtx {
+            stream: core::mem::take(&mut stream.stream),
+        };
         let mut uz = owned.unzip();
 
         while let Some(inst) = uz.next_inst() {
             match inst {
                 VCode::Alu { ref op } => emit_alu(op, &mut uz, ctx)?,
-                VCode::BrIf { ref op, block_if, block_else } => {
+                VCode::BrIf {
+                    ref op,
+                    block_if,
+                    block_else,
+                } => {
                     emit_brif(self, op, block_if, block_else, &mut uz, ctx)?;
                 }
                 VCode::Branch { target } => emit_branch(self, target, ctx)?,
                 VCode::Materialize => emit_materialize(&mut uz, ctx)?,
-                VCode::Return => encode(Ret { rn: XGpr(GprId::LINK_REGISTER) }, ctx)?,
+                VCode::Return => encode(
+                    Ret {
+                        rn: XGpr(GprId::LINK_REGISTER),
+                    },
+                    ctx,
+                )?,
                 _ => return Err(EmitError::Unhandled),
             }
         }
@@ -164,7 +176,13 @@ fn emit_brif(
 
     let cond = comp_op_to_cond(op).invert();
     let patch_offset = ctx.offset();
-    encode(BCond { cond, offset: SImm19::try_from(0).unwrap() }, ctx)?;
+    encode(
+        BCond {
+            cond,
+            offset: SImm19::try_from(0).unwrap(),
+        },
+        ctx,
+    )?;
     emitter.patches.push(PatchSite {
         offset: patch_offset,
         target: Label::Block(emitter.func_idx, block_else),
@@ -180,7 +198,12 @@ fn emit_branch(
     ctx: &mut impl CodeContext,
 ) -> Result<(), EmitError> {
     let patch_offset = ctx.offset();
-    encode(B { offset: SImm26::try_from(0).unwrap() }, ctx)?;
+    encode(
+        B {
+            offset: SImm26::try_from(0).unwrap(),
+        },
+        ctx,
+    )?;
     emitter.patches.push(PatchSite {
         offset: patch_offset,
         target: Label::Block(emitter.func_idx, target),
@@ -189,10 +212,7 @@ fn emit_branch(
     Ok(())
 }
 
-fn emit_materialize(
-    uz: &mut CodeCtxUnzipper,
-    ctx: &mut impl CodeContext,
-) -> Result<(), EmitError> {
+fn emit_materialize(uz: &mut CodeCtxUnzipper, ctx: &mut impl CodeContext) -> Result<(), EmitError> {
     let val = next_op(uz)?;
     let (dst_preg, width) = next_dst(uz)?;
 
@@ -201,15 +221,20 @@ fn emit_materialize(
     };
 
     let rd = to_gpr_or_zr(dst_preg, width);
-    let uval = imm as u64;
-    let n = match width { Width::W32 => 2, Width::W64 => 4 };
-    let chunk = |hw: usize| UImm16::from(((uval >> (hw * 16)) & 0xFFFF) as u16);
+    let chunk = |hw: u8| UImm16::from((((imm as u64) >> (hw * 16)) & 0xFFFF) as u16);
 
-    encode(Movz { rd, imm: chunk(0), hw: 0 }, ctx)?;
-    for hw in 1..n {
+    encode(
+        Movz {
+            rd,
+            imm: chunk(0),
+            hw: 0,
+        },
+        ctx,
+    )?;
+    for hw in 1..width.bytes() as u8 {
         let imm = chunk(hw);
         if imm.value() != 0 {
-            encode(Movk { rd, imm, hw: hw as u8 }, ctx)?;
+            encode(Movk { rd, imm, hw }, ctx)?;
         }
     }
 
@@ -240,11 +265,16 @@ fn expect_preg(op: &Operand) -> Result<PReg, EmitError> {
 
 fn encode(inst: impl Aarch64Inst, ctx: &mut impl CodeContext) -> Result<(), EmitError> {
     let word = inst.encode_word();
-    ctx.emit_bytes(&word.to_le_bytes()).map_err(|_| EmitError::ImmediateOutOfRange)
+    ctx.emit_bytes(&word.to_le_bytes())
+        .map_err(|_| EmitError::ImmediateOutOfRange)
 }
 
-fn to_wgpr(p: PReg) -> WGpr { WGpr(GprId::from_index(p.0)) }
-fn to_xgpr(p: PReg) -> XGpr { XGpr(GprId::from_index(p.0)) }
+fn to_wgpr(p: PReg) -> WGpr {
+    WGpr(GprId::from_index(p.0))
+}
+fn to_xgpr(p: PReg) -> XGpr {
+    XGpr(GprId::from_index(p.0))
+}
 
 fn to_gpr_or_zr(p: PReg, w: Width) -> GprOrZr {
     match w {
