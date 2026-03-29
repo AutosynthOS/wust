@@ -48,7 +48,8 @@ impl Selector for PRegAllocSelector<'_> {
                 VCode::Define(vreg) => {
                     let preg = self.state.alloc_preg(vreg)?;
                     if after_producing_inst {
-                        output.push_operand(Operand::DstPReg(preg));
+                        let width = self.state.alloc.borrow().width(vreg);
+                        output.push_operand(Operand::DstPReg(preg, width));
                         after_producing_inst = false;
                     }
                 }

@@ -94,9 +94,9 @@ fn next_op(uz: &mut CodeCtxUnzipper) -> Result<Operand, EmitError> {
     uz.next_operand().map_err(|_| EmitError::OperandUnderflow)
 }
 
-fn next_dst(uz: &mut CodeCtxUnzipper) -> Result<PReg, EmitError> {
+fn next_dst(uz: &mut CodeCtxUnzipper) -> Result<(PReg, Width), EmitError> {
     match uz.next_operand() {
-        Ok(Operand::DstPReg(preg)) => Ok(preg),
+        Ok(Operand::DstPReg(preg, width)) => Ok((preg, width)),
         _ => Err(EmitError::OperandUnderflow),
     }
 }
@@ -108,12 +108,11 @@ fn emit_alu(
 ) -> Result<(), EmitError> {
     let lhs = next_op(uz)?;
     let rhs = next_op(uz)?;
-    let dst = next_dst(uz)?;
+    let (dst, width) = next_dst(uz)?;
 
     match op {
         AluOp::Add => {
             let lhs_preg = expect_preg(&lhs)?;
-            let width = Width::W32;
 
             match rhs {
                 Operand::UImm12(imm) => {
@@ -195,30 +194,22 @@ fn emit_materialize(
     ctx: &mut impl CodeContext,
 ) -> Result<(), EmitError> {
     let val = next_op(uz)?;
-    let dst_preg = next_dst(uz)?;
+    let (dst_preg, width) = next_dst(uz)?;
 
     let Operand::Const(imm) = val else {
         return Err(EmitError::UnresolvedOperand);
     };
 
-    // TODO: width should come from the VRegDef, not hardcoded.
-    let width = Width::W32;
     let rd = to_gpr_or_zr(dst_preg, width);
     let uval = imm as u64;
-    let max_hw: u8 = match width {
-        Width::W32 => 1,
-        Width::W64 => 3,
-    };
-    let chunk = |hw: u8| ((uval >> (hw as u32 * 16)) & 0xFFFF) as u16;
+    let n = match width { Width::W32 => 2, Width::W64 => 4 };
+    let chunk = |hw: usize| UImm16::from(((uval >> (hw * 16)) & 0xFFFF) as u16);
 
-    // movz: load lowest 16 bits, zero the rest.
-    encode(Movz { rd, imm: UImm16::from(chunk(0)), hw: 0 }, ctx)?;
-
-    // movk: patch in each non-zero 16-bit chunk above.
-    for hw in 1..=max_hw {
-        let bits = chunk(hw);
-        if bits != 0 {
-            encode(Movk { rd, imm: UImm16::from(bits), hw }, ctx)?;
+    encode(Movz { rd, imm: chunk(0), hw: 0 }, ctx)?;
+    for hw in 1..n {
+        let imm = chunk(hw);
+        if imm.value() != 0 {
+            encode(Movk { rd, imm, hw: hw as u8 }, ctx)?;
         }
     }
 

@@ -80,7 +80,7 @@ fn add_const_rhs_folds() {
         Operand::PReg(PReg(0)).into(),                        // lhs = param
         Operand::UImm12(UImm12::try_from(5).unwrap()).into(), // rhs folded
         VCode::Alu { op: AluOp::Add },
-        Operand::DstPReg(PReg(0)).into(),                              // dst reuses x0 (lhs dead)
+        Operand::DstPReg(PReg(0), Width::W32).into(),                              // dst reuses x0 (lhs dead)
         VCode::Return,
     ]);
 }
@@ -100,7 +100,7 @@ fn add_large_const_rhs_materializes() {
         VCode::Materialize,               // materialize 5000 → x1
         Operand::PReg(PReg(1)).into(),    // rhs = materialized
         VCode::Alu { op: AluOp::Add },
-        Operand::DstPReg(PReg(0)).into(),          // dst reuses x0
+        Operand::DstPReg(PReg(0), Width::W32).into(),          // dst reuses x0
         VCode::Return,
     ]);
 }
@@ -123,7 +123,7 @@ fn add_const_lhs_swaps() {
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(5).unwrap()).into(),
         VCode::Alu { op: AluOp::Add },
-        Operand::DstPReg(PReg(0)).into(),
+        Operand::DstPReg(PReg(0), Width::W32).into(),
         VCode::Return,
     ]);
 }
@@ -148,7 +148,7 @@ fn sub_const_lhs_materializes() {
         Operand::PReg(PReg(1)).into(),    // lhs = materialized const
         Operand::PReg(PReg(0)).into(),    // rhs = param
         VCode::Alu { op: AluOp::Sub },
-        Operand::DstPReg(PReg(0)).into(),          // dst reuses x0 (first freed)
+        Operand::DstPReg(PReg(0), Width::W32).into(),          // dst reuses x0 (first freed)
         VCode::Return,
     ]);
 }
@@ -178,12 +178,12 @@ fn add_lhs_reused_needs_fresh_dst() {
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(3).unwrap()).into(),
         VCode::Alu { op: AluOp::Add },
-        Operand::DstPReg(PReg(1)).into(),
+        Operand::DstPReg(PReg(1), Width::W32).into(),
         // Second: dst2 = param + 7 → x0 (param dead after this, reuse)
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(7).unwrap()).into(),
         VCode::Alu { op: AluOp::Add },
-        Operand::DstPReg(PReg(0)).into(),
+        Operand::DstPReg(PReg(0), Width::W32).into(),
         VCode::Return,
     ]);
 }

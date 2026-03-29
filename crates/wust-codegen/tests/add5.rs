@@ -2,7 +2,7 @@
 
 use autosynth_codegen::pipeline::compile;
 use autosynth_ir::{AluOp, BlockId, Operand, VCode};
-use autosynth_isa::{PReg, UImm12};
+use autosynth_isa::{PReg, UImm12, Width};
 use autosynth_select_aarch64::Aarch64Selector;
 
 mod common;
@@ -20,7 +20,7 @@ fn add5() {
         Operand::PReg(PReg(0)).into(),
         Operand::UImm12(UImm12::try_from(5).unwrap()).into(),
         VCode::Alu { op: AluOp::Add },
-        Operand::DstPReg(PReg(0)).into(),
+        Operand::DstPReg(PReg(0), Width::W32).into(),
         VCode::Return,
     ]);
 

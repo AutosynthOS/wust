@@ -2,7 +2,7 @@
 
 use autosynth_codegen::pipeline::compile;
 use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode};
-use autosynth_isa::{PReg, UImm12};
+use autosynth_isa::{PReg, UImm12, Width};
 use autosynth_select_aarch64::Aarch64Selector;
 
 mod common;
@@ -54,7 +54,7 @@ fn if_result() {
     common::assert_stream_eq(&result.blocks[&BlockId::User(4)], &[
         Operand::Const(10).into(),
         VCode::Materialize,
-        Operand::DstPReg(PReg(0)).into(),
+        Operand::DstPReg(PReg(0), Width::W32).into(),
         VCode::Branch { target: BlockId::User(7) },
     ]);
 
@@ -64,7 +64,7 @@ fn if_result() {
     common::assert_stream_eq(&result.blocks[&BlockId::User(6)], &[
         Operand::Const(20).into(),
         VCode::Materialize,
-        Operand::DstPReg(PReg(0)).into(),
+        Operand::DstPReg(PReg(0), Width::W32).into(),
         VCode::Branch { target: BlockId::User(7) },
     ]);
 
@@ -76,7 +76,7 @@ fn if_result() {
         Operand::PReg(PReg(0)).into(),    // phi
         Operand::UImm12(UImm12::try_from(5).unwrap()).into(),
         VCode::Alu { op: AluOp::Add },
-        Operand::DstPReg(PReg(0)).into(),          // result → x0
+        Operand::DstPReg(PReg(0), Width::W32).into(),          // result → x0
         VCode::Return,
     ]);
 

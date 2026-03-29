@@ -466,7 +466,7 @@ pub enum Operand {
     VReg(VReg),
     PReg(PReg),
     /// Destination PReg — which register an instruction writes its result to.
-    DstPReg(PReg),
+    DstPReg(PReg, Width),
     Mem(SlotRef),
     UImm12(autosynth_isa::UImm12),
 }
