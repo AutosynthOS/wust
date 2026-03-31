@@ -30,9 +30,7 @@ impl Selector for PRegAllocSelector<'_> {
             match item {
                 VCode::Operand(Operand::VReg(vreg)) => {
                     // Materialize consts if needed.
-                    let alloc = self.state.alloc.borrow();
-                    let konst = alloc.state(vreg).r#const;
-                    drop(alloc);
+                    let konst = self.state.alloc.borrow().state(vreg).r#const;
                     if let Some(val) = konst {
                         output.push_operand(Operand::Const(val));
                         output.push(VCode::Materialize);
@@ -62,8 +60,13 @@ impl Selector for PRegAllocSelector<'_> {
                 }
                 VCode::Clobber => {
                     // Flush the VReg to its stack slot and unbind.
-                    let op = input.next_operand()?;
-                    if let Operand::VReg(vreg) = op {
+                    let op = output.pop_operand_back()?;
+                    if let Operand::PReg(preg) = op {
+                        // Find which VReg owns this PReg.
+                        let vreg = self
+                            .state
+                            .occupant(preg)
+                            .ok_or(CompileError::UnresolvedOperand)?;
                         if let Some(vs) = self.state.vregs.get(&vreg) {
                             if let (Some(preg), Some(slot)) = (vs.preg, vs.slot) {
                                 if vs.dirty {

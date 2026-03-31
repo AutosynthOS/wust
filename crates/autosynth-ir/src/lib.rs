@@ -353,7 +353,7 @@ pub struct SlotRef {
     /// Base physical register (e.g. frame pointer).
     pub base: PReg,
     /// Byte offset from the base register.
-    pub offset: u32,
+    pub offset: u16,
 }
 
 /// Per-VReg state. Tracks where a value currently lives.
@@ -572,10 +572,10 @@ pub enum VCode {
     Load,
 
     /// Store value to memory location
+    /// - Operand::VReg -> value
     /// - Operand::PReg -> base
     /// - Operand::Const -> offset
     /// - VCode::Store
-    /// - Operand::DstPreg | Operand::DstVreg
     Store,
 
     /// Move / copy.

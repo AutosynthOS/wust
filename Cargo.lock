@@ -162,6 +162,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "autosynth-graph"
+version = "0.1.0"
+dependencies = [
+ "autosynth-isa",
+ "smallvec",
+]
+
+[[package]]
 name = "autosynth-ir"
 version = "0.1.0"
 dependencies = [

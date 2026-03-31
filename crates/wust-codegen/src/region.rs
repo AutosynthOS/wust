@@ -4,7 +4,7 @@ use std::rc::Weak;
 use autosynth_codegen::builder::VRegOrRef;
 use autosynth_ir::{SlotRef, VReg, VRegState};
 use autosynth_isa::PReg;
-use autosynth_regalloc::VRegAllocator;
+use autosynth_regalloc::{SharedVRegAllocator, VRegAllocator};
 
 /// A region on the managed stack (locals, operands, fibre).
 /// Tracks VRegs and their individual slot offsets.
@@ -12,14 +12,14 @@ use autosynth_regalloc::VRegAllocator;
 #[derive(Clone)]
 pub struct StackRegion {
     pub base: PReg,
-    pub base_offset: u32,
-    pub cursor: u32,
+    pub base_offset: u16,
+    pub cursor: u16,
     entries: Vec<VRegOrRef>,
     alloc: Weak<RefCell<VRegAllocator>>,
 }
 
 impl StackRegion {
-    pub fn new(base: PReg, base_offset: u32, alloc: &std::rc::Rc<RefCell<VRegAllocator>>) -> Self {
+    pub fn new(base: PReg, base_offset: u16, alloc: &SharedVRegAllocator) -> Self {
         Self {
             base,
             base_offset,
@@ -32,7 +32,7 @@ impl StackRegion {
     /// Push a VReg onto the region. Slot offset computed from VReg's width.
     /// Caller must emit a VCode::SetSlot operation
     pub fn push(&mut self, val: VRegOrRef) -> SlotRef {
-        let byte_size = self.vreg_bytes(val);
+        let byte_size = self.vreg_bytes(val) as u16;
         let slot = SlotRef {
             base: self.base,
             offset: self.base_offset + self.cursor,
@@ -49,7 +49,7 @@ impl StackRegion {
             base: self.base,
             offset: self.base_offset + self.cursor,
         });
-        self.cursor += state.width.bytes();
+        self.cursor += state.width.bytes() as u16;
         let alloc = self.alloc.upgrade().expect("allocator dropped");
         let vreg = alloc.borrow_mut().define(state);
         self.entries.push(VRegOrRef::VReg(vreg));
@@ -76,15 +76,15 @@ impl StackRegion {
         &mut self.entries
     }
 
-    pub fn size(&self) -> u32 {
+    pub fn size(&self) -> u16 {
         self.cursor
     }
 
-    fn vreg_bytes(&self, val: VRegOrRef) -> u32 {
+    fn vreg_bytes(&self, val: VRegOrRef) -> u16 {
         let alloc = self.alloc.upgrade().expect("allocator dropped");
         let alloc = alloc.borrow();
         match val {
-            VRegOrRef::VReg(vreg) => alloc.width(vreg).bytes(),
+            VRegOrRef::VReg(vreg) => alloc.width(vreg).bytes() as u16,
             VRegOrRef::Ref(_) => todo!("ref width lookup"),
         }
     }

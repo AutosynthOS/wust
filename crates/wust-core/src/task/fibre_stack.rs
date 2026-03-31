@@ -13,7 +13,7 @@ const GUARD_PAGES: usize = 1;
 /// ```text
 /// [guard]  [usable ................]  [guard]
 ///  NONE     READ|WRITE                 NONE
-///           ^base          ^top (initial SP)
+///           ^base                  ^top (initial SP)
 /// ```
 #[repr(C)]
 pub struct FibreStackPointer {

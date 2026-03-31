@@ -73,10 +73,16 @@ impl WasmFunctionBuilder {
         let g_lr = self.isa_reg(IsaReg::ReturnAddress);
         let g_lb = self.isa_reg(IsaReg::FramePointer);
 
-        let alloc_rc = self.inner.alloc.clone();
+        let alloc = self.inner.alloc.clone();
         self.inner.start_block(BlockId::Entry(1));
 
-        let mut locals = StackRegion::new(g_lb, 0, &alloc_rc);
+        let mut locals = StackRegion::new(g_lb, 0, &alloc);
+        let mut fibre = StackRegion::new(g_sp, 0, &alloc);
+        let operands = StackRegion::new(
+            g_lb,
+            self.meta.locals_size + FRAME_HEADER_SIZE as u16,
+            &alloc,
+        );
 
         // Function parameter locals (dirty)
         // Parameters arrive in physical registers 0..N
@@ -102,11 +108,6 @@ impl WasmFunctionBuilder {
             self.inner.emit(VCode::Define(vreg));
         }
 
-        // Operands stack starts empty
-        let operands = StackRegion::new(g_lb, locals.cursor + FRAME_HEADER_SIZE as u32, &alloc_rc);
-
-        // Fibre stack for link register
-        let mut fibre = StackRegion::new(g_sp, 0, &alloc_rc);
         // push link-register onto the fibre stack
         let lr_vreg = fibre.push_define(VRegState {
             // link register is set by CPU on
@@ -129,7 +130,7 @@ impl WasmFunctionBuilder {
             WasmBlock::new(
                 BTreeMap::from([("locals", locals), ("operands", operands), ("fibre", fibre)]),
                 &jit_entry,
-                &alloc_rc,
+                &alloc,
             ),
         );
     }

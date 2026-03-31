@@ -44,27 +44,27 @@ fn add5() {
             Operand::UImm12(UImm12::try_from(0).unwrap()).into(),
             VCode::Load,
             Operand::DstPReg(PReg(0), Width::W32).into(),
-            // str x30, [sp, #-16]!
-            Operand::PReg(PReg(31)).into(),
+            // sub sp, sp, #16
+            Operand::PReg(sp).into(),
             Operand::UImm12(UImm12::try_from(16).unwrap()).into(),
             VCode::Alu { op: AluOp::Sub },
-            Operand::DstPReg(PReg(31), Width::W64).into(),
+            Operand::DstPReg(sp, Width::W64).into(),
             // bl Entry(1)
             VCode::Bl {
                 target: Label::Block(FunctionIdx::User(0), BlockId::Entry(1)),
             },
-            // str w0, [x29, #0]
-            Operand::PReg(PReg(0)).into(),
-            Operand::PReg(PReg(29)).into(),
-            Operand::UImm12(UImm12::try_from(0).unwrap()).into(),
-            VCode::Store,
-            // ldr x30, [sp], #16
-            Operand::PReg(PReg(31)).into(),
-            Operand::SImm9(SImm9::try_from(16).unwrap()).into(),
-            VCode::Store,
-            Operand::DstPReg(PReg(30), Width::W64).into(),
-            // ret
-            VCode::Return,
+            // // str w0, [x29, #0]
+            // Operand::PReg(PReg(0)).into(),
+            // Operand::PReg(PReg(29)).into(),
+            // Operand::UImm12(UImm12::try_from(0).unwrap()).into(),
+            // VCode::Store,
+            // // ldr x30, [sp], #16
+            // Operand::PReg(PReg(31)).into(),
+            // Operand::SImm9(SImm9::try_from(16).unwrap()).into(),
+            // VCode::Store,
+            // Operand::DstPReg(PReg(30), Width::W64).into(),
+            // // ret
+            // VCode::Return,
         ],
     );
 
