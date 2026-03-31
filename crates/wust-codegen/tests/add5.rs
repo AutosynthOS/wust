@@ -2,8 +2,11 @@
 
 use autosynth_codegen::pipeline::compile;
 use autosynth_ir::{AluOp, BlockId, FunctionIdx, Label, Operand, VCode};
-use autosynth_isa::{PReg, SImm9, UImm12, Width};
+use autosynth_isa::{IsaReg, PReg, SImm9, UImm12, Width};
 use autosynth_select_aarch64::Aarch64Selector;
+use autosynth_test_utils::assert_stream_eq;
+
+use crate::common::aarch64_config;
 
 mod common;
 
@@ -23,17 +26,21 @@ mod common;
 #[test]
 fn add5() {
     let module = common::parse_wat(include_str!("add5.wat"));
-    let func = common::compile_func(&module, 0);
+    let config = aarch64_config();
+    let lr = config.expect_isa_reg(IsaReg::ReturnAddress);
+    let sp = config.expect_isa_reg(IsaReg::StackPointer);
+    let lb = config.expect_isa_reg(IsaReg::FramePointer);
+    let func = common::compile_func(&module, 0, config.clone());
 
     let mut selector = Aarch64Selector::new(func.alloc.clone());
     let result = compile(&func, &mut selector).unwrap();
 
     // Entry(0) — trampoline
-    common::assert_stream_eq(
+    assert_stream_eq(
         &result.blocks[&BlockId::Entry(0)],
         &[
             // ldr w0, [x29, #0]
-            Operand::PReg(PReg(29)).into(),
+            Operand::PReg(lb).into(),
             Operand::UImm12(UImm12::try_from(0).unwrap()).into(),
             VCode::Load,
             Operand::DstPReg(PReg(0), Width::W32).into(),
@@ -62,7 +69,7 @@ fn add5() {
     );
 
     // Entry(1) — body
-    common::assert_stream_eq(
+    assert_stream_eq(
         &result.blocks[&BlockId::Entry(1)],
         &[
             Operand::PReg(PReg(0)).into(),
@@ -74,7 +81,7 @@ fn add5() {
     );
 
     // Execute
-    let jit = common::jit_compile(&module, 0);
+    let jit = common::jit_compile(&module, 0, config);
     assert_eq!(jit.call_i32(10), 15);
     assert_eq!(jit.call_i32(0), 5);
     assert_eq!(jit.call_i32(100), 105);

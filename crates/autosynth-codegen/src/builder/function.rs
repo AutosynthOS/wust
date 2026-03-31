@@ -22,6 +22,7 @@ impl FunctionBuilder {
     pub fn new(config: MachineConfig) -> Self {
         let alloc: SharedVRegAllocator = Rc::new(RefCell::new(VRegAllocator::new()));
         let entry = BlockId::Entry(1);
+        let config = config.clone();
         let mut blocks = BTreeMap::new();
         blocks.insert(entry, Rc::new(RefCell::new(BlockBuilder::new(entry))));
         Self {

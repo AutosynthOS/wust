@@ -735,7 +735,7 @@ impl CodeCtxUnzipper {
     }
 
     /// Get the next operand, expecting a PReg. Errors if not a PReg.
-    pub fn next_preg(&mut self) -> Result<PReg, CompileError> {
+    pub fn expect_preg(&mut self) -> Result<PReg, CompileError> {
         match self.next_operand()? {
             Operand::PReg(preg) => Ok(preg),
             _ => Err(CompileError::UnresolvedOperand),
@@ -743,7 +743,7 @@ impl CodeCtxUnzipper {
     }
 
     /// Get the next operand, expecting a DstPReg. Errors if not a DstPReg.
-    pub fn next_dst(&mut self) -> Result<(PReg, Width), CompileError> {
+    pub fn expect_dst(&mut self) -> Result<(PReg, Width), CompileError> {
         match self.next_operand()? {
             Operand::DstPReg(preg, width) => Ok((preg, width)),
             _ => Err(CompileError::OperandUnderflow),

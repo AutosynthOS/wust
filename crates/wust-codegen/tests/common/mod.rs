@@ -1,25 +1,24 @@
-pub use autosynth_test_utils::assert_stream_eq;
-
 use autosynth_codegen::ir::IrFunction;
 use autosynth_codegen::pipeline::compile;
 use autosynth_emit_aarch64::Aarch64Emitter;
 use autosynth_emitter::{CodeContext, Emitter};
 use autosynth_ir::{AluOp, BlockId, FunctionIdx, Label};
 use autosynth_isa::Width;
+use autosynth_regalloc::MachineConfig;
 use autosynth_select_aarch64::Aarch64Selector;
 use wust_codegen::CodeBuffer;
 use wust_codegen::wasm_builder::WasmFunctionBuilder;
-use wust_core::{FRAME_HEADER_SIZE, FuncMeta, OpCode, ParsedModule, slot_size};
+use wust_core::{FRAME_HEADER_SIZE, OpCode, ParsedModule, slot_size};
 
 pub fn parse_wat(wat: &str) -> ParsedModule {
     let bytes = wat::parse_str(wat).expect("parse WAT");
     ParsedModule::new(&bytes).expect("parse module")
 }
 
-pub fn aarch64_config() -> autosynth_regalloc::MachineConfig {
+pub fn aarch64_config() -> MachineConfig {
     use autosynth_isa::{IsaReg, PReg};
     use std::collections::BTreeMap;
-    let mut config = autosynth_regalloc::MachineConfig::new(
+    let config = MachineConfig::new(
         32,
         BTreeMap::from([
             (IsaReg::FramePointer, PReg(29)),
@@ -31,9 +30,9 @@ pub fn aarch64_config() -> autosynth_regalloc::MachineConfig {
     config
 }
 
-pub fn compile_func(module: &ParsedModule, func_idx: usize) -> IrFunction {
+pub fn compile_func(module: &ParsedModule, func_idx: usize, config: MachineConfig) -> IrFunction {
     let func = &module.funcs[func_idx];
-    let mut f = WasmFunctionBuilder::new(func, aarch64_config());
+    let mut f = WasmFunctionBuilder::new(func, config);
 
     let mut pc = 0;
     loop {
@@ -88,9 +87,9 @@ pub fn compile_func(module: &ParsedModule, func_idx: usize) -> IrFunction {
 }
 
 /// Full pipeline: IR → select → emit → executable.
-pub fn jit_compile(module: &ParsedModule, func_idx: usize) -> JitFunction {
+pub fn jit_compile(module: &ParsedModule, func_idx: usize, config: MachineConfig) -> JitFunction {
     let func_meta = &module.funcs[func_idx];
-    let mut ir_func = compile_func(module, func_idx);
+    let mut ir_func = compile_func(module, func_idx, config);
 
     let mut selector = Aarch64Selector::new(ir_func.alloc.clone());
     let vcode = compile(&ir_func, &mut selector).unwrap();

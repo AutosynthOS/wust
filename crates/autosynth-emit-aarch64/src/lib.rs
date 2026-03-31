@@ -88,9 +88,9 @@ fn emit_alu(
     uz: &mut CodeCtxUnzipper,
     ctx: &mut impl CodeContext,
 ) -> Result<(), CompileError> {
-    let lhs = uz.next_preg()?;
+    let lhs = uz.expect_preg()?;
     let rhs = uz.next_operand()?;
-    let (dst, width) = uz.next_dst()?;
+    let (dst, width) = uz.expect_dst()?;
 
     match op {
         AluOp::Add => match rhs {
@@ -113,7 +113,7 @@ fn emit_brif(
     uz: &mut CodeCtxUnzipper,
     ctx: &mut impl CodeContext,
 ) -> Result<(), CompileError> {
-    let lhs = uz.next_preg()?;
+    let lhs = uz.expect_preg()?;
     let rhs = uz.next_operand()?;
     let width = Width::W32; // TODO: derive from operand width
 
@@ -173,7 +173,7 @@ fn emit_materialize(
     ctx: &mut impl CodeContext,
 ) -> Result<(), CompileError> {
     let val = uz.next_operand()?;
-    let (dst, width) = uz.next_dst()?;
+    let (dst, width) = uz.expect_dst()?;
 
     let Operand::Const(imm) = val else {
         return Err(CompileError::UnresolvedOperand);

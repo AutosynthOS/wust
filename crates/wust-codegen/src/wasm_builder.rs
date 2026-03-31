@@ -170,17 +170,18 @@ impl WasmFunctionBuilder {
         self.inner.emit(VCode::Define(lr_vreg));
 
         // --- prepare for call --
+        // ensure params in target
+        while let Some(vreg_or_ref) = params.pop() {
+            let vreg = self.inner.resolve(vreg_or_ref);
+            self.inner.push_operand(vreg);
+            self.inner.emit(VCode::Materialize);
+            self.inner.emit(VCode::Operand(Operand::DstVReg(vreg)));
+        }
+
         // clobber fibre vregs
         while let Some(vreg_or_ref) = fibre.pop() {
             self.inner.push_operand(vreg_or_ref);
             self.inner.emit(VCode::Clobber);
-        }
-
-        // ensure params in target
-        while let Some(vreg_or_ref) = params.pop() {
-            self.inner.push_operand(vreg_or_ref);
-            self.inner.emit(VCode::Materialize);
-            self.inner.push_operand(vreg_or_ref);
         }
 
         // decrement stack pointer
