@@ -8,7 +8,7 @@
 //! - Define(VReg): allocate a PReg — dead input PRegs are now free
 //!   for reuse.
 
-use autosynth_ir::{CodeCtx, CompileError, Operand, VCode, VReg};
+use autosynth_ir::{CodeCtx, CompileError, Operand, SlotRef, VCode};
 use autosynth_regalloc::RegState;
 use autosynth_selector::Selector;
 
@@ -60,18 +60,42 @@ impl Selector for PRegAllocSelector<'_> {
                 VCode::KeepAlive => {
                     let _ = input.next_operand();
                 }
+                VCode::Clobber => {
+                    // Flush the VReg to its stack slot and unbind.
+                    let op = input.next_operand()?;
+                    if let Operand::VReg(vreg) = op {
+                        if let Some(vs) = self.state.vregs.get(&vreg) {
+                            if let (Some(preg), Some(slot)) = (vs.preg, vs.slot) {
+                                if vs.dirty {
+                                    // Emit store: [value, base, offset] Store
+                                    let width = self.state.alloc.borrow().width(vreg);
+                                    output.push_operand(Operand::PReg(preg));
+                                    output.push_operand(Operand::PReg(slot.base));
+                                    output.push_operand(Operand::Const(slot.offset as i64));
+                                    output.push(VCode::Store);
+                                }
+                            }
+                        }
+                        // Mark clean and unbind
+                        if let Some(vs) = self.state.vregs.get_mut(&vreg) {
+                            vs.dirty = false;
+                        }
+                        self.state.unbind(vreg);
+                    }
+                }
                 VCode::SetSlot { vreg, slot } => {
                     if let Some(vs) = self.state.vregs.get_mut(&vreg) {
-                        vs.slot = Some(autosynth_regalloc::MemSlot {
+                        vs.slot = Some(SlotRef {
                             base: slot.base,
                             offset: slot.offset,
-                            dirty: false,
                         });
+                        vs.dirty = true
                     }
                 }
                 VCode::ClearSlot(vreg) => {
                     if let Some(vs) = self.state.vregs.get_mut(&vreg) {
                         vs.slot = None;
+                        vs.dirty = false;
                     }
                 }
                 // Instruction boundary

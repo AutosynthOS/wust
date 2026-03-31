@@ -1,18 +1,18 @@
-use std::collections::BTreeMap;
-use std::cell::RefCell;
-use std::rc::Rc;
 use autosynth_ir::{BlockId, Operand, VCode, VReg, VRegSource};
 use autosynth_isa::{PReg, Width};
 use autosynth_regalloc::{MachineConfig, SharedVRegAllocator, VRegAllocator, VRegState};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::rc::Rc;
 
-use super::{BlockBuilder, BuilderItem, VRefId, VRegOrRef};
 use super::block::SharedBlockBuilder;
+use super::{BlockBuilder, BuilderItem, VRefId, VRegOrRef};
 use crate::ir::{IrBlock, IrFunction, block_order};
 
 /// Builds a function's VCode representation.
 pub struct FunctionBuilder {
     pub alloc: SharedVRegAllocator,
-    config: MachineConfig,
+    pub config: MachineConfig,
     blocks: BTreeMap<BlockId, SharedBlockBuilder>,
     current_block: BlockId,
     refs: Vec<VRegSource>,
@@ -40,7 +40,10 @@ impl FunctionBuilder {
 
     pub fn define(&mut self, state: VRegState) -> VReg {
         let vreg = self.alloc.borrow_mut().define(state);
-        self.blocks[&self.current_block].borrow_mut().defs.push(vreg);
+        self.blocks[&self.current_block]
+            .borrow_mut()
+            .defs
+            .push(vreg);
         vreg
     }
 
@@ -53,7 +56,9 @@ impl FunctionBuilder {
     }
 
     pub fn push_operand(&mut self, val: impl Into<VRegOrRef>) {
-        self.blocks[&self.current_block].borrow_mut().push_operand(val);
+        self.blocks[&self.current_block]
+            .borrow_mut()
+            .push_operand(val);
     }
 
     pub fn current_block_id(&self) -> BlockId {
@@ -61,7 +66,9 @@ impl FunctionBuilder {
     }
 
     pub fn start_block(&mut self, id: BlockId) {
-        self.blocks.entry(id).or_insert_with(|| Rc::new(RefCell::new(BlockBuilder::new(id))));
+        self.blocks
+            .entry(id)
+            .or_insert_with(|| Rc::new(RefCell::new(BlockBuilder::new(id))));
         self.current_block = id;
     }
 
@@ -88,11 +95,7 @@ impl FunctionBuilder {
     /// Merge a new source into a phi. If the existing VReg is already
     /// a Phi, pushes the new source. Otherwise creates a new Phi VReg,
     /// inheriting the target constraint, and returns it.
-    pub fn merge_phi(
-        &mut self,
-        existing: VRegSource,
-        new_source: VRegSource,
-    ) -> Option<VReg> {
+    pub fn merge_phi(&mut self, existing: VRegSource, new_source: VRegSource) -> Option<VReg> {
         let mut alloc = self.alloc.borrow_mut();
         let st = alloc.state_mut(existing.vreg);
         match &mut st.phi {
@@ -130,7 +133,9 @@ impl FunctionBuilder {
     // --- Build ---
 
     pub fn build(self) -> IrFunction {
-        let successors: BTreeMap<BlockId, Vec<BlockId>> = self.blocks.iter()
+        let successors: BTreeMap<BlockId, Vec<BlockId>> = self
+            .blocks
+            .iter()
             .map(|(&id, b)| (id, b.borrow().successors()))
             .collect();
 
@@ -141,47 +146,71 @@ impl FunctionBuilder {
             }
         }
 
-        let order = block_order::rpo(BlockId::Entry(1), &successors);
+        // Collect all Entry blocks, sorted, and run RPO from each.
+        let mut entries: Vec<BlockId> = self
+            .blocks
+            .keys()
+            .filter(|id| matches!(id, BlockId::Entry(_)))
+            .copied()
+            .collect();
+        entries.sort();
 
-        let blocks = self.blocks.into_iter().map(|(id, shared_b)| {
-            let b = Rc::try_unwrap(shared_b)
-                .unwrap_or_else(|_| panic!("block {id:?} still borrowed"))
-                .into_inner();
-
-            let mut stream = std::collections::VecDeque::new();
-            let mut params = Vec::new();
-
-            for item in b.stream {
-                match item {
-                    BuilderItem::Operand(val) => {
-                        let vreg = match val {
-                            VRegOrRef::VReg(vreg) => vreg,
-                            VRegOrRef::Ref(ref_id) => {
-                                let vreg = self.refs[ref_id.0 as usize].vreg;
-                                if !params.contains(&vreg) {
-                                    params.push(vreg);
-                                }
-                                vreg
-                            }
-                        };
-                        stream.push_back(VCode::Operand(Operand::VReg(vreg)));
-                    }
-                    BuilderItem::Inst(inst) => {
-                        stream.push_back(inst);
-                    }
+        let mut order = Vec::new();
+        for entry in entries {
+            let rpo = block_order::rpo(entry, &successors);
+            for block in rpo {
+                if !order.contains(&block) {
+                    order.push(block);
                 }
             }
+        }
 
-            (id, IrBlock {
-                id,
-                stream,
-                successors: successors.get(&id).cloned().unwrap_or_default(),
-                predecessors: predecessors.remove(&id).unwrap_or_default(),
-                defs: b.defs,
-                params,
-                results: Vec::new(),
+        let blocks = self
+            .blocks
+            .into_iter()
+            .map(|(id, shared_b)| {
+                let b = Rc::try_unwrap(shared_b)
+                    .unwrap_or_else(|_| panic!("block {id:?} still borrowed"))
+                    .into_inner();
+
+                let mut stream = std::collections::VecDeque::new();
+                let mut params = Vec::new();
+
+                for item in b.stream {
+                    match item {
+                        BuilderItem::Operand(val) => {
+                            let vreg = match val {
+                                VRegOrRef::VReg(vreg) => vreg,
+                                VRegOrRef::Ref(ref_id) => {
+                                    let vreg = self.refs[ref_id.0 as usize].vreg;
+                                    if !params.contains(&vreg) {
+                                        params.push(vreg);
+                                    }
+                                    vreg
+                                }
+                            };
+                            stream.push_back(VCode::Operand(Operand::VReg(vreg)));
+                        }
+                        BuilderItem::Inst(inst) => {
+                            stream.push_back(inst);
+                        }
+                    }
+                }
+
+                (
+                    id,
+                    IrBlock {
+                        id,
+                        stream,
+                        successors: successors.get(&id).cloned().unwrap_or_default(),
+                        predecessors: predecessors.remove(&id).unwrap_or_default(),
+                        defs: b.defs,
+                        params,
+                        results: Vec::new(),
+                    },
+                )
             })
-        }).collect();
+            .collect();
 
         IrFunction {
             alloc: self.alloc,

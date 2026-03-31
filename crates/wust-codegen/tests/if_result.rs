@@ -37,7 +37,7 @@ fn if_result() {
     let result = compile(&func, &mut selector).unwrap();
 
     // 4 blocks: Entry, then(U4), else(U6), merge(U7)
-    assert_eq!(result.block_order.len(), 4);
+    assert_eq!(result.block_order.len(), 5); // Entry(0), Entry(1), U4, U6, U7
 
     // --- Entry ---
     // eqz fused into BrIf(Eq). param already in x0, zero folded to #0.

@@ -8,6 +8,6 @@ mod machine;
 mod regstate;
 
 pub use allocator::{SharedVRegAllocator, VRegAllocator};
-pub use autosynth_ir::{MemSlot, SlotRef, VReg, VRegSource, VRegState};
+pub use autosynth_ir::{SlotRef, VReg, VRegSource, VRegState};
 pub use machine::MachineConfig;
 pub use regstate::RegState;

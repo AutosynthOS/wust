@@ -356,15 +356,6 @@ pub struct SlotRef {
     pub offset: u32,
 }
 
-/// A memory slot on the managed stack.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "trace", derive(serde::Serialize))]
-pub struct MemSlot {
-    pub base: PReg,
-    pub offset: u32,
-    pub dirty: bool,
-}
-
 /// Per-VReg state. Tracks where a value currently lives.
 /// Multiple fields can be active simultaneously — a value can be
 /// in a register AND in memory AND known as a constant.
@@ -373,7 +364,8 @@ pub struct VRegState {
     pub width: Width,
     pub preg: Option<PReg>,
     pub target: Option<PReg>,
-    pub slot: Option<MemSlot>,
+    pub slot: Option<SlotRef>,
+    pub dirty: bool,
     pub r#const: Option<i64>,
     pub copy: Option<VReg>,
     pub phi: Option<Vec<VRegSource>>,
@@ -387,6 +379,7 @@ impl VRegState {
             preg: None,
             target: None,
             slot: None,
+            dirty: true,
             r#const: None,
             copy: None,
             phi: None,
@@ -571,28 +564,37 @@ pub enum VCode {
     /// Branch-and-link (call). Saves return address, jumps to target label.
     Bl { target: Label },
 
-    /// Load from [base + offset]. Operands: [base, offset] → DstPReg.
-    Load { width: Width },
+    /// Load value to memory location
+    /// - Operand::PReg -> base
+    /// - Operand::Const -> offset
+    /// - VCode::Load
+    /// - Operand::DstPReg | Operand::DstVReg
+    Load,
 
-    /// Store to [base + offset]. Operands: [value, base, offset].
-    Store { width: Width },
-
-    /// Store with pre-decrement: str Rt, [Rn, #imm]!
-    /// Operands: [value, base, offset]. Base is updated.
-    StrPre,
-
-    /// Load with post-increment: ldr Rt, [Rn], #imm
-    /// Operands: [base, offset] → DstPReg. Base is updated.
-    LdrPost,
+    /// Store value to memory location
+    /// - Operand::PReg -> base
+    /// - Operand::Const -> offset
+    /// - VCode::Store
+    /// - Operand::DstPreg | Operand::DstVreg
+    Store,
 
     /// Move / copy.
     Move,
 
-    /// Materialize a constant into a register.
+    /// Materialize a vreg, const or value into a register.
+    /// - Operand::Const
+    /// - VCode::Clobber
+    /// - Operand::DstVReg | Operand::DstPReg
     Materialize,
 
     /// Return from function.
     Return,
+
+    /// Clobber's a VReg, causing a store instruction to be emitted
+    /// if it's still dirty
+    /// - VReg
+    /// - VCode::Clobber
+    Clobber,
 }
 
 impl From<Operand> for VCode {

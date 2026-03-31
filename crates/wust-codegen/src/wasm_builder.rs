@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use autosynth_codegen::builder::{FunctionBuilder, VRegOrRef};
 use autosynth_ir::{AluOp, BlockId, CompOp, Operand, VCode, VRegState};
-use autosynth_isa::{PReg, Width};
+use autosynth_isa::{IsaReg, PReg, Width};
 use autosynth_regalloc::MachineConfig;
 use wust_core::{FRAME_HEADER_SIZE, FuncMeta};
 
@@ -12,84 +12,193 @@ use crate::wasm_block::WasmBlock;
 
 /// Wasm-aware function builder.
 pub struct WasmFunctionBuilder {
+    meta: FuncMeta,
     pub inner: FunctionBuilder,
     blocks: BTreeMap<BlockId, WasmBlock>,
 }
 
+/// ## Wasm ABI Stack Design
+///
+/// ┌─────────┬─────────┐ ← g_lb + 0
+/// │ param 0 │ param 1 │
+/// │  (i32)  │  (i32)  │
+/// ├─────────┴─────────┤ ← g_lb + 8
+/// │     param 2       │
+/// │      (i64)        │
+/// ├─────────┬─────────┤ ← g_lb + 16
+/// │ local 0 │ local 1 │
+/// │  (i32)  │  (i64)  │
+/// ├─────────┘         │
+/// │         ┌─────────┤
+/// │ ..cont  │ local 2 │
+/// │         │  (i32)  │
+/// ├─────────┴─────────┤ ← g_lb + 32 (locals_size)
+/// │   FRAME HEADER    │
+/// │    (12 bytes)     │
+/// ├─────────┬─────────┤ ← g_lb + 44 (operands base)
+/// │  i32    │   i32   │
+/// │         │         │
+/// ├─────────┼─────────┘
+/// │  i32    │
+/// │         │
+/// └─────────┘
 impl WasmFunctionBuilder {
-    pub fn new(func: &FuncMeta, mut config: MachineConfig) -> Self {
-        let g_lb = config.isa_reg(autosynth_isa::IsaReg::FramePointer).expect("no frame pointer");
-        let g_sp = config.isa_reg(autosynth_isa::IsaReg::StackPointer).expect("no stack pointer");
+    pub fn new(meta: &FuncMeta, config: MachineConfig) -> Self {
+        let mut function = Self {
+            meta: meta.clone(),
+            inner: FunctionBuilder::new(config),
+            blocks: BTreeMap::new(),
+        };
 
-        let mut inner = FunctionBuilder::new(config);
-        let mut blocks = BTreeMap::new();
+        function.emit_host_to_jit_block();
+        function.emit_jit_entry();
 
-        let alloc_rc = inner.alloc.clone();
+        function
+    }
+
+    /// ## Get an ISA Reg
+    ///
+    /// g_sp = IsaReg::StackPointer -> Native Fibre Stack Pointer
+    /// g_lr = IsaReg::ReturnAddress -> Native Link Return Address
+    /// g_lb = IsaReg::FramePointer -> WASM Locals Base Pointer
+    fn isa_reg(&self, reg: IsaReg) -> PReg {
+        self.inner
+            .config
+            .isa_reg(reg)
+            .expect("expected reserveed pointer")
+    }
+
+    fn emit_jit_entry(&mut self) {
+        let g_sp = self.isa_reg(IsaReg::StackPointer);
+        let g_lr = self.isa_reg(IsaReg::ReturnAddress);
+        let g_lb = self.isa_reg(IsaReg::FramePointer);
+
+        let alloc_rc = self.inner.alloc.clone();
+        self.inner.start_block(BlockId::Entry(1));
+
+        let mut locals = StackRegion::new(g_lb, 0, &alloc_rc);
+
+        // Function parameter locals (dirty)
+        // Parameters arrive in physical registers 0..N
+        // With their memory stack slots defined as dirty
+        for (i, param) in self.meta.params.iter().enumerate() {
+            let vreg = locals.push_define(VRegState {
+                preg: Some(PReg(i as u8)),
+                dirty: true,
+                ..VRegState::new(val_width(param))
+            });
+            self.inner.emit(VCode::Define(vreg));
+        }
+
+        // Zero-initialized locals
+        // - Initialized to const 0
+        // - Memory slot is dirty
+        for local in self.meta.locals.iter() {
+            let vreg = locals.push_define(VRegState {
+                r#const: Some(0),
+                dirty: true,
+                ..VRegState::new(val_width(local))
+            });
+            self.inner.emit(VCode::Define(vreg));
+        }
+
+        // Operands stack starts empty
+        let operands = StackRegion::new(g_lb, locals.cursor + FRAME_HEADER_SIZE as u32, &alloc_rc);
+
+        // Fibre stack for link register
+        let mut fibre = StackRegion::new(g_sp, 0, &alloc_rc);
+        // push link-register onto the fibre stack
+        let lr_vreg = fibre.push_define(VRegState {
+            // link register is set by CPU on
+            // branch-link/function call operation.
+            preg: Some(g_lr),
+            // we must store this value into the
+            // fibre stack if it's ever about to be
+            // cloberred by a call
+            dirty: true,
+            // this value always must end up in the return
+            // address register
+            target: Some(g_lr),
+            ..VRegState::new(Width::W64)
+        });
+        self.inner.emit(VCode::Define(lr_vreg));
+
+        let jit_entry = self.inner.block(BlockId::Entry(1));
+        self.blocks.insert(
+            BlockId::Entry(1),
+            WasmBlock::new(
+                BTreeMap::from([("locals", locals), ("operands", operands), ("fibre", fibre)]),
+                &jit_entry,
+                &alloc_rc,
+            ),
+        );
+    }
+
+    fn emit_host_to_jit_block(&mut self) {
+        let g_sp = self.isa_reg(IsaReg::StackPointer);
+        let g_lr = self.isa_reg(IsaReg::ReturnAddress);
+        let g_lb = self.isa_reg(IsaReg::FramePointer);
+
+        let alloc_rc = self.inner.alloc.clone();
 
         // --- Entry(0): host trampoline ---
         // Params on managed stack (clean — host put them there).
-        {
-            inner.start_block(BlockId::Entry(0));
-            let mut params = StackRegion::new(g_lb, 0, &alloc_rc);
-            for param in func.params.iter() {
-                let vreg = params.push_define(VRegState::new(val_width(param)), false);
-                inner.emit(VCode::Define(vreg));
-            }
+        self.start_block(BlockId::Entry(0));
+        let mut params = StackRegion::new(g_lb, 0, &alloc_rc);
+        let mut fibre = StackRegion::new(g_sp, 0, &alloc_rc);
 
-            // TODO: emit trampoline VCode
-
-            let fibre = StackRegion::new(g_sp, 0, &alloc_rc);
-            let entry0_block = inner.block(BlockId::Entry(0));
-            blocks.insert(
-                BlockId::Entry(0),
-                WasmBlock::new(
-                    BTreeMap::from([("params", params), ("fibre", fibre)]),
-                    &entry0_block,
-                    &alloc_rc,
-                ),
-            );
+        for (i, param) in self.meta.params.iter().enumerate() {
+            let vreg = params.push_define(VRegState {
+                // host places function parameters into
+                // their canonical wasm abi stack locations
+                dirty: false,
+                // jit call expects function parameters in
+                // registers 0..N for function calls
+                target: Some(PReg(i as u8)),
+                ..VRegState::new(val_width(param))
+            });
+            self.inner.emit(VCode::Define(vreg));
         }
 
-        // --- Entry(1): function body ---
-        // Params in CC regs + stack slots (dirty). Locals const 0 + stack slots (clean).
-        {
-            inner.start_block(BlockId::Entry(1));
-            let mut locals = StackRegion::new(g_lb, 0, &alloc_rc);
-            for (i, param) in func.params.iter().enumerate() {
-                let vreg = locals.push_define(
-                    VRegState {
-                        preg: Some(PReg(i as u8)),
-                        ..VRegState::new(val_width(param))
-                    },
-                    true,
-                );
-                inner.emit(VCode::Define(vreg));
-            }
-            for local in func.locals.iter() {
-                let vreg = locals.push_define(
-                    VRegState {
-                        r#const: Some(0),
-                        ..VRegState::new(val_width(local))
-                    },
-                    true,
-                );
-                inner.emit(VCode::Define(vreg));
-            }
-            let locals_header_size = func.locals_size as u32 + FRAME_HEADER_SIZE as u32;
-            let operands = StackRegion::new(g_lb, locals_header_size, &alloc_rc);
-            let fibre = StackRegion::new(g_sp, 0, &alloc_rc);
-            let entry1_block = inner.block(BlockId::Entry(1));
-            blocks.insert(
-                BlockId::Entry(1),
-                WasmBlock::new(
-                    BTreeMap::from([("locals", locals), ("operands", operands), ("fibre", fibre)]),
-                    &entry1_block,
-                    &alloc_rc,
-                ),
-            );
+        // Push return address onto fibre stack
+        let lr_vreg = fibre.push_define(VRegState {
+            preg: Some(g_lr),
+            target: Some(g_lr),
+            dirty: true,
+            ..VRegState::new(Width::W64)
+        });
+        self.inner.emit(VCode::Define(lr_vreg));
+
+        // --- prepare for call --
+        // clobber fibre vregs
+        while let Some(vreg_or_ref) = fibre.pop() {
+            self.inner.push_operand(vreg_or_ref);
+            self.inner.emit(VCode::Clobber);
         }
 
-        Self { inner, blocks }
+        // ensure params in target
+        while let Some(vreg_or_ref) = params.pop() {
+            self.inner.push_operand(vreg_or_ref);
+            self.inner.emit(VCode::Materialize);
+            self.inner.push_operand(vreg_or_ref);
+        }
+
+        // decrement stack pointer
+        self.inner.emit(VCode::Operand(Operand::PReg(g_sp))); // lhs register
+        self.inner.emit(VCode::Operand(Operand::Const(16))); // rhs
+        self.inner.emit(VCode::Alu { op: AluOp::Sub });
+        self.inner
+            .emit(VCode::Operand(Operand::DstPReg(g_sp, Width::W64)));
+
+        let host_to_jit = self.inner.block(BlockId::Entry(0));
+        self.blocks.insert(
+            BlockId::Entry(0),
+            WasmBlock::new(
+                BTreeMap::from([("params", params), ("fibre", fibre)]),
+                &host_to_jit,
+                &alloc_rc,
+            ),
+        );
     }
 
     fn current_id(&self) -> BlockId {
@@ -121,8 +230,8 @@ impl WasmFunctionBuilder {
     }
 
     pub fn push_local(&mut self, idx: usize) {
-        let local = self.region_ref("locals").get(idx).val;
-        let source = self.inner.resolve(local);
+        let local = self.region_ref("locals").get(idx);
+        let source = self.inner.resolve(*local);
         let width = self.inner.width(source);
         let copy = self.inner.define(VRegState {
             copy: Some(source),
@@ -135,7 +244,6 @@ impl WasmFunctionBuilder {
         self.region("operands")
             .pop()
             .expect("operand stack underflow")
-            .val
     }
 
     pub fn push(&mut self, val: VRegOrRef) {

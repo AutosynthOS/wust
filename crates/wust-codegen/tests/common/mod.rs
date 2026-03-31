@@ -17,14 +17,17 @@ pub fn parse_wat(wat: &str) -> ParsedModule {
 }
 
 pub fn aarch64_config() -> autosynth_regalloc::MachineConfig {
-    use std::collections::BTreeMap;
     use autosynth_isa::{IsaReg, PReg};
-    let mut config = autosynth_regalloc::MachineConfig::new(32, BTreeMap::from([
-        (IsaReg::FramePointer, PReg(29)),
-        (IsaReg::StackPointer, PReg(31)),
-        (IsaReg::ReturnAddress, PReg(30)),
-        (IsaReg::PlatformReserved, PReg(18)),
-    ]));
+    use std::collections::BTreeMap;
+    let mut config = autosynth_regalloc::MachineConfig::new(
+        32,
+        BTreeMap::from([
+            (IsaReg::FramePointer, PReg(29)),
+            (IsaReg::StackPointer, PReg(31)),
+            (IsaReg::ReturnAddress, PReg(30)),
+            (IsaReg::PlatformReserved, PReg(18)),
+        ]),
+    );
     config
 }
 
