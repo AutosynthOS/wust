@@ -9,5 +9,5 @@ mod state;
 mod op;
 
 pub use pool::{Pool, VRegRef};
-pub use state::VRegState;
-pub use op::Op;
+pub use state::{VRegState, SlotRef};
+pub use op::{Op, OpCode};
