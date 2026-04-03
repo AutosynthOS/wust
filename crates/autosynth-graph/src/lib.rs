@@ -5,6 +5,7 @@
 //! physical location at each point in the program. The pathfinder
 //! resolves register assignments by finding paths through this grid.
 
+pub mod builder;
 pub mod display;
 pub mod grid;
 pub mod op;

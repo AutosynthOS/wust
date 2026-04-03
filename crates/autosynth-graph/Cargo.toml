@@ -7,7 +7,7 @@ edition = "2024"
 autosynth-isa = { path = "../autosynth-isa" }
 smallvec = "1"
 slotmap = "1"
+wust-core = { path = "../wust-core" }
 
 [dev-dependencies]
-wust-core = { path = "../wust-core" }
 wat = "1.245.1"
