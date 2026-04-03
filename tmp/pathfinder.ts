@@ -1,6 +1,6 @@
-import type { PReg, TimeNode, SlotMap, VRegId, Slot, MemSlot, Operation, Define } from "./types";
+import type { PReg, TimeNode, SlotMap, VRegId, Slot, MemSlot, Operation } from "./types";
 import { w, oref, vref, fmtPreg, PREG_COUNT } from "./types";
-import { slotVreg, resolveOperandVreg, opKind } from "./slots";
+import { slotVreg, resolveOperandVreg } from "./slots";
 import { getSlotsBefore } from "./timeline";
 import { C } from "./format";
 
@@ -13,10 +13,13 @@ export interface PathResult {
   cost: number;
 }
 
-export const COST_FREE = 0;
-export const COST_MOV = 10;
-export const COST_LOAD = 100;
-export const COST_STORE = 150;
+export const costs = {
+  free: 0,
+  mov: 10,
+  load: 100,
+  store: 150,
+  materialize: 10,
+};
 
 export let nextOpId = 100;
 
@@ -49,20 +52,15 @@ export function findPath(from: TimeNode, targetSlotKey: string | null, targetVre
     if (vid !== targetVreg) continue;
     if (slot.kind === "preg" && slot.state === false) continue;
 
-    let cost: number;
-    if (slot.kind === "vreg") {
-      cost = COST_FREE;
-    } else if (slot.kind === "preg" && targetSlotKey !== null && k === targetSlotKey) {
-      cost = COST_FREE;
-    } else if (slot.kind === "preg") {
-      cost = COST_MOV;
-    } else if (slot.kind === "mem") {
-      cost = COST_LOAD;
-    } else if (slot.kind === "const") {
-      cost = COST_MOV;
-    } else {
-      continue;
-    }
+    const isExactPreg = slot.kind === "preg" && targetSlotKey !== null && k === targetSlotKey;
+    const cost =
+      slot.kind === "vreg"  ? costs.free :
+      isExactPreg           ? costs.free :
+      slot.kind === "preg"  ? costs.mov :
+      slot.kind === "mem"   ? costs.load :
+      slot.kind === "const" ? costs.materialize :
+      null;
+    if (cost === null) continue;
 
     const storeOrder = slot.kind === "mem" ? (findStore(prev, k, targetVreg)?.order ?? Infinity) : Infinity;
     if (!best || cost < best.cost || (cost === best.cost && storeOrder < bestStoreOrder)) {
@@ -112,97 +110,97 @@ function findSourceOp(node: TimeNode, vreg: VRegId): string | undefined {
   return findDefiningOp(path.foundAt, vreg)?.op.id;
 }
 
-// Run pathfinder on a list of nodes (in forward order).
+// Check if a contract entry is already satisfied by prev's results.
+function isSatisfied(prevResults: SlotMap, k: string, reqVreg: VRegId): boolean {
+  if (k.startsWith("need:")) {
+    for (const [, slot] of prevResults) {
+      if (slot.kind === "preg" && typeof slot.state === "string" && slot.state === reqVreg) return true;
+    }
+    return false;
+  }
+  const prevSlot = prevResults.get(k);
+  return prevSlot ? slotVreg(prevSlot) === reqVreg : false;
+}
+
+// Assign a preg to an unallocated vreg's defining op.
+function assignPreg(path: PathResult, reqVreg: VRegId, required: Slot): boolean {
+  const defNode = findDefiningOp(path.foundAt, reqVreg);
+  const def = defNode?.op.defines.find(d => d.vreg === reqVreg);
+  if (!def || !defNode) return false;
+
+  if (required.kind === "preg") {
+    def.preg = { num: required.num, width: required.width };
+    console.log(`  ${C.green}ASSIGN${C.reset} ${C.dim}${defNode.op.id}${C.reset}: ${C.cyan}${reqVreg}${C.reset} → dst=${C.magenta}w${required.num}${C.reset}`);
+  } else {
+    const free = findFreePreg(getSlotsBefore(defNode));
+    if (!free) return false;
+    def.preg = free;
+    console.log(`  ${C.green}ASSIGN${C.reset} ${C.dim}${defNode.op.id}${C.reset}: ${C.cyan}${reqVreg}${C.reset} → dst=${C.magenta}${fmtPreg(free)}${C.reset}`);
+  }
+  return true;
+}
+
+// Insert a load from memory before a consumer node.
+function emitLoad(cur: TimeNode, path: PathResult, reqVreg: VRegId, ops: Map<string, Operation>, visited?: Map<string, TimeNode>): boolean {
+  const memSlot = path.foundSlot as MemSlot;
+  const free = findFreePreg(getSlotsBefore(cur));
+  if (!free) return false;
+
+  const store = findStore(cur.prev!, path.foundIn, reqVreg);
+  const loadId = `gen${nextOpId++}`;
+  const loadOp: Operation = {
+    id: loadId,
+    op: { kind: "load", base: memSlot.base, offset: memSlot.offset },
+    operands: store ? [oref(store.op.id)] : [vref(reqVreg)],
+    defines: [{ vreg: reqVreg, preg: free }],
+  };
+  ops.set(loadId, loadOp);
+  const loadNode: TimeNode = { op: loadOp, order: 0, prev: cur.prev, inputs: new Map(), results: new Map() };
+  insertBefore(cur, loadNode);
+  if (visited) visited.set(loadId, loadNode);
+
+  console.log(`  ${C.green}LOAD${C.reset} ${C.dim}${loadId}${C.reset}: ${C.cyan}${reqVreg}${C.reset} from ${C.blue}${path.foundIn}${C.reset} → ${C.magenta}${fmtPreg(free)}${C.reset} (before ${C.dim}${cur.op.id}${C.reset})`);
+  return true;
+}
+
+// Rewrite operands to point at their valid source via pathfinder.
+function rewriteOperands(cur: TimeNode, ops: Map<string, Operation>) {
+  for (let i = 0; i < cur.op.operands.length; i++) {
+    const operand = cur.op.operands[i];
+    if (operand.kind !== "op") continue;
+    const vid = resolveOperandVreg(operand, ops);
+    if (!vid) continue;
+    const sourceId = findSourceOp(cur, vid);
+    if (sourceId && sourceId !== operand.op) {
+      cur.op.operands[i] = oref(sourceId);
+    }
+  }
+}
+
+// Run pathfinder: resolve contracts, insert loads, rewrite operands.
 export function applyPaths(nodes: TimeNode[], ops: Map<string, Operation>, visited?: Map<string, TimeNode>) {
   let applied = 0;
+  const assigned = new Set<VRegId>();
+
   for (const cur of nodes) {
     if (!cur.prev) continue;
 
-    // Phase 1: Resolve contract violations
-    if (cur.inputs.size > 0) {
-      for (const [k, required] of cur.inputs) {
-        const reqVreg = slotVreg(required);
-        if (!reqVreg) continue;
+    for (const [k, required] of cur.inputs) {
+      const reqVreg = slotVreg(required);
+      if (!reqVreg || isSatisfied(cur.prev.results, k, reqVreg)) continue;
 
-        const isNeedAny = k.startsWith("need:");
-        let satisfied = false;
-        if (isNeedAny) {
-          for (const [, slot] of cur.prev.results) {
-            if (slot.kind === "preg" && typeof slot.state === "string" && slot.state === reqVreg) {
-              satisfied = true; break;
-            }
-          }
-        } else {
-          const prevSlot = cur.prev.results.get(k);
-          const prevVreg = prevSlot ? slotVreg(prevSlot) : null;
-          satisfied = prevVreg === reqVreg;
-        }
+      const path = findPath(cur, k.startsWith("need:") ? null : k, reqVreg);
+      if (!path) continue;
 
-        if (satisfied) continue;
-
-        const targetSlotKey = isNeedAny ? null : k;
-        const path = findPath(cur, targetSlotKey, reqVreg);
-        if (!path) continue;
-
-        if (path.foundSlot.kind === "vreg" && path.cost === COST_FREE) {
-          const defNode = findDefiningOp(path.foundAt, reqVreg);
-          const def = defNode?.op.defines.find(d => d.vreg === reqVreg);
-          if (def && defNode) {
-            if (required.kind === "preg") {
-              def.preg = { num: required.num, width: required.width };
-              console.log(`  ${C.green}ASSIGN${C.reset} ${C.dim}${defNode.op.id}${C.reset}: ${C.cyan}${reqVreg}${C.reset} → dst=${C.magenta}${k}${C.reset}`);
-            } else {
-              const before = getSlotsBefore(defNode);
-              const free = findFreePreg(before);
-              if (free) {
-                def.preg = free;
-                console.log(`  ${C.green}ASSIGN${C.reset} ${C.dim}${defNode.op.id}${C.reset}: ${C.cyan}${reqVreg}${C.reset} → dst=${C.magenta}${fmtPreg(free)}${C.reset}`);
-              }
-            }
-            applied++;
-          }
-        } else if (path.foundSlot.kind === "mem") {
-          const memSlot = path.foundSlot as MemSlot;
-          const before = getSlotsBefore(cur);
-          const free = findFreePreg(before);
-          if (free) {
-            const store = findStore(cur.prev!, path.foundIn, reqVreg);
-            const storeId = store?.op.id;
-
-            const loadId = `gen${nextOpId++}`;
-            const loadOp: Operation = {
-              id: loadId,
-              op: { kind: "load", base: memSlot.base, offset: memSlot.offset },
-              operands: storeId ? [oref(storeId)] : [vref(reqVreg)],
-              defines: [{ vreg: reqVreg, preg: free }],
-            };
-            ops.set(loadId, loadOp);
-            const loadNode: TimeNode = {
-              op: loadOp, order: 0, prev: cur.prev,
-              inputs: new Map(), results: new Map(),
-            };
-            insertBefore(cur, loadNode);
-            if (visited) visited.set(loadId, loadNode);
-
-            console.log(`  ${C.green}LOAD${C.reset} ${C.dim}${loadId}${C.reset}: ${C.cyan}${reqVreg}${C.reset} from ${C.blue}${path.foundIn}${C.reset} → ${C.magenta}${fmtPreg(free)}${C.reset} (before ${C.dim}${cur.op.id}${C.reset})`);
-            applied++;
-          }
-        }
+      const isNeedAny = k.startsWith("need:");
+      if (path.foundSlot.kind === "vreg" && path.cost === costs.free && !(isNeedAny && assigned.has(reqVreg))) {
+        if (assignPreg(path, reqVreg, required)) { assigned.add(reqVreg); applied++; }
+      } else if (path.foundSlot.kind === "mem") {
+        if (emitLoad(cur, path, reqVreg, ops, visited)) applied++;
       }
     }
 
-    // Phase 2: Rewrite ALL operands to their valid source via pathfinder
-    for (let i = 0; i < cur.op.operands.length; i++) {
-      const operand = cur.op.operands[i];
-      if (operand.kind !== "op") continue;
-      const vid = resolveOperandVreg(operand, ops);
-      if (!vid) continue;
-
-      const sourceId = findSourceOp(cur, vid);
-      if (sourceId && sourceId !== operand.op) {
-        cur.op.operands[i] = oref(sourceId);
-      }
-    }
+    rewriteOperands(cur, ops);
   }
   return applied;
 }

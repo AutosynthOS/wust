@@ -1,7 +1,7 @@
-import type { Operation, TimeNode } from "./types";
+import type { Operation } from "./types";
 import { w, x, oref, vref } from "./types";
 import { C, fmtOp, printTimeline } from "./format";
-import { buildNodes, topoSortAndLink, assignOrder, computeAllStates, checkScope, checkContracts } from "./timeline";
+import { buildNodes, topoSortAndLink, assignOrder, collectNodes, computeAllStates, checkScope, checkContracts } from "./timeline";
 import { foldImmediates, markReachable, sweep } from "./transforms";
 import { applyPaths } from "./pathfinder";
 
@@ -135,12 +135,7 @@ while (true) {
   if (applied === 0) break;
   // Re-collect nodes (new loads were inserted) but DON'T re-sort.
   // The loads were inserted with correct prev pointers.
-  const allNodes = [...visited.values()];
-  // Sort by walking prev to get correct order
-  const seen = new Set<TimeNode>();
-  nodes = [];
-  function visit(n: TimeNode) { if (seen.has(n)) return; seen.add(n); if (n.prev) visit(n.prev); nodes.push(n); }
-  for (const n of allNodes) visit(n);
+  nodes = collectNodes(visited);
   assignOrder(nodes);
 }
 

@@ -1,5 +1,5 @@
-import type { Operation, TimeNode, SlotMap, Operand } from "./types";
-import { opKind, slotVreg, resolveOperandVreg } from "./slots";
+import type { Operation, TimeNode, Operand } from "./types";
+import { resolveOperandVreg } from "./slots";
 
 export function resolveConst(operand: Operand, ops: Map<string, Operation>): number | undefined {
   if (operand.kind === "imm12") return operand.value;

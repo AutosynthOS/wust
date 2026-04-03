@@ -56,6 +56,21 @@ export function topoSortAndLink(visited: Map<string, TimeNode>, ops: Map<string,
   return sorted;
 }
 
+// Collect all nodes from a visited map by walking prev chains.
+// Returns nodes in dependency order (predecessors before successors).
+export function collectNodes(visited: Map<string, TimeNode>): TimeNode[] {
+  const seen = new Set<TimeNode>();
+  const result: TimeNode[] = [];
+  function walk(n: TimeNode) {
+    if (seen.has(n)) return;
+    seen.add(n);
+    if (n.prev) walk(n.prev);
+    result.push(n);
+  }
+  for (const n of visited.values()) walk(n);
+  return result;
+}
+
 // Assign sequential order numbers.
 export function assignOrder(nodes: TimeNode[]) {
   for (let i = 0; i < nodes.length; i++) {
