@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 autosynth-isa = { path = "../autosynth-isa" }
 smallvec = "1"
+slotmap = "1"
 
 [dev-dependencies]
 wust-core = { path = "../wust-core" }

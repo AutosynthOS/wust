@@ -1,21 +1,17 @@
-#![feature(deref_patterns, deref_pure_trait)]
-#![allow(incomplete_features)]
-
-//! Hash-interned value state graph IR.
+//! Grid-based register allocator prototype.
 //!
-//! Every value in the program is a `NodeRef` — an Rc-backed handle into
-//! a pool of `VRegState`s. Operations take NodeRefs in and produce
-//! NodeRefs out. Structural equality via hash gives free CSE.
-//! Dead subtrees clean up automatically via reference counting.
+//! Operations and VRegs live in SlotMap arenas. The "grid" is a
+//! BTreeMap<SlotKey, VRegKey> tracking which vreg occupies which
+//! physical location at each point in the program. The pathfinder
+//! resolves register assignments by finding paths through this grid.
 
-mod node;
-mod pool;
-mod state;
-mod op;
-pub mod select;
-pub mod selectors;
+pub mod display;
+pub mod grid;
+pub mod op;
+pub mod pathfinder;
+pub mod timeline;
+pub mod transforms;
+pub mod types;
 
-pub use node::{Node, NodeRef};
-pub use pool::Pool;
-pub use state::{Define, VRegState, SlotRef};
-pub use op::{AluOp, CmpOp, Op, Operand, VCode};
+pub use op::{AluOp, CmpOp};
+pub use types::{Input, MemSlot, OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey};
