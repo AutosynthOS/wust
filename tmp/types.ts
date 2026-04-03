@@ -1,5 +1,7 @@
 export type Width = 32 | 64;
 
+export const PREG_COUNT = 31;
+
 export interface PReg {
   num: number;
   width: Width;
@@ -78,10 +80,8 @@ export interface TimeNode {
   op: Operation;
   order: number;
   prev?: TimeNode;
-  next?: TimeNode;
-  contract: SlotMap;
-  before: SlotMap;
-  after: SlotMap;
+  inputs: SlotMap;   // what this op REQUIRES (vreg needs preg, call needs w0, etc)
+  results: SlotMap;  // slot state AFTER this op executes
 }
 
 export function fmtPreg(p: PReg): string {

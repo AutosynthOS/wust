@@ -104,22 +104,29 @@ export function stripAnsi(s: string): number {
   return s.replace(/\x1b\[[0-9;]*m/g, "").length;
 }
 
-export function printTimeline(label: string, head: TimeNode, ops: Map<string, Operation>) {
+import { getSlotsBefore, detectBlocks } from "./timeline";
+import type { Block } from "./timeline";
+
+export function printTimeline(label: string, nodes: TimeNode[], terminals: TimeNode[], ops: Map<string, Operation>) {
   console.log(`\n${C.bold}=== ${label} ===${C.reset}`);
+  const blocks = detectBlocks(nodes, terminals, ops);
+
   let maxWidth = 0;
-  let cur: TimeNode | undefined = head;
-  while (cur) {
-    const line = `[${String(cur.order).padStart(2)}] ${fmtOp(cur.op, ops, cur.before)}`;
+  for (const cur of nodes) {
+    const before = getSlotsBefore(cur);
+    const line = `[${String(cur.order).padStart(2)}] ${fmtOp(cur.op, ops, before)}`;
     maxWidth = Math.max(maxWidth, stripAnsi(line));
-    cur = cur.next;
   }
-  cur = head;
-  while (cur) {
-    const line = `  ${C.dim}[${String(cur.order).padStart(2)}]${C.reset} ${fmtOp(cur.op, ops, cur.before)}`;
-    const padding = maxWidth - stripAnsi(line) + 4;
-    const after = fmtSlots(cur.after);
-    const sep = after ? `${" ".repeat(Math.max(padding, 2))}${C.dim}||>${C.reset} ${after}` : "";
-    console.log(`${line}${sep}`);
-    cur = cur.next;
+
+  for (const block of blocks) {
+    console.log(`  ${C.dim}--- ${block.label} ---${C.reset}`);
+    for (const cur of block.nodes) {
+      const before = getSlotsBefore(cur);
+      const line = `  ${C.dim}[${String(cur.order).padStart(2)}]${C.reset} ${fmtOp(cur.op, ops, before)}`;
+      const padding = maxWidth - stripAnsi(line) + 4;
+      const results = fmtSlots(cur.results);
+      const sep = results ? `${" ".repeat(Math.max(padding, 2))}${C.dim}||>${C.reset} ${results}` : "";
+      console.log(`${line}${sep}`);
+    }
   }
 }

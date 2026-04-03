@@ -1,7 +1,9 @@
-import type { Slot, SlotMap, VRegId, OpCode, Operation, Operand, ConstSlot, MemSlot, VRegSlot } from "./types";
-import { fmtPreg } from "./types";
+import type { Slot, SlotMap, VRegId, OpCode, Operation, Operand, PRegSlot, ConstSlot, MemSlot, VRegSlot } from "./types";
+import { fmtPreg, PREG_COUNT } from "./types";
 
-export function opKind(oc: OpCode): string {
+export type OpKindStr = "param" | "const" | "alu" | "set_slot" | "clear_slot" | "load" | "brif" | "call" | "return";
+
+export function opKind(oc: OpCode): OpKindStr {
   if (typeof oc === "string") return oc;
   if ("alu" in oc) return "alu";
   return oc.kind;
@@ -9,7 +11,7 @@ export function opKind(oc: OpCode): string {
 
 export function slotId(s: Slot): string {
   switch (s.kind) {
-    case "preg": return `${s.width === 32 ? 'w' : 'x'}${s.num}`;
+    case "preg": return fmtPreg(s);
     case "mem": return `m[${fmtPreg(s.base)}+${s.offset}]`;
     case "const": return `c#${s.value}`;
     case "vreg": return s.id;
@@ -17,47 +19,51 @@ export function slotId(s: Slot): string {
 }
 
 export function slotVreg(s: Slot): VRegId | null {
-  switch (s.kind) {
-    case "preg": return typeof s.state === "string" ? s.state : null;
-    case "mem": return s.state;
-    case "const": return s.state;
-    case "vreg": return s.state;
-  }
+  if (s.kind === "preg") return typeof s.state === "string" ? s.state : null;
+  return s.state;
 }
 
 export function emptySlotMap(): SlotMap {
   const m: SlotMap = new Map();
-  for (let i = 0; i <= 30; i++) {
+  for (let i = 0; i < PREG_COUNT; i++) {
     m.set(`w${i}`, { kind: "preg", num: i, width: 32, state: true });
   }
   return m;
 }
 
 export function cloneSlotMap(m: SlotMap): SlotMap {
-  return new Map([...m.entries()].map(([k, v]) => [k, { ...v }]));
+  const clone: SlotMap = new Map();
+  for (const [k, v] of m) clone.set(k, { ...v });
+  return clone;
 }
 
 export function applyMicroOps(slots: SlotMap, o: Operation) {
   const oc = o.op;
   const kind = opKind(oc);
 
-  switch (kind) {
-    case "param": {
-      for (const d of o.defines) {
-        if (d.preg) {
-          slots.set(slotId({ kind: "preg", ...d.preg, state: d.vreg }),
-            { kind: "preg", ...d.preg, state: d.vreg });
-        }
+  // Write defines into the slot map. If a define has a preg, write a preg slot.
+  // Otherwise fall back to a vreg slot (unassigned). Const defines get const slots.
+  function writeDefines(defines: typeof o.defines) {
+    for (const d of defines) {
+      if (d.const !== undefined) {
+        const slot: ConstSlot = { kind: "const", value: d.const, width: 32, state: d.vreg };
+        slots.set(slotId(slot), slot);
+      } else if (d.preg) {
+        const slot: PRegSlot = { kind: "preg", ...d.preg, state: d.vreg };
+        slots.set(slotId(slot), slot);
+      } else {
+        const vs: VRegSlot = { kind: "vreg", id: d.vreg, width: 32, state: d.vreg };
+        slots.set(slotId(vs), vs);
       }
-      break;
     }
-    case "const": {
-      for (const d of o.defines) {
-        if (d.const !== undefined) {
-          const slot: ConstSlot = { kind: "const", value: d.const, width: 32, state: d.vreg };
-          slots.set(slotId(slot), slot);
-        }
-      }
+  }
+
+  switch (kind) {
+    case "param":
+    case "const":
+    case "load":
+    case "alu": {
+      writeDefines(o.defines);
       break;
     }
     case "set_slot": {
@@ -75,43 +81,14 @@ export function applyMicroOps(slots: SlotMap, o: Operation) {
       slots.delete(key);
       break;
     }
-    case "load": {
-      for (const d of o.defines) {
-        if (d.preg) {
-          slots.set(slotId({ kind: "preg", ...d.preg, state: d.vreg }),
-            { kind: "preg", ...d.preg, state: d.vreg });
-        }
-      }
-      break;
-    }
     case "call": {
-      for (let i = 0; i <= 30; i++) {
+      for (let i = 0; i < PREG_COUNT; i++) {
         slots.set(`w${i}`, { kind: "preg", num: i, width: 32, state: false });
       }
       for (const [k, slot] of [...slots]) {
         if (slot.kind === "vreg") slots.delete(k);
       }
-      for (const d of o.defines) {
-        if (d.preg) {
-          slots.set(slotId({ kind: "preg", ...d.preg, state: d.vreg }),
-            { kind: "preg", ...d.preg, state: d.vreg });
-        } else {
-          const vs: VRegSlot = { kind: "vreg", id: d.vreg, width: 32, state: d.vreg };
-          slots.set(slotId(vs), vs);
-        }
-      }
-      break;
-    }
-    case "alu": {
-      for (const d of o.defines) {
-        if (d.preg) {
-          slots.set(slotId({ kind: "preg", ...d.preg, state: d.vreg }),
-            { kind: "preg", ...d.preg, state: d.vreg });
-        } else {
-          const vs: VRegSlot = { kind: "vreg", id: d.vreg, width: 32, state: d.vreg };
-          slots.set(slotId(vs), vs);
-        }
-      }
+      writeDefines(o.defines);
       break;
     }
   }
@@ -127,9 +104,9 @@ export function resolveOperandVreg(operand: Operand, ops: Map<string, Operation>
   if (def) return def.vreg;
   const kind = opKind(target.op);
   if (kind === "set_slot" || kind === "clear_slot") {
-    const vregOp = target.operands.find(o => o.kind === "vreg");
+    const vregOp = target.operands[1];
     if (vregOp?.kind === "vreg") return vregOp.id;
-    const opOp = target.operands.find(o => o.kind === "op");
+    const opOp = target.operands[0];
     if (opOp) return resolveOperandVreg(opOp, ops);
   }
   return null;
