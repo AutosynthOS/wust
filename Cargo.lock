@@ -167,6 +167,8 @@ version = "0.1.0"
 dependencies = [
  "autosynth-isa",
  "smallvec",
+ "wat",
+ "wust-core",
 ]
 
 [[package]]

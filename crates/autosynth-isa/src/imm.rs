@@ -44,7 +44,7 @@ macro_rules! impl_try_from {
 /// assert!(UImm12::try_from(5000_i32).is_err());
 /// assert!(UImm12::try_from(-1_i32).is_err());
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct UImm12(u16);
 
 impl UImm12 {

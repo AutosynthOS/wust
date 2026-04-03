@@ -2,3 +2,4 @@
 .ignore*
 .claude/worktrees
 viz/src/lib/trace.json
+tmp/
