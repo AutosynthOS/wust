@@ -28,7 +28,7 @@ pub fn fold_immediates(
         }
 
         let rhs = &op.inputs[1];
-        let val = resolve_const(rhs, vregs);
+        let val = resolve_const(rhs, ops, vregs);
         let Some(val) = val else { continue };
         if val < 0 || val > 4095 {
             continue;
@@ -42,10 +42,18 @@ pub fn fold_immediates(
 }
 
 /// Resolve an input to a constant value if it references a const vreg.
-fn resolve_const(input: &Input, vregs: &SlotMap<VRegKey, VRegDef>) -> Option<i64> {
+fn resolve_const(
+    input: &Input,
+    ops: &SlotMap<OpKey, Operation>,
+    vregs: &SlotMap<VRegKey, VRegDef>,
+) -> Option<i64> {
     match input {
         Input::Imm12(imm) => Some(imm.value() as i64),
         Input::VReg(key) => vregs.get(*key)?.constant,
+        Input::Op(_) => {
+            let vreg_key = crate::types::resolve_input_vreg(input, ops)?;
+            vregs.get(vreg_key)?.constant
+        }
     }
 }
 
@@ -68,10 +76,16 @@ pub fn mark_reachable(
         }
         let Some(op) = ops.get(key) else { return };
         for input in &op.inputs {
-            if let Input::VReg(vreg_key) = input {
-                if let Some(def) = vregs.get(*vreg_key) {
-                    walk(def.definer, ops, vregs, live);
+            match input {
+                Input::VReg(vreg_key) => {
+                    if let Some(def) = vregs.get(*vreg_key) {
+                        walk(def.definer, ops, vregs, live);
+                    }
                 }
+                Input::Op(op_key) => {
+                    walk(*op_key, ops, vregs, live);
+                }
+                Input::Imm12(_) => {}
             }
         }
         if let Some(effect) = op.effect {

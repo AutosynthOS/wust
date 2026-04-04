@@ -8,7 +8,7 @@ use slotmap::{Key, SlotMap};
 
 use crate::grid::{self, Grid};
 use crate::timeline::Block;
-use crate::types::{Input, OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey};
+use crate::types::{resolve_input_vreg, Input, OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey};
 
 /// ANSI color codes.
 mod color {
@@ -72,6 +72,7 @@ fn fmt_vreg_with_preg(
 /// Format an input operand for display.
 fn fmt_input(
     input: &Input,
+    ops: &SlotMap<OpKey, Operation>,
     vregs: &SlotMap<VRegKey, VRegDef>,
     before: Option<&Grid>,
 ) -> String {
@@ -88,6 +89,32 @@ fn fmt_input(
                 }
             }
             fmt_vreg_with_preg(*key, vregs, before)
+        }
+        Input::Op(op_key) => {
+            // Resolve the op reference to a vreg for display
+            if let Some(vreg_key) = resolve_input_vreg(input, ops) {
+                // Show as "oref(opN)->vN" style
+                let vreg_str = fmt_vreg_with_preg(vreg_key, vregs, before);
+                // Check if it's a constant
+                if let Some(def) = vregs.get(vreg_key) {
+                    if let Some(val) = def.constant {
+                        return format!(
+                            "{YELLOW}#{val}{RESET}",
+                            YELLOW = color::YELLOW,
+                            RESET = color::RESET,
+                        );
+                    }
+                }
+                vreg_str
+            } else {
+                let ffi = op_key.data().as_ffi();
+                let idx = ffi & 0xFFFF_FFFF;
+                format!(
+                    "{DIM}oref(o{idx}){RESET}",
+                    DIM = color::DIM,
+                    RESET = color::RESET,
+                )
+            }
         }
         Input::Imm12(imm) => {
             format!(
@@ -126,7 +153,7 @@ pub fn fmt_op(
     let operands: Vec<String> = op
         .inputs
         .iter()
-        .map(|i| fmt_input(i, vregs, before))
+        .map(|i| fmt_input(i, ops, vregs, before))
         .collect();
     let operands_str = operands.join(", ");
 

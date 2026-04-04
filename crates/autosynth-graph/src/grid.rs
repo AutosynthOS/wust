@@ -27,6 +27,7 @@ const PREG_COUNT: u8 = 31;
 pub fn apply_micro_ops(
     grid: &mut Grid,
     op: &Operation,
+    ops: &SlotMap<OpKey, Operation>,
     vregs: &SlotMap<VRegKey, VRegDef>,
 ) {
     match op.opcode {
@@ -34,9 +35,12 @@ pub fn apply_micro_ops(
             write_defines(grid, op, vregs);
         }
         OpCode::SetSlot(mem) => {
-            // The vreg being stored is identified by the second input
-            // (the vref operand in the TS prototype).
-            if let Some(vreg_key) = resolve_vreg_input(op, 0) {
+            // The vreg being stored: for the new builder pattern, input[1]
+            // is a VReg (vref) and input[0] is an Op (oref). For the old
+            // pattern, input[0] is a VReg. Try index 1 first, then 0.
+            let vreg_key = resolve_vreg_input(op, 1, ops)
+                .or_else(|| resolve_vreg_input(op, 0, ops));
+            if let Some(vreg_key) = vreg_key {
                 grid.insert(SlotKey::Mem(mem), vreg_key);
             }
         }
@@ -91,9 +95,20 @@ fn write_defines(
 }
 
 /// Resolve the vreg referenced by an input at the given index.
-fn resolve_vreg_input(op: &Operation, index: usize) -> Option<VRegKey> {
+///
+/// For `Input::Op`, we need the ops arena to trace through the
+/// operation reference. When `ops` is not available (or for
+/// set_slot/clear_slot micro-ops), we also check `Input::VReg`.
+fn resolve_vreg_input(
+    op: &Operation,
+    index: usize,
+    ops: &SlotMap<OpKey, Operation>,
+) -> Option<VRegKey> {
     match op.inputs.get(index) {
         Some(crate::types::Input::VReg(k)) => Some(*k),
+        Some(input @ crate::types::Input::Op(_)) => {
+            crate::types::resolve_input_vreg(input, ops)
+        }
         _ => None,
     }
 }
@@ -123,7 +138,7 @@ pub fn get_slots_before(
     let mut grid = Grid::new();
     for &key in &chain {
         if let Some(prev_op) = ops.get(key) {
-            apply_micro_ops(&mut grid, prev_op, vregs);
+            apply_micro_ops(&mut grid, prev_op, ops, vregs);
         }
     }
     grid
@@ -139,7 +154,7 @@ pub fn get_slots_after(
 ) -> Grid {
     let mut grid = get_slots_before(op_key, ops, vregs);
     if let Some(op) = ops.get(op_key) {
-        apply_micro_ops(&mut grid, op, vregs);
+        apply_micro_ops(&mut grid, op, ops, vregs);
     }
     grid
 }

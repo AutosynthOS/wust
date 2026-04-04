@@ -111,12 +111,13 @@ enum Contract {
 /// Compute the contracts for an operation.
 fn compute_contracts(
     op: &Operation,
+    ops: &SlotMap<OpKey, Operation>,
     vregs: &SlotMap<VRegKey, VRegDef>,
 ) -> Vec<Contract> {
     let mut contracts = Vec::new();
     match op.opcode {
         OpCode::Call(_) | OpCode::Return => {
-            if let Some(vreg_key) = resolve_input_vreg(&op.inputs[0], vregs) {
+            if let Some(vreg_key) = resolve_input_vreg_skip_const(&op.inputs[0], ops, vregs) {
                 contracts.push(Contract::SpecificPreg {
                     input_idx: 0,
                     vreg_key,
@@ -126,14 +127,19 @@ fn compute_contracts(
         }
         OpCode::Alu(_) | OpCode::BrIf => {
             for (i, input) in op.inputs.iter().enumerate() {
-                if let Some(vreg_key) = resolve_input_vreg(input, vregs) {
+                if let Some(vreg_key) = resolve_input_vreg_skip_const(input, ops, vregs) {
                     contracts.push(Contract::AnyPreg { input_idx: i, vreg_key });
                 }
             }
         }
         OpCode::SetSlot(_) => {
-            if let Some(vreg_key) = resolve_input_vreg(&op.inputs[0], vregs) {
-                contracts.push(Contract::AnyPreg { input_idx: 0, vreg_key });
+            // For the new builder pattern, the vreg is at input[1] (vref).
+            // For the old pattern, it's at input[0].
+            for (i, input) in op.inputs.iter().enumerate() {
+                if let Some(vreg_key) = resolve_input_vreg_skip_const(input, ops, vregs) {
+                    contracts.push(Contract::AnyPreg { input_idx: i, vreg_key });
+                    break;
+                }
             }
         }
         _ => {}
@@ -142,21 +148,22 @@ fn compute_contracts(
 }
 
 /// Resolve an input to the vreg key it references, skipping constants and imms.
-fn resolve_input_vreg(
+fn resolve_input_vreg_skip_const(
     input: &Input,
+    ops: &SlotMap<OpKey, Operation>,
     vregs: &SlotMap<VRegKey, VRegDef>,
 ) -> Option<VRegKey> {
-    match input {
-        Input::VReg(key) => {
-            if let Some(def) = vregs.get(*key) {
-                if def.constant.is_some() {
-                    return None;
-                }
-            }
-            Some(*key)
-        }
+    let vreg_key = match input {
+        Input::VReg(key) => Some(*key),
+        Input::Op(_) => crate::types::resolve_input_vreg(input, ops),
         Input::Imm12(_) => None,
+    }?;
+    if let Some(def) = vregs.get(vreg_key) {
+        if def.constant.is_some() {
+            return None;
+        }
     }
+    Some(vreg_key)
 }
 
 /// Assign a preg to a vreg's definition.
@@ -271,7 +278,10 @@ fn find_store(
     while let Some(key) = cur {
         let op = ops.get(key)?;
         if op.opcode == OpCode::SetSlot(mem) {
-            if resolve_vreg_input(op, 0) == Some(vreg_key) {
+            // Try input[1] first (new builder: oref + vref), then input[0] (old builder: vref).
+            let stored_vreg = resolve_vreg_input(op, 1, ops)
+                .or_else(|| resolve_vreg_input(op, 0, ops));
+            if stored_vreg == Some(vreg_key) {
                 return Some(key);
             }
         }
@@ -281,9 +291,14 @@ fn find_store(
 }
 
 /// Resolve the vreg referenced by an operation's input at the given index.
-fn resolve_vreg_input(op: &Operation, index: usize) -> Option<VRegKey> {
+fn resolve_vreg_input(
+    op: &Operation,
+    index: usize,
+    ops: &SlotMap<OpKey, Operation>,
+) -> Option<VRegKey> {
     match op.inputs.get(index) {
         Some(Input::VReg(k)) => Some(*k),
+        Some(input @ Input::Op(_)) => crate::types::resolve_input_vreg(input, ops),
         _ => None,
     }
 }
@@ -324,10 +339,13 @@ fn find_source_op(
 
 /// Rewrite operands on an operation to point at their valid source.
 ///
-/// For each VReg input, find where that vreg actually lives (via find_path),
-/// then find the source op. If the source op defines a different vreg
-/// (e.g. a load created a new vreg for the same logical value), rewrite
-/// the input to reference the load's vreg instead.
+/// Two kinds of rewrites:
+/// 1. `Input::Op` → `Input::VReg`: resolve the op reference to the
+///    underlying vreg, breaking the ordering dependency on the
+///    set_slot/clear_slot chain so the sweep can remove it.
+/// 2. VReg source changed: if the pathfinder inserted a load that
+///    defines a new vreg for the same logical value, rewrite to use
+///    the load's vreg.
 fn rewrite_operands(
     op_key: OpKey,
     ops: &mut SlotMap<OpKey, Operation>,
@@ -338,27 +356,49 @@ fn rewrite_operands(
         let Some(op) = ops.get(op_key) else { return };
         let mut result = Vec::new();
         for (i, input) in op.inputs.iter().enumerate() {
-            let Input::VReg(vreg_key) = input else {
-                continue;
+            let (vreg_key, is_op_ref) = match input {
+                Input::VReg(k) => (*k, false),
+                Input::Op(_) => {
+                    match crate::types::resolve_input_vreg(input, ops) {
+                        Some(k) => (k, true),
+                        None => continue,
+                    }
+                }
+                Input::Imm12(_) => continue,
             };
             // Skip constants
-            if let Some(def) = vregs.get(*vreg_key) {
+            if let Some(def) = vregs.get(vreg_key) {
                 if def.constant.is_some() {
+                    // Still rewrite Op→VReg for constants to break
+                    // the ordering dependency.
+                    if is_op_ref {
+                        result.push((i, vreg_key));
+                    }
                     continue;
                 }
             }
-            let Some(source_key) = find_source_op(op_key, *vreg_key, ops, vregs) else {
+            // For Op refs, find the best source and rewrite to VReg.
+            // For VReg refs, only rewrite if the source changed.
+            let Some(source_key) = find_source_op(op_key, vreg_key, ops, vregs) else {
+                // No source found — if it's an Op ref, at least
+                // rewrite to the resolved vreg.
+                if is_op_ref {
+                    result.push((i, vreg_key));
+                }
                 continue;
             };
             let Some(source_op) = ops.get(source_key) else {
+                if is_op_ref {
+                    result.push((i, vreg_key));
+                }
                 continue;
             };
-            // If the source op defines a different vreg for the same value,
-            // rewrite to use that vreg.
             if let Some(&new_vreg) = source_op.defines.first() {
-                if new_vreg != *vreg_key {
+                if new_vreg != vreg_key || is_op_ref {
                     result.push((i, new_vreg));
                 }
+            } else if is_op_ref {
+                result.push((i, vreg_key));
             }
         }
         result
@@ -388,7 +428,7 @@ pub fn apply_paths(
         let Some(op) = ops.get(op_key) else { continue };
         if op.prev.is_none() { continue; }
 
-        let contracts = compute_contracts(op, vregs);
+        let contracts = compute_contracts(op, ops, vregs);
 
         for contract in &contracts {
             // Recompute grid each time — previous contract resolutions

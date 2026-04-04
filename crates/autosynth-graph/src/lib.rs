@@ -15,4 +15,6 @@ pub mod transforms;
 pub mod types;
 
 pub use op::{AluOp, CmpOp};
-pub use types::{Input, MemSlot, OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey};
+pub use types::{
+    resolve_input_vreg, Input, MemSlot, OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey,
+};

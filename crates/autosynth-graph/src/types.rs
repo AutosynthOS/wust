@@ -63,8 +63,54 @@ pub struct VRegDef {
 pub enum Input {
     /// Reference to a virtual register.
     VReg(VRegKey),
+    /// Reference to another operation (for ordering + derived vreg).
+    ///
+    /// Used by set_slot/clear_slot (ordering chain) and ALU ops
+    /// (referencing clear_slot pops). The vreg is resolved by tracing
+    /// through the referenced operation's defines or vref operands.
+    Op(OpKey),
     /// A folded 12-bit unsigned immediate.
     Imm12(UImm12),
+}
+
+/// Resolve an input to the VRegKey it references.
+///
+/// Mirrors the TS prototype's `resolveOperandVreg`:
+/// - `VReg(k)` → Some(k)
+/// - `Imm12(_)` → None
+/// - `Op(key)` → look up the operation:
+///   - If it defines a vreg, return that vreg
+///   - If it's a set_slot/clear_slot, check operands[1] (vref) or
+///     recursively resolve operands[0] (oref chain)
+pub fn resolve_input_vreg(
+    input: &Input,
+    ops: &slotmap::SlotMap<OpKey, Operation>,
+) -> Option<VRegKey> {
+    match input {
+        Input::VReg(k) => Some(*k),
+        Input::Imm12(_) => None,
+        Input::Op(op_key) => {
+            let op = ops.get(*op_key)?;
+            // If the op defines a vreg, return it.
+            if let Some(&vreg) = op.defines.first() {
+                return Some(vreg);
+            }
+            // For set_slot/clear_slot: check the vref operand (index 1),
+            // then fall back to recursively resolving the oref (index 0).
+            match op.opcode {
+                OpCode::SetSlot(_) | OpCode::ClearSlot(_) => {
+                    if let Some(Input::VReg(k)) = op.inputs.get(1) {
+                        return Some(*k);
+                    }
+                    if let Some(oref) = op.inputs.first() {
+                        return resolve_input_vreg(oref, ops);
+                    }
+                    None
+                }
+                _ => None,
+            }
+        }
+    }
 }
 
 /// The opcode of an operation.

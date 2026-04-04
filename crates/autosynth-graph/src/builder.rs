@@ -9,10 +9,11 @@
 //! - **Operands**: the wasm operand stack, push/pop by bytecode flow.
 //!
 //! Every operand stack push emits a `SetSlot` and every pop emits a
-//! `ClearSlot`. This faithfully represents the wasm stack machine.
-//! These bookkeeping ops chain to each other (not to the main effect
-//! chain), so the sweep eliminates them once the pathfinder has
-//! resolved operand references through direct vreg edges.
+//! `ClearSlot`. These operations use `Input::Op` for ordering (oref)
+//! and `Input::VReg` for data (vref), matching the TS prototype
+//! pattern exactly. ALU ops reference the `ClearSlot` pop operations
+//! via `Input::Op`, and the underlying vreg is derived by tracing
+//! through the op reference chain.
 
 use autosynth_isa::{PReg, Width};
 use slotmap::SlotMap;
@@ -25,17 +26,26 @@ use crate::types::{Input, MemSlot, OpCode, OpKey, Operation, VRegDef, VRegKey};
 /// ABI registers.
 const G_LB: PReg = PReg(29);
 
+/// An entry in a region: tracks both the vreg and the last operation
+/// that touched this slot (for ordering chains).
+#[derive(Clone)]
+struct RegionEntry {
+    vreg: VRegKey,
+    last_op: OpKey,
+}
+
 /// A contiguous region on the managed stack.
 ///
-/// Tracks which VRegKey occupies each slot and a cursor for the
-/// current stack position. The `base` and `base_offset` determine
-/// the MemSlot address for SetSlot/ClearSlot/Load operations.
+/// Tracks which VRegKey occupies each slot, along with the OpKey of
+/// the last operation that touched it (for ordering via `Input::Op`).
+/// The `base` and `base_offset` determine the MemSlot address for
+/// SetSlot/ClearSlot/Load operations.
 #[derive(Clone)]
 struct Region {
     base: PReg,
     base_offset: u16,
     cursor: u16,
-    entries: Vec<VRegKey>,
+    entries: Vec<RegionEntry>,
 }
 
 impl Region {
@@ -52,41 +62,44 @@ impl Region {
     ///
     /// Used for initial param/local setup where the value definition
     /// is the Param/Const op itself, not a SetSlot.
-    fn define(&mut self, vreg: VRegKey) {
-        self.entries.push(vreg);
+    fn define(&mut self, vreg: VRegKey, defining_op: OpKey) {
+        self.entries.push(RegionEntry {
+            vreg,
+            last_op: defining_op,
+        });
         self.cursor += 4; // W32 = 4 bytes
     }
 
     /// Push a vreg onto this region, returning the MemSlot it occupies.
     ///
     /// Advances the cursor by 4 bytes (W32). The caller is responsible
-    /// for emitting the SetSlot operation.
-    fn push(&mut self, vreg: VRegKey) -> MemSlot {
+    /// for emitting the SetSlot operation and updating `last_op`.
+    fn push(&mut self, vreg: VRegKey, last_op: OpKey) -> MemSlot {
         let slot = self.mem_slot_at_cursor();
-        self.entries.push(vreg);
+        self.entries.push(RegionEntry { vreg, last_op });
         self.cursor += 4;
         slot
     }
 
-    /// Pop a vreg from this region, returning the vreg and its MemSlot.
+    /// Pop a vreg from this region, returning the entry and its MemSlot.
     ///
     /// Decrements the cursor by 4 bytes. The caller is responsible for
     /// emitting the ClearSlot operation.
-    fn pop(&mut self) -> (VRegKey, MemSlot) {
-        let vreg = self.entries.pop().expect("region underflow");
+    fn pop(&mut self) -> (RegionEntry, MemSlot) {
+        let entry = self.entries.pop().expect("region underflow");
         self.cursor -= 4;
         let slot = self.mem_slot_at_cursor();
-        (vreg, slot)
+        (entry, slot)
     }
 
-    /// Get the vreg at the given index.
-    fn get(&self, idx: usize) -> VRegKey {
-        self.entries[idx]
+    /// Get the entry at the given index.
+    fn get(&self, idx: usize) -> &RegionEntry {
+        &self.entries[idx]
     }
 
     /// Set the vreg at the given index.
-    fn set(&mut self, idx: usize, vreg: VRegKey) {
-        self.entries[idx] = vreg;
+    fn set(&mut self, idx: usize, vreg: VRegKey, last_op: OpKey) {
+        self.entries[idx] = RegionEntry { vreg, last_op };
     }
 
     /// Compute the MemSlot for entry at the given index.
@@ -115,12 +128,6 @@ struct WasmBlock {
     operands: Region,
     /// Most recent side-effecting operation in this block.
     last_effect: Option<OpKey>,
-    /// Most recent operand stack bookkeeping op (set_slot/clear_slot).
-    ///
-    /// These chain to each other for ordering but do NOT feed into
-    /// `last_effect`. This keeps them "floating" so the sweep can
-    /// eliminate them once the pathfinder resolves value references.
-    last_stack_op: Option<OpKey>,
 }
 
 /// Output of the wasm-to-graph compiler.
@@ -132,41 +139,53 @@ pub struct WasmGraph {
 
 /// Push a vreg onto the operand stack, emitting a SetSlot operation.
 ///
-/// The SetSlot chains to `last_stack_op` (not `last_effect`), keeping
-/// operand stack bookkeeping separate from the main effect chain.
+/// The SetSlot takes two inputs matching the TS prototype pattern:
+/// - `Input::Op(ordering_op)` — ordering dependency (oref)
+/// - `Input::VReg(vreg)` — the value being stored (vref)
+///
+/// Returns the OpKey of the SetSlot for chaining.
 fn operand_push(
     vreg: VRegKey,
+    ordering_op: OpKey,
     block: &mut WasmBlock,
     ops: &mut SlotMap<OpKey, Operation>,
-) {
-    let slot = block.operands.push(vreg);
+) -> OpKey {
+    let slot = block.operands.push(vreg, OpKey::default());
     let set_key = ops.insert_with_key(|_| Operation {
         opcode: OpCode::SetSlot(slot),
-        inputs: smallvec![Input::VReg(vreg)],
-        effect: block.last_stack_op,
+        inputs: smallvec![Input::Op(ordering_op), Input::VReg(vreg)],
+        effect: None,
         prev: None,
         defines: smallvec![],
     });
-    block.last_stack_op = Some(set_key);
+    // Update the entry's last_op to point to this SetSlot.
+    let last_idx = block.operands.entries.len() - 1;
+    block.operands.entries[last_idx].last_op = set_key;
+    set_key
 }
 
 /// Pop a vreg from the operand stack, emitting a ClearSlot operation.
 ///
-/// The ClearSlot chains to `last_stack_op` (not `last_effect`).
+/// The ClearSlot takes two inputs matching the TS prototype pattern:
+/// - `Input::Op(set_slot_key)` — ordering dependency on the push (oref)
+/// - `Input::VReg(vreg)` — the value being cleared (vref)
+///
+/// Returns the OpKey of the ClearSlot. ALU operations should reference
+/// this ClearSlot via `Input::Op` to establish ordering and derive
+/// the underlying vreg.
 fn operand_pop(
     block: &mut WasmBlock,
     ops: &mut SlotMap<OpKey, Operation>,
-) -> VRegKey {
-    let (vreg, slot) = block.operands.pop();
+) -> OpKey {
+    let (entry, slot) = block.operands.pop();
     let clear_key = ops.insert_with_key(|_| Operation {
         opcode: OpCode::ClearSlot(slot),
-        inputs: smallvec![Input::VReg(vreg)],
-        effect: block.last_stack_op,
+        inputs: smallvec![Input::Op(entry.last_op), Input::VReg(entry.vreg)],
+        effect: None,
         prev: None,
         defines: smallvec![],
     });
-    block.last_stack_op = Some(clear_key);
-    vreg
+    clear_key
 }
 
 /// Compile a wasm function to the graph IR.
@@ -178,20 +197,24 @@ fn operand_pop(
 /// # Algorithm
 ///
 /// 1. Initialize locals region with param ops (preg-hinted) and
-///    declared-local const-zero ops. No SetSlot emitted for these.
+///    declared-local const-zero ops. SetSlot emitted for each to
+///    establish the local's memory position.
 /// 2. Walk each bytecode:
-///    - Arithmetic/comparison: pop operands (ClearSlot each), create
-///      ALU op, push result (SetSlot).
-///    - LocalGet: push local's vreg to operand stack (SetSlot).
+///    - Arithmetic/comparison: pop operands (ClearSlot each via oref),
+///      create ALU op with Input::Op refs to the ClearSlots, push
+///      result (SetSlot).
+///    - LocalGet: push local's vreg to operand stack (SetSlot with
+///      oref to last op touching that local).
 ///    - LocalSet: pop from operand stack (ClearSlot), emit SetSlot
 ///      to local's memory position.
 ///    - I32Const: create Const op, push to operand stack (SetSlot).
-///    - If: pop condition (ClearSlot), create BrIf, snapshot state.
+///    - If: pop condition (ClearSlot), create BrIf with oref to pop.
 ///    - Else: swap saved and current block states.
 ///    - End: merge blocks, creating phi nodes where values diverge.
-///    - Call: pop args (ClearSlot each), create Call op, push result
-///      (SetSlot).
-///    - Return: pop results (ClearSlot each), create Return op.
+///    - Call: pop args (ClearSlot each), create Call with oref to
+///      pops, push result (SetSlot).
+///    - Return: pop results (ClearSlot each), create Return with
+///      oref to pops.
 /// 3. If the operand stack is non-empty at function end, emit an
 ///    implicit return for the remaining values.
 /// 4. Return (ops, vregs, roots).
@@ -206,11 +229,11 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
         locals: Region::new(G_LB, 0),
         operands: Region::new(G_LB, operand_base),
         last_effect: None,
-        last_stack_op: None,
     };
 
     // Define params — each arrives in a PReg per calling convention.
-    // No SetSlot emitted: the param op itself is the definition.
+    // Emit a SetSlot for each param to establish its local memory
+    // position, matching the TS prototype pattern.
     for (i, _ty) in func.params.iter().enumerate() {
         let op_key = ops.insert_with_key(|_| Operation {
             opcode: OpCode::Param,
@@ -227,11 +250,22 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
             mem: None,
         });
         ops[op_key].defines = smallvec![vreg];
-        block.locals.define(vreg);
+
+        // SetSlot to local memory — NOT in the effect chain.
+        // Ordering comes from the oref to the param op.
+        let mem = block.locals.mem_slot(i);
+        let set_key = ops.insert_with_key(|_| Operation {
+            opcode: OpCode::SetSlot(mem),
+            inputs: smallvec![Input::Op(op_key), Input::VReg(vreg)],
+            effect: None,
+            prev: None,
+            defines: smallvec![],
+        });
+        block.locals.define(vreg, set_key);
     }
 
     // Define declared locals — const 0.
-    for _ty in func.locals.iter() {
+    for (_i, _ty) in func.locals.iter().enumerate() {
         let op_key = ops.insert_with_key(|_| Operation {
             opcode: OpCode::Const,
             inputs: smallvec![],
@@ -247,7 +281,7 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
             mem: None,
         });
         ops[op_key].defines = smallvec![vreg];
-        block.locals.define(vreg);
+        block.locals.define(vreg, op_key);
     }
 
     let mut roots: Vec<OpKey> = Vec::new();
@@ -278,18 +312,22 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
                     mem: None,
                 });
                 ops[op_key].defines = smallvec![vreg];
-                operand_push(vreg, &mut block, &mut ops);
+                operand_push(vreg, op_key, &mut block, &mut ops);
             }
 
             WasmOp::LocalGetI32 => {
                 let idx = inline_op.local_index() as usize;
-                let vreg = block.locals.get(idx);
-                operand_push(vreg, &mut block, &mut ops);
+                let entry = block.locals.get(idx).clone();
+                operand_push(entry.vreg, entry.last_op, &mut block, &mut ops);
             }
 
             WasmOp::LocalSetI32 => {
                 let idx = inline_op.local_index() as usize;
-                let val = operand_pop(&mut block, &mut ops);
+                let pop_key = operand_pop(&mut block, &mut ops);
+                let vreg = crate::types::resolve_input_vreg(
+                    &Input::Op(pop_key),
+                    &ops,
+                ).expect("pop should resolve to a vreg");
                 let mem = block.locals.mem_slot(idx);
 
                 // Emit SetSlot to write the value to the local's
@@ -297,13 +335,13 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
                 // chain since local writes are real side effects.
                 let set_key = ops.insert_with_key(|_| Operation {
                     opcode: OpCode::SetSlot(mem),
-                    inputs: smallvec![Input::VReg(val)],
+                    inputs: smallvec![Input::Op(pop_key), Input::VReg(vreg)],
                     effect: block.last_effect,
                     prev: None,
                     defines: smallvec![],
                 });
                 block.last_effect = Some(set_key);
-                block.locals.set(idx, val);
+                block.locals.set(idx, vreg, set_key);
             }
 
             WasmOp::I32Add => {
@@ -325,7 +363,8 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
                 );
             }
             WasmOp::I32Eqz => {
-                let val = operand_pop(&mut block, &mut ops);
+                let pop_key = operand_pop(&mut block, &mut ops);
+
                 let zero_key = ops.insert_with_key(|_| Operation {
                     opcode: OpCode::Const,
                     inputs: smallvec![],
@@ -344,7 +383,7 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
 
                 let cmp_key = ops.insert_with_key(|_| Operation {
                     opcode: OpCode::Alu(AluOp::Cmp(CmpOp::Eq)),
-                    inputs: smallvec![Input::VReg(val), Input::VReg(zero)],
+                    inputs: smallvec![Input::Op(pop_key), Input::VReg(zero)],
                     effect: None,
                     prev: None,
                     defines: smallvec![],
@@ -357,14 +396,14 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
                     mem: None,
                 });
                 ops[cmp_key].defines = smallvec![result];
-                operand_push(result, &mut block, &mut ops);
+                operand_push(result, cmp_key, &mut block, &mut ops);
             }
 
             WasmOp::Return => {
                 let mut inputs = smallvec::SmallVec::<[Input; 2]>::new();
                 for _i in 0..func.results.len() {
-                    let val = operand_pop(&mut block, &mut ops);
-                    inputs.push(Input::VReg(val));
+                    let pop_key = operand_pop(&mut block, &mut ops);
+                    inputs.push(Input::Op(pop_key));
                 }
                 // Reverse so result 0 is first in the inputs list.
                 inputs.reverse();
@@ -395,14 +434,14 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
                 );
 
                 // Pop arguments (rightmost first from stack).
-                let mut arg_vregs = Vec::new();
+                let mut arg_pop_keys = Vec::new();
                 for _ in 0..callee.params.len() {
-                    arg_vregs.push(operand_pop(&mut block, &mut ops));
+                    arg_pop_keys.push(operand_pop(&mut block, &mut ops));
                 }
-                arg_vregs.reverse();
+                arg_pop_keys.reverse();
                 let mut args = smallvec::SmallVec::<[Input; 2]>::new();
-                for vreg in &arg_vregs {
-                    args.push(Input::VReg(*vreg));
+                for &pop_key in &arg_pop_keys {
+                    args.push(Input::Op(pop_key));
                 }
 
                 let call_key = ops.insert_with_key(|_| Operation {
@@ -426,15 +465,15 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
 
                 // Push return values onto the operand stack.
                 if !callee.results.is_empty() {
-                    operand_push(result, &mut block, &mut ops);
+                    operand_push(result, call_key, &mut block, &mut ops);
                 }
             }
 
             WasmOp::If => {
-                let cond = operand_pop(&mut block, &mut ops);
+                let pop_key = operand_pop(&mut block, &mut ops);
                 let brif_key = ops.insert_with_key(|_| Operation {
                     opcode: OpCode::BrIf,
-                    inputs: smallvec![Input::VReg(cond)],
+                    inputs: smallvec![Input::Op(pop_key)],
                     effect: block.last_effect,
                     prev: None,
                     defines: smallvec![],
@@ -499,8 +538,8 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
     // end, emit a return node for them.
     if !block.operands.entries.is_empty() {
         let mut inputs = smallvec::SmallVec::<[Input; 2]>::new();
-        for vreg in &block.operands.entries {
-            inputs.push(Input::VReg(*vreg));
+        for entry in &block.operands.entries {
+            inputs.push(Input::Op(entry.last_op));
         }
         let ret_key = ops.insert_with_key(|_| Operation {
             opcode: OpCode::Return,
@@ -526,8 +565,10 @@ fn spill_live_locals(
     ops: &mut SlotMap<OpKey, Operation>,
     vregs: &SlotMap<VRegKey, VRegDef>,
 ) {
-    for (idx, &vreg) in locals.entries.iter().enumerate() {
-        let Some(def) = vregs.get(vreg) else { continue };
+    for (idx, entry) in locals.entries.iter().enumerate() {
+        let Some(def) = vregs.get(entry.vreg) else {
+            continue;
+        };
         // Skip constants — they don't need memory backing.
         if def.constant.is_some() {
             continue;
@@ -540,7 +581,7 @@ fn spill_live_locals(
         let mem = locals.mem_slot(idx);
         let set_key = ops.insert_with_key(|_| Operation {
             opcode: OpCode::SetSlot(mem),
-            inputs: smallvec![Input::VReg(vreg)],
+            inputs: smallvec![Input::Op(entry.last_op), Input::VReg(entry.vreg)],
             effect: *last_effect,
             prev: None,
             defines: smallvec![],
@@ -552,19 +593,20 @@ fn spill_live_locals(
 /// Emit a binary ALU operation.
 ///
 /// Pops two operands (emitting ClearSlot for each), creates the ALU
-/// op, and pushes the result (emitting SetSlot).
+/// op with `Input::Op` refs to the ClearSlots, and pushes the result
+/// (emitting SetSlot).
 fn emit_binary(
     alu: AluOp,
     block: &mut WasmBlock,
     ops: &mut SlotMap<OpKey, Operation>,
     vregs: &mut SlotMap<VRegKey, VRegDef>,
 ) {
-    let rhs = operand_pop(block, ops);
-    let lhs = operand_pop(block, ops);
+    let rhs_pop = operand_pop(block, ops);
+    let lhs_pop = operand_pop(block, ops);
 
     let op_key = ops.insert_with_key(|_| Operation {
         opcode: OpCode::Alu(alu),
-        inputs: smallvec![Input::VReg(lhs), Input::VReg(rhs)],
+        inputs: smallvec![Input::Op(lhs_pop), Input::Op(rhs_pop)],
         effect: None,
         prev: None,
         defines: smallvec![],
@@ -577,7 +619,7 @@ fn emit_binary(
         mem: None,
     });
     ops[op_key].defines = smallvec![result];
-    operand_push(result, block, ops);
+    operand_push(result, op_key, block, ops);
 }
 
 /// Merge two divergent block states, creating phi nodes where values
@@ -618,23 +660,23 @@ fn merge_blocks(
 
 /// Merge region entries, creating phi ops where then != else.
 fn merge_region_entries(
-    target: &mut [VRegKey],
-    then_entries: &[VRegKey],
-    else_entries: &[VRegKey],
+    target: &mut [RegionEntry],
+    then_entries: &[RegionEntry],
+    else_entries: &[RegionEntry],
     _decision: OpKey,
     ops: &mut SlotMap<OpKey, Operation>,
     vregs: &mut SlotMap<VRegKey, VRegDef>,
 ) {
     assert_eq!(then_entries.len(), else_entries.len());
     for i in 0..then_entries.len() {
-        if then_entries[i] != else_entries[i] {
+        if then_entries[i].vreg != else_entries[i].vreg {
             // TODO: use a proper Phi opcode instead of ALU Add
             // placeholder.
             let phi_key = ops.insert_with_key(|_| Operation {
                 opcode: OpCode::Alu(AluOp::Add),
                 inputs: smallvec![
-                    Input::VReg(then_entries[i]),
-                    Input::VReg(else_entries[i]),
+                    Input::VReg(then_entries[i].vreg),
+                    Input::VReg(else_entries[i].vreg),
                 ],
                 effect: None,
                 prev: None,
@@ -648,7 +690,10 @@ fn merge_region_entries(
                 mem: None,
             });
             ops[phi_key].defines = smallvec![phi_vreg];
-            target[i] = phi_vreg;
+            target[i] = RegionEntry {
+                vreg: phi_vreg,
+                last_op: phi_key,
+            };
         }
     }
 }

@@ -42,10 +42,16 @@ fn walk_reachable(
     }
     let Some(op) = ops.get(key) else { return };
     for input in &op.inputs {
-        if let Input::VReg(vreg_key) = input {
-            if let Some(def) = vregs.get(*vreg_key) {
-                walk_reachable(def.definer, ops, vregs, visited);
+        match input {
+            Input::VReg(vreg_key) => {
+                if let Some(def) = vregs.get(*vreg_key) {
+                    walk_reachable(def.definer, ops, vregs, visited);
+                }
             }
+            Input::Op(op_key) => {
+                walk_reachable(*op_key, ops, vregs, visited);
+            }
+            Input::Imm12(_) => {}
         }
     }
     if let Some(effect) = op.effect {
@@ -104,10 +110,16 @@ fn topo_visit(
         topo_visit(effect_key, ops, vregs, reachable, visited, output);
     }
     for input in &inputs {
-        if let Input::VReg(vreg_key) = input {
-            if let Some(def) = vregs.get(*vreg_key) {
-                topo_visit(def.definer, ops, vregs, reachable, visited, output);
+        match input {
+            Input::VReg(vreg_key) => {
+                if let Some(def) = vregs.get(*vreg_key) {
+                    topo_visit(def.definer, ops, vregs, reachable, visited, output);
+                }
             }
+            Input::Op(op_key) => {
+                topo_visit(*op_key, ops, vregs, reachable, visited, output);
+            }
+            Input::Imm12(_) => {}
         }
     }
     output.push(key);
