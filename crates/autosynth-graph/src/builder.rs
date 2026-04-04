@@ -423,16 +423,6 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
                 let callee_idx = inline_op.immediate_u32();
                 let callee = &funcs[callee_idx as usize];
 
-                // Pre-call spill: emit SetSlot for any local whose
-                // value is in a register (has a preg) and isn't a
-                // constant. The call clobbers all pregs.
-                spill_live_locals(
-                    &block.locals,
-                    &mut block.last_effect,
-                    &mut ops,
-                    &vregs,
-                );
-
                 // Pop arguments (rightmost first from stack).
                 let mut arg_pop_keys = Vec::new();
                 for _ in 0..callee.params.len() {

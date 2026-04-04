@@ -421,6 +421,20 @@ pub fn apply_paths(
     ops: &mut SlotMap<OpKey, Operation>,
     vregs: &mut SlotMap<VRegKey, VRegDef>,
 ) -> u32 {
+    // Pre-scan: build a map of vreg → required preg for all SpecificPreg
+    // contracts. When an AnyPreg assignment encounters a vreg with a
+    // downstream SpecificPreg requirement, it uses that preg directly —
+    // no wasted register, no mov needed.
+    let mut preg_hints: std::collections::HashMap<VRegKey, PReg> = std::collections::HashMap::new();
+    for &op_key in sorted {
+        let Some(op) = ops.get(op_key) else { continue };
+        for contract in compute_contracts(op, ops, vregs) {
+            if let Contract::SpecificPreg { vreg_key, preg, .. } = contract {
+                preg_hints.insert(vreg_key, preg);
+            }
+        }
+    }
+
     let mut applied = 0u32;
     let mut assigned: HashSet<VRegKey> = HashSet::new();
 
@@ -460,7 +474,6 @@ pub fn apply_paths(
                             if let Some((_load_key, load_vreg)) =
                                 emit_load(op_key, *vreg_key, mem, ops, vregs)
                             {
-                                // Rewrite the consumer's input to use the load's vreg
                                 ops[op_key].inputs[*input_idx] = Input::VReg(load_vreg);
                                 applied += 1;
                             }
@@ -478,7 +491,10 @@ pub fn apply_paths(
                     let is_already_assigned = assigned.contains(vreg_key);
                     match path.found_in {
                         SlotKey::VReg(_) if !is_already_assigned => {
-                            if assign_preg(*vreg_key, None, ops, vregs) {
+                            // Use the preg hint if this vreg has a downstream
+                            // SpecificPreg requirement (e.g. call needs w0).
+                            let hint = preg_hints.get(vreg_key).copied();
+                            if assign_preg(*vreg_key, hint, ops, vregs) {
                                 assigned.insert(*vreg_key);
                                 applied += 1;
                             }
