@@ -331,16 +331,16 @@ pub fn compile(func: &FuncMeta, funcs: &[FuncMeta]) -> WasmGraph {
                 let mem = block.locals.mem_slot(idx);
 
                 // Emit SetSlot to write the value to the local's
-                // memory position. This goes into the main effect
-                // chain since local writes are real side effects.
+                // memory position. NOT in the effect chain — ordering
+                // comes from the Input::Op chain. Effect chain is
+                // reserved for control flow (brif, call, return).
                 let set_key = ops.insert_with_key(|_| Operation {
                     opcode: OpCode::SetSlot(mem),
                     inputs: smallvec![Input::Op(pop_key), Input::VReg(vreg)],
-                    effect: block.last_effect,
+                    effect: None,
                     prev: None,
                     defines: smallvec![],
                 });
-                block.last_effect = Some(set_key);
                 block.locals.set(idx, vreg, set_key);
             }
 
