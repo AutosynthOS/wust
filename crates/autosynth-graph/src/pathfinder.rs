@@ -16,8 +16,9 @@ use autosynth_isa::{PReg, Width};
 use slotmap::SlotMap;
 use smallvec::smallvec;
 
+use crate::VRegKey;
 use crate::grid::{self, Grid};
-use crate::types::{Input, MemSlot, OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey};
+use crate::types::{Input, MemSlot, OpKey, Operation, SlotKey, VCode, VInit};
 
 const PREG_COUNT: u8 = 31;
 
@@ -89,9 +90,8 @@ fn find_free_preg(grid: &Grid) -> Option<PReg> {
 
 /// Check if a "need any preg" contract is satisfied: the vreg is in some preg.
 fn is_in_any_preg(grid: &Grid, vreg_key: VRegKey) -> bool {
-    grid.iter().any(|(slot_key, &v)| {
-        v == vreg_key && matches!(slot_key, SlotKey::PReg(_))
-    })
+    grid.iter()
+        .any(|(slot_key, &v)| v == vreg_key && matches!(slot_key, SlotKey::PReg(_)))
 }
 
 /// Check if a specific preg contract is satisfied: the vreg is in that exact preg.
@@ -103,7 +103,11 @@ fn is_in_preg(grid: &Grid, preg: PReg, vreg_key: VRegKey) -> bool {
 /// Tracks the input index so we can rewrite it after resolution.
 enum Contract {
     /// Vreg must be in a specific preg (e.g. w0 for call/return).
-    SpecificPreg { input_idx: usize, vreg_key: VRegKey, preg: PReg },
+    SpecificPreg {
+        input_idx: usize,
+        vreg_key: VRegKey,
+        preg: PReg,
+    },
     /// Vreg must be in any preg (ALU operands, set_slot values).
     AnyPreg { input_idx: usize, vreg_key: VRegKey },
 }
@@ -112,11 +116,11 @@ enum Contract {
 fn compute_contracts(
     op: &Operation,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> Vec<Contract> {
     let mut contracts = Vec::new();
     match op.opcode {
-        OpCode::Call(_) | OpCode::Return => {
+        VCode::Call { .. } | VCode::Return { .. } => {
             if let Some(vreg_key) = resolve_input_vreg_skip_const(&op.inputs[0], ops, vregs) {
                 contracts.push(Contract::SpecificPreg {
                     input_idx: 0,
@@ -125,19 +129,25 @@ fn compute_contracts(
                 });
             }
         }
-        OpCode::Alu(_) | OpCode::BrIf => {
+        VCode::Alu(_) | VCode::BrIf => {
             for (i, input) in op.inputs.iter().enumerate() {
                 if let Some(vreg_key) = resolve_input_vreg_skip_const(input, ops, vregs) {
-                    contracts.push(Contract::AnyPreg { input_idx: i, vreg_key });
+                    contracts.push(Contract::AnyPreg {
+                        input_idx: i,
+                        vreg_key,
+                    });
                 }
             }
         }
-        OpCode::SetSlot(_) => {
+        VCode::SetSlot(_) => {
             // For the new builder pattern, the vreg is at input[1] (vref).
             // For the old pattern, it's at input[0].
             for (i, input) in op.inputs.iter().enumerate() {
                 if let Some(vreg_key) = resolve_input_vreg_skip_const(input, ops, vregs) {
-                    contracts.push(Contract::AnyPreg { input_idx: i, vreg_key });
+                    contracts.push(Contract::AnyPreg {
+                        input_idx: i,
+                        vreg_key,
+                    });
                     break;
                 }
             }
@@ -151,12 +161,13 @@ fn compute_contracts(
 fn resolve_input_vreg_skip_const(
     input: &Input,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> Option<VRegKey> {
     let vreg_key = match input {
         Input::VReg(key) => Some(*key),
         Input::Op(_) => crate::types::resolve_input_vreg(input, ops),
         Input::Imm12(_) => None,
+        Input::VRef(_) => unimplemented!(),
     }?;
     if let Some(def) = vregs.get(vreg_key) {
         if def.constant.is_some() {
@@ -174,17 +185,16 @@ fn assign_preg(
     vreg_key: VRegKey,
     required: Option<PReg>,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &mut SlotMap<VRegKey, VRegDef>,
+    vregs: &mut SlotMap<VRegKey, VInit>,
 ) -> bool {
     let Some(def) = vregs.get(vreg_key) else {
         return false;
     };
-    let definer = def.definer;
 
     let preg = if let Some(p) = required {
         p
     } else {
-        let grid = grid::get_slots_before(definer, ops, vregs);
+        let grid = grid::get_slots_before(def.from_op, ops, vregs);
         let Some(p) = find_free_preg(&grid) else {
             return false;
         };
@@ -211,9 +221,9 @@ fn emit_load(
     vreg_key: VRegKey,
     mem: MemSlot,
     ops: &mut SlotMap<OpKey, Operation>,
-    vregs: &mut SlotMap<VRegKey, VRegDef>,
+    vregs: &mut SlotMap<VRegKey, VInit>,
 ) -> Option<(OpKey, VRegKey)> {
-    let grid = grid::get_slots_before(consumer_key, ops, vregs);
+    let grid = grid::get_slots_before(Some(consumer_key), ops, vregs);
     let free = find_free_preg(&grid)?;
 
     // Find the store that wrote this vreg to this mem slot.
@@ -228,16 +238,15 @@ fn emit_load(
 
     // Create the load operation and its vreg
     let load_key = ops.insert_with_key(|_key| Operation {
-        opcode: OpCode::Load(mem),
+        opcode: VCode::Load(mem),
         inputs: smallvec![],
         effect: effect_dep,
         prev: consumer_prev,
         defines: smallvec![],
     });
 
-    let load_vreg = vregs.insert(VRegDef {
+    let load_vreg = vregs.insert(VInit {
         width: Width::W32,
-        definer: load_key,
         constant: None,
         preg: Some(free),
         mem: Some(mem),
@@ -251,15 +260,12 @@ fn emit_load(
 }
 
 /// Walk backwards via prev to find the most recent side-effecting operation.
-fn find_last_effect(
-    from: OpKey,
-    ops: &SlotMap<OpKey, Operation>,
-) -> Option<OpKey> {
+fn find_last_effect(from: OpKey, ops: &SlotMap<OpKey, Operation>) -> Option<OpKey> {
     let mut cur = ops.get(from)?.prev;
     while let Some(key) = cur {
         let op = ops.get(key)?;
         match op.opcode {
-            OpCode::Call(_) | OpCode::SetSlot(_) | OpCode::Load(_) => return Some(key),
+            VCode::Call { .. } | VCode::SetSlot(_) | VCode::Load(_) => return Some(key),
             _ => {}
         }
         cur = op.prev;
@@ -277,10 +283,10 @@ fn find_store(
     let mut cur = ops.get(from)?.prev;
     while let Some(key) = cur {
         let op = ops.get(key)?;
-        if op.opcode == OpCode::SetSlot(mem) {
+        if op.opcode == VCode::SetSlot(mem) {
             // Try input[1] first (new builder: oref + vref), then input[0] (old builder: vref).
-            let stored_vreg = resolve_vreg_input(op, 1, ops)
-                .or_else(|| resolve_vreg_input(op, 0, ops));
+            let stored_vreg =
+                resolve_vreg_input(op, 1, ops).or_else(|| resolve_vreg_input(op, 0, ops));
             if stored_vreg == Some(vreg_key) {
                 return Some(key);
             }
@@ -291,17 +297,7 @@ fn find_store(
 }
 
 /// Resolve the vreg referenced by an operation's input at the given index.
-fn resolve_vreg_input(
-    op: &Operation,
-    index: usize,
-    ops: &SlotMap<OpKey, Operation>,
-) -> Option<VRegKey> {
-    match op.inputs.get(index) {
-        Some(Input::VReg(k)) => Some(*k),
-        Some(input @ Input::Op(_)) => crate::types::resolve_input_vreg(input, ops),
-        _ => None,
-    }
-}
+use crate::types::resolve_vreg_input;
 
 /// Walk backwards via prev to find the operation that defines a vreg.
 fn find_defining_op(
@@ -326,9 +322,9 @@ fn find_source_op(
     op_key: OpKey,
     vreg_key: VRegKey,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> Option<OpKey> {
-    let grid = grid::get_slots_before(op_key, ops, vregs);
+    let grid = grid::get_slots_before(Some(op_key), ops, vregs);
     let path = find_path_in_grid(&grid, None, vreg_key)?;
 
     match path.found_in {
@@ -349,7 +345,7 @@ fn find_source_op(
 fn rewrite_operands(
     op_key: OpKey,
     ops: &mut SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) {
     // Collect rewrite targets first to avoid borrow conflicts
     let rewrites: Vec<(usize, VRegKey)> = {
@@ -358,13 +354,12 @@ fn rewrite_operands(
         for (i, input) in op.inputs.iter().enumerate() {
             let (vreg_key, is_op_ref) = match input {
                 Input::VReg(k) => (*k, false),
-                Input::Op(_) => {
-                    match crate::types::resolve_input_vreg(input, ops) {
-                        Some(k) => (k, true),
-                        None => continue,
-                    }
-                }
+                Input::Op(_) => match crate::types::resolve_input_vreg(input, ops) {
+                    Some(k) => (k, true),
+                    None => continue,
+                },
                 Input::Imm12(_) => continue,
+                Input::VRef(_) => unimplemented!(),
             };
             // Skip constants
             if let Some(def) = vregs.get(vreg_key) {
@@ -419,7 +414,7 @@ fn rewrite_operands(
 pub fn apply_paths(
     sorted: &[OpKey],
     ops: &mut SlotMap<OpKey, Operation>,
-    vregs: &mut SlotMap<VRegKey, VRegDef>,
+    vregs: &mut SlotMap<VRegKey, VInit>,
 ) -> u32 {
     // Pre-scan: build a map of vreg → required preg for all SpecificPreg
     // contracts. When an AnyPreg assignment encounters a vreg with a
@@ -440,7 +435,9 @@ pub fn apply_paths(
 
     for &op_key in sorted {
         let Some(op) = ops.get(op_key) else { continue };
-        if op.prev.is_none() { continue; }
+        if op.prev.is_none() {
+            continue;
+        }
 
         let contracts = compute_contracts(op, ops, vregs);
 
@@ -452,15 +449,15 @@ pub fn apply_paths(
             let prev_grid = grid::get_slots_after(prev_key, ops, vregs);
 
             match contract {
-                Contract::SpecificPreg { input_idx, vreg_key, preg } => {
+                Contract::SpecificPreg {
+                    input_idx,
+                    vreg_key,
+                    preg,
+                } => {
                     if is_in_preg(&prev_grid, *preg, *vreg_key) {
                         continue;
                     }
-                    let path = find_path_in_grid(
-                        &prev_grid,
-                        Some(SlotKey::PReg(*preg)),
-                        *vreg_key,
-                    );
+                    let path = find_path_in_grid(&prev_grid, Some(SlotKey::PReg(*preg)), *vreg_key);
                     let Some(path) = path else { continue };
 
                     match path.found_in {
@@ -481,7 +478,10 @@ pub fn apply_paths(
                         _ => {}
                     }
                 }
-                Contract::AnyPreg { input_idx, vreg_key } => {
+                Contract::AnyPreg {
+                    input_idx,
+                    vreg_key,
+                } => {
                     if is_in_any_preg(&prev_grid, *vreg_key) {
                         continue;
                     }
@@ -525,10 +525,7 @@ pub fn apply_paths(
 /// After the pathfinder inserts loads (which patch prev pointers),
 /// the original sorted list is stale. This walks from each root
 /// backwards via prev, then returns operations in forward order.
-pub fn collect_nodes(
-    roots: &[OpKey],
-    ops: &SlotMap<OpKey, Operation>,
-) -> Vec<OpKey> {
+pub fn collect_nodes(roots: &[OpKey], ops: &SlotMap<OpKey, Operation>) -> Vec<OpKey> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
 

@@ -11,13 +11,26 @@ use autosynth_isa::{PReg, UImm12, Width};
 use slotmap::new_key_type;
 use smallvec::SmallVec;
 
+use wust_core::{FuncIdx, ValType};
+
+use crate::builder::BlockId;
 use crate::op::AluOp;
+
+/// Calling convention / ABI for calls and returns.
+/// Determines how inputs/outputs map to physical registers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Abi {
+    /// Wasm JIT: position i → PReg(i). inputs[0] → w0, inputs[1] → w1, ...
+    WasmJit,
+}
 
 new_key_type! {
     /// Key into the VReg arena.
     pub struct VRegKey;
     /// Key into the Operation arena.
     pub struct OpKey;
+    /// Key into the VRegRef arena.
+    pub struct VRegRefKey;
 }
 
 /// A memory slot on the managed stack.
@@ -29,7 +42,10 @@ pub struct MemSlot {
 
 impl Ord for MemSlot {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.base.0.cmp(&other.base.0).then(self.offset.cmp(&other.offset))
+        self.base
+            .0
+            .cmp(&other.base.0)
+            .then(self.offset.cmp(&other.offset))
     }
 }
 
@@ -49,14 +65,15 @@ impl fmt::Display for MemSlot {
 ///
 /// The vreg knows which operation defined it, its width, and optional
 /// hints for where it should live (preg, memory slot, constant).
-#[derive(Debug, Clone)]
-pub struct VRegDef {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VInit {
     pub width: Width,
-    pub definer: OpKey,
+    pub from_op: Option<OpKey>,
     pub constant: Option<i64>,
     pub preg: Option<PReg>,
     pub mem: Option<MemSlot>,
 }
+
 
 /// An input operand to an operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +88,20 @@ pub enum Input {
     Op(OpKey),
     /// A folded 12-bit unsigned immediate.
     Imm12(UImm12),
+    /// Indirect reference to a virtual register or phi node by key.
+    VRef(VRegRefKey),
+}
+
+impl Into<Input> for VRegKey {
+    fn into(self) -> Input {
+        Input::VReg(self)
+    }
+}
+
+impl Into<Input> for VRegRefKey {
+    fn into(self) -> Input {
+        Input::VRef(self)
+    }
 }
 
 /// Resolve an input to the VRegKey it references.
@@ -98,7 +129,7 @@ pub fn resolve_input_vreg(
             // For set_slot/clear_slot: check the vref operand (index 1),
             // then fall back to recursively resolving the oref (index 0).
             match op.opcode {
-                OpCode::SetSlot(_) | OpCode::ClearSlot(_) => {
+                VCode::SetSlot(_) | VCode::ClearSlot(_) => {
                     if let Some(Input::VReg(k)) = op.inputs.get(1) {
                         return Some(*k);
                     }
@@ -110,16 +141,28 @@ pub fn resolve_input_vreg(
                 _ => None,
             }
         }
+        Input::VRef(..) => unimplemented!(),
+    }
+}
+
+/// Resolve the vreg referenced by an operation's input at the given index.
+pub fn resolve_vreg_input(
+    op: &Operation,
+    index: usize,
+    ops: &slotmap::SlotMap<OpKey, Operation>,
+) -> Option<VRegKey> {
+    match op.inputs.get(index) {
+        Some(Input::VReg(k)) => Some(*k),
+        Some(input @ Input::Op(_)) => resolve_input_vreg(input, ops),
+        _ => None,
     }
 }
 
 /// The opcode of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OpCode {
-    /// Function parameter — defines a vreg arriving in a PReg.
-    Param,
-    /// Constant materialization.
-    Const,
+pub enum VCode {
+    /// Define a value. The VRegDef holds the metadata (const, preg, etc).
+    Define,
     /// ALU operation (add, sub, cmp, etc.).
     Alu(AluOp),
     /// Store a vreg to a memory slot (spill).
@@ -130,25 +173,32 @@ pub enum OpCode {
     Load(MemSlot),
     /// Conditional branch.
     BrIf,
-    /// Function call to callee at the given function index.
-    Call(u32),
+    /// Function call.
+    Call {
+        func_idx: FuncIdx,
+        label: BlockId,
+        abi: Abi,
+    },
     /// Function return.
-    Return,
+    Return { abi: Abi },
+    /// Phi — merges two values from if/else branches.
+    /// Inputs: [decision (brif), then_value, else_value].
+    Phi,
 }
 
-impl OpCode {
+impl VCode {
     /// Short name for display purposes.
     pub fn name(&self) -> &'static str {
         match self {
-            OpCode::Param => "param",
-            OpCode::Const => "const",
-            OpCode::Alu(alu) => alu.name(),
-            OpCode::SetSlot(_) => "set_slot",
-            OpCode::ClearSlot(_) => "clear_slot",
-            OpCode::Load(_) => "load",
-            OpCode::BrIf => "brif",
-            OpCode::Call(_) => "call",
-            OpCode::Return => "return",
+            VCode::Define => "define",
+            VCode::Alu(alu) => alu.name(),
+            VCode::SetSlot(_) => "set_slot",
+            VCode::ClearSlot(_) => "clear_slot",
+            VCode::Load(_) => "load",
+            VCode::BrIf => "brif",
+            VCode::Call { .. } => "call",
+            VCode::Return { .. } => "return",
+            VCode::Phi => "phi",
         }
     }
 }
@@ -161,7 +211,7 @@ impl OpCode {
 /// the immediately preceding operation in the total order.
 #[derive(Debug, Clone)]
 pub struct Operation {
-    pub opcode: OpCode,
+    pub opcode: VCode,
     pub inputs: SmallVec<[Input; 2]>,
     /// Previous side-effecting operation (declared dependency).
     pub effect: Option<OpKey>,
@@ -214,5 +264,15 @@ impl Ord for SlotKey {
 impl PartialOrd for SlotKey {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
+    }
+}
+
+pub fn valtype_width(ty: ValType) -> Width {
+    match ty {
+        ValType::I32 => Width::W32,
+        ValType::I64 => Width::W64,
+        ValType::F32 => Width::W32,
+        ValType::F64 => Width::W64,
+        ty => panic!("unsupported type: {:?}", ty),
     }
 }

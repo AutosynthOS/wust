@@ -8,7 +8,7 @@ use std::collections::HashSet;
 
 use slotmap::SlotMap;
 
-use crate::types::{Input, OpKey, Operation, VRegDef, VRegKey};
+use crate::types::{Input, OpKey, Operation, VInit, VRegKey};
 
 /// A block of operations sharing a control-flow context.
 #[derive(Debug)]
@@ -22,7 +22,7 @@ pub struct Block {
 pub fn collect_reachable(
     roots: &[OpKey],
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> HashSet<OpKey> {
     let mut visited = HashSet::new();
     for &root in roots {
@@ -34,7 +34,7 @@ pub fn collect_reachable(
 fn walk_reachable(
     key: OpKey,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
     visited: &mut HashSet<OpKey>,
 ) {
     if !visited.insert(key) {
@@ -44,14 +44,19 @@ fn walk_reachable(
     for input in &op.inputs {
         match input {
             Input::VReg(vreg_key) => {
-                if let Some(def) = vregs.get(*vreg_key) {
-                    walk_reachable(def.definer, ops, vregs, visited);
+                if let Some(VInit {
+                    from_op: Some(from_op),
+                    ..
+                }) = vregs.get(*vreg_key)
+                {
+                    walk_reachable(*from_op, ops, vregs, visited);
                 }
             }
             Input::Op(op_key) => {
                 walk_reachable(*op_key, ops, vregs, visited);
             }
             Input::Imm12(_) => {}
+            Input::VRef(_) => unimplemented!(),
         }
     }
     if let Some(effect) = op.effect {
@@ -67,7 +72,7 @@ fn walk_reachable(
 pub fn topo_sort_and_link(
     roots: &[OpKey],
     ops: &mut SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> Vec<OpKey> {
     let reachable = collect_reachable(roots, ops, vregs);
     let mut sorted = Vec::with_capacity(reachable.len());
@@ -92,7 +97,7 @@ pub fn topo_sort_and_link(
 fn topo_visit(
     key: OpKey,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
     reachable: &HashSet<OpKey>,
     visited: &mut HashSet<OpKey>,
     output: &mut Vec<OpKey>,
@@ -112,14 +117,19 @@ fn topo_visit(
     for input in &inputs {
         match input {
             Input::VReg(vreg_key) => {
-                if let Some(def) = vregs.get(*vreg_key) {
-                    topo_visit(def.definer, ops, vregs, reachable, visited, output);
+                if let Some(VInit {
+                    from_op: Some(from_op),
+                    ..
+                }) = vregs.get(*vreg_key)
+                {
+                    topo_visit(*from_op, ops, vregs, reachable, visited, output);
                 }
             }
             Input::Op(op_key) => {
                 topo_visit(*op_key, ops, vregs, reachable, visited, output);
             }
             Input::Imm12(_) => {}
+            Input::VRef(_) => unimplemented!(),
         }
     }
     output.push(key);
@@ -133,7 +143,7 @@ pub fn detect_blocks(
     sorted: &[OpKey],
     terminals: &[OpKey],
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> Vec<Block> {
     // Compute reachability from each terminal independently
     let per_terminal: Vec<HashSet<OpKey>> = terminals

@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use autosynth_isa::PReg;
 use slotmap::SlotMap;
 
-use crate::types::{OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey};
+use crate::{
+    VRegKey,
+    types::{OpKey, Operation, SlotKey, VCode, VInit},
+};
 
 /// The grid state: a map from physical locations to the vreg occupying them.
 pub type Grid = BTreeMap<SlotKey, VRegKey>;
@@ -28,26 +31,26 @@ pub fn apply_micro_ops(
     grid: &mut Grid,
     op: &Operation,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) {
     match op.opcode {
-        OpCode::Param | OpCode::Const | OpCode::Load(_) | OpCode::Alu(_) => {
+        VCode::Define | VCode::Load(_) | VCode::Alu(_) => {
             write_defines(grid, op, vregs);
         }
-        OpCode::SetSlot(mem) => {
+        VCode::SetSlot(mem) => {
             // The vreg being stored: for the new builder pattern, input[1]
             // is a VReg (vref) and input[0] is an Op (oref). For the old
             // pattern, input[0] is a VReg. Try index 1 first, then 0.
-            let vreg_key = resolve_vreg_input(op, 1, ops)
-                .or_else(|| resolve_vreg_input(op, 0, ops));
+            let vreg_key =
+                resolve_vreg_input(op, 1, ops).or_else(|| resolve_vreg_input(op, 0, ops));
             if let Some(vreg_key) = vreg_key {
                 grid.insert(SlotKey::Mem(mem), vreg_key);
             }
         }
-        OpCode::ClearSlot(mem) => {
+        VCode::ClearSlot(mem) => {
             grid.remove(&SlotKey::Mem(mem));
         }
-        OpCode::Call(_) => {
+        VCode::Call { .. } => {
             // Clobber all pregs
             for i in 0..PREG_COUNT {
                 grid.remove(&SlotKey::PReg(PReg(i)));
@@ -63,9 +66,10 @@ pub fn apply_micro_ops(
             }
             write_defines(grid, op, vregs);
         }
-        OpCode::BrIf | OpCode::Return => {
-            // No grid effect
+        VCode::Phi => {
+            write_defines(grid, op, vregs);
         }
+        VCode::BrIf | VCode::Return { .. } => {}
     }
 }
 
@@ -75,11 +79,7 @@ pub fn apply_micro_ops(
 /// - If it has a preg hint, write to that preg slot
 /// - If it has a constant, write to a const slot
 /// - Otherwise write to vreg-space (unassigned)
-fn write_defines(
-    grid: &mut Grid,
-    op: &Operation,
-    vregs: &SlotMap<VRegKey, VRegDef>,
-) {
+fn write_defines(grid: &mut Grid, op: &Operation, vregs: &SlotMap<VRegKey, VInit>) {
     for &vreg_key in &op.defines {
         let Some(def) = vregs.get(vreg_key) else {
             continue;
@@ -99,34 +99,27 @@ fn write_defines(
 /// For `Input::Op`, we need the ops arena to trace through the
 /// operation reference. When `ops` is not available (or for
 /// set_slot/clear_slot micro-ops), we also check `Input::VReg`.
-fn resolve_vreg_input(
-    op: &Operation,
-    index: usize,
-    ops: &SlotMap<OpKey, Operation>,
-) -> Option<VRegKey> {
-    match op.inputs.get(index) {
-        Some(crate::types::Input::VReg(k)) => Some(*k),
-        Some(input @ crate::types::Input::Op(_)) => {
-            crate::types::resolve_input_vreg(input, ops)
-        }
-        _ => None,
-    }
-}
+use crate::types::resolve_vreg_input;
 
 /// Compute the grid state just before an operation executes.
 ///
 /// Walks the prev chain upward to collect all predecessors, then
 /// replays micro-ops forward from an empty grid.
 pub fn get_slots_before(
-    op_key: OpKey,
+    op_key: Option<OpKey>,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> Grid {
-    // Collect the chain of predecessors (not including op_key itself)
-    let mut chain = Vec::new();
+    let op_key = match op_key {
+        None => return Grid::new(),
+        Some(key) => key,
+    };
+
     let Some(op) = ops.get(op_key) else {
         return Grid::new();
     };
+    // Collect the chain of predecessors (not including op_key itself)
+    let mut chain = Vec::new();
     let mut cur = op.prev;
     while let Some(prev_key) = cur {
         chain.push(prev_key);
@@ -150,9 +143,9 @@ pub fn get_slots_before(
 pub fn get_slots_after(
     op_key: OpKey,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> Grid {
-    let mut grid = get_slots_before(op_key, ops, vregs);
+    let mut grid = get_slots_before(Some(op_key), ops, vregs);
     if let Some(op) = ops.get(op_key) {
         apply_micro_ops(&mut grid, op, ops, vregs);
     }

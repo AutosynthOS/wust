@@ -6,7 +6,7 @@ use autosynth_graph::pathfinder;
 use autosynth_graph::timeline::{detect_blocks, topo_sort_and_link};
 use autosynth_graph::transforms;
 use autosynth_graph::types::*;
-use wust_core::ParsedModule;
+use wust_core::{FuncIdx, ParsedModule};
 
 fn load_module(wat_bytes: &[u8]) -> ParsedModule {
     let wasm = wat::parse_bytes(wat_bytes).expect("failed to parse wat");
@@ -16,12 +16,15 @@ fn load_module(wat_bytes: &[u8]) -> ParsedModule {
 #[test]
 fn wasm_fib_compiles_to_graph() {
     let module = load_module(include_bytes!("fib.wat"));
-    let func = &module.funcs[0];
 
-    let graph = builder::compile(func, &module.funcs);
+    let graph = builder::compile::compile(FuncIdx::new(0), &module.funcs);
     let mut ops = graph.ops;
     let mut vregs = graph.vregs;
-    let roots = graph.roots;
+    let roots: Vec<OpKey> = ops
+        .iter()
+        .filter(|(_, op)| matches!(op.opcode, autosynth_graph::types::VCode::Return { .. }))
+        .map(|(k, _)| k)
+        .collect();
 
     // Step 1: topo sort
     let mut sorted = topo_sort_and_link(&roots, &mut ops, &vregs);
@@ -84,14 +87,17 @@ fn wasm_fib_compiles_to_graph() {
 
     // Entry should have: param, cmp, brif
     assert_eq!(blocks[0].ops.len(), 3, "Entry should have 3 ops");
-    assert_eq!(ops[blocks[0].ops[0]].opcode, OpCode::Param);
+    assert_eq!(ops[blocks[0].ops[0]].opcode, VCode::Define);
     assert!(
-        matches!(ops[blocks[0].ops[1]].opcode, OpCode::Alu(_)),
+        matches!(ops[blocks[0].ops[1]].opcode, VCode::Alu(_)),
         "second entry op should be ALU (cmp)"
     );
-    assert_eq!(ops[blocks[0].ops[2]].opcode, OpCode::BrIf);
+    assert_eq!(ops[blocks[0].ops[2]].opcode, VCode::BrIf);
 
     // Case(0): return
     assert_eq!(blocks[1].ops.len(), 1, "Case(0) should have 1 op");
-    assert_eq!(ops[blocks[1].ops[0]].opcode, OpCode::Return);
+    assert_eq!(
+        ops[blocks[1].ops[0]].opcode,
+        VCode::Return { abi: Abi::WasmJit }
+    );
 }

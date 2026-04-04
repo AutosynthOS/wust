@@ -6,9 +6,10 @@
 use autosynth_isa::{PReg, Width};
 use slotmap::{Key, SlotMap};
 
+use crate::VRegKey;
 use crate::grid::{self, Grid};
 use crate::timeline::Block;
-use crate::types::{resolve_input_vreg, Input, OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey};
+use crate::types::{Input, VCode, OpKey, Operation, SlotKey, VInit, resolve_input_vreg};
 
 /// ANSI color codes.
 mod color {
@@ -44,7 +45,7 @@ fn fmt_vreg(key: VRegKey) -> String {
 /// Format a vreg with its preg location if known.
 fn fmt_vreg_with_preg(
     key: VRegKey,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
     before: Option<&Grid>,
 ) -> String {
     let name = fmt_vreg(key);
@@ -73,7 +74,7 @@ fn fmt_vreg_with_preg(
 fn fmt_input(
     input: &Input,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
     before: Option<&Grid>,
 ) -> String {
     match input {
@@ -124,6 +125,7 @@ fn fmt_input(
                 RESET = color::RESET,
             )
         }
+        Input::VRef(..) => unimplemented!(),
     }
 }
 
@@ -131,7 +133,7 @@ fn fmt_input(
 pub fn fmt_op(
     op_key: OpKey,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
     before: Option<&Grid>,
 ) -> String {
     let Some(op) = ops.get(op_key) else {
@@ -143,7 +145,11 @@ pub fn fmt_op(
     let defs_prefix = if defs_str.is_empty() {
         String::new()
     } else {
-        format!("{defs_str} {DIM}={RESET} ", DIM = color::DIM, RESET = color::RESET)
+        format!(
+            "{defs_str} {DIM}={RESET} ",
+            DIM = color::DIM,
+            RESET = color::RESET
+        )
     };
 
     // Format opcode
@@ -174,7 +180,8 @@ pub fn fmt_op(
         None => String::new(),
     };
 
-    format!("{defs_prefix}{BOLD}{opcode}{RESET}({operands}){effect}",
+    format!(
+        "{defs_prefix}{BOLD}{opcode}{RESET}({operands}){effect}",
         BOLD = color::BOLD,
         opcode = opcode_str,
         RESET = color::RESET,
@@ -184,7 +191,7 @@ pub fn fmt_op(
 }
 
 /// Format the defines of an operation.
-fn format_defines(op: &Operation, vregs: &SlotMap<VRegKey, VRegDef>) -> String {
+fn format_defines(op: &Operation, vregs: &SlotMap<VRegKey, VInit>) -> String {
     let parts: Vec<String> = op
         .defines
         .iter()
@@ -211,29 +218,26 @@ fn format_defines(op: &Operation, vregs: &SlotMap<VRegKey, VRegDef>) -> String {
 }
 
 /// Format an opcode for display (just the name part).
-fn format_opcode(opcode: OpCode) -> String {
+fn format_opcode(opcode: VCode) -> String {
     match opcode {
-        OpCode::SetSlot(mem) => format!("set_slot {}", mem),
-        OpCode::ClearSlot(mem) => format!("clear_slot {}", mem),
-        OpCode::Load(mem) => format!("load {}", mem),
-        OpCode::Call(idx) => format!("call ${idx}"),
+        VCode::SetSlot(mem) => format!("set_slot {}", mem),
+        VCode::ClearSlot(mem) => format!("clear_slot {}", mem),
+        VCode::Load(mem) => format!("load {}", mem),
+        VCode::Call { func_idx: idx, .. } => format!("call ${idx}"),
         _ => opcode.name().to_string(),
     }
 }
 
 /// Format just the opcode name (for effect chain references).
-fn format_opcode_name(opcode: OpCode) -> String {
+fn format_opcode_name(opcode: VCode) -> String {
     match opcode {
-        OpCode::Call(idx) => format!("call ${idx}"),
+        VCode::Call { func_idx: idx, .. } => format!("call ${idx}"),
         _ => opcode.name().to_string(),
     }
 }
 
 /// Format the grid state for display.
-pub fn fmt_grid(
-    grid: &Grid,
-    vregs: &SlotMap<VRegKey, VRegDef>,
-) -> String {
+pub fn fmt_grid(grid: &Grid, vregs: &SlotMap<VRegKey, VInit>) -> String {
     let parts: Vec<String> = grid
         .iter()
         .map(|(&slot_key, &vreg_key)| {
@@ -263,7 +267,7 @@ pub fn fmt_grid(
 }
 
 /// Format a slot key for display.
-fn format_slot_key(key: SlotKey, _vregs: &SlotMap<VRegKey, VRegDef>) -> String {
+fn format_slot_key(key: SlotKey, _vregs: &SlotMap<VRegKey, VInit>) -> String {
     match key {
         SlotKey::PReg(preg) => {
             // Default to w prefix (W32) — could be refined
@@ -298,7 +302,7 @@ pub fn print_timeline(
     label: &str,
     blocks: &[Block],
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) {
     println!(
         "\n{BOLD}=== {label} ==={RESET}",
@@ -310,7 +314,7 @@ pub fn print_timeline(
     let mut max_width = 0;
     for block in blocks {
         for (i, &op_key) in block.ops.iter().enumerate() {
-            let before = grid::get_slots_before(op_key, ops, vregs);
+            let before = grid::get_slots_before(Some(op_key), ops, vregs);
             let line = format!(
                 "  [{order:>2}] {op}",
                 order = i + 1,
@@ -331,7 +335,7 @@ pub fn print_timeline(
         );
         for &op_key in &block.ops {
             global_order += 1;
-            let before = grid::get_slots_before(op_key, ops, vregs);
+            let before = grid::get_slots_before(Some(op_key), ops, vregs);
             let after = grid::get_slots_after(op_key, ops, vregs);
             let line = format!(
                 "  {DIM}[{order:>2}]{RESET} {op}",

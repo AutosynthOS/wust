@@ -16,14 +16,10 @@ use slotmap::SlotMap;
 use smallvec::smallvec;
 
 /// Helper to create a vreg definition with a preg hint.
-fn vreg_in_preg(
-    vregs: &mut SlotMap<VRegKey, VRegDef>,
-    definer: OpKey,
-    preg: PReg,
-) -> VRegKey {
-    vregs.insert(VRegDef {
+fn vreg_in_preg(vregs: &mut SlotMap<VRegKey, VInit>, from_op: Some(OpKey), preg: PReg) -> VRegKey {
+    vregs.insert(VInit {
         width: Width::W32,
-        definer,
+        from_op,
         constant: None,
         preg: Some(preg),
         mem: None,
@@ -31,13 +27,10 @@ fn vreg_in_preg(
 }
 
 /// Helper to create a vreg with no preg assignment.
-fn vreg_unassigned(
-    vregs: &mut SlotMap<VRegKey, VRegDef>,
-    definer: OpKey,
-) -> VRegKey {
-    vregs.insert(VRegDef {
+fn vreg_unassigned(vregs: &mut SlotMap<VRegKey, VInit>, from_op: Some(OpKey)) -> VRegKey {
+    vregs.insert(VInit {
         width: Width::W32,
-        definer,
+        from_op,
         constant: None,
         preg: None,
         mem: None,
@@ -45,14 +38,10 @@ fn vreg_unassigned(
 }
 
 /// Helper to create a constant vreg.
-fn vreg_const(
-    vregs: &mut SlotMap<VRegKey, VRegDef>,
-    definer: OpKey,
-    value: i64,
-) -> VRegKey {
-    vregs.insert(VRegDef {
+fn vreg_const(vregs: &mut SlotMap<VRegKey, VInit>, from_op: Some(OpKey), value: i64) -> VRegKey {
+    vregs.insert(VInit {
         width: Width::W32,
-        definer,
+        from_op,
         constant: Some(value),
         preg: None,
         mem: None,
@@ -69,7 +58,7 @@ fn show(
     sorted: &[OpKey],
     roots: &[OpKey],
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) {
     let blocks = detect_blocks(sorted, roots, ops, vregs);
     print_timeline(label, &blocks, ops, vregs);
@@ -96,21 +85,21 @@ fn fib_timeline() {
     assert_eq!(blocks.len(), 3);
     assert_eq!(blocks[0].label, "Entry");
     assert_eq!(blocks[0].ops.len(), 3);
-    assert_eq!(ops[blocks[0].ops[0]].opcode, OpCode::Param);
+    assert_eq!(ops[blocks[0].ops[0]].opcode, VCode::Param);
     assert_eq!(
         ops[blocks[0].ops[1]].opcode,
-        OpCode::Alu(AluOp::Cmp(CmpOp::LeS))
+        VCode::Alu(AluOp::Cmp(CmpOp::LeS))
     );
-    assert_eq!(ops[blocks[0].ops[2]].opcode, OpCode::BrIf);
+    assert_eq!(ops[blocks[0].ops[2]].opcode, VCode::BrIf);
 
     assert_eq!(blocks[1].label, "Case(0)");
     assert_eq!(blocks[1].ops.len(), 1);
-    assert_eq!(ops[blocks[1].ops[0]].opcode, OpCode::Return);
+    assert_eq!(ops[blocks[1].ops[0]].opcode, VCode::Return);
 
     assert_eq!(blocks[2].label, "Case(1)");
     assert_eq!(blocks[2].ops.len(), 10);
-    assert_eq!(ops[blocks[2].ops[0]].opcode, OpCode::SetSlot(mem_0));
-    assert_eq!(ops[blocks[2].ops[2]].opcode, OpCode::Call(0));
+    assert_eq!(ops[blocks[2].ops[0]].opcode, VCode::SetSlot(mem_0));
+    assert_eq!(ops[blocks[2].ops[2]].opcode, VCode::Call(0));
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -238,17 +227,11 @@ fn fib_pathfinder() {
     // Verify all ALU ops have pregs assigned
     for &op_key in &sorted {
         let op = &ops[op_key];
-        if let OpCode::Alu(_) = op.opcode {
-            assert!(
-                !op.defines.is_empty(),
-                "ALU op should have defines"
-            );
+        if let VCode::Alu(_) = op.opcode {
+            assert!(!op.defines.is_empty(), "ALU op should have defines");
             for &vreg_key in &op.defines {
                 let def = &vregs[vreg_key];
-                assert!(
-                    def.preg.is_some(),
-                    "ALU vreg should have preg assigned"
-                );
+                assert!(def.preg.is_some(), "ALU vreg should have preg assigned");
             }
         }
     }
@@ -256,7 +239,7 @@ fn fib_pathfinder() {
     // Verify loads were inserted for values crossing calls
     let load_count = sorted
         .iter()
-        .filter(|&&k| matches!(ops[k].opcode, OpCode::Load(_)))
+        .filter(|&&k| matches!(ops[k].opcode, VCode::Load(_)))
         .count();
     assert!(
         load_count >= 2,
@@ -272,11 +255,11 @@ fn fib_pathfinder() {
 /// and stores/loads already placed.
 fn build_hand_built_fib() -> (
     SlotMap<OpKey, Operation>,
-    SlotMap<VRegKey, VRegDef>,
+    SlotMap<VRegKey, VInit>,
     Vec<OpKey>,
 ) {
     let mut ops: SlotMap<OpKey, Operation> = SlotMap::with_key();
-    let mut vregs: SlotMap<VRegKey, VRegDef> = SlotMap::with_key();
+    let mut vregs: SlotMap<VRegKey, VInit> = SlotMap::with_key();
 
     let w0 = PReg(0);
     let w1 = PReg(1);
@@ -292,7 +275,7 @@ fn build_hand_built_fib() -> (
 
     // --- Entry ---
     let op_param = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Param,
+        opcode: VCode::Param,
         inputs: smallvec![],
         effect: None,
         prev: None,
@@ -302,7 +285,7 @@ fn build_hand_built_fib() -> (
     ops[op_param].defines = smallvec![v0];
 
     let op_cmp = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Alu(AluOp::Cmp(CmpOp::LeS)),
+        opcode: VCode::Alu(AluOp::Cmp(CmpOp::LeS)),
         inputs: smallvec![Input::VReg(v0), imm(1)],
         effect: None,
         prev: None,
@@ -312,7 +295,7 @@ fn build_hand_built_fib() -> (
     ops[op_cmp].defines = smallvec![v1];
 
     let op_brif = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::BrIf,
+        opcode: VCode::BrIf,
         inputs: smallvec![Input::VReg(v1)],
         effect: None,
         prev: None,
@@ -321,7 +304,7 @@ fn build_hand_built_fib() -> (
 
     // --- Case(0) ---
     let op_ret0 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Return,
+        opcode: VCode::Return,
         inputs: smallvec![Input::VReg(v0)],
         effect: Some(op_brif),
         prev: None,
@@ -330,7 +313,7 @@ fn build_hand_built_fib() -> (
 
     // --- Case(1) ---
     let op_spill_v0 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::SetSlot(mem_0),
+        opcode: VCode::SetSlot(mem_0),
         inputs: smallvec![Input::VReg(v0)],
         effect: Some(op_brif),
         prev: None,
@@ -338,7 +321,7 @@ fn build_hand_built_fib() -> (
     });
 
     let op_sub1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Alu(AluOp::Sub),
+        opcode: VCode::Alu(AluOp::Sub),
         inputs: smallvec![Input::VReg(v0), imm(1)],
         effect: None,
         prev: None,
@@ -348,7 +331,7 @@ fn build_hand_built_fib() -> (
     ops[op_sub1].defines = smallvec![v2];
 
     let op_call1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Call(0),
+        opcode: VCode::Call(0),
         inputs: smallvec![Input::VReg(v2)],
         effect: Some(op_spill_v0),
         prev: None,
@@ -358,7 +341,7 @@ fn build_hand_built_fib() -> (
     ops[op_call1].defines = smallvec![v3];
 
     let op_spill_v3 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::SetSlot(mem_4),
+        opcode: VCode::SetSlot(mem_4),
         inputs: smallvec![Input::VReg(v3)],
         effect: Some(op_call1),
         prev: None,
@@ -366,7 +349,7 @@ fn build_hand_built_fib() -> (
     });
 
     let op_load_v0 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Load(mem_0),
+        opcode: VCode::Load(mem_0),
         inputs: smallvec![],
         effect: Some(op_spill_v3),
         prev: None,
@@ -376,7 +359,7 @@ fn build_hand_built_fib() -> (
     ops[op_load_v0].defines = smallvec![v4];
 
     let op_sub2 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Alu(AluOp::Sub),
+        opcode: VCode::Alu(AluOp::Sub),
         inputs: smallvec![Input::VReg(v4), imm(2)],
         effect: None,
         prev: None,
@@ -386,7 +369,7 @@ fn build_hand_built_fib() -> (
     ops[op_sub2].defines = smallvec![v5];
 
     let op_call2 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Call(0),
+        opcode: VCode::Call(0),
         inputs: smallvec![Input::VReg(v5)],
         effect: Some(op_load_v0),
         prev: None,
@@ -396,7 +379,7 @@ fn build_hand_built_fib() -> (
     ops[op_call2].defines = smallvec![v6];
 
     let op_load_v3 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Load(mem_4),
+        opcode: VCode::Load(mem_4),
         inputs: smallvec![],
         effect: Some(op_call2),
         prev: None,
@@ -406,7 +389,7 @@ fn build_hand_built_fib() -> (
     ops[op_load_v3].defines = smallvec![v7];
 
     let op_add = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Alu(AluOp::Add),
+        opcode: VCode::Alu(AluOp::Add),
         inputs: smallvec![Input::VReg(v7), Input::VReg(v6)],
         effect: None,
         prev: None,
@@ -416,7 +399,7 @@ fn build_hand_built_fib() -> (
     ops[op_add].defines = smallvec![v8];
 
     let op_ret1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Return,
+        opcode: VCode::Return,
         inputs: smallvec![Input::VReg(v8)],
         effect: Some(op_call2),
         prev: None,
@@ -435,11 +418,11 @@ fn build_hand_built_fib() -> (
 /// and NO load ops. The pathfinder must assign pregs and insert loads.
 fn build_raw_fib() -> (
     SlotMap<OpKey, Operation>,
-    SlotMap<VRegKey, VRegDef>,
+    SlotMap<VRegKey, VInit>,
     Vec<OpKey>,
 ) {
     let mut ops: SlotMap<OpKey, Operation> = SlotMap::with_key();
-    let mut vregs: SlotMap<VRegKey, VRegDef> = SlotMap::with_key();
+    let mut vregs: SlotMap<VRegKey, VInit> = SlotMap::with_key();
 
     let w0 = PReg(0);
     let x29 = PReg(29);
@@ -465,7 +448,7 @@ fn build_raw_fib() -> (
 
     // param() -> v0:w0 (ABI-fixed)
     let op_param = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Param,
+        opcode: VCode::Param,
         inputs: smallvec![],
         effect: None,
         prev: None,
@@ -476,7 +459,7 @@ fn build_raw_fib() -> (
 
     // const() -> c1 = 1
     let op_const1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Const,
+        opcode: VCode::Const,
         inputs: smallvec![],
         effect: None,
         prev: None,
@@ -487,7 +470,7 @@ fn build_raw_fib() -> (
 
     // const() -> c2 = 2
     let op_const2 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Const,
+        opcode: VCode::Const,
         inputs: smallvec![],
         effect: None,
         prev: None,
@@ -500,7 +483,7 @@ fn build_raw_fib() -> (
 
     // set_slot [x29+24](v0)  — push v0
     let op_push_v0 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::SetSlot(stk_24),
+        opcode: VCode::SetSlot(stk_24),
         inputs: smallvec![Input::VReg(v0)],
         effect: None,
         prev: None,
@@ -508,7 +491,7 @@ fn build_raw_fib() -> (
     });
     // clear_slot [x29+24](v0) — pop v0
     let _op_pop_v0 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::ClearSlot(stk_24),
+        opcode: VCode::ClearSlot(stk_24),
         inputs: smallvec![Input::VReg(v0)],
         effect: Some(op_push_v0),
         prev: None,
@@ -517,7 +500,7 @@ fn build_raw_fib() -> (
 
     // set_slot [x29+28](c1) — push c1
     let op_push_c1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::SetSlot(stk_28),
+        opcode: VCode::SetSlot(stk_28),
         inputs: smallvec![Input::VReg(c1)],
         effect: None,
         prev: None,
@@ -525,7 +508,7 @@ fn build_raw_fib() -> (
     });
     // clear_slot [x29+28](c1) — pop c1
     let _op_pop_c1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::ClearSlot(stk_28),
+        opcode: VCode::ClearSlot(stk_28),
         inputs: smallvec![Input::VReg(c1)],
         effect: Some(op_push_c1),
         prev: None,
@@ -534,7 +517,7 @@ fn build_raw_fib() -> (
 
     // --- cmp_les(v0, c1) -> v_cmp (NO preg assigned) ---
     let op_cmp = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Alu(AluOp::Cmp(CmpOp::LeS)),
+        opcode: VCode::Alu(AluOp::Cmp(CmpOp::LeS)),
         inputs: smallvec![Input::VReg(v0), Input::VReg(c1)],
         effect: None,
         prev: None,
@@ -545,7 +528,7 @@ fn build_raw_fib() -> (
 
     // brif(v_cmp)
     let op_brif = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::BrIf,
+        opcode: VCode::BrIf,
         inputs: smallvec![Input::VReg(v_cmp)],
         effect: None,
         prev: None,
@@ -554,7 +537,7 @@ fn build_raw_fib() -> (
 
     // --- Case(0): return(v0) ---
     let op_ret0 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Return,
+        opcode: VCode::Return,
         inputs: smallvec![Input::VReg(v0)],
         effect: Some(op_brif),
         prev: None,
@@ -565,7 +548,7 @@ fn build_raw_fib() -> (
 
     // Spill v0 to [x29+0] before first call
     let op_spill_v0 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::SetSlot(mem_0),
+        opcode: VCode::SetSlot(mem_0),
         inputs: smallvec![Input::VReg(v0)],
         effect: Some(op_brif),
         prev: None,
@@ -574,7 +557,7 @@ fn build_raw_fib() -> (
 
     // sub(v0, c1) -> v_sub1 (NO preg)
     let op_sub1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Alu(AluOp::Sub),
+        opcode: VCode::Alu(AluOp::Sub),
         inputs: smallvec![Input::VReg(v0), Input::VReg(c1)],
         effect: None,
         prev: None,
@@ -585,7 +568,7 @@ fn build_raw_fib() -> (
 
     // call $0(v_sub1) -> v_call1:w0 (ABI-fixed result)
     let op_call1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Call(0),
+        opcode: VCode::Call(0),
         inputs: smallvec![Input::VReg(v_sub1)],
         effect: Some(op_spill_v0),
         prev: None,
@@ -596,7 +579,7 @@ fn build_raw_fib() -> (
 
     // Spill call1 result to [x29+4]
     let op_spill_call1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::SetSlot(mem_4),
+        opcode: VCode::SetSlot(mem_4),
         inputs: smallvec![Input::VReg(v_call1)],
         effect: Some(op_call1),
         prev: None,
@@ -605,7 +588,7 @@ fn build_raw_fib() -> (
 
     // sub(v0, c2) -> v_sub2 (NO preg)
     let op_sub2 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Alu(AluOp::Sub),
+        opcode: VCode::Alu(AluOp::Sub),
         inputs: smallvec![Input::VReg(v0), Input::VReg(c2)],
         effect: None,
         prev: None,
@@ -616,7 +599,7 @@ fn build_raw_fib() -> (
 
     // call $0(v_sub2) -> v_call2:w0 (ABI-fixed result)
     let op_call2 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Call(0),
+        opcode: VCode::Call(0),
         inputs: smallvec![Input::VReg(v_sub2)],
         effect: Some(op_spill_call1),
         prev: None,
@@ -627,7 +610,7 @@ fn build_raw_fib() -> (
 
     // add(v_call1, v_call2) -> v_add (NO preg)
     let op_add = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Alu(AluOp::Add),
+        opcode: VCode::Alu(AluOp::Add),
         inputs: smallvec![Input::VReg(v_call1), Input::VReg(v_call2)],
         effect: None,
         prev: None,
@@ -638,7 +621,7 @@ fn build_raw_fib() -> (
 
     // return(v_add) [after call2]
     let op_ret1 = ops.insert_with_key(|_| Operation {
-        opcode: OpCode::Return,
+        opcode: VCode::Return,
         inputs: smallvec![Input::VReg(v_add)],
         effect: Some(op_call2),
         prev: None,

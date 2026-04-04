@@ -16,5 +16,5 @@ pub mod types;
 
 pub use op::{AluOp, CmpOp};
 pub use types::{
-    resolve_input_vreg, Input, MemSlot, OpCode, OpKey, Operation, SlotKey, VRegDef, VRegKey,
+    Input, MemSlot, OpKey, Operation, SlotKey, VCode, VInit, VRegKey, resolve_input_vreg,
 };

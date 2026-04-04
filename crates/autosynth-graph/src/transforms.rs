@@ -11,18 +11,21 @@ use std::collections::HashSet;
 use autosynth_isa::UImm12;
 use slotmap::SlotMap;
 
-use crate::types::{Input, OpCode, OpKey, Operation, VRegDef, VRegKey};
+use crate::{
+    VRegKey,
+    types::{Input, OpKey, Operation, VCode, VInit},
+};
 
 /// For each ALU op with 2 inputs, if the RHS input traces back to a
 /// constant vreg with value 0..4095, replace with Input::Imm12.
 pub fn fold_immediates(
     sorted: &[OpKey],
     ops: &mut SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) {
     for &op_key in sorted {
         let Some(op) = ops.get(op_key) else { continue };
-        let is_alu = matches!(op.opcode, OpCode::Alu(_));
+        let is_alu = matches!(op.opcode, VCode::Alu(_));
         if !is_alu || op.inputs.len() != 2 {
             continue;
         }
@@ -45,7 +48,7 @@ pub fn fold_immediates(
 fn resolve_const(
     input: &Input,
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> Option<i64> {
     match input {
         Input::Imm12(imm) => Some(imm.value() as i64),
@@ -54,6 +57,7 @@ fn resolve_const(
             let vreg_key = crate::types::resolve_input_vreg(input, ops)?;
             vregs.get(vreg_key)?.constant
         }
+        Input::VRef(_) => unimplemented!(),
     }
 }
 
@@ -61,14 +65,14 @@ fn resolve_const(
 pub fn mark_reachable(
     roots: &[OpKey],
     ops: &SlotMap<OpKey, Operation>,
-    vregs: &SlotMap<VRegKey, VRegDef>,
+    vregs: &SlotMap<VRegKey, VInit>,
 ) -> HashSet<OpKey> {
     let mut live = HashSet::new();
 
     fn walk(
         key: OpKey,
         ops: &SlotMap<OpKey, Operation>,
-        vregs: &SlotMap<VRegKey, VRegDef>,
+        vregs: &SlotMap<VRegKey, VInit>,
         live: &mut HashSet<OpKey>,
     ) {
         if !live.insert(key) {
@@ -78,14 +82,18 @@ pub fn mark_reachable(
         for input in &op.inputs {
             match input {
                 Input::VReg(vreg_key) => {
-                    if let Some(def) = vregs.get(*vreg_key) {
-                        walk(def.definer, ops, vregs, live);
+                    if let Some(VInit {
+                        ..
+                    }) = vregs.get(*vreg_key)
+                    {
+                        walk(*from_op, ops, vregs, live);
                     }
                 }
                 Input::Op(op_key) => {
                     walk(*op_key, ops, vregs, live);
                 }
                 Input::Imm12(_) => {}
+                Input::VRef(..) => unimplemented!(),
             }
         }
         if let Some(effect) = op.effect {
@@ -106,7 +114,7 @@ pub fn sweep(
     sorted: &[OpKey],
     live: &HashSet<OpKey>,
     ops: &mut SlotMap<OpKey, Operation>,
-    vregs: &mut SlotMap<VRegKey, VRegDef>,
+    vregs: &mut SlotMap<VRegKey, VInit>,
 ) -> Vec<OpKey> {
     let mut result = Vec::new();
     for &key in sorted {
